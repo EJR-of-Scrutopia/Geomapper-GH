@@ -237,11 +237,13 @@ Expected: build succeeds with no errors.
 
 - [ ] **Step 7: Verify the default path is unchanged**
 
-Run the bridge with no `--file-name-stem` on a tiny bbox, into a scratch folder:
+Run the bridge with no `--file-name-stem` on a tiny bbox, into a scratch folder.
+
+Note the space between `--bbox` and its value. The bridge's hand-rolled parser at `Options.Parse` matches on the exact token `--bbox`, so the `--bbox=value` form argparse accepts is rejected here as an unknown argument.
 
 ```powershell
 dotnet run --project tools/UrbanoBridge/UrbanoBridge.csproj -- `
-  --bbox=-3.29,51.38,-3.28,51.39 `
+  --bbox -3.29,51.38,-3.28,51.39 `
   --output-folder .\_verify\coord `
   --skip-blocks --skip-climate --skip-elevation
 ```
@@ -252,7 +254,7 @@ Expected: console prints `File name stem: 51.39_51.38_-3.28_-3.29` and writes `5
 
 ```powershell
 dotnet run --project tools/UrbanoBridge/UrbanoBridge.csproj -- `
-  --bbox=-3.29,51.38,-3.28,51.39 `
+  --bbox -3.29,51.38,-3.28,51.39 `
   --output-folder .\_verify\named `
   --file-name-stem "Barry-Waterfront_2026-08-01" `
   --skip-blocks --skip-climate --skip-elevation

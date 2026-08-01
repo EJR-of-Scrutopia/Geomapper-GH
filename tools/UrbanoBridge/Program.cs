@@ -52,7 +52,9 @@ static void Execute(Options options)
     var keyType = RequireType(coreAssembly, "Urbano.Core.Data.Key");
     var coreKeys = ReadCoreKeys(keyType);
 
-    var fileNameStr = BuildFileNameString(options.BBox);
+    var fileNameStr = string.IsNullOrWhiteSpace(options.FileNameStem)
+        ? BuildFileNameString(options.BBox)
+        : options.FileNameStem;
     var basePath = Path.Combine(outputFolder, fileNameStr);
 
     Console.WriteLine($"Package dir: {packageDir}");
@@ -1052,6 +1054,7 @@ sealed class Options
     public string? OsmFilePath { get; init; }
     public string? ElevationTiffPath { get; init; }
     public string? TravelerModelPath { get; init; }
+    public string? FileNameStem { get; init; }
     public bool SkipClimate { get; init; }
     public bool SkipBlocks { get; init; }
     public bool SkipBlockMeta { get; init; }
@@ -1067,6 +1070,7 @@ sealed class Options
         string? osmFilePath = null;
         string? elevationTiffPath = null;
         string? travelerModelPath = null;
+        string? fileNameStem = null;
         var skipClimate = false;
         var skipBlocks = false;
         var skipBlockMeta = false;
@@ -1098,6 +1102,9 @@ sealed class Options
                     break;
                 case "--traveler-model":
                     travelerModelPath = NextValue(args, ref index, argument);
+                    break;
+                case "--file-name-stem":
+                    fileNameStem = NextValue(args, ref index, argument);
                     break;
                 case "--skip-climate":
                     skipClimate = true;
@@ -1138,6 +1145,7 @@ sealed class Options
             OsmFilePath = osmFilePath,
             ElevationTiffPath = elevationTiffPath,
             TravelerModelPath = travelerModelPath,
+            FileNameStem = fileNameStem,
             SkipClimate = skipClimate,
             SkipBlocks = skipBlocks,
             SkipBlockMeta = skipBlockMeta,
