@@ -2,6 +2,7 @@ import pytest
 
 from mapgen.geo import BBox, Tile
 from mapgen.sources.base import (
+    DuplicateSourceError,
     Estimate,
     NullProgress,
     UnknownSourceError,
@@ -13,11 +14,13 @@ from mapgen.sources.base import (
 
 
 class FakeSource:
-    id = "fake"
     display_name = "Fake Source"
     licence = "CC0"
     attribution = "nobody"
     requires_api_key = False
+
+    def __init__(self, id="fake"):
+        self.id = id
 
     def estimate(self, bbox, tiles):
         return Estimate(bytes_estimate=1024 * len(tiles), seconds_estimate=2.0 * len(tiles))
@@ -79,11 +82,12 @@ def test_unknown_source_error_lists_what_is_available():
         get_source("nope")
 
 
-def test_registering_a_duplicate_id_replaces_the_entry():
-    register(FakeSource())
-    replacement = FakeSource()
-    register(replacement)
-    assert get_source("fake") is replacement
+def test_registering_a_duplicate_id_raises_an_error():
+    register(FakeSource(id="fake"))
+    replacement = FakeSource(id="fake")
+    with pytest.raises(DuplicateSourceError, match="'fake'"):
+        register(replacement)
+    assert get_source("fake") is not replacement
     assert len(available_sources()) == 1
 
 
@@ -116,3 +120,9 @@ def test_progress_sink_receives_emitted_events(tmp_path):
     FakeSource().fetch(bbox, [_tile("r00_c00")], tmp_path / "work", Recorder())
 
     assert events == [("tile_done", {"source": "fake", "tile_id": "r00_c00"})]
+
+
+def test_registry_isolation_proves_clear_registry_runs():
+    source = FakeSource(id="unique_id_only_in_this_test")
+    register(source)
+    assert available_sources() == [source]

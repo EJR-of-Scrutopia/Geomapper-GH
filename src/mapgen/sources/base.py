@@ -24,6 +24,10 @@ class UnknownSourceError(KeyError):
     """Raised when a source id is not in the registry."""
 
 
+class DuplicateSourceError(ValueError):
+    """Raised when two sources try to register the same id."""
+
+
 @runtime_checkable
 class ProgressSink(Protocol):
     def emit(self, event: str, **fields: object) -> None: ...
@@ -38,6 +42,16 @@ class NullProgress:
 
 @runtime_checkable
 class LayerSource(Protocol):
+    """A survey data source.
+
+    Sources may expose additional read-only attributes beyond this protocol for
+    survey.json provenance tracking. These are deliberately not part of the
+    protocol because they are source-specific: for example, OsmSource exposes
+    endpoints_used (WMS server addresses), but ElevationSource has no equivalent.
+    Consumers must read such attributes with getattr(source, 'attribute_name',
+    default_value) to handle sources that do not expose them.
+    """
+
     id: str
     display_name: str
     licence: str
@@ -61,6 +75,11 @@ _REGISTRY: dict[str, LayerSource] = {}
 
 
 def register(source: LayerSource) -> None:
+    if source.id in _REGISTRY:
+        raise DuplicateSourceError(
+            f"id {source.id!r} is already registered. Each source needs a unique "
+            f"id; if you copied an existing source module, change its id attribute."
+        )
     _REGISTRY[source.id] = source
 
 
