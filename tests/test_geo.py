@@ -1,6 +1,8 @@
+import json
+
 import pytest
 
-from mapgen.geo import BBox, BBoxError, build_tiles, extent_metres
+from mapgen.geo import BBox, BBoxError, Tile, build_tiles, extent_metres
 
 
 def test_parse_accepts_west_south_east_north():
@@ -92,3 +94,57 @@ def test_build_tiles_single_tile_when_area_is_smaller_than_tile_size():
     tiles = build_tiles(BBox.parse("-3.29,51.38,-3.28,51.39"), 5000.0, 100.0)
     assert len(tiles) == 1
     assert tiles[0].tile_id == "r00_c00"
+
+
+def test_bbox_to_dict_returns_four_keys():
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    result = bbox.to_dict()
+    assert set(result.keys()) == {"west", "south", "east", "north"}
+    assert isinstance(result["west"], float)
+    assert isinstance(result["south"], float)
+    assert isinstance(result["east"], float)
+    assert isinstance(result["north"], float)
+
+
+def test_bbox_to_dict_rounds_to_seven_decimals():
+    bbox = BBox(
+        west=-3.66265432123456,
+        south=51.37090987654321,
+        east=-3.14830555555555,
+        north=51.54760123456789,
+    )
+    result = bbox.to_dict()
+    assert result["west"] == -3.6626543
+    assert result["south"] == 51.3709099
+    assert result["east"] == -3.1483056
+    assert result["north"] == 51.5476012
+
+
+def test_tile_to_dict_returns_required_keys():
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    tiles = build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0)
+    tile_dict = tiles[0].to_dict()
+    assert set(tile_dict.keys()) == {"tile_id", "row", "col", "core_bbox", "query_bbox"}
+    assert tile_dict["tile_id"] == "r00_c00"
+    assert tile_dict["row"] == 0
+    assert tile_dict["col"] == 0
+
+
+def test_tile_to_dict_nested_bboxes_are_dicts():
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    tiles = build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0)
+    tile_dict = tiles[0].to_dict()
+    assert isinstance(tile_dict["core_bbox"], dict)
+    assert isinstance(tile_dict["query_bbox"], dict)
+    assert set(tile_dict["core_bbox"].keys()) == {"west", "south", "east", "north"}
+    assert set(tile_dict["query_bbox"].keys()) == {"west", "south", "east", "north"}
+
+
+def test_tile_to_dict_is_json_serialisable():
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    tiles = build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0)
+    tile_dict = tiles[5].to_dict()
+    json_str = json.dumps(tile_dict)
+    assert isinstance(json_str, str)
+    assert "tile_id" in json_str
+    assert tiles[5].tile_id in json_str
