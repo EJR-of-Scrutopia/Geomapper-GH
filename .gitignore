@@ -1,0 +1,35 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# .NET build output
+bin/
+obj/
+
+# Downloaded and generated survey data: never commit
+data/
+south-wales-package-*/
+temp_*.osm
+temp_*.geojson
+*.osm
+*.osm.pbf
+*.parquet
+*.tif
+*.tiff
+*.egrid
+*.blocks
+*.epw
+
+# Local config and secrets
+.env
+*.local.json
+user_config.json
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
