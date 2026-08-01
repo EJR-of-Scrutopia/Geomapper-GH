@@ -33,3 +33,6 @@ user_config.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# SDD scratch workspace (ledger, briefs, review packages)
+.superpowers/
