@@ -91,7 +91,7 @@ def build_package_paths(
         root = region_dir / f"{base_name}{suffix}"
         counter += 1
 
-    stem = stem_override if stem_override else f"{site_slug}_{date_str}{suffix}"
+    stem = f"{stem_override}{suffix}" if stem_override else f"{site_slug}_{date_str}{suffix}"
     return _compose(root, stem)
 
 
@@ -101,11 +101,17 @@ def check_path_length(
     limit: int = DEFAULT_PATH_LIMIT,
 ) -> None:
     longest_type = max(overture_types, key=len) if overture_types else "overture"
-    worst_case = paths.work_dir / "raw" / "overture" / longest_type / "r00_c00.geojson"
-    length = len(str(worst_case.resolve() if not worst_case.is_absolute() else worst_case))
+    overture_path = paths.work_dir / "raw" / "overture" / longest_type / "r00_c00.geojson"
+    overture_length = len(str(overture_path.resolve() if not overture_path.is_absolute() else overture_path))
+
+    project_setting_length = len(str(paths.project_setting.resolve() if not paths.project_setting.is_absolute() else paths.project_setting))
+
+    longest_candidate = overture_path if overture_length >= project_setting_length else paths.project_setting
+    length = max(overture_length, project_setting_length)
+
     if length > limit:
         raise PathTooLongError(
             f"This job would produce paths of {length} characters, over the "
-            f"{limit} character limit. The longest path would be:\n  {worst_case}\n"
+            f"{limit} character limit. The longest path would be:\n  {longest_candidate}\n"
             f"Choose a shorter output root, or shorten the region or site name."
         )

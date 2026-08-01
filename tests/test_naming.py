@@ -25,7 +25,19 @@ def test_slugify_drops_punctuation():
 
 
 def test_slugify_transliterates_non_ascii():
-    assert slugify("Dwr Cymru", "region") == "Dwr-Cymru"
+    assert slugify("Dŵr Cymru", "region") == "Dwr-Cymru"
+
+
+def test_slugify_transliterates_hand_coded_table_ø():
+    assert slugify("Søren", "site") == "Soren"
+
+
+def test_slugify_transliterates_hand_coded_table_ß():
+    assert slugify("Straße", "site") == "Strasse"
+
+
+def test_slugify_transliterates_nfkd_decomposable_accents():
+    assert slugify("Caerdydd Bâch", "site") == "Caerdydd-Bach"
 
 
 def test_slugify_collapses_repeated_hyphens():
@@ -92,6 +104,18 @@ def test_build_package_paths_honours_a_stem_override(tmp_path):
     assert paths.project_setting.name == "51.39_51.38_-3.28_-3.29_project_setting.json"
 
 
+def test_build_package_paths_appends_collision_suffix_to_stem_override(tmp_path):
+    first = build_package_paths(
+        tmp_path, "South Wales", "Barry", date(2026, 8, 1), stem_override="51.39_51.38"
+    )
+    first.root.mkdir(parents=True)
+    second = build_package_paths(
+        tmp_path, "South Wales", "Barry", date(2026, 8, 1), stem_override="51.39_51.38"
+    )
+    assert second.stem == "51.39_51.38_02"
+    assert second.project_setting.name == "51.39_51.38_02_project_setting.json"
+
+
 def test_check_path_length_passes_for_a_short_root(tmp_path):
     paths = build_package_paths(tmp_path, "South Wales", "Barry", date(2026, 8, 1))
     check_path_length(paths, ["building", "infrastructure"])
@@ -104,6 +128,15 @@ def test_check_path_length_rejects_a_deep_root():
         check_path_length(paths, ["infrastructure"])
     assert "240" in str(excinfo.value)
     assert "shorter output root" in str(excinfo.value)
+
+
+def test_check_path_length_rejects_long_site_name_pushing_project_setting_over_limit():
+    deep = Path("C:/") / ("x" * 150)
+    long_site = "A" * 40
+    paths = build_package_paths(deep, "R", long_site, date(2026, 8, 1))
+    with pytest.raises(PathTooLongError) as excinfo:
+        check_path_length(paths, ["x"], limit=240)
+    assert str(paths.project_setting) in str(excinfo.value)
 
 
 def test_check_path_length_boundary_is_inclusive(tmp_path):
