@@ -132,3 +132,138 @@ def test_assert_inputs_present_rejects_a_zero_length_file(tmp_path):
 def test_assert_inputs_present_with_force_returns_only_usable_files(tmp_path):
     present = _write(tmp_path, "a.osm", TILE_A)
     assert assert_inputs_present([present, tmp_path / "b.osm"], force=True) == [present]
+
+
+def test_assert_inputs_present_success_path_with_all_files_present(tmp_path):
+    a = _write(tmp_path, "a.osm", TILE_A)
+    b = _write(tmp_path, "b.osm", TILE_B)
+    result = assert_inputs_present([a, b], force=False)
+    assert result == [a, b]
+
+
+def _overture_feature(feature_id, geometry_type="Point"):
+    return {
+        "type": "Feature",
+        "geometry": {"type": geometry_type, "coordinates": [0, 0]},
+        "properties": {"id": feature_id},
+    }
+
+
+def _overture_collection(*feature_ids):
+    return json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [_overture_feature(fid) for fid in feature_ids],
+        }
+    )
+
+
+def test_merge_geojson_deduplicates_overture_features_with_properties_id(tmp_path):
+    """Shared feature from overlapping tiles has id in properties, not top-level."""
+    a = _write(tmp_path, "a.geojson", _overture_collection("f1", "f2"))
+    b = _write(tmp_path, "b.geojson", _overture_collection("f2", "f3"))
+    assert merge_geojson([a, b], tmp_path / "merged.geojson") == 3
+
+
+def test_merge_geojson_prefers_top_level_id_when_present(tmp_path):
+    """Legacy support: if top-level id exists, use it even if properties has one."""
+    a = _write(
+        tmp_path,
+        "a.geojson",
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "id": "top-f1",
+                        "geometry": {"type": "Point", "coordinates": [0, 0]},
+                        "properties": {"id": "props-f1"},
+                    }
+                ],
+            }
+        ),
+    )
+    out = tmp_path / "merged.geojson"
+    merge_geojson([a], out)
+    parsed = json.loads(out.read_text(encoding="utf-8"))
+    assert len(parsed["features"]) == 1
+
+
+def test_merge_geojson_handles_falsy_feature_ids(tmp_path):
+    """Falsy ids like 0 or empty string are real ids, not skipped."""
+    a = _write(
+        tmp_path,
+        "a.geojson",
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [0, 0]},
+                        "properties": {"id": 0},
+                    },
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [1, 1]},
+                        "properties": {"id": ""},
+                    },
+                ],
+            }
+        ),
+    )
+    out = tmp_path / "merged.geojson"
+    assert merge_geojson([a], out) == 2
+
+
+def test_merge_geojson_raises_on_missing_feature_id(tmp_path):
+    """Feature with no id anywhere raises MergeError, not silently synthesized."""
+    a = _write(
+        tmp_path,
+        "a.geojson",
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point", "coordinates": [0, 0]},
+                        "properties": {},
+                    }
+                ],
+            }
+        ),
+    )
+    out = tmp_path / "merged.geojson"
+    with pytest.raises(MergeError, match="a.geojson.*feature 0"):
+        merge_geojson([a], out)
+
+
+def test_merge_osm_xml_handles_non_numeric_ids_in_sort(tmp_path):
+    """OSM elements with non-numeric ids should not crash the sort."""
+    xml_with_non_numeric = """<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <node id="abc" version="1" lat="51.38" lon="-3.29"/>
+  <node id="2" version="1" lat="51.39" lon="-3.28"/>
+</osm>
+"""
+    out = tmp_path / "all.osm"
+    merge_osm_xml([_write(tmp_path, "a.osm", xml_with_non_numeric)], out)
+    assert out.exists()
+
+
+def test_merge_osm_xml_includes_relations(tmp_path):
+    """Relations should be included in merge output and sort after ways."""
+    xml_with_relation = """<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+  <node id="1" version="1" lat="51.38" lon="-3.29"/>
+  <way id="10" version="1"><nd ref="1"/></way>
+  <relation id="100" version="1"><member type="node" ref="1" role=""/></relation>
+</osm>
+"""
+    out = tmp_path / "all.osm"
+    merge_osm_xml([_write(tmp_path, "a.osm", xml_with_relation)], out)
+    text = out.read_text(encoding="utf-8")
+    assert '<relation id="100"' in text
+    assert text.index("<way") < text.index("<relation")

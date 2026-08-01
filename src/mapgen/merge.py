@@ -51,6 +51,13 @@ def _element_rank(element: ET.Element) -> int:
         return 0
 
 
+def _element_id_or_zero(element: ET.Element) -> int:
+    try:
+        return int(element.get("id", "0"))
+    except ValueError:
+        return 0
+
+
 def merge_osm_xml(input_paths: Iterable[Path], output_path: Path) -> int:
     deduped: OrderedDict[str, ET.Element] = OrderedDict()
 
@@ -69,7 +76,7 @@ def merge_osm_xml(input_paths: Iterable[Path], output_path: Path) -> int:
 
     ordered = sorted(
         deduped.values(),
-        key=lambda el: (OSM_TYPE_ORDER.index(el.tag), int(el.get("id", "0"))),
+        key=lambda el: (OSM_TYPE_ORDER.index(el.tag), _element_id_or_zero(el)),
     )
 
     with atomic_writer(output_path) as handle:
@@ -87,7 +94,16 @@ def merge_osm_xml(input_paths: Iterable[Path], output_path: Path) -> int:
 def _iter_features(path: Path) -> Iterator[tuple[str, str]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     for index, feature in enumerate(payload.get("features", [])):
-        feature_id = feature.get("id") or f"{path.name}:{index}"
+        top_level_id = feature.get("id")
+        if top_level_id is not None:
+            feature_id = top_level_id
+        else:
+            props = (feature.get("properties") or {})
+            feature_id = props.get("id")
+            if feature_id is None:
+                raise MergeError(
+                    f"{path.name} feature {index} has no id at top level or in properties"
+                )
         yield str(feature_id), json.dumps(feature, separators=(",", ":"))
 
 
