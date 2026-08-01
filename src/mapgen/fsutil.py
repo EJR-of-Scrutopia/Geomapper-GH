@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Iterator
@@ -18,7 +20,8 @@ def ensure_dir(path: Path) -> None:
 
 
 def _temp_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.{os.getpid()}.part")
+    unique = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+    return path.with_name(f"{path.name}.{unique}.part")
 
 
 @contextmanager
@@ -51,8 +54,6 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 def best_effort_rmtree(path: Path) -> None:
-    if not path.exists():
-        return
     shutil.rmtree(path, ignore_errors=True)
 
 
