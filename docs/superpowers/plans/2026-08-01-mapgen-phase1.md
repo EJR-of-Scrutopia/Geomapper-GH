@@ -1015,6 +1015,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Iterator
@@ -1025,7 +1027,12 @@ def ensure_dir(path: Path) -> None:
 
 
 def _temp_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.{os.getpid()}.part")
+    # Unique per call, not per process. Threads share a pid, and this tool runs
+    # a job worker alongside a threading HTTP server, so a pid-only temp name
+    # lets two threads writing the same target interleave into one file and
+    # report success to both callers.
+    unique = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+    return path.with_name(f"{path.name}.{unique}.part")
 
 
 @contextmanager
