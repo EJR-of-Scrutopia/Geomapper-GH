@@ -1,4 +1,7 @@
-# Site Survey Downloader: design
+# mapgen: design
+
+A site survey data tool for architectural work. Draw an extent, name it, get a
+folder Grasshopper and Urbano 2 can read.
 
 Date: 2026-08-01
 Status: approved, ready for implementation planning
@@ -70,12 +73,12 @@ subprocess orchestration and CLI parsing in one file, so every change carries
 the risk surface of all of them. Splitting it is what makes phase 2 additive.
 
 ```text
-osm-overture-downloader/          git repo root
+mapgen/                           git repo root
   pyproject.toml                  pinned dependencies, console script entry point
   bootstrap.ps1                   creates .venv and installs, one double-click
   .gitignore
   README.md
-  src/sitepack/
+  src/mapgen/
     __init__.py
     geo.py          bbox parse and normalise, tiling maths, projection helpers
     naming.py       slugify, folder and stem construction, path length guard
@@ -125,7 +128,8 @@ hour two of a download.
 
 ## The UI
 
-Launched by `python -m sitepack ui` or a desktop shortcut. The server binds
+Launched by `mapgen ui`, or `python -m mapgen ui` before the console script is
+on PATH, or from a desktop shortcut. The server binds
 127.0.0.1 on an ephemeral port, mints a per-launch token, and opens the browser
 at a URL carrying that token. Requests without the token are rejected. Loopback
 binding plus the token means nothing else on the machine can drive it.
