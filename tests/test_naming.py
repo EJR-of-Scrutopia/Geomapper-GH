@@ -131,11 +131,19 @@ def test_check_path_length_rejects_a_deep_root():
 
 
 def test_check_path_length_rejects_long_site_name_pushing_project_setting_over_limit():
-    deep = Path("C:/") / ("x" * 150)
+    deep = Path("C:/") / ("x" * 112)
     long_site = "A" * 40
     paths = build_package_paths(deep, "R", long_site, date(2026, 8, 1))
+
+    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure" / "r00_c00.geojson"
+    overture_length = len(str(overture_path.resolve() if not overture_path.is_absolute() else overture_path))
+    project_setting_length = len(str(paths.project_setting.resolve() if not paths.project_setting.is_absolute() else paths.project_setting))
+
+    assert overture_length <= 240, f"Overture path must be under 240 to test new check: {overture_length}"
+    assert project_setting_length > 240, f"Project setting path must be over 240 to isolate the new check: {project_setting_length}"
+
     with pytest.raises(PathTooLongError) as excinfo:
-        check_path_length(paths, ["x"], limit=240)
+        check_path_length(paths, ["infrastructure"], limit=240)
     assert str(paths.project_setting) in str(excinfo.value)
 
 
