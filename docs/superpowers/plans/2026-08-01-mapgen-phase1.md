@@ -20,9 +20,9 @@
 - Folder scheme: `<output root>/<Region>/<YYYY-MM-DD>_<Site>/`. File stem: `<Site>_<YYYY-MM-DD>`.
 - Collisions append `_02`, `_03` to the dated folder name.
 - `survey.json` `schema_version` is `1`.
-- All file writes are write-to-temp-then-rename. No exceptions.
+- All file writes are write-to-temp-then-rename. No exceptions. This includes output written by a third-party process on our behalf: point it at a `.part` path and rename once it exits successfully.
 - Tests never make live network calls. The one live smoke test is marked `@pytest.mark.live` and excluded from the default run.
-- The existing CLI subcommands `plan`, `download`, `merge`, `urbano-package` keep working with identical flags throughout.
+- The legacy subcommand names `plan`, `download`, `merge` and `urbano-package` remain available as aliases for `survey` and `estimate`, carrying the **new** flag set. They are not flag-compatible with the old script: `--region` and `--site` are required, and `--output-dir`, `--tile-id` and `--max-tiles` are gone. An old invocation fails with a clear argument error rather than doing something subtly different.
 
 ## Deviations from the spec
 
@@ -2226,6 +2226,37 @@ def test_fetch_reports_a_cli_failure_with_its_stderr(tmp_path):
         )
 
 
+def test_fetch_points_the_cli_at_a_part_file_not_the_final_path(tmp_path):
+    runner = FakeRunner()
+    _source(runner).fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    written_to = runner.commands[0][runner.commands[0].index("--output") + 1]
+    assert written_to.endswith(".part")
+
+
+def test_fetch_leaves_no_partial_file_when_the_cli_fails(tmp_path):
+    runner = FakeRunner(returncode=1, stderr="boom")
+    with pytest.raises(OvertureError):
+        _source(runner).fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert not (tmp_path / "water" / "r00_c00.geojson").exists()
+    assert list((tmp_path / "water").glob("*.part")) == []
+
+
+def test_fetch_fails_loudly_when_the_cli_exits_cleanly_without_writing(tmp_path):
+    class SilentRunner(FakeRunner):
+        def __call__(self, command, **kwargs):
+            self.commands.append(command)
+            return FakeCompleted(0)
+
+    with pytest.raises(OvertureError, match="wrote nothing"):
+        _source(SilentRunner()).fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+
+
 def test_fetch_reports_a_missing_cli_clearly(tmp_path):
     source = OvertureSource(
         types=["water"], runner=FakeRunner(), executable_finder=lambda _name: None
@@ -2394,6 +2425,11 @@ class OvertureSource:
             )
 
         ensure_dir(output_path.parent)
+        # The CLI writes wherever we point it, and a killed process leaves a
+        # truncated file that resume would later mistake for a finished tile.
+        # Point it at a .part path and rename only once it exits cleanly.
+        temp_path = output_path.with_suffix(".geojson.part")
+        temp_path.unlink(missing_ok=True)
         command = [
             executable,
             "download",
@@ -2403,17 +2439,25 @@ class OvertureSource:
             "--type",
             overture_type,
             "--output",
-            str(output_path),
+            str(temp_path),
         ]
         if self.release:
             command.extend(["--release", self.release])
 
         result = self._runner(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
+            temp_path.unlink(missing_ok=True)
             detail = (result.stderr or result.stdout or "").strip()
             raise OvertureError(
                 f"overturemaps failed for tile {tile.tile_id}, type {overture_type}: {detail}"
             )
+
+        if not temp_path.exists():
+            raise OvertureError(
+                f"overturemaps exited cleanly but wrote nothing for tile "
+                f"{tile.tile_id}, type {overture_type}."
+            )
+        temp_path.replace(output_path)
 
     def merge(self, parts: Sequence[Path], out_dir: Path) -> list[Path]:
         by_type: dict[str, list[Path]] = {}
@@ -2431,7 +2475,7 @@ class OvertureSource:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_sources_overture.py -v`
-Expected: 12 passed.
+Expected: 15 passed.
 
 - [ ] **Step 5: Commit**
 
