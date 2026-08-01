@@ -1508,11 +1508,12 @@ def test_unknown_source_error_lists_what_is_available():
         get_source("nope")
 
 
-def test_registering_a_duplicate_id_replaces_the_entry():
-    register(FakeSource())
-    replacement = FakeSource()
-    register(replacement)
-    assert get_source("fake") is replacement
+def test_registering_a_duplicate_id_raises_and_keeps_the_original():
+    original = FakeSource()
+    register(original)
+    with pytest.raises(DuplicateSourceError, match="fake"):
+        register(FakeSource())
+    assert get_source("fake") is original
     assert len(available_sources()) == 1
 
 
@@ -1583,6 +1584,16 @@ class UnknownSourceError(KeyError):
     """Raised when a source id is not in the registry."""
 
 
+class DuplicateSourceError(ValueError):
+    """Raised when two sources try to register the same id.
+
+    Registration fails loudly rather than overwriting. This is the phase 2
+    extension seam, and the likeliest way to add a source is to copy an
+    existing module, so a forgotten id would otherwise drop a whole data
+    layer from the CLI and the UI with nothing failing.
+    """
+
+
 @runtime_checkable
 class ProgressSink(Protocol):
     def emit(self, event: str, **fields: object) -> None: ...
@@ -1620,6 +1631,12 @@ _REGISTRY: dict[str, LayerSource] = {}
 
 
 def register(source: LayerSource) -> None:
+    if source.id in _REGISTRY:
+        raise DuplicateSourceError(
+            f"Source id {source.id!r} is already registered. Each source needs "
+            f"a unique id. If you copied an existing source module, change its "
+            f"id attribute."
+        )
     _REGISTRY[source.id] = source
 
 
