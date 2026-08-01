@@ -1,8 +1,8 @@
 """OpenStreetMap as a LayerSource.
 
 Standard .osm XML comes from the OSM map API, which caps a request at 50000
-nodes. Overpass is the fallback and the only option for JSON. Both are free
-public services, so requests are spaced out and back off on failure.
+nodes. Overpass is the fallback for tiles that exceed that limit. Both are
+free public services, so requests are spaced out and back off on failure.
 """
 
 from __future__ import annotations
@@ -88,6 +88,16 @@ class RateLimiter:
 
 
 class OsmSource:
+    """OpenStreetMap LayerSource: the OSM map API by default, Overpass on request.
+
+    endpoints_used lists the distinct endpoints contacted DURING THIS RUN, in
+    first-contacted order. A tile skipped because it was already downloaded in
+    an earlier run contributes nothing to this list: there is no record of
+    which endpoint served it, and guessing would misinform survey.json rather
+    than inform it. A fully resumed fetch, where every tile is already on
+    disk, therefore leaves endpoints_used empty by design, not by omission.
+    """
+
     id = "osm"
     display_name = "OpenStreetMap"
     licence = "Open Database License (ODbL) 1.0"
@@ -104,6 +114,7 @@ class OsmSource:
         min_interval_seconds: float = 2.0,
         sleeper: Callable[[float], None] = time.sleep,
         use_overpass: bool = False,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.session = session if session is not None else requests.Session()
         self.overpass_urls = list(overpass_urls or DEFAULT_OVERPASS_URLS)
@@ -112,7 +123,9 @@ class OsmSource:
         self.timeout_seconds = timeout_seconds
         self.use_overpass = use_overpass
         self._sleeper = sleeper
-        self._limiter = RateLimiter(min_interval_seconds, sleeper=sleeper)
+        self._limiter = RateLimiter(min_interval_seconds, sleeper=sleeper, clock=clock)
+        # Endpoints actually contacted this run, deduplicated, first-seen
+        # order. See the class docstring: a skipped tile records nothing.
         self.endpoints_used: list[str] = []
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
@@ -144,10 +157,11 @@ class OsmSource:
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
-            endpoint = self.overpass_urls[(attempt - 1) % len(self.overpass_urls)]
+            overpass_candidate = self.overpass_urls[(attempt - 1) % len(self.overpass_urls)]
+            endpoint = overpass_candidate if self.use_overpass else self.osm_api_url
             self._limiter.wait()
             try:
-                response = self._request(tile, endpoint)
+                response = self._request(tile, overpass_candidate)
             except Exception as exc:
                 last_error = exc
                 self._sleeper(retry_delay_seconds(None, attempt))
@@ -155,9 +169,7 @@ class OsmSource:
 
             if response.status_code == 200:
                 atomic_write_text(output_path, response.text)
-                self.endpoints_used.append(
-                    self.osm_api_url if not self.use_overpass else endpoint
-                )
+                self._record_endpoint(endpoint)
                 return
 
             if response.status_code == 400 and "too many nodes" in response.text.lower():
@@ -176,6 +188,10 @@ class OsmSource:
             f"Failed to download OSM tile {tile.tile_id} after "
             f"{self.max_retries} attempts."
         ) from last_error
+
+    def _record_endpoint(self, endpoint: str) -> None:
+        if endpoint not in self.endpoints_used:
+            self.endpoints_used.append(endpoint)
 
     def _request(self, tile: Tile, endpoint: str):
         headers = {"User-Agent": USER_AGENT}

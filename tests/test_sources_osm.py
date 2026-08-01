@@ -83,7 +83,24 @@ def test_fetch_writes_one_file_per_tile(tmp_path):
 def test_fetch_records_the_endpoint_that_served_each_tile(tmp_path):
     source = _source([FakeResponse()])
     source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
-    assert len(source.endpoints_used) == 1
+    assert source.endpoints_used == [source.osm_api_url]
+
+
+def test_endpoints_used_is_deduplicated_across_tiles(tmp_path):
+    source = _source([FakeResponse(), FakeResponse()])
+    tiles = [_tile("r00_c00"), _tile("r00_c01")]
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), tiles, tmp_path, NullProgress())
+    # Both tiles were served by the same endpoint: one entry, not two.
+    assert source.endpoints_used == [source.osm_api_url]
+
+
+def test_endpoints_used_is_empty_when_every_tile_is_skipped(tmp_path):
+    (tmp_path / "r00_c00.osm").write_text(OSM_XML, encoding="utf-8")
+    source = _source([])  # no responses queued: a request would raise IndexError
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
+    # Intended, not a bug: a fully resumed fetch contacts nothing new, so there
+    # is no endpoint to attribute the on-disk data to. See the class docstring.
+    assert source.endpoints_used == []
 
 
 def test_fetch_emits_progress_per_tile(tmp_path):
@@ -125,6 +142,33 @@ def test_fetch_raises_after_exhausting_retries(tmp_path):
         )
 
 
+def test_failure_message_names_the_osm_api_url_on_the_default_path(tmp_path):
+    source = _source([FakeResponse(status_code=504, text="gateway")] * 4, max_retries=4)
+    with pytest.raises(OsmDownloadError) as exc_info:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    # The per-attempt diagnostic is chained on as the cause; it must name the
+    # service that was actually contacted, not a rotating Overpass URL that
+    # was never called on the default (non-Overpass) path.
+    assert source.osm_api_url in str(exc_info.value.__cause__)
+
+
+def test_failure_message_names_the_overpass_url_when_use_overpass_is_true(tmp_path):
+    source = _source(
+        [FakeResponse(status_code=504, text="gateway")] * 4,
+        max_retries=4,
+        use_overpass=True,
+    )
+    with pytest.raises(OsmDownloadError) as exc_info:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    # 4 attempts rotating through 2 Overpass URLs: the last attempt (4) used
+    # index (4-1) % 2 == 1, so that is the URL the final diagnostic must name.
+    assert source.overpass_urls[1] in str(exc_info.value.__cause__)
+
+
 def test_node_limit_failure_is_reported_immediately_without_retrying(tmp_path):
     source = _source(
         [FakeResponse(status_code=400, text="You requested too many nodes")], max_retries=4
@@ -134,6 +178,37 @@ def test_node_limit_failure_is_reported_immediately_without_retrying(tmp_path):
             BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
         )
     assert len(source.session.calls) == 1
+
+
+def test_overpass_fetch_issues_a_post_with_the_query_body_and_content_type(tmp_path):
+    source = _source([FakeResponse()], use_overpass=True)
+    tile = _tile()
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [tile], tmp_path, NullProgress())
+
+    assert len(source.session.calls) == 1
+    method, url, kwargs = source.session.calls[0]
+    assert method == "POST"
+    assert url == source.overpass_urls[0]
+    expected_query = build_overpass_query(tile.query_bbox, source.timeout_seconds)
+    assert kwargs["data"] == expected_query.encode("utf-8")
+    assert kwargs["headers"]["Content-Type"] == "text/plain; charset=utf-8"
+
+
+def test_overpass_retries_rotate_through_the_endpoint_list(tmp_path):
+    source = _source(
+        [FakeResponse(status_code=504, text="gateway"), FakeResponse()],
+        use_overpass=True,
+    )
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
+
+    urls_called = [call[1] for call in source.session.calls]
+    assert urls_called == [source.overpass_urls[0], source.overpass_urls[1]]
+
+
+def test_overpass_fetch_records_the_overpass_endpoint(tmp_path):
+    source = _source([FakeResponse()], use_overpass=True)
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
+    assert source.endpoints_used == [source.overpass_urls[0]]
 
 
 def test_retry_delay_honours_retry_after_in_seconds():
@@ -171,6 +246,28 @@ def test_rate_limiter_does_not_wait_when_enough_time_has_passed():
     limiter.wait()
     limiter.wait()
     assert slept == []
+
+
+def test_fetch_waits_between_consecutive_tiles(tmp_path):
+    """Regression guard for the rate limiter actually being wired into fetch.
+
+    Every other fetch-level test forces min_interval_seconds=0.0 so it never
+    has to wait, which means none of them would notice if self._limiter.wait()
+    were deleted from _download_tile. This test uses a non-zero interval with
+    an injected fake clock and a recording sleeper, so it fails if the wiring
+    is removed.
+    """
+    slept = []
+    clock_values = iter([0.0, 0.0, 0.5, 0.5])
+    source = _source(
+        [FakeResponse(), FakeResponse()],
+        min_interval_seconds=2.0,
+        sleeper=slept.append,
+        clock=lambda: next(clock_values),
+    )
+    tiles = [_tile("r00_c00"), _tile("r00_c01")]
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), tiles, tmp_path, NullProgress())
+    assert slept == [pytest.approx(1.5)]
 
 
 def test_estimate_scales_with_tile_count():
