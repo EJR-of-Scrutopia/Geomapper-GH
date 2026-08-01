@@ -606,8 +606,8 @@ git commit -m "feat(geo): move bbox and tiling into mapgen.geo with tests"
 - Produces:
   - `slugify(value: str, field: str, max_length: int = 40) -> str`, raising `NamingError` when the result is empty.
   - `PackagePaths` frozen dataclass with fields `root: Path`, `stem: str`, `layers_dir: Path`, `work_dir: Path`, `survey_json: Path`, `project_setting: Path`.
-  - `build_package_paths(output_root: Path, region: str, site: str, date: date, stem_override: str | None = None) -> PackagePaths`
-  - `check_path_length(paths: PackagePaths, overture_types: Sequence[str], limit: int = 240) -> None`, raising `PathTooLongError`.
+  - `build_package_paths(output_root: Path, region: str, site: str, survey_date: date, stem_override: str | None = None) -> PackagePaths`. The parameter is `survey_date`, not `date`, so it does not shadow the `date` type imported into the same module. Callers passing it by keyword must use `survey_date=`.
+  - `check_path_length(paths: PackagePaths, overture_types: Sequence[str], limit: int = 240) -> None`, raising `PathTooLongError`. It measures the longest path the job will actually produce, which means both the nested `_work/raw/overture/<type>/rNN_cNN.geojson` tile path and `paths.project_setting`. The project setting file embeds the full stem and can be the longer of the two, so checking only the tile path lets real overruns through.
   - `NamingError(ValueError)` and `PathTooLongError(NamingError)`.
 
 - [ ] **Step 1: Write the failing tests**
