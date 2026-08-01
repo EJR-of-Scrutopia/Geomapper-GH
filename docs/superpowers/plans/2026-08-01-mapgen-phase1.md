@@ -1349,9 +1349,24 @@ def merge_osm_xml(input_paths: Iterable[Path], output_path: Path) -> int:
 
 
 def _iter_features(path: Path) -> Iterator[tuple[str, str]]:
+    # The overturemaps CLI writes Features with exactly three top-level keys:
+    # type, geometry, properties. There is never a top-level id. The GERS
+    # identifier lives at properties["id"], so that fallback is the one that
+    # actually fires in production. Use explicit None checks rather than "or",
+    # because "or" would also reject a legitimately falsy id such as "" or 0.
+    # A feature with no id anywhere is a loud failure, not a synthesised key:
+    # a positional key salted with the filename gives the same feature two
+    # different keys in two overlapping tiles, silently defeating the dedupe.
     payload = json.loads(path.read_text(encoding="utf-8"))
     for index, feature in enumerate(payload.get("features", [])):
-        feature_id = feature.get("id") or f"{path.name}:{index}"
+        feature_id = feature.get("id")
+        if feature_id is None:
+            feature_id = (feature.get("properties") or {}).get("id")
+        if feature_id is None:
+            raise MergeError(
+                f"Feature {index} in {path.name} has no id at the top level or "
+                f"in properties, so it cannot be deduplicated across tile seams."
+            )
         yield str(feature_id), json.dumps(feature, separators=(",", ":"))
 
 
@@ -1372,7 +1387,7 @@ def merge_geojson(input_paths: Iterable[Path], output_path: Path) -> int:
     return len(deduped)
 ```
 
-Note on `test_merge_leaves_no_output_when_an_input_is_corrupt`: `merge_geojson` reads inputs lazily inside the `atomic_writer` block, so the `json.JSONDecodeError` from the corrupt file propagates while the temp file is still open. `atomic_writer` deletes the temp file on exception, which is what makes the assertion hold. Do not restructure this to read all inputs before opening the writer.
+Note on `test_merge_leaves_no_output_when_an_input_is_corrupt`: it passes because the read loop runs to completion before `atomic_writer` opens, so a `json.JSONDecodeError` from a corrupt input aborts before any temp file exists. It would also pass with the reads moved inside the writer block, where `atomic_writer` would delete the temp file on exception instead. The test cannot distinguish the two orderings, and neither is streaming: the full deduplicated feature set is buffered in the `OrderedDict` regardless. Do not claim otherwise in a report.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
