@@ -36,7 +36,11 @@ class FakeRunner:
                     {
                         "type": "FeatureCollection",
                         "features": [
-                            {"type": "Feature", "id": "f1", "properties": {}, "geometry": None}
+                            {
+                                "type": "Feature",
+                                "geometry": None,
+                                "properties": {"id": "f1"},
+                            }
                         ],
                     },
                     handle,
@@ -186,6 +190,107 @@ def test_fetch_includes_the_release_when_configured(tmp_path):
     assert "2026-02-18.0" in runner.commands[0]
 
 
+def test_fetch_omits_release_when_not_configured(tmp_path):
+    runner = FakeRunner()
+    source = OvertureSource(
+        types=["water"],
+        release=None,
+        runner=runner,
+        executable_finder=lambda _name: "overturemaps",
+    )
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
+    assert "--release" not in runner.commands[0]
+
+
+class FailingWriter(FakeRunner):
+    """Runner that writes a partial file then fails, simulating a CLI crash."""
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        output = command[command.index("--output") + 1]
+        with open(output, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "geometry": None,
+                            "properties": {"id": "partial"},
+                        }
+                    ],
+                },
+                handle,
+            )
+        return FakeCompleted(1, stderr="CLI crashed mid-flight")
+
+
+def test_fetch_cleans_partial_file_on_cli_failure(tmp_path):
+    runner = FailingWriter()
+    with pytest.raises(OvertureError):
+        _source(runner).fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert not (tmp_path / "water" / "r00_c00.geojson").exists()
+    assert list((tmp_path / "water").glob("*.part")) == []
+
+
+class SameFeatureForAllTiles(FakeRunner):
+    """Runner that writes the same feature ID for all tiles to test deduplication."""
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        if self._returncode == 0:
+            output = command[command.index("--output") + 1]
+            with open(output, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": None,
+                                "properties": {"id": "shared-feature-1"},
+                            }
+                        ],
+                    },
+                    handle,
+                )
+        return FakeCompleted(self._returncode, stderr=self._stderr)
+
+
+def test_fetch_and_merge_deduplicates_across_tiles(tmp_path):
+    runner = SameFeatureForAllTiles()
+    source = OvertureSource(
+        types=["water"],
+        runner=runner,
+        executable_finder=lambda _name: "overturemaps",
+    )
+    paths = source.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"),
+        [_tile("r00_c00"), _tile("r00_c01")],
+        tmp_path,
+        NullProgress(),
+    )
+    outputs = source.merge(paths, tmp_path / "merged")
+    assert len(outputs) == 1
+
+    merged_content = json.loads(outputs[0].read_text(encoding="utf-8"))
+    assert len(merged_content["features"]) == 1
+    assert merged_content["features"][0]["properties"]["id"] == "shared-feature-1"
+
+
+def test_fetch_re_downloads_a_zero_byte_existing_file(tmp_path):
+    target = tmp_path / "water" / "r00_c00.geojson"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"")
+    runner = FakeRunner()
+    _source(runner).fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    assert len(runner.commands) == 1
+
+
 def test_merge_writes_one_file_per_type(tmp_path):
     work = tmp_path / "work"
     for overture_type in ("water", "building"):
@@ -201,11 +306,16 @@ def test_merge_writes_one_file_per_type(tmp_path):
         work / "building" / "r00_c00.geojson",
     ]
     outputs = source.merge(parts, tmp_path / "out")
-    assert sorted(p.name for p in outputs) == ["building.geojson", "water.geojson"]
+    assert [p.name for p in outputs] == ["building.geojson", "water.geojson"]
 
 
 def test_estimate_scales_with_tiles_and_types():
     bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
-    one_type = OvertureSource(types=["water"]).estimate(bbox, [_tile()])
-    two_types = OvertureSource(types=["water", "building"]).estimate(bbox, [_tile()])
-    assert two_types.bytes_estimate > one_type.bytes_estimate
+    one_tile_one_type = OvertureSource(types=["water"]).estimate(bbox, [_tile()])
+    one_tile_two_types = OvertureSource(types=["water", "building"]).estimate(bbox, [_tile()])
+    two_tiles_one_type = OvertureSource(types=["water"]).estimate(
+        bbox, [_tile("r00_c00"), _tile("r00_c01")]
+    )
+
+    assert one_tile_two_types.bytes_estimate == 2 * one_tile_one_type.bytes_estimate
+    assert two_tiles_one_type.bytes_estimate == 2 * one_tile_one_type.bytes_estimate
