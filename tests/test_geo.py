@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from mapgen.geo import BBox, BBoxError, Tile, build_tiles, extent_metres
+from mapgen.geo import BBox, BBoxError, Tile, TilingError, build_tiles, extent_metres
 
 
 def test_parse_accepts_west_south_east_north():
@@ -94,6 +94,57 @@ def test_build_tiles_single_tile_when_area_is_smaller_than_tile_size():
     tiles = build_tiles(BBox.parse("-3.29,51.38,-3.28,51.39"), 5000.0, 100.0)
     assert len(tiles) == 1
     assert tiles[0].tile_id == "r00_c00"
+
+
+# --- Review round 1: tile_size_m must be validated, and an absurd tiling
+# refused cheaply, before build_tiles's own nested loop runs -------------
+#
+# A zero tile_size_m previously raised an uncaught ZeroDivisionError deep
+# in the row/col arithmetic, which server.py's except tuple did not
+# catch, dropping the connection on /api/estimate and /api/extent, and
+# on /api/jobs being accepted with a 202 that then failed asynchronously
+# in the worker instead of being rejected up front. A negative tile_size_m
+# did not raise at all: ceil() of a negative quotient is a negative int,
+# range() of a negative count is empty, so it silently returned "tiles":
+# 0, 200 OK, with nothing to say the input was nonsensical.
+
+
+def test_build_tiles_rejects_a_zero_tile_size():
+    with pytest.raises(TilingError, match="greater than zero"):
+        build_tiles(BBox.parse("-3.29,51.38,-3.28,51.39"), tile_size_m=0.0, overlap_m=50.0)
+
+
+def test_build_tiles_rejects_a_negative_tile_size():
+    with pytest.raises(TilingError, match="greater than zero"):
+        build_tiles(BBox.parse("-3.29,51.38,-3.28,51.39"), tile_size_m=-600.0, overlap_m=50.0)
+
+
+def test_build_tiles_refuses_a_tiling_over_the_max_tiles_cap():
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")  # the reference bbox: 32 tiles at 5000m
+    # A tiny cap makes this cheap and deterministic to test without
+    # actually building a many-thousand-tile bbox: the real default
+    # (10,000) is unaffected, this only overrides it for the test.
+    with pytest.raises(TilingError, match="over the 10 limit"):
+        build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0, max_tiles=10)
+
+
+def test_build_tiles_at_or_under_the_cap_is_unaffected():
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    tiles = build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0, max_tiles=32)
+    assert len(tiles) == 32
+
+
+def test_build_tiles_cap_check_runs_before_the_expensive_loop():
+    # Proves the check is on the cheap row*col arithmetic, not on
+    # len(tiles) after the fact: if it were checked after building the
+    # list, this would still raise, but only after doing the O(rows*cols)
+    # work the review specifically asked to avoid. This cannot directly
+    # measure "before the loop ran" from outside, so it instead pins the
+    # one observable consequence: TilingError, not a fully-built,
+    # over-cap tiles list, ever escapes build_tiles.
+    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    with pytest.raises(TilingError):
+        build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0, max_tiles=1)
 
 
 def test_bbox_to_dict_returns_four_keys():

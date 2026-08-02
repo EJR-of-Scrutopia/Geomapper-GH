@@ -371,6 +371,101 @@ def test_jobs_endpoint_returns_400_rather_than_crashing_on_a_null_overlap(server
     assert excinfo.value.code == 400
 
 
+# --- Review round 1: tile_size_m must be validated, and an absurd tiling
+# refused, identically on all three routes that can be asked to tile ------
+
+
+@pytest.mark.parametrize("path", ["/api/estimate", "/api/extent"])
+def test_a_zero_tile_size_returns_400_rather_than_dropping_the_connection(server, tmp_path, path):
+    body = {"bbox": "-3.29,51.38,-3.28,51.39", "tile_size_m": 0}
+    if path == "/api/estimate":
+        body.update(region="R", site="S", output_root=str(tmp_path), sources=["stub"])
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(server, path, body)
+    assert excinfo.value.code == 400
+
+
+def test_a_negative_tile_size_is_rejected_rather_than_silently_reporting_zero_tiles(server, tmp_path):
+    # Previously: HTTP 200, {"tiles": 0}, and the client's refreshEstimate
+    # success path would have enabled Download for a request that could
+    # never produce anything.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/estimate",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "tile_size_m": -600,
+                "sources": ["stub"],
+            },
+        )
+    assert excinfo.value.code == 400
+
+
+def test_jobs_endpoint_rejects_a_zero_tile_size_synchronously_rather_than_202_then_failing(
+    server, tmp_path
+):
+    # The specific "worse" case the review named: /api/jobs must not
+    # accept a request that can never be tiled with a 202 and only fail
+    # it later, asynchronously, in the worker thread.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/jobs",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "tile_size_m": 0,
+                "sources": ["stub"],
+                "run_bridge": False,
+            },
+        )
+    assert excinfo.value.code == 400
+    # A job must never have been created for the rejected request: if it
+    # had, the server's manager would still be busy and this legitimate
+    # follow-up would come back 409 instead of 202, the same technique
+    # test_posting_a_job_without_a_token_has_no_side_effects already uses
+    # to prove an unauthorised POST has no side effects.
+    status, payload = _post(
+        server,
+        "/api/jobs",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "R",
+            "site": "S",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+            "run_bridge": False,
+        },
+    )
+    assert status == 202
+    _wait_for_state(server, payload["id"])
+
+
+@pytest.mark.parametrize("path", ["/api/estimate", "/api/extent"])
+def test_an_absurd_tiling_is_refused_rather_than_hanging(server, tmp_path, path):
+    # The live-feedback path (/api/extent) fires on every draw with no
+    # names required, so this is the one an accidental zoomed-out drag
+    # hits hardest, but the same underlying build_tiles call protects
+    # /api/estimate identically. A whole-Europe-sized bbox at a small
+    # tile size is refused from row/col counts alone, not by actually
+    # building the tiles.
+    body = {
+        "bbox": "-10.0,35.0,30.0,60.0",  # roughly Western Europe
+        "tile_size_m": 100,
+    }
+    if path == "/api/estimate":
+        body.update(region="R", site="S", output_root=str(tmp_path), sources=["stub"])
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(server, path, body)
+    assert excinfo.value.code == 400
+
+
 # --- Task 18 item 6: /api/extent, a bare-geometry endpoint needing no
 # region, site or output_root at all ---------------------------------------
 

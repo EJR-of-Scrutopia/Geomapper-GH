@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from mapgen.config import load_config, save_config
-from mapgen.geo import BBox, BBoxError
+from mapgen.geo import BBox, BBoxError, build_tiles
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, NominatimClient
 from mapgen.jobs import CancelToken, Cancelled, EventLog
 from mapgen.naming import NamingError
@@ -140,7 +140,7 @@ class JobManager:
 
 
 def _survey_request(payload: dict) -> SurveyRequest:
-    return SurveyRequest(
+    request = SurveyRequest(
         bbox=BBox.parse(payload["bbox"]),
         region=payload["region"],
         site=payload["site"],
@@ -152,6 +152,18 @@ def _survey_request(payload: dict) -> SurveyRequest:
         coordinate_stem=bool(payload.get("coordinate_stem", False)),
         run_bridge_step=bool(payload.get("run_bridge", True)),
     )
+    # Validated synchronously, here, rather than left for run_survey to
+    # discover inside JobManager's background worker thread. /api/jobs
+    # would otherwise accept a request that can never be tiled (Task 18
+    # review: tile_size_m <= 0, or an absurd tile count) with a 202 that
+    # is certain to fail, only surfacing the problem later as an
+    # asynchronous job failure instead of the same synchronous 400
+    # /api/estimate gives for the identical input. TilingError is a
+    # ValueError, already caught by _REQUEST_VALUE_ERRORS at both call
+    # sites below, so this raises the same way BBox.parse already does
+    # two lines up.
+    build_tiles(request.bbox, request.tile_size_m, request.overlap_m)
+    return request
 
 
 def make_handler(

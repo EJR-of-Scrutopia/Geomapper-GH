@@ -18,6 +18,17 @@ class BBoxError(ValueError):
     """Raised when a bounding box is malformed or geographically impossible."""
 
 
+class TilingError(ValueError):
+    """Raised when tile_size_m cannot produce a real tiling, or would
+    produce an unreasonable one.
+
+    A ValueError subclass deliberately: server.py's _REQUEST_VALUE_ERRORS
+    already catches ValueError generically for /api/estimate, /api/jobs
+    and /api/extent, so this needs no separate wiring there to become a
+    clean 400 instead of an unhandled exception.
+    """
+
+
 @dataclass(frozen=True)
 class BBox:
     west: float
@@ -115,13 +126,41 @@ def _clamp(bbox: BBox, bounds: BBox) -> BBox:
     )
 
 
-def build_tiles(bbox: BBox, tile_size_m: float, overlap_m: float) -> list[Tile]:
+# Real single-site surveys in this tool's own reference material top out
+# around a few dozen tiles (the South Wales reference package is 32).
+# 10,000 is generous enough that no legitimate use is ever near it, while
+# still being small enough to build in a blink: it exists purely to
+# reject an accidental drag over a whole country before build_tiles's own
+# nested loop ever starts constructing Tile objects for it. Review round
+# 1 measured a real drag over Western Europe building 4,699,380 tiles in
+# 29.9 seconds; this is checked from row/col counts alone, before any of
+# that work happens, so the cost of refusing it is one multiplication.
+DEFAULT_MAX_TILES = 10_000
+
+
+def build_tiles(
+    bbox: BBox,
+    tile_size_m: float,
+    overlap_m: float,
+    max_tiles: int = DEFAULT_MAX_TILES,
+) -> list[Tile]:
+    if tile_size_m <= 0:
+        raise TilingError(f"tile_size_m must be greater than zero, got {tile_size_m}.")
+
     ref_lat = (bbox.south + bbox.north) / 2.0
     x_min, y_min = lonlat_to_local_metres(bbox.west, bbox.south, ref_lat)
     x_max, y_max = lonlat_to_local_metres(bbox.east, bbox.north, ref_lat)
 
     cols = math.ceil((x_max - x_min) / tile_size_m)
     rows = math.ceil((y_max - y_min) / tile_size_m)
+
+    total = rows * cols
+    if total > max_tiles:
+        raise TilingError(
+            f"This extent and tile size would produce {total} tiles, over the "
+            f"{max_tiles} limit. Draw a smaller extent or choose a larger tile size."
+        )
+
     tiles: list[Tile] = []
 
     for row in range(rows):

@@ -179,6 +179,30 @@ def test_survey_reports_a_path_that_is_too_long_without_a_traceback(capsys):
     assert "240" in capsys.readouterr().err
 
 
+def test_estimate_reports_a_zero_tile_size_without_a_traceback(tmp_path, capsys):
+    # Review round 1: build_tiles now raises TilingError (a ValueError) for
+    # tile_size_m <= 0 instead of an uncaught ZeroDivisionError. main()'s
+    # except tuple needs it named explicitly, the same as BBoxError and
+    # NamingError, or a CLI user hitting this gets a raw traceback instead
+    # of the clean, one-line message every other validation error gets.
+    exit_code = main(
+        [
+            "estimate",
+            "--bbox=-3.29,51.38,-3.28,51.39",
+            "--region=R",
+            "--site=S",
+            "--output-root",
+            str(tmp_path),
+            "--tile-size-m",
+            "0",
+            "--source",
+            "stub",
+        ]
+    )
+    assert exit_code == 1
+    assert "greater than zero" in capsys.readouterr().err
+
+
 def test_coordinate_stem_flag_is_accepted():
     parser = build_parser()
     args = parser.parse_args(

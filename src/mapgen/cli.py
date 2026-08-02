@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mapgen import __version__
-from mapgen.geo import BBox, BBoxError
+from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
     SurveyRequest,
@@ -181,7 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return args.func(args)
-    except (NamingError, UnknownSourceError, BBoxError) as exc:
+    except (NamingError, UnknownSourceError, BBoxError, TilingError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
