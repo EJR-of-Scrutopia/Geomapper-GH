@@ -3,6 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      The per-launch token lives in this page's own URL. no-referrer means
+      it is never sent as a Referer header to anywhere, including the map
+      tile servers, the only other host this page talks to. Geocoding used
+      to be a second host reached straight from the browser and relied on
+      referrerPolicy on the fetch() calls themselves for this; now that it
+      is server-side (see mapgen.geocode), this tag is what is left doing
+      that job, made explicit here rather than left to rely only on
+      whatever a browser's own default referrer policy happens to be.
+    -->
+    <meta name="referrer" content="no-referrer" />
     <title>mapgen</title>
     <link rel="stylesheet" href="vendor/leaflet.css" />
     <link rel="stylesheet" href="styles.css" />

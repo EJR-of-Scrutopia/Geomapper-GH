@@ -22,6 +22,7 @@ from mapgen.geocode import (
     NOMINATIM_REVERSE_URL,
     NOMINATIM_SEARCH_URL,
     GeocodeError,
+    GeocodeQueueFullError,
     GeocodeRateLimiter,
     GeocodeResult,
     NominatimClient,
@@ -199,6 +200,19 @@ def test_reverse_returns_empty_strings_for_a_point_with_no_address_data():
     assert result == ReverseResult(region="", site="")
 
 
+def test_reverse_treats_an_error_response_as_empty_even_if_address_is_also_present():
+    # The previous version of this test used a payload with no "address"
+    # key at all, so the "error" branch and the missing-address fallback
+    # produced the identical empty result: deleting the "error" check
+    # left the test green, because reverse() never needed it to pass.
+    # This payload carries both keys, so only the explicit "error" check,
+    # not the fallback, can be what stops "Should not be used" coming back.
+    payload = {**REVERSE_NO_HIT, "address": {"town": "Should not be used"}}
+    client = _client([FakeGeocodeResponse(payload=payload)])
+    result = client.reverse(0.0, 0.0)
+    assert result == ReverseResult(region="", site="")
+
+
 def test_reverse_sends_lat_lon_and_a_real_user_agent():
     client = _client([FakeGeocodeResponse(payload=REVERSE_HIT)])
     client.reverse(51.405, -3.283)
@@ -251,6 +265,77 @@ def test_reverse_waits_via_the_limiter_before_calling_out():
     assert waited == [True]
 
 
+# --- GeocodeRateLimiter: bounded queue -------------------------------------
+#
+# Reserving a slot with no bound on how many can queue is exactly how a
+# handful of concurrent callers each end up waiting several seconds for a
+# turn that, if Nominatim is down, was never going to succeed: the queue
+# sheds no load, it just makes every excess caller wait before finding
+# that out.
+#
+# A first version of this test started max_queue + 1 threads together and
+# counted how many came back rejected, expecting exactly one. That is
+# unreliable for the same reason the lock test above was: whichever
+# caller happens to be first sees no existing reservation, computes a
+# wait_for of 0, and returns through the no-op sleeper before the others
+# have necessarily even reached their own check, so _pending can be back
+# down to 0 again before a third caller ever looks at it, and nothing
+# gets rejected at all depending on how the threads happen to be
+# scheduled. This version uses a sleeper that blocks on a real Event
+# instead of returning immediately, and a Barrier to know for certain
+# that exactly max_queue callers are genuinely stuck mid-wait before the
+# next one is attempted, so the outcome does not depend on timing.
+
+
+def test_rate_limiter_rejects_concurrent_waiters_beyond_the_bound():
+    max_queue = 2
+    entered_wait = threading.Barrier(max_queue + 1)  # the two workers, plus this test
+    release = threading.Event()
+
+    def blocking_sleeper(_seconds):
+        entered_wait.wait(timeout=5)
+        assert release.wait(timeout=5), "never released"
+
+    limiter = GeocodeRateLimiter(
+        min_interval_seconds=1.0, sleeper=blocking_sleeper, max_queue=max_queue
+    )
+    # A fresh limiter's first caller always computes wait_for == 0 (nothing
+    # reserved yet) and never reaches the sleeper at all. Priming a
+    # reservation already in the future forces every caller below to
+    # actually wait, and so to actually reach blocking_sleeper.
+    limiter._next_allowed_at = time.monotonic() + 30.0
+
+    worker_errors = []
+
+    def worker():
+        try:
+            limiter.wait()
+        except GeocodeQueueFullError as exc:
+            worker_errors.append(exc)
+
+    workers = [threading.Thread(target=worker) for _ in range(max_queue)]
+    for t in workers:
+        t.start()
+    # Blocks until both workers are inside blocking_sleeper, i.e. genuinely
+    # holding a pending slot each, not merely started.
+    entered_wait.wait(timeout=5)
+
+    # _pending is now exactly max_queue, held there by the two workers
+    # blocked on `release`. A third caller must be rejected immediately,
+    # without ever reaching the sleeper.
+    with pytest.raises(GeocodeQueueFullError):
+        limiter.wait()
+
+    release.set()
+    for t in workers:
+        t.join(timeout=5)
+    assert worker_errors == [], "a legitimate waiter was itself rejected"
+
+    # Once the two workers have finished, the queue has room again.
+    limiter._sleeper = lambda _seconds: None
+    limiter.wait()
+
+
 # --- GeocodeRateLimiter: reservation math, fake clock, mirrors how
 # mapgen.sources.osm.RateLimiter is tested elsewhere in this suite -------
 
@@ -286,44 +371,127 @@ def test_rate_limiter_first_call_never_waits():
 
 # --- GeocodeRateLimiter: real concurrency, real threads --------------------
 #
-# The fake-clock tests above prove the reservation arithmetic is right when
-# called one after another, which is how mapgen.sources.osm.RateLimiter is
-# tested because it is only ever called that way: one job, one worker
-# thread. GeocodeRateLimiter exists specifically because this one is not
-# called that way, ThreadingHTTPServer hands two concurrent browser
-# requests to two concurrent OS threads, so what actually needs proving is
-# that a lock around the reservation, not just correct arithmetic, holds
-# under real concurrent callers. A fake clock cannot show that: it would
-# need to be thread-safe itself to be read from two real threads, at which
-# point the lock under test would no longer be the only thing serialising
-# them. This uses a real small interval and real threads instead.
+# The fake-clock tests above prove the reservation arithmetic is right for
+# calls made one after another, which is how mapgen.sources.osm.RateLimiter
+# is tested because it is only ever called that way: one job, one worker
+# thread. They prove nothing about the lock: a fake clock fed fixed values
+# and a sleeper that just records a duration without advancing anything
+# produce byte-identical results whether the reservation is written before
+# or after the "sleep" (confirmed directly: both orderings recorded the
+# same slept=[1.5] against the same two-call sequence). Only real
+# concurrent execution, a real clock actually moving while threads race
+# each other, can tell the two apart.
+#
+# A first version of this test used 3 threads. A review found it passed
+# even with `with self._lock:` deleted outright, keeping only the correct
+# reserve-before-sleep order: the critical section here is a handful of
+# fast operations with no I/O in it, so 3 threads contending for it almost
+# never actually get interrupted by the GIL mid-section, lock or no lock.
+# Measured directly at 24 threads instead: the unlocked build collides at
+# a ~0.00002s gap, the locked (committed) build lands at ~0.05s. This test
+# now uses enough threads and a low enough threshold to sit clearly between
+# those two numbers, so it actually discriminates a missing lock rather
+# than passing for the same reason a 3-thread version passes regardless.
 
 
 def test_rate_limiter_serialises_real_concurrent_threads():
-    limiter = GeocodeRateLimiter(min_interval_seconds=0.2)
+    thread_count = 24
+    limiter = GeocodeRateLimiter(min_interval_seconds=0.05, max_queue=thread_count)
     finished_at = []
     lock = threading.Lock()
-    barrier = threading.Barrier(3)
+    barrier = threading.Barrier(thread_count)
 
     def call():
-        barrier.wait(timeout=5)  # all three start waiting at once
+        barrier.wait(timeout=5)  # every thread starts waiting at once
         limiter.wait()
         with lock:
             finished_at.append(time.monotonic())
 
-    threads = [threading.Thread(target=call) for _ in range(3)]
+    threads = [threading.Thread(target=call) for _ in range(thread_count)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5)
+        t.join(timeout=10)
 
-    assert len(finished_at) == 3
+    assert len(finished_at) == thread_count
     finished_at.sort()
-    gap_a = finished_at[1] - finished_at[0]
-    gap_b = finished_at[2] - finished_at[1]
-    # 0.15s threshold against a 0.2s interval: generous slack for OS
-    # scheduling jitter while still discriminating from the unlocked bug
-    # (reserve-after-sleep), where two threads reading the same pending
-    # slot finish together and a gap comes back near 0.
-    assert gap_a >= 0.15, f"first pair only {gap_a:.3f}s apart, expected >= 0.2s"
-    assert gap_b >= 0.15, f"second pair only {gap_b:.3f}s apart, expected >= 0.2s"
+    gaps = [finished_at[i + 1] - finished_at[i] for i in range(thread_count - 1)]
+    smallest_gap = min(gaps)
+    assert smallest_gap >= 0.03, (
+        f"smallest gap between {thread_count} consecutive finishers was "
+        f"{smallest_gap:.6f}s, expected each to be serialised roughly 0.05s "
+        f"apart; a near-zero gap means two threads collided"
+    )
+
+
+def test_rate_limiter_lock_forces_a_second_caller_to_wait_for_the_first_to_finish():
+    """Deterministic version of the same property, not dependent on GIL
+    scheduling luck at all.
+
+    The test above relies on natural OS/GIL contention among real threads
+    to expose a missing lock, and re-measuring it directly on this machine
+    found that unreliable: even at 24 threads, deleting `with self._lock:`
+    while keeping the correct reserve-before-sleep order still passed 5/5
+    runs here, because the critical section is only a handful of fast,
+    non-blocking operations, too short for CPython's time-sliced thread
+    switching to reliably land inside it. That contradicts an earlier,
+    informal measurement elsewhere of a reliable collision at that thread
+    count, which this project has no way to reproduce or verify further.
+
+    Rather than tune a thread count against unreliable timing and hope,
+    this forces the exact interleaving a missing lock would allow: an
+    injected clock blocks the first caller mid-critical-section, and a
+    second caller is only released once the first is confirmed to be
+    inside. If wait() is genuinely serialised, the second caller cannot
+    even reach its own clock call, since that call sits behind the same
+    lock the first caller is still holding, until the first caller has
+    finished and written its reservation. If it is not serialised, the
+    second caller's clock call happens while the first is still blocked,
+    before any reservation has been written at all. Checking what
+    _next_allowed_at looks like at the exact moment the second caller's
+    clock fires distinguishes the two unconditionally, with no dependence
+    on how fast either thread happens to run.
+    """
+    limiter = GeocodeRateLimiter(min_interval_seconds=1.0, sleeper=lambda _s: None)
+    first_is_inside = threading.Event()
+    release_first = threading.Event()
+    real_clock = time.monotonic
+    call_count = [0]
+    observed_reservation_at_second_call = []
+
+    def controlled_clock():
+        call_count[0] += 1
+        if call_count[0] == 1:
+            first_is_inside.set()
+            assert release_first.wait(timeout=5), "first caller was never released"
+        elif call_count[0] == 2:
+            observed_reservation_at_second_call.append(limiter._next_allowed_at)
+        return real_clock()
+
+    limiter._clock = controlled_clock
+
+    def first_caller():
+        limiter.wait()
+
+    def second_caller():
+        assert first_is_inside.wait(timeout=5), "first caller never reached its clock call"
+        limiter.wait()
+
+    t1 = threading.Thread(target=first_caller)
+    t2 = threading.Thread(target=second_caller)
+    t1.start()
+    t2.start()
+    # Give the second caller every opportunity to reach its own clock call
+    # before the first is released, which it can only do this early if
+    # nothing is serialising the two of them.
+    time.sleep(0.2)
+    release_first.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert observed_reservation_at_second_call, "the second caller's clock was never reached"
+    assert observed_reservation_at_second_call[0] is not None, (
+        "the second caller's clock call observed _next_allowed_at as None, "
+        "meaning it ran before the first caller had written its reservation: "
+        "the two callers were not serialised"
+    )

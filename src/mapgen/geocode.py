@@ -37,6 +37,7 @@ from mapgen import __version__
 
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
+DEFAULT_MAX_QUEUE = 3
 
 # "AppName/version (+url)" is the conventional shape for a self-identifying
 # bot/tool User-Agent, and is explicitly acceptable under Nominatim's
@@ -63,8 +64,29 @@ class GeocodeError(RuntimeError):
     """
 
 
+class GeocodeQueueFullError(GeocodeError):
+    """Raised when too many callers are already waiting for a rate-limit
+    slot.
+
+    A subclass of GeocodeError, not a sibling, so a caller that only wants
+    "did geocoding work" still gets a true answer with a single except
+    clause; server.py distinguishes it only to answer with 429 instead of
+    502, since this caller never even reached Nominatim to fail there.
+
+    Reserving a slot with no bound on how many can queue is exactly how a
+    handful of concurrent requests turn into several seconds of every one
+    of them waiting its turn, even when Nominatim is failing instantly and
+    every one of those waits was always going nowhere: a failing upstream
+    otherwise sheds no load at all, it just makes everyone wait for a
+    turn that was never going to succeed. Rejecting outright once the
+    queue is already full answers the excess callers fast instead.
+    """
+
+
 class GeocodeRateLimiter:
-    """Serialises calls to at most one per min_interval_seconds.
+    """Serialises calls to at most one per min_interval_seconds, and
+    refuses outright once max_queue callers are already waiting for a
+    turn rather than queuing a further, unbounded number of them.
 
     Guarded by a lock, unlike the superficially similar RateLimiter in
     mapgen.sources.osm. That one is only ever called from a single job's
@@ -81,6 +103,14 @@ class GeocodeRateLimiter:
     made rather than the value from before it existed. The wait itself
     happens outside the lock; only the bookkeeping is exclusive, so
     waiting threads don't serialise on holding it.
+
+    The queue bound only covers time spent here, waiting for a turn, not
+    the outbound call that follows: once released, how long that call
+    itself takes is timeout_seconds' concern, on NominatimClient, not
+    this class's. A caller already released cannot be recalled by
+    anything on this side of the connection either; see app.js's own
+    AbortController handling and its documented limit for why that is a
+    client-side mitigation, not a server-side guarantee.
     """
 
     def __init__(
@@ -88,21 +118,34 @@ class GeocodeRateLimiter:
         min_interval_seconds: float = DEFAULT_MIN_INTERVAL_SECONDS,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        max_queue: int = DEFAULT_MAX_QUEUE,
     ) -> None:
         self.min_interval_seconds = min_interval_seconds
+        self.max_queue = max_queue
         self._sleeper = sleeper
         self._clock = clock
         self._lock = threading.Lock()
         self._next_allowed_at: float | None = None
+        self._pending = 0
 
     def wait(self) -> None:
         with self._lock:
+            if self._pending >= self.max_queue:
+                raise GeocodeQueueFullError(
+                    f"Too many geocoding requests are already waiting "
+                    f"(limit {self.max_queue}). Try again shortly."
+                )
+            self._pending += 1
             now = self._clock()
             base = now if self._next_allowed_at is None else max(now, self._next_allowed_at)
             wait_for = base - now
             self._next_allowed_at = base + self.min_interval_seconds
-        if wait_for > 0:
-            self._sleeper(wait_for)
+        try:
+            if wait_for > 0:
+                self._sleeper(wait_for)
+        finally:
+            with self._lock:
+                self._pending -= 1
 
 
 @dataclass(frozen=True)

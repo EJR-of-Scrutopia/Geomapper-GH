@@ -1,3 +1,4 @@
+import hashlib
 import http.client
 import json
 import re
@@ -12,7 +13,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from mapgen.geo import BBox
-from mapgen.geocode import GeocodeError, GeocodeResult, ReverseResult
+from mapgen.geocode import GeocodeError, GeocodeQueueFullError, GeocodeResult, ReverseResult
 from mapgen.jobs import EventLog
 from mapgen.package import SurveyRequest
 from mapgen.sources.base import Estimate, clear_registry, register
@@ -927,10 +928,17 @@ def test_index_referenced_asset_is_served(server, asset_path):
 
 
 def test_geocode_requires_a_token(geocode_server):
-    base, _stub = geocode_server
+    base, stub = geocode_server
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         urllib.request.urlopen(f"{base}/api/geocode?q=Barry", timeout=10)
     assert excinfo.value.code == 403
+    # Not just "the response was 403": if the auth check ever moved below
+    # the geocode call, or a route were added that skipped it, this would
+    # still see a 403 from some other check while a real outbound call
+    # (and a real rate-limit slot) had already happened. This is the same
+    # gap the existing test_posting_a_job_without_a_token_has_no_side_effects
+    # closes for jobs, applied to the geocode client specifically.
+    assert stub.search_calls == []
 
 
 def test_geocode_requires_a_query(geocode_server):
@@ -972,11 +980,24 @@ def test_geocode_returns_502_when_nominatim_is_unreachable(geocode_server):
     assert "error" in payload
 
 
+def test_geocode_returns_429_when_the_rate_limit_queue_is_full(geocode_server):
+    # GeocodeQueueFullError is a GeocodeError subclass, so this also proves
+    # the route checks for it specifically rather than only the general
+    # case: catching GeocodeError first would send this back as a 502,
+    # burying "come back shortly" under "something is broken".
+    base, stub = geocode_server
+    stub.search_error = GeocodeQueueFullError("Too many geocoding requests are already waiting.")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/geocode?q=Barry&token={TOKEN}", timeout=10)
+    assert excinfo.value.code == 429
+
+
 def test_reverse_requires_a_token(geocode_server):
-    base, _stub = geocode_server
+    base, stub = geocode_server
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         urllib.request.urlopen(f"{base}/api/reverse?lat=51.4&lon=-3.3", timeout=10)
     assert excinfo.value.code == 403
+    assert stub.reverse_calls == []
 
 
 def test_reverse_requires_numeric_lat_and_lon(geocode_server):
@@ -993,6 +1014,32 @@ def test_reverse_requires_both_lat_and_lon(geocode_server):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         urllib.request.urlopen(f"{base}/api/reverse?lat=51.4&token={TOKEN}", timeout=10)
     assert excinfo.value.code == 400
+
+
+@pytest.mark.parametrize("garbage_lat", ["nan", "inf", "-inf", "1e400"])
+def test_reverse_rejects_non_finite_lat(geocode_server, garbage_lat):
+    # Python's float() parses "nan", "inf" and an overflowing literal like
+    # "1e400" (which becomes inf) without raising, so a bare try/except
+    # ValueError around the float() call lets every one of these through
+    # to spend a rate-limit slot on a call to Nominatim that was always
+    # going to be meaningless.
+    base, stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            f"{base}/api/reverse?lat={garbage_lat}&lon=-3.3&token={TOKEN}", timeout=10
+        )
+    assert excinfo.value.code == 400
+    assert stub.reverse_calls == []
+
+
+def test_reverse_rejects_an_out_of_world_but_finite_lat(geocode_server):
+    base, stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            f"{base}/api/reverse?lat=200&lon=-3.3&token={TOKEN}", timeout=10
+        )
+    assert excinfo.value.code == 400
+    assert stub.reverse_calls == []
 
 
 def test_reverse_returns_region_and_site(geocode_server):
@@ -1017,6 +1064,16 @@ def test_reverse_returns_502_when_nominatim_is_unreachable(geocode_server):
     assert excinfo.value.code == 502
 
 
+def test_reverse_returns_429_when_the_rate_limit_queue_is_full(geocode_server):
+    base, stub = geocode_server
+    stub.reverse_error = GeocodeQueueFullError("Too many geocoding requests are already waiting.")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            f"{base}/api/reverse?lat=51.4&lon=-3.3&token={TOKEN}", timeout=10
+        )
+    assert excinfo.value.code == 429
+
+
 def test_build_server_wires_a_real_nominatim_client_by_default():
     # Regression guard for make_handler's geocode_client=None default: a
     # server built the normal way (build_server, or the CLI's `mapgen ui`)
@@ -1029,3 +1086,87 @@ def test_build_server_wires_a_real_nominatim_client_by_default():
         assert isinstance(httpd.geocode_client, NominatimClient)
     finally:
         httpd.server_close()
+
+
+# --- the page must never call out beyond loopback and the map tiles -------
+#
+# This is the one constraint the whole geocoding-moved-server-side round
+# existed to satisfy, and until now nothing in the repository checked it
+# as a fact about the committed files: a reviewer pasted a live
+# fetch("https://nominatim.openstreetmap.org/...") back into
+# runPlaceSearch and the full suite passed unchanged, 329 green, because
+# every other test only exercises behaviour through a stub and none of
+# them would ever actually reach a real fetch call to notice it was
+# there. This greps the committed source itself, so a stray URL is
+# caught even in a code path no test happens to execute.
+#
+# Scoped to files this project authors (STATIC_DIR, excluding vendor/):
+# Leaflet's own source is third-party and not written here, and auditing
+# its comments or sourcemap references for incidental URL-shaped strings
+# is a different question from the one this test asks, which is whether
+# OUR code calls out to an unexpected host.
+
+_ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org"}
+_URL_HOST_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)", re.IGNORECASE)
+
+
+def _authored_static_files() -> list[Path]:
+    files: list[Path] = []
+    for pattern in ("*.html", "*.css", "*.js"):
+        files.extend(STATIC_DIR.rglob(pattern))
+    return sorted(p for p in files if "vendor" not in p.relative_to(STATIC_DIR).parts)
+
+
+def test_authored_static_files_reference_no_host_outside_the_tile_allowlist():
+    files = _authored_static_files()
+    assert files, "expected at least one authored static file to scan"
+    offenders = []
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for host in _URL_HOST_RE.findall(text):
+            if host not in _ALLOWED_STATIC_HOSTS:
+                offenders.append(f"{path.relative_to(STATIC_DIR)}: {host}")
+    assert not offenders, f"found references to disallowed hosts: {offenders}"
+
+
+# --- the vendor README's recorded hashes must stay true ---------------------
+#
+# .gitattributes guarantees the committed bytes of vendor/leaflet.js and
+# vendor/leaflet.css survive a checkout unchanged; nothing guarantees the
+# SHA256 table in vendor/README.md still describes those same bytes after
+# some future commit touches either file. This hashes the files as
+# actually committed and checks them against the table, parsed out of the
+# README rather than duplicated here: the README is the single source of
+# truth this test exists to keep honest, so a second, hand-copied set of
+# hashes in the test would just be one more place to forget to update.
+
+_VENDOR_HASH_ROW_RE = re.compile(
+    r"^\|\s*`([^`]+)`\s*\|.*\|\s*`([0-9a-f]{64})`\s*\|\s*$", re.IGNORECASE
+)
+
+
+def _vendor_readme_hash_table() -> dict[str, str]:
+    text = (STATIC_DIR / "vendor" / "README.md").read_text(encoding="utf-8")
+    table = {}
+    for line in text.splitlines():
+        match = _VENDOR_HASH_ROW_RE.match(line.strip())
+        if match:
+            table[match.group(1)] = match.group(2).lower()
+    return table
+
+
+def test_vendor_readme_hashes_match_the_committed_files():
+    table = _vendor_readme_hash_table()
+    assert table, "expected vendor/README.md to list at least one file/hash pair"
+    mismatches = []
+    for filename, expected_hash in table.items():
+        path = STATIC_DIR / "vendor" / filename
+        if not path.is_file():
+            mismatches.append(f"{filename}: listed in vendor/README.md but not found on disk")
+            continue
+        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            mismatches.append(
+                f"{filename}: README says {expected_hash}, actual file hashes to {actual_hash}"
+            )
+    assert not mismatches, "\n".join(mismatches)

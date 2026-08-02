@@ -8,6 +8,7 @@ from a single machine are how you get rate limited.
 from __future__ import annotations
 
 import json
+import math
 import re
 import secrets
 import threading
@@ -20,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from mapgen.config import load_config, save_config
 from mapgen.geo import BBox, BBoxError
-from mapgen.geocode import GeocodeError, NominatimClient
+from mapgen.geocode import GeocodeError, GeocodeQueueFullError, NominatimClient
 from mapgen.jobs import CancelToken, Cancelled, EventLog
 from mapgen.naming import NamingError
 from mapgen.package import (
@@ -237,6 +238,8 @@ def make_handler(
                     return self._send_json(400, {"error": "q is required."})
                 try:
                     result = geocode_client.search(search_query)
+                except GeocodeQueueFullError as exc:
+                    return self._send_json(429, {"error": str(exc)})
                 except GeocodeError as exc:
                     return self._send_json(502, {"error": str(exc)})
                 if result is None:
@@ -259,8 +262,23 @@ def make_handler(
                     lon = float(query.get("lon", [None])[0])
                 except (TypeError, ValueError):
                     return self._send_json(400, {"error": "lat and lon must both be numbers."})
+                # float() accepts "nan", "inf" and overflowing literals like
+                # "1e400" without raising, so a plain try/except above lets
+                # every one of those through to spend a rate-limit slot on
+                # a request Nominatim was never going to answer.
+                # isfinite() catches nan and inf; the range check catches
+                # an out-of-world but finite value such as lat=200.
+                if not (math.isfinite(lat) and math.isfinite(lon)):
+                    return self._send_json(400, {"error": "lat and lon must both be numbers."})
+                if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+                    return self._send_json(
+                        400,
+                        {"error": "lat must be between -90 and 90, lon between -180 and 180."},
+                    )
                 try:
                     reverse_result = geocode_client.reverse(lat, lon)
+                except GeocodeQueueFullError as exc:
+                    return self._send_json(429, {"error": str(exc)})
                 except GeocodeError as exc:
                     return self._send_json(502, {"error": str(exc)})
                 return self._send_json(

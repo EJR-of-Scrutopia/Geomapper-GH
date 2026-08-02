@@ -31,6 +31,15 @@ async function api(path, options = {}) {
 
 // --- extent selection ------------------------------------------------
 
+// Debounced the same way the place field is (see below): drawing or
+// pasting several extents in quick succession would otherwise fire one
+// reverse-geocode lookup per change, each queuing for a rate-limit slot
+// server-side. Waiting for a quiet moment before actually asking cuts
+// that down to the one lookup that matters, the extent the user actually
+// settles on.
+const SUGGEST_DEBOUNCE_MS = 400;
+let suggestDebounce = null;
+
 function setBBox(next, fit = true) {
   bbox = next;
   if (rectangle) map.removeLayer(rectangle);
@@ -42,7 +51,8 @@ function setBBox(next, fit = true) {
   rectangle.addTo(map);
   if (fit) map.fitBounds(bounds);
   $("bbox").value = `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`;
-  suggestNames();
+  clearTimeout(suggestDebounce);
+  suggestDebounce = setTimeout(suggestNames, SUGGEST_DEBOUNCE_MS);
   refreshEstimate();
 }
 
@@ -100,16 +110,31 @@ $("bbox").addEventListener("change", () => {
 // requirements of Nominatim's usage policy, not just politeness, and the
 // server, one process shared by every tab and every reload, is the only
 // place that can actually enforce them. See mapgen.geocode for the
-// enforcement itself. This also means the page's own network footprint
-// is exactly loopback plus the map tile servers, nothing else.
+// enforcement itself, including its own bounded queue: a caller here
+// waiting for a rate-limit slot can be told the queue is full (a clean
+// 429) rather than queuing indefinitely.
 //
 // The debounce here is a separate, client-only concern: it stops a
 // committed search firing in a burst (mashing Enter), which is not the
 // same problem as the server's own one-per-second gate and is not
 // replaced by it.
+//
+// Each function also aborts its own previous, still-in-flight request
+// before starting a new one, so a superseded lookup stops this tab
+// waiting on it. This is a client-side mitigation only: once a request
+// has actually reached the server, that handler thread is already past
+// the point where anything on this side of the connection can reach in
+// and stop it (Python's http.server has no cooperative cancellation), so
+// aborting here does not free the server's queue slot early. What it
+// does do is guarantee this tab never has more than one outstanding
+// geocode request of a given kind at once, which is what keeps a single
+// tab from being the thing that fills the server's queue by itself; the
+// queue bound itself, not this, is what actually protects against a
+// failing or slow Nominatim piling up work, from any tab.
 
 const PLACE_DEBOUNCE_MS = 400;
 let placeDebounce = null;
+let placeSearchController = null;
 
 $("place").addEventListener("change", () => {
   clearTimeout(placeDebounce);
@@ -119,19 +144,29 @@ $("place").addEventListener("change", () => {
 });
 
 async function runPlaceSearch(query) {
+  if (placeSearchController) placeSearchController.abort();
+  const controller = new AbortController();
+  placeSearchController = controller;
   try {
-    const result = await api(`/api/geocode?q=${encodeURIComponent(query)}`);
+    const result = await api(`/api/geocode?q=${encodeURIComponent(query)}`, {
+      signal: controller.signal,
+    });
     setBBox({ west: result.west, south: result.south, east: result.east, north: result.north });
   } catch (error) {
+    if (error.name === "AbortError") return; // superseded by a newer search
     if (error.status === 404) {
       // The server's own "no match for ..." message, worth showing as is.
       showEstimateError(error.message);
+    } else if (error.status === 429) {
+      showEstimateError("Too many geocoding requests right now. Try again in a moment.");
     } else {
       // Geocoding is down, rate-limited, or slow enough to have timed out
       // server-side. The map is exactly as usable as before the search:
       // draw the extent or paste coordinates.
       showEstimateError("Place search is unavailable right now. Draw the extent or paste coordinates instead.");
     }
+  } finally {
+    if (placeSearchController === controller) placeSearchController = null;
   }
 }
 
@@ -143,19 +178,27 @@ async function runPlaceSearch(query) {
 // again after the (possibly slow) request returns, so a reply for an
 // extent the user has since replaced can't overwrite a newer,
 // already-filled suggestion.
+let suggestController = null;
+
 async function suggestNames() {
   if (!bbox) return;
   if ($("region").value && $("site").value) return;
   const requestedBBox = bbox;
   const lat = (requestedBBox.south + requestedBBox.north) / 2;
   const lon = (requestedBBox.west + requestedBBox.east) / 2;
+  if (suggestController) suggestController.abort();
+  const controller = new AbortController();
+  suggestController = controller;
   try {
-    const result = await api(`/api/reverse?lat=${lat}&lon=${lon}`);
+    const result = await api(`/api/reverse?lat=${lat}&lon=${lon}`, { signal: controller.signal });
     if (bbox !== requestedBBox) return;
     if (!$("site").value) $("site").value = result.site || "";
     if (!$("region").value) $("region").value = result.region || "";
   } catch (error) {
-    // Quiet on purpose, see the comment above.
+    // Quiet on purpose, see the comment above. Includes an AbortError
+    // from a newer extent superseding this one.
+  } finally {
+    if (suggestController === controller) suggestController = null;
   }
 }
 
@@ -200,6 +243,15 @@ async function refreshEstimate() {
       `${data.tiles} tiles (${data.rows} x ${data.cols})<br />` +
       `around ${Math.round(data.bytes_estimate / 1e6)} MB, about ${minutes} min`;
     $("download").disabled = false;
+    // Only persist output-root/tile-size/overlap once they have actually
+    // passed an estimate, which is the same call that would reject, for
+    // example, an output root too long for Windows' path limit. Wiring
+    // this to the field's own "change" event directly, alongside
+    // refreshEstimate, would persist a value the estimate had just
+    // rejected: the interface would then reload next launch pre-filled
+    // with a path it already knows is broken, with nothing on screen to
+    // explain why.
+    persistFieldSettings();
   } catch (error) {
     showEstimateError(error.message);
   }
@@ -256,9 +308,9 @@ function persistFieldSettings() {
   });
 }
 
-["tile-size", "overlap", "output-root"].forEach((id) =>
-  $(id).addEventListener("change", persistFieldSettings)
-);
+// No separate "change" listener here: persistFieldSettings is called from
+// refreshEstimate's own success path above, deliberately, so a value the
+// estimate has just rejected is never the one saved.
 
 // --- job -------------------------------------------------------------
 
@@ -283,7 +335,21 @@ $("download").addEventListener("click", async () => {
     $("cancel").hidden = false;
     let seen = 0;
     poller = setInterval(async () => {
-      const job = await api(`/api/jobs/${jobId}`);
+      let job;
+      try {
+        job = await api(`/api/jobs/${jobId}`);
+      } catch (error) {
+        // Without this, a single failed poll (a stale token, the server
+        // restarting) becomes an unhandled rejection every 700ms forever:
+        // setInterval keeps calling regardless, clearInterval is never
+        // reached because it only happens below, and the buttons are left
+        // showing a job that is, as far as this tab knows, still running.
+        clearInterval(poller);
+        $("cancel").hidden = true;
+        $("download").disabled = false;
+        log(`Lost contact with the job: ${error.message}`, true);
+        return;
+      }
       job.events.slice(seen).forEach((e) => {
         const detail = Object.entries(e)
           .filter(([k]) => k !== "event")
@@ -312,22 +378,33 @@ $("cancel").addEventListener("click", async () => {
 // --- boot ------------------------------------------------------------
 
 (async function boot() {
-  const config = await api("/api/config");
-  $("output-root").value = config.output_root;
-  $("tile-size").value = config.tile_size_m;
-  $("overlap").value = config.overlap_m;
-  if (config.last_region) $("region").value = config.last_region;
-  savedConfig = config;
+  try {
+    const config = await api("/api/config");
+    $("output-root").value = config.output_root;
+    $("tile-size").value = config.tile_size_m;
+    $("overlap").value = config.overlap_m;
+    if (config.last_region) $("region").value = config.last_region;
+    savedConfig = config;
 
-  const sources = await api("/api/sources");
-  $("sources").innerHTML = sources
-    .map(
-      (s) => `
-      <label title="${s.licence}">
-        <input type="checkbox" value="${s.id}" ${s.id === "elevation" ? "" : "checked"} />
-        <span>${s.display_name}${s.requires_api_key ? " (needs an API key)" : ""}</span>
-      </label>`
-    )
-    .join("");
-  $("sources").addEventListener("change", refreshEstimate);
+    const sources = await api("/api/sources");
+    $("sources").innerHTML = sources
+      .map(
+        (s) => `
+        <label title="${s.licence}">
+          <input type="checkbox" value="${s.id}" ${s.id === "elevation" ? "" : "checked"} />
+          <span>${s.display_name}${s.requires_api_key ? " (needs an API key)" : ""}</span>
+        </label>`
+      )
+      .join("");
+    $("sources").addEventListener("change", refreshEstimate);
+  } catch (error) {
+    // Without this, a wrong or stale token throws on the very first await
+    // and boot() just stops: no config, no sources, no estimate, and
+    // nothing on screen says why. The 403 this is usually caused by is
+    // entirely correct server-side and completely invisible otherwise.
+    log(
+      `Could not load the interface: ${error.message} Reload from the mapgen ui command; the token may be stale.`,
+      true
+    );
+  }
 })();
