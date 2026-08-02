@@ -31,7 +31,13 @@ from mapgen.naming import (
     slugify,
     tiling_fingerprint,
 )
-from mapgen.sources.base import NullProgress, ProgressSink, get_source, register
+from mapgen.sources.base import (
+    NullProgress,
+    ProgressSink,
+    available_sources,
+    get_source,
+    register,
+)
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.osm import OsmSource
 from mapgen.sources.overture import (
@@ -76,9 +82,18 @@ class SurveyResult:
 
 
 def register_default_sources() -> None:
-    register(OsmSource())
-    register(OvertureSource())
-    register(ElevationSource())
+    """Register the three phase 1 sources, skipping any id already present.
+
+    The CLI's main() calls this on every invocation, so a second call within
+    the same process, for example a second main() call in one test session,
+    must be a no-op rather than a DuplicateSourceError. register() itself
+    still raises for a genuine id collision from any other caller; only this
+    convenience wrapper is made safe to repeat.
+    """
+    registered = {source.id for source in available_sources()}
+    for source in (OsmSource(), OvertureSource(), ElevationSource()):
+        if source.id not in registered:
+            register(source)
 
 
 def _coordinate_stem(bbox: BBox) -> str:
