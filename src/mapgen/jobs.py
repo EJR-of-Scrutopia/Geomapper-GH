@@ -1,0 +1,123 @@
+"""Job state, progress events, and cancellation.
+
+State is written after every tile so a job that dies at hour two resumes rather
+than restarts. A listener that raises must never take the job down with it,
+because the most likely listener is a browser tab that got closed.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from typing import Callable, Sequence
+
+from mapgen.fsutil import atomic_write_text
+
+STATE_FILENAME = "state.json"
+PENDING = "pending"
+OK = "ok"
+FAILED = "failed"
+
+
+class Cancelled(Exception):
+    """Raised inside a job when the user has asked it to stop."""
+
+
+class CancelToken:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        if self._event.is_set():
+            raise Cancelled("Job cancelled at the user's request.")
+
+
+class EventLog:
+    """A ProgressSink that keeps history and optionally forwards live."""
+
+    def __init__(self, listener: Callable[[dict], None] | None = None) -> None:
+        self.events: list[dict] = []
+        self._listener = listener
+        self._lock = threading.Lock()
+
+    def emit(self, event: str, **fields: object) -> None:
+        payload = {"event": event, **fields}
+        with self._lock:
+            self.events.append(payload)
+        if self._listener is not None:
+            try:
+                self._listener(payload)
+            except Exception:
+                # A dead listener is a closed browser tab, not a job failure.
+                pass
+
+
+class JobState:
+    def __init__(
+        self, state_path: Path, tiles: Sequence[str], source_ids: Sequence[str]
+    ) -> None:
+        self.state_path = state_path
+        self.source_ids = list(source_ids)
+        self.tiles: dict[str, dict[str, str]] = {
+            tile_id: {source_id: PENDING for source_id in source_ids}
+            for tile_id in tiles
+        }
+
+    @classmethod
+    def load_or_create(
+        cls, work_dir: Path, tiles: Sequence[str], source_ids: Sequence[str]
+    ) -> "JobState":
+        state = cls(work_dir / STATE_FILENAME, tiles, source_ids)
+        state._merge_saved()
+        return state
+
+    def _merge_saved(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        saved = payload.get("tiles", {})
+        for tile_id, sources in self.tiles.items():
+            saved_sources = saved.get(tile_id, {})
+            for source_id in sources:
+                if saved_sources.get(source_id) in (OK, FAILED):
+                    sources[source_id] = saved_sources[source_id]
+
+    def mark(self, tile_id: str, source_id: str, status: str) -> None:
+        self.tiles.setdefault(tile_id, {})[source_id] = status
+        self.save()
+
+    def status(self, tile_id: str, source_id: str) -> str:
+        return self.tiles.get(tile_id, {}).get(source_id, PENDING)
+
+    def is_done(self, tile_id: str, source_id: str) -> bool:
+        return self.status(tile_id, source_id) == OK
+
+    @property
+    def complete(self) -> bool:
+        return all(
+            status == OK
+            for sources in self.tiles.values()
+            for status in sources.values()
+        )
+
+    def as_tile_records(self) -> list[dict[str, object]]:
+        return [
+            {"tile_id": tile_id, **sources}
+            for tile_id, sources in sorted(self.tiles.items())
+        ]
+
+    def save(self) -> None:
+        atomic_write_text(
+            self.state_path,
+            json.dumps({"tiles": self.tiles}, indent=2),
+        )
