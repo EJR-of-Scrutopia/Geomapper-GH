@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 
@@ -186,3 +187,34 @@ def test_event_log_survives_a_listener_that_raises():
     log = EventLog(listener=bad_listener)
     log.emit("tile_done", tile_id="r00_c00")
     assert len(log.events) == 1
+
+
+def test_snapshot_is_a_copy_taken_under_the_lock():
+    log = EventLog()
+    log.emit("one", index=1)
+    taken = log.snapshot()
+    log.emit("two", index=2)
+
+    assert [event["event"] for event in taken] == ["one"]
+    assert [event["event"] for event in log.snapshot()] == ["one", "two"]
+
+
+def test_snapshot_survives_concurrent_emits():
+    log = EventLog()
+    stop = threading.Event()
+
+    def writer():
+        index = 0
+        while not stop.is_set():
+            log.emit("tick", index=index)
+            index += 1
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    try:
+        for _ in range(200):
+            # json.dumps iterates the list; a live list would be a race.
+            json.dumps(log.snapshot())
+    finally:
+        stop.set()
+        thread.join(timeout=5)

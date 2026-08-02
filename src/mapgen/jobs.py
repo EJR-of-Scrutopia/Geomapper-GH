@@ -58,6 +58,16 @@ class EventLog:
                 # A dead listener is a closed browser tab, not a job failure.
                 pass
 
+    def snapshot(self) -> list[dict]:
+        """A copy of the history, taken under the lock.
+
+        The HTTP handler thread reads a running job's events while the worker
+        thread appends to them. Each payload dict is built fresh in emit and
+        never mutated afterwards, so copying the list is enough.
+        """
+        with self._lock:
+            return list(self.events)
+
 
 class JobState:
     def __init__(
