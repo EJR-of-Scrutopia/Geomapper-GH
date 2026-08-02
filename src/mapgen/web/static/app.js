@@ -55,9 +55,12 @@ async function api(path, options = {}) {
 //   must never reach a third party.
 // - Never let the interface break because Nominatim is slow, down, or
 //   rate-limiting us. Both call sites below fail into a plain, recoverable
-//   state instead of an unhandled rejection.
+//   state instead of an unhandled rejection, and a request that just never
+//   answers is cut off by NOMINATIM_TIMEOUT_MS rather than left to hang
+//   forever: a slow server should look like a failure, not a stall.
 
 const NOMINATIM_MIN_INTERVAL_MS = 1000;
+const NOMINATIM_TIMEOUT_MS = 8000;
 let nominatimReadyAt = 0;
 
 async function nominatimFetch(url) {
@@ -65,9 +68,15 @@ async function nominatimFetch(url) {
   const wait = Math.max(0, nominatimReadyAt - now);
   nominatimReadyAt = now + wait + NOMINATIM_MIN_INTERVAL_MS;
   if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-  const response = await fetch(url, { referrerPolicy: "origin" });
-  if (!response.ok) throw new Error(`Nominatim returned HTTP ${response.status}`);
-  return response.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NOMINATIM_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { referrerPolicy: "origin", signal: controller.signal });
+    if (!response.ok) throw new Error(`Nominatim returned HTTP ${response.status}`);
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // --- extent selection ------------------------------------------------
