@@ -16,7 +16,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from mapgen.config import load_config, save_config
 from mapgen.geo import BBox, BBoxError
@@ -104,7 +104,15 @@ class JobManager:
             finally:
                 self._busy = False
 
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            # The worker never ran, so its own finally: self._busy = False
+            # never fires either. Left alone, this wedges the manager
+            # permanently busy with no job to cancel and no way to start
+            # another, which needs a process restart to clear.
+            self._busy = False
+            raise
         return job_id
 
     def get(self, job_id: str) -> JobRecord | None:
@@ -152,12 +160,42 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
         def _authorised(self, query: dict) -> bool:
             return query.get("token", [None])[0] == token
 
-        def _read_json(self) -> dict:
-            length = int(self.headers.get("Content-Length", "0"))
-            return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        def _drain_body(self) -> bytes:
+            """Read and return the full request body, always, before any
+            routing or auth decision.
+
+            protocol_version is HTTP/1.1, so a client (Task 16's browser
+            fetch(), which reuses connections; the test suite's raw
+            http.client checks below) may send another request on the same
+            socket right after this one. If a route returns early, 403 for a
+            bad token or 404 for an unknown path, without reading a body the
+            client already sent, those bytes are still sitting on the wire
+            and get parsed as the start of the next request on that same
+            connection. Draining unconditionally here, before any branch
+            that could return early, closes that off for every route at
+            once rather than needing every early return to remember it.
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                # An unparseable Content-Length means the number of pending
+                # body bytes is unknown, so there is no safe amount to read
+                # for a connection that is about to be reused. Close it
+                # instead of guessing and desyncing the next request anyway.
+                self.close_connection = True
+                return b""
+            if length <= 0:
+                return b""
+            return self.rfile.read(length)
+
+        def _parse_json(self, body: bytes) -> dict:
+            if not body:
+                return {}
+            return json.loads(body.decode("utf-8"))
 
         # --- routes --------------------------------------------------
         def do_GET(self) -> None:
+            self._drain_body()
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
 
@@ -204,14 +242,15 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
             return self._send_json(404, {"error": "Unknown endpoint."})
 
         def do_POST(self) -> None:
+            body = self._drain_body()
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
             if not self._authorised(query):
                 return self._send_json(403, {"error": "Invalid or missing token."})
 
             try:
-                payload = self._read_json()
-            except json.JSONDecodeError:
+                payload = self._parse_json(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._send_json(400, {"error": "Body was not valid JSON."})
 
             if parsed.path == "/api/estimate":
@@ -238,6 +277,7 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
             return self._send_json(404, {"error": "Unknown endpoint."})
 
         def do_PUT(self) -> None:
+            body = self._drain_body()
             parsed = urlparse(self.path)
             if not self._authorised(parse_qs(parsed.query)):
                 return self._send_json(403, {"error": "Invalid or missing token."})
@@ -245,8 +285,8 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
                 return self._send_json(404, {"error": "Unknown endpoint."})
 
             try:
-                payload = self._read_json()
-            except json.JSONDecodeError:
+                payload = self._parse_json(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._send_json(400, {"error": "Body was not valid JSON."})
 
             current = load_config()
@@ -257,7 +297,14 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
             return self._send_json(200, current.__dict__)
 
         def _serve_static(self, path: str) -> None:
-            relative = "index.html" if path in ("/", "") else path.lstrip("/")
+            # unquote first, so a name like map%20pin.svg reaches an actual
+            # file called "map pin.svg". The traversal guard below runs on
+            # the fully resolved path regardless of how "relative" was
+            # spelled, so decoding first does not reopen it: an encoded
+            # ../ still collapses under resolve() and still fails
+            # is_relative_to same as a literal ../ would.
+            decoded = unquote(path)
+            relative = "index.html" if decoded in ("/", "") else decoded.lstrip("/")
             resolved_static_dir = static_dir.resolve()
             target = (static_dir / relative).resolve()
             if not target.is_relative_to(resolved_static_dir) or not target.is_file():

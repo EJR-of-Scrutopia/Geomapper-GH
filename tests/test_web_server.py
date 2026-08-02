@@ -1,9 +1,12 @@
+import http.client
 import json
 import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -11,7 +14,13 @@ from mapgen.geo import BBox
 from mapgen.jobs import EventLog
 from mapgen.package import SurveyRequest
 from mapgen.sources.base import Estimate, clear_registry, register
-from mapgen.web.server import JobBusyError, JobManager, build_server
+from mapgen.web.server import (
+    JobBusyError,
+    JobManager,
+    JobRecord,
+    build_server,
+    make_handler,
+)
 
 TOKEN = "test-token"
 
@@ -80,6 +89,25 @@ class BlockingSource:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")
         return [out]
+
+
+class _CountingEventLog(EventLog):
+    """Counts snapshot() calls, to prove the handler actually calls it.
+
+    JobRecord holding an EventLog (asserted elsewhere) is a necessary shape,
+    but not sufficient: a handler that reaches past snapshot() straight at
+    the underlying `.events` list would have the exact right shape and
+    still bypass the lock. This catches that specific mistake directly,
+    since JobRecord's shape alone does not.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.snapshot_calls = 0
+
+    def snapshot(self):
+        self.snapshot_calls += 1
+        return super().snapshot()
 
 
 @pytest.fixture(autouse=True)
@@ -156,7 +184,8 @@ def test_requests_with_the_wrong_token_are_rejected(server):
     assert excinfo.value.code == 403
 
 
-def test_config_endpoint_returns_the_saved_defaults(server):
+def test_config_endpoint_returns_the_saved_defaults(server, tmp_path, monkeypatch):
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
     status, payload = _get(server, "/api/config")
     assert status == 200
     assert "output_root" in payload
@@ -533,3 +562,214 @@ def test_config_put_with_invalid_json_returns_400(server, tmp_path, monkeypatch)
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         urllib.request.urlopen(request, timeout=10)
     assert excinfo.value.code == 400
+
+
+# --- Round 1 review findings -----------------------------------------------
+#
+# The tests above (both the brief's nine and the fourteen added afterward)
+# all passed against a version of the handler that read record.log.events
+# directly instead of calling record.log.snapshot(), against a version of
+# EventLog.snapshot() with the lock deleted, and against the original
+# keep-alive body-draining bug, confirmed independently. The tests below
+# close those specific gaps.
+
+
+def test_job_status_endpoint_reads_through_snapshot_not_the_live_list():
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        counting_log = _CountingEventLog()
+        record = JobRecord(id="counting-job", state="done", log=counting_log)
+        httpd.manager._jobs[record.id] = record
+
+        status, _payload = _get(base, f"/api/jobs/{record.id}")
+
+        assert status == 200
+        assert counting_log.snapshot_calls == 1
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_keep_alive_connection_survives_an_unauthorised_post_with_a_body(
+    server, tmp_path, monkeypatch
+):
+    # Reproduces the review's manual finding on a single socket, using
+    # http.client rather than urllib.request: urllib opens a fresh
+    # connection per call, so it cannot observe a connection left desynced
+    # by an early return that skipped the request body.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+    parsed = urlsplit(server)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        body = json.dumps(
+            {"bbox": "-3.29,51.38,-3.28,51.39", "region": "R", "site": "S"}
+        ).encode("utf-8")
+        conn.request(
+            "POST",
+            "/api/jobs",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        first = conn.getresponse()
+        assert first.status == 403
+        first.read()
+
+        # Same connection. If the POST's body was left on the wire, these
+        # leftover bytes get parsed as the start of this request instead.
+        conn.request("GET", f"/api/config?token={TOKEN}")
+        second = conn.getresponse()
+        assert second.status == 200
+        json.loads(second.read().decode("utf-8"))
+    finally:
+        conn.close()
+
+
+def test_keep_alive_connection_survives_a_put_to_an_unknown_path_with_a_body(
+    server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+    parsed = urlsplit(server)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        body = json.dumps({"tile_size_m": 750.0}).encode("utf-8")
+        conn.request(
+            "PUT",
+            f"/api/not-config?token={TOKEN}",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        first = conn.getresponse()
+        assert first.status == 404
+        first.read()
+
+        conn.request("GET", f"/api/config?token={TOKEN}")
+        second = conn.getresponse()
+        assert second.status == 200
+        json.loads(second.read().decode("utf-8"))
+    finally:
+        conn.close()
+
+
+def test_a_non_numeric_content_length_does_not_crash_the_handler(server):
+    parsed = urlsplit(server)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        conn.putrequest("POST", f"/api/estimate?token={TOKEN}")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "abc")
+        conn.endheaders()
+        response = conn.getresponse()
+        # A malformed Content-Length is treated as no body, so /api/estimate
+        # then fails on its own missing required fields. What matters here
+        # is that this is a clean HTTP response at all, not a dropped
+        # connection from an unhandled ValueError inside the handler.
+        assert response.status == 400
+        response.read()
+    finally:
+        conn.close()
+
+
+def test_build_server_defaults_to_loopback_only():
+    httpd = build_server(port=0, token=TOKEN)
+    try:
+        assert httpd.server_address[0] == "127.0.0.1"
+    finally:
+        httpd.server_close()
+
+
+def test_busy_flag_clears_if_the_worker_thread_fails_to_start(tmp_path, monkeypatch):
+    manager = JobManager()
+
+    def _boom(self):
+        raise RuntimeError("simulated thread start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", _boom)
+
+    with pytest.raises(RuntimeError):
+        manager.start(
+            SurveyRequest(
+                bbox=BBox.parse("-3.29,51.38,-3.28,51.39"),
+                region="R",
+                site="S",
+                output_root=tmp_path,
+                source_ids=("stub",),
+                run_bridge_step=False,
+            )
+        )
+
+    assert manager.is_busy() is False
+
+
+def test_static_serving_decodes_percent_encoded_names(tmp_path):
+    (tmp_path / "map pin.svg").write_text("<svg></svg>", encoding="utf-8")
+    manager = JobManager()
+    handler = make_handler(manager, TOKEN, tmp_path)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with urllib.request.urlopen(f"{base}/map%20pin.svg", timeout=10) as response:
+            assert response.status == 200
+            assert response.read() == b"<svg></svg>"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_static_traversal_is_still_rejected_after_percent_decoding(tmp_path):
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    outside = tmp_path / "outside_secret.txt"
+    outside.write_text("do not serve me", encoding="utf-8")
+
+    manager = JobManager()
+    handler = make_handler(manager, TOKEN, static_dir)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(f"{base}/%2e%2e/outside_secret.txt", timeout=10)
+        assert excinfo.value.code == 404
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_static_path_traversal_cannot_reach_a_prefix_sharing_sibling_directory(tmp_path):
+    # The reviewer's confirmed exploit against the original string-prefix
+    # guard: static2 shares a string prefix with static, so
+    # str(target).startswith(str(static_dir)) let it through. is_relative_to
+    # does not. Reverting to the prefix check leaves every other test in
+    # this file green, so this is the only thing that discriminates it.
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<html></html>", encoding="utf-8")
+    sibling = tmp_path / "static2"
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("do not serve me", encoding="utf-8")
+
+    manager = JobManager()
+    handler = make_handler(manager, TOKEN, static_dir)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(f"{base}/../static2/secret.txt", timeout=10)
+        assert excinfo.value.code == 404
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
