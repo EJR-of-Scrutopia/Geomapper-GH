@@ -295,6 +295,45 @@ def test_estimate_returns_400_for_an_unknown_source(server, tmp_path):
     assert excinfo.value.code == 400
 
 
+def test_posting_a_job_without_a_token_has_no_side_effects(server, tmp_path):
+    request = urllib.request.Request(
+        f"{server}/api/jobs",
+        data=json.dumps(
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "South Wales",
+                "site": "Barry",
+                "output_root": str(tmp_path),
+                "sources": ["stub"],
+                "run_bridge": False,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(request, timeout=10)
+    assert excinfo.value.code == 403
+
+    # If the unauthorised POST above had actually started a job, the manager
+    # would still be busy and this legitimate request would come back 409
+    # instead of 202.
+    status, payload = _post(
+        server,
+        "/api/jobs",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+            "run_bridge": False,
+        },
+    )
+    assert status == 202
+    _wait_for_state(server, payload["id"])
+
+
 def test_starting_a_job_reaches_done_with_events_and_result_root(server, tmp_path):
     status, payload = _post(
         server,
