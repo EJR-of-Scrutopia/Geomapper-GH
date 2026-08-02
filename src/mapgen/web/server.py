@@ -25,11 +25,23 @@ from mapgen.jobs import CancelToken, Cancelled, EventLog
 from mapgen.naming import NamingError
 from mapgen.package import (
     SurveyRequest,
+    estimate_geometry,
     estimate_survey,
     register_default_sources,
     run_survey,
 )
 from mapgen.sources.base import available_sources
+
+# _survey_request() and the bare-geometry parsing in /api/extent both call
+# float() on caller-supplied JSON values. A well-behaved client always
+# sends a number, but JSON has no NaN/Infinity literal, so
+# JSON.stringify(NaN) on the browser side produces the literal text null:
+# the key stays present with value None, which dict.get(key, default)
+# does not treat as absent, and float(None) raises TypeError, not
+# ValueError. Both are request-shaped problems, not server bugs, and
+# belong in the same 400 branch as BBoxError/NamingError rather than
+# killing the handler thread.
+_REQUEST_VALUE_ERRORS = (BBoxError, NamingError, KeyError, TypeError, ValueError)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -236,23 +248,31 @@ def make_handler(
                 if not search_query:
                     return self._send_json(400, {"error": "q is required."})
                 try:
-                    result = geocode_client.search(search_query)
+                    results = geocode_client.search(search_query)
                 except GeocodeQueueFullError as exc:
                     return self._send_json(429, {"error": str(exc)})
                 except GeocodeError as exc:
                     return self._send_json(502, {"error": str(exc)})
-                if result is None:
+                if not results:
                     return self._send_json(
                         404, {"error": f'No match for "{search_query}"'}
                     )
+                # A list, one entry per hit, each with display_name plus a
+                # bbox: Task 18 turned this from a one-shot search that
+                # jumped straight to a single guess into a typeahead,
+                # which needs enough to tell same-named places apart.
                 return self._send_json(
                     200,
-                    {
-                        "west": result.west,
-                        "south": result.south,
-                        "east": result.east,
-                        "north": result.north,
-                    },
+                    [
+                        {
+                            "display_name": result.display_name,
+                            "west": result.west,
+                            "south": result.south,
+                            "east": result.east,
+                            "north": result.north,
+                        }
+                        for result in results
+                    ],
                 )
 
             if parsed.path == "/api/reverse":
@@ -319,7 +339,23 @@ def make_handler(
             if parsed.path == "/api/estimate":
                 try:
                     return self._send_json(200, estimate_survey(_survey_request(payload)))
-                except (BBoxError, NamingError, KeyError) as exc:
+                except _REQUEST_VALUE_ERRORS as exc:
+                    return self._send_json(400, {"error": str(exc)})
+
+            if parsed.path == "/api/extent":
+                # The bare-geometry counterpart to /api/estimate: bbox,
+                # tile_size_m and overlap_m only, no region, site or
+                # output_root at all, so the interface can show a live
+                # tile count and area while a rectangle is being drawn or
+                # pasted, well before either name exists.
+                try:
+                    bbox = BBox.parse(payload["bbox"])
+                    tile_size_m = float(payload.get("tile_size_m", 2000.0))
+                    overlap_m = float(payload.get("overlap_m", 100.0))
+                    return self._send_json(
+                        200, estimate_geometry(bbox, tile_size_m, overlap_m)
+                    )
+                except _REQUEST_VALUE_ERRORS as exc:
                     return self._send_json(400, {"error": str(exc)})
 
             if parsed.path == "/api/jobs":
@@ -327,7 +363,7 @@ def make_handler(
                     job_id = manager.start(_survey_request(payload))
                 except JobBusyError as exc:
                     return self._send_json(409, {"error": str(exc)})
-                except (BBoxError, NamingError, KeyError) as exc:
+                except _REQUEST_VALUE_ERRORS as exc:
                     return self._send_json(400, {"error": str(exc)})
                 return self._send_json(202, {"id": job_id})
 

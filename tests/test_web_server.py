@@ -120,24 +120,26 @@ class StubGeocodeClient:
     Mirrors what StubSource is for LayerSource: server.py's routing and
     status-code translation is tested here, independent of NominatimClient's
     own HTTP call and Nominatim-shape parsing, which have their own tests in
-    test_geocode.py. search_result/reverse_result and search_error/
+    test_geocode.py. search_results/reverse_result and search_error/
     reverse_error are read per call, not snapshotted at construction, so a
     test can flip them between requests against the same running server.
+    search_results matches NominatimClient.search's real contract: a list,
+    empty rather than None when nothing matched.
     """
 
     def __init__(self):
-        self.search_result: GeocodeResult | None = None
+        self.search_results: list[GeocodeResult] = []
         self.search_error: Exception | None = None
         self.reverse_result: ReverseResult = ReverseResult(region="", site="")
         self.reverse_error: Exception | None = None
         self.search_calls: list[str] = []
         self.reverse_calls: list[tuple[float, float]] = []
 
-    def search(self, query: str) -> GeocodeResult | None:
+    def search(self, query: str) -> list[GeocodeResult]:
         self.search_calls.append(query)
         if self.search_error is not None:
             raise self.search_error
-        return self.search_result
+        return self.search_results
 
     def reverse(self, lat: float, lon: float) -> ReverseResult:
         self.reverse_calls.append((lat, lon))
@@ -286,6 +288,160 @@ def test_estimate_returns_400_for_a_bad_bbox(server, tmp_path):
             },
         )
     assert excinfo.value.code == 400
+
+
+def test_estimate_endpoint_includes_the_real_folder_path(server, tmp_path):
+    # Task 18 item 7: the folder preview the interface shows before
+    # downloading must come from this response, produced by the same
+    # naming.build_package_paths call that plans the job itself.
+    status, payload = _post(
+        server,
+        "/api/estimate",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "Vale of Glamorgan",
+            "site": "Barry Waterfront",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+        },
+    )
+    assert status == 200
+    assert payload["folder"].startswith(str(tmp_path))
+    assert "Vale-of-Glamorgan" in payload["folder"]
+    assert "Barry-Waterfront" in payload["folder"]
+
+
+def test_estimate_endpoint_reports_no_warnings_for_a_source_with_no_readiness_check(
+    server, tmp_path
+):
+    status, payload = _post(
+        server,
+        "/api/estimate",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "R",
+            "site": "S",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+        },
+    )
+    assert status == 200
+    assert payload["warnings"] == []
+
+
+def test_estimate_returns_400_rather_than_crashing_on_a_null_tile_size(server, tmp_path):
+    # Mirrors what a real browser sends when the tile-size field is
+    # empty: JSON.stringify(NaN) is the literal "null", so the key is
+    # PRESENT with value None, which payload.get(key, default) does not
+    # treat as absent. float(None) raises TypeError, which the original
+    # except (BBoxError, NamingError, KeyError) tuple did not catch.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/estimate",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "tile_size_m": None,
+                "sources": ["stub"],
+            },
+        )
+    assert excinfo.value.code == 400
+
+
+def test_jobs_endpoint_returns_400_rather_than_crashing_on_a_null_overlap(server, tmp_path):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/jobs",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "overlap_m": None,
+                "sources": ["stub"],
+                "run_bridge": False,
+            },
+        )
+    assert excinfo.value.code == 400
+
+
+# --- Task 18 item 6: /api/extent, a bare-geometry endpoint needing no
+# region, site or output_root at all ---------------------------------------
+
+
+def test_extent_requires_a_token(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"{server}/api/extent",
+                data=json.dumps({"bbox": "-3.29,51.38,-3.28,51.39"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=10,
+        )
+    assert excinfo.value.code == 403
+
+
+def test_extent_endpoint_returns_tile_geometry_with_no_region_site_or_output_root(server):
+    status, payload = _post(
+        server,
+        "/api/extent",
+        {"bbox": "-3.29,51.38,-3.28,51.39", "tile_size_m": 600, "overlap_m": 50},
+    )
+    assert status == 200
+    assert payload["tiles"] >= 1
+    assert set(payload) == {"tiles", "rows", "cols", "extent_km"}
+
+
+def test_extent_endpoint_defaults_tile_size_and_overlap_like_estimate_does(server):
+    status, payload = _post(server, "/api/extent", {"bbox": "-3.29,51.38,-3.28,51.39"})
+    assert status == 200
+    assert payload["tiles"] >= 1
+
+
+def test_extent_endpoint_returns_400_for_a_bad_bbox(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(server, "/api/extent", {"bbox": "nonsense"})
+    assert excinfo.value.code == 400
+
+
+def test_extent_endpoint_returns_400_rather_than_crashing_on_a_null_tile_size(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/extent",
+            {"bbox": "-3.29,51.38,-3.28,51.39", "tile_size_m": None},
+        )
+    assert excinfo.value.code == 400
+
+
+def test_extent_endpoint_matches_estimate_endpoint_tiling_for_the_same_inputs(server, tmp_path):
+    bbox = "-3.29,51.38,-3.28,51.39"
+    _, extent_payload = _post(
+        server, "/api/extent", {"bbox": bbox, "tile_size_m": 600, "overlap_m": 50}
+    )
+    _, estimate_payload = _post(
+        server,
+        "/api/estimate",
+        {
+            "bbox": bbox,
+            "region": "R",
+            "site": "S",
+            "output_root": str(tmp_path),
+            "tile_size_m": 600,
+            "overlap_m": 50,
+            "sources": ["stub"],
+        },
+    )
+    assert extent_payload["tiles"] == estimate_payload["tiles"]
+    assert extent_payload["rows"] == estimate_payload["rows"]
+    assert extent_payload["cols"] == estimate_payload["cols"]
+    assert extent_payload["extent_km"] == estimate_payload["extent_km"]
 
 
 def test_index_is_served_without_a_token(server):
@@ -603,6 +759,25 @@ def test_config_put_saves_and_round_trips_through_get(server, tmp_path, monkeypa
     assert status == 200
     assert reloaded["tile_size_m"] == 750.0
     assert reloaded["last_region"] == "Cardiff"
+
+
+def test_config_put_saves_and_round_trips_the_api_key(server, tmp_path, monkeypatch):
+    # Task 18 item 5: the settings field's whole point is that a saved key
+    # survives a reload without the owner retyping it. Generic PUT/GET
+    # plumbing already covers every field the same way (see the test
+    # above); this one names the new field directly since it is the
+    # reason this task added it.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+
+    status, payload = _put(
+        server, "/api/config", {"opentopography_api_key": "sk-real-key-value"}
+    )
+    assert status == 200
+    assert payload["opentopography_api_key"] == "sk-real-key-value"
+
+    status, reloaded = _get(server, "/api/config")
+    assert status == 200
+    assert reloaded["opentopography_api_key"] == "sk-real-key-value"
 
 
 def test_config_put_with_invalid_json_returns_400(server, tmp_path, monkeypatch):
@@ -950,19 +1125,58 @@ def test_geocode_requires_a_query(geocode_server):
 
 def test_geocode_returns_a_bbox_for_a_match(geocode_server):
     base, stub = geocode_server
-    stub.search_result = GeocodeResult(west=-3.31, south=51.38, east=-3.25, north=51.43)
+    stub.search_results = [
+        GeocodeResult(
+            display_name="Barry, Vale of Glamorgan, Wales, United Kingdom",
+            west=-3.31,
+            south=51.38,
+            east=-3.25,
+            north=51.43,
+        )
+    ]
     with urllib.request.urlopen(
         f"{base}/api/geocode?q=Barry%2C+Wales&token={TOKEN}", timeout=10
     ) as response:
         assert response.status == 200
         payload = json.loads(response.read().decode("utf-8"))
-    assert payload == {"west": -3.31, "south": 51.38, "east": -3.25, "north": 51.43}
+    assert payload == [
+        {
+            "display_name": "Barry, Vale of Glamorgan, Wales, United Kingdom",
+            "west": -3.31,
+            "south": 51.38,
+            "east": -3.25,
+            "north": 51.43,
+        }
+    ]
     assert stub.search_calls == ["Barry, Wales"]
+
+
+def test_geocode_returns_several_matches_for_disambiguation(geocode_server):
+    # Task 18's whole point: a typeahead needs enough hits to tell two
+    # same-named places apart, not just the single best guess a one-shot
+    # search used to jump straight to.
+    base, stub = geocode_server
+    stub.search_results = [
+        GeocodeResult(display_name="Barry, Wales", west=-3.31, south=51.38, east=-3.25, north=51.43),
+        GeocodeResult(display_name="Barrie, Ontario", west=-79.72, south=44.36, east=-79.63, north=44.42),
+        GeocodeResult(display_name="Barry, California", west=-118.5, south=34.0, east=-118.4, north=34.1),
+    ]
+    with urllib.request.urlopen(
+        f"{base}/api/geocode?q=Barr&token={TOKEN}", timeout=10
+    ) as response:
+        assert response.status == 200
+        payload = json.loads(response.read().decode("utf-8"))
+    assert len(payload) == 3
+    assert [p["display_name"] for p in payload] == [
+        "Barry, Wales",
+        "Barrie, Ontario",
+        "Barry, California",
+    ]
 
 
 def test_geocode_returns_404_for_no_match(geocode_server):
     base, stub = geocode_server
-    stub.search_result = None
+    stub.search_results = []
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         urllib.request.urlopen(f"{base}/api/geocode?q=nowhere&token={TOKEN}", timeout=10)
     assert excinfo.value.code == 404
