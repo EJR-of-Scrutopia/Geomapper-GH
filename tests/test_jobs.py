@@ -1,5 +1,4 @@
 import json
-import threading
 
 import pytest
 
@@ -199,22 +198,33 @@ def test_snapshot_is_a_copy_taken_under_the_lock():
     assert [event["event"] for event in log.snapshot()] == ["one", "two"]
 
 
-def test_snapshot_survives_concurrent_emits():
+class _RecordingLock:
+    """Stands in for threading.Lock and records whether it was entered.
+
+    A concurrent stress test cannot reliably prove snapshot() takes the
+    lock: under CPython's GIL, an unguarded list.append versus list
+    iteration does not corrupt memory or raise, so a missing `with
+    self._lock:` can pass a load test by accident and still be wrong. This
+    proves the lock is actually used, directly, with no timing involved.
+    """
+
+    def __init__(self) -> None:
+        self.entered = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_snapshot_acquires_the_lock():
     log = EventLog()
-    stop = threading.Event()
+    log.emit("one", index=1)
+    recording_lock = _RecordingLock()
+    log._lock = recording_lock
 
-    def writer():
-        index = 0
-        while not stop.is_set():
-            log.emit("tick", index=index)
-            index += 1
+    log.snapshot()
 
-    thread = threading.Thread(target=writer, daemon=True)
-    thread.start()
-    try:
-        for _ in range(200):
-            # json.dumps iterates the list; a live list would be a race.
-            json.dumps(log.snapshot())
-    finally:
-        stop.set()
-        thread.join(timeout=5)
+    assert recording_lock.entered is True
