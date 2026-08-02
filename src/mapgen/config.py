@@ -1,6 +1,10 @@
 """User config, remembered between runs.
 
-Only holds preferences, never secrets. API keys come from the environment.
+Mostly preferences. Task 18 added one exception: the elevation layer's
+OpenTopography key, because the interface has nowhere else to put a value
+the owner types in. Every other API key this tool might ever need still
+comes from the environment; this file is not becoming a general credential
+store.
 """
 
 from __future__ import annotations
@@ -21,6 +25,14 @@ class Config:
     tile_size_m: float = 2000.0
     overlap_m: float = 100.0
     last_region: str = ""
+    # The one exception to this module's own docstring: Task 18 gave the
+    # elevation layer's OpenTopography key an interface field, and the
+    # owner chose to save it here rather than nowhere. An environment
+    # variable still wins over this if one is set; see
+    # mapgen.sources.elevation.resolve_api_key. Never logged: the web
+    # server's job events never include it, and the interface field is
+    # type="password".
+    opentopography_api_key: str = ""
 
 
 def load_config(path: Path | None = None) -> Config:

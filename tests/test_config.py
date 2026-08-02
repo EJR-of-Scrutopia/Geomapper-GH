@@ -75,3 +75,37 @@ def test_a_bool_value_for_a_float_field_falls_back_to_the_default(tmp_path):
     target = tmp_path / "config.json"
     target.write_text('{"tile_size_m": true}', encoding="utf-8")
     assert load_config(target).tile_size_m == 2000.0
+
+
+# --- Task 18: the elevation API key field -----------------------------
+#
+# opentopography_api_key is a string field like output_root, so it already
+# rides load_config's existing per-field type check (see the isinstance
+# branch above) rather than needing one of its own. These tests exist to
+# prove that generalisation actually holds for this specific field, not to
+# add new fallback logic.
+
+
+def test_api_key_defaults_to_an_empty_string():
+    assert Config().opentopography_api_key == ""
+
+
+def test_save_then_load_round_trips_the_api_key(tmp_path):
+    target = tmp_path / "config.json"
+    save_config(Config(opentopography_api_key="sk-real-key-value"), target)
+    assert load_config(target).opentopography_api_key == "sk-real-key-value"
+
+
+def test_a_null_api_key_falls_back_to_the_default_without_raising(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"opentopography_api_key": null}', encoding="utf-8")
+    assert load_config(target).opentopography_api_key == ""
+
+
+def test_a_numeric_api_key_falls_back_to_the_default(tmp_path):
+    # A key is always a string; a bare number in hand-edited JSON is the
+    # wrong shape entirely, not a value worth coercing the way an int is
+    # accepted for a float field.
+    target = tmp_path / "config.json"
+    target.write_text('{"opentopography_api_key": 12345}', encoding="utf-8")
+    assert load_config(target).opentopography_api_key == ""

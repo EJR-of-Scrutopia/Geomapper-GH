@@ -15,6 +15,7 @@ from typing import Mapping, Sequence
 
 import requests
 
+from mapgen.config import load_config
 from mapgen.fsutil import atomic_write_bytes
 from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.sources.base import Estimate, ProgressSink
@@ -37,10 +38,27 @@ def is_tiff(header: bytes) -> bool:
 
 
 def resolve_api_key(
-    explicit: str | None = None, environ: Mapping[str, str] | None = None
+    explicit: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    configured: str | None = None,
 ) -> str:
+    """explicit, then the environment, then configured, then failure.
+
+    explicit and the two environment variables are the original,
+    unchanged precedence. configured is Task 18's addition: the key saved
+    via the interface's settings field. The owner's ruling was explicit
+    that "an environment variable still tak[es] precedence if one is
+    set", so it sits above configured, not below it: a key set in the
+    shell for one machine or one debugging session overrides whatever is
+    saved in ~/.mapgen/config.json, not the other way round.
+    """
     env = os.environ if environ is None else environ
-    key = explicit or env.get("OPENTOPOGRAPHY_API_KEY") or env.get("OPENTOPO_API_KEY")
+    key = (
+        explicit
+        or env.get("OPENTOPOGRAPHY_API_KEY")
+        or env.get("OPENTOPO_API_KEY")
+        or configured
+    )
     if not key:
         raise MissingApiKeyError(
             "Elevation download needs an OpenTopography API key. Set the "
@@ -73,6 +91,37 @@ class ElevationSource:
         self.timeout_seconds = timeout_seconds
         self._environ = environ
 
+    def _configured_key(self) -> str | None:
+        """The key saved via the interface's settings field, if any.
+
+        Read fresh on every call rather than cached at construction: this
+        source is registered once per server process, but the owner can
+        change the saved key at any point through PUT /api/config, and
+        that must take effect on the next estimate or job without a
+        restart. load_config() defaults to str, so a config file with no
+        key at all, or a corrupt one, resolves to "" here, normalised to
+        None so it never wins resolve_api_key's `or` chain by accident.
+        """
+        return load_config().opentopography_api_key or None
+
+    def readiness_problem(self) -> str | None:
+        """A plain-English problem if this source cannot run right now,
+        else None.
+
+        This is the optional LayerSource extension documented on the
+        protocol itself (see sources/base.py: attributes and methods
+        beyond the protocol are source-specific and read defensively via
+        getattr). package.py's estimate_survey calls this, if present,
+        for every selected source, so a missing key is visible on the
+        estimate rather than discovered only after OSM and Overture have
+        already finished downloading.
+        """
+        try:
+            resolve_api_key(self._api_key, self._environ, self._configured_key())
+        except MissingApiKeyError as exc:
+            return str(exc)
+        return None
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         # Estimate based on bbox area. COP30 resolution is 30 m per pixel.
         # Model: pixel_count * 2 bytes per pixel (16-bit elevation) * 1.2 for
@@ -97,7 +146,7 @@ class ElevationSource:
             progress.emit("tile_skipped", source=self.id, tile_id="whole-area")
             return [output_path]
 
-        api_key = resolve_api_key(self._api_key, self._environ)
+        api_key = resolve_api_key(self._api_key, self._environ, self._configured_key())
         params = {
             "demtype": self.demtype,
             "south": f"{bbox.south:.7f}",
@@ -108,18 +157,34 @@ class ElevationSource:
             "API_Key": api_key,
         }
 
-        try:
-            with self.session.get(
-                self.url,
-                params=params,
-                headers={"User-Agent": USER_AGENT},
-                stream=True,
-                timeout=self.timeout_seconds,
-            ) as response:
+        # response is bound by entering the context manager, outside the
+        # try, so the except clause below can always read
+        # response.status_code regardless of what raises inside it.
+        with self.session.get(
+            self.url,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            stream=True,
+            timeout=self.timeout_seconds,
+        ) as response:
+            try:
                 response.raise_for_status()
                 payload = b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
-        except (RuntimeError, requests.exceptions.HTTPError) as e:
-            raise ElevationError(f"Failed to download DEM: {e}") from e
+            except (RuntimeError, requests.exceptions.HTTPError) as e:
+                # Built from the status code, not from str(e). A real
+                # requests.exceptions.HTTPError's message includes
+                # response.url, and API_Key travels as a plain query
+                # parameter on this endpoint, so echoing e verbatim would
+                # put a real OpenTopography key into this exception's
+                # message, and from there into survey.json's
+                # source_failed event, the job's error field, and the log
+                # panel that renders it. The status code is everything a
+                # caller needs to diagnose this; the key itself never
+                # appears here regardless of which exception shape raised
+                # it.
+                raise ElevationError(
+                    f"Failed to download DEM: HTTP {response.status_code}"
+                ) from e
 
         if not is_tiff(payload[:16]):
             preview = payload[:300].decode("utf-8", errors="replace")
