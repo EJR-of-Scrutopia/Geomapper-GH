@@ -4439,16 +4439,97 @@ git commit -m "feat(cli): survey, estimate, ui and sources commands with legacy 
 **Files:**
 - Create: `src/mapgen/web/__init__.py`
 - Create: `src/mapgen/web/server.py`
+- Modify: `src/mapgen/jobs.py` (add `EventLog.snapshot`)
 - Test: `tests/test_web_server.py`
+- Test: `tests/test_jobs.py` (add the `snapshot` test)
 
 **Interfaces:**
 - Consumes: `mapgen.package`, `mapgen.config`, `mapgen.jobs`.
 - Produces:
   - `JobManager` class: `start(request) -> str` returning a job id, `get(job_id) -> JobRecord`, `cancel(job_id) -> bool`, `is_busy() -> bool`. Rejects a second concurrent job with `JobBusyError`.
-  - `JobRecord` dataclass: `id: str`, `state: str` in `{"running", "done", "failed", "cancelled"}`, `events: list[dict]`, `error: str | None`, `result_root: str | None`.
+  - `JobRecord` dataclass: `id: str`, `state: str` in `{"running", "done", "failed", "cancelled"}`, `log: EventLog`, `error: str | None`, `result_root: str | None`.
   - `make_handler(manager, token, static_dir)` returning a `BaseHTTPRequestHandler` subclass.
+  - `build_server(host="127.0.0.1", port=0, token=None)` returning a bound `ThreadingHTTPServer` with `.token` and `.manager` attached. The tests import this; `serve` is a thin wrapper over it.
   - `serve(open_browser=True, port=0, host="127.0.0.1") -> None`.
   - `JobBusyError(RuntimeError)`.
+- Modifies in `mapgen.jobs`: `EventLog.snapshot() -> list[dict]`, returning a copy of the history taken under the existing lock.
+
+**Concurrency requirement (binding).** A job's events are written by the worker
+thread and read by the HTTP handler thread. Those are different threads, so the
+read must be a locked snapshot, never a live list. `EventLog` already owns both
+the history and a lock; `JobRecord` must therefore hold the `EventLog` itself
+rather than a second, unguarded copy of its events. Do not give `JobRecord` a
+bare `events: list[dict]` and do not wire a `listener=` into `EventLog` for
+this path: that duplicates the history into a list nothing guards, and the
+handler would then serialise it while the worker appends to it.
+
+A shallow `list(self.events)` is the correct copy. Each payload dict is built
+fresh in `emit` and never mutated afterwards, so the snapshot's dicts cannot
+change under the reader.
+
+- [ ] **Step 0a: Write the failing test for the locked snapshot**
+
+Add to `tests/test_jobs.py`. It already imports `json` and `EventLog`; add
+`import threading` to the top of the file.
+
+```python
+def test_snapshot_is_a_copy_taken_under_the_lock():
+    log = EventLog()
+    log.emit("one", index=1)
+    taken = log.snapshot()
+    log.emit("two", index=2)
+
+    assert [event["event"] for event in taken] == ["one"]
+    assert [event["event"] for event in log.snapshot()] == ["one", "two"]
+
+
+def test_snapshot_survives_concurrent_emits():
+    log = EventLog()
+    stop = threading.Event()
+
+    def writer():
+        index = 0
+        while not stop.is_set():
+            log.emit("tick", index=index)
+            index += 1
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    try:
+        for _ in range(200):
+            # json.dumps iterates the list; a live list would be a race.
+            json.dumps(log.snapshot())
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+```
+
+Run: `python -m pytest tests/test_jobs.py -k snapshot -v`
+Expected: FAIL with `AttributeError: 'EventLog' object has no attribute 'snapshot'`
+
+- [ ] **Step 0b: Add `snapshot` to `EventLog` in `src/mapgen/jobs.py`**
+
+```python
+    def snapshot(self) -> list[dict]:
+        """A copy of the history, taken under the lock.
+
+        The HTTP handler thread reads a running job's events while the worker
+        thread appends to them. Each payload dict is built fresh in `emit` and
+        never mutated afterwards, so copying the list is enough.
+        """
+        with self._lock:
+            return list(self.events)
+```
+
+Run: `python -m pytest tests/test_jobs.py -v`
+Expected: PASS
+
+- [ ] **Step 0c: Commit**
+
+```bash
+git add src/mapgen/jobs.py tests/test_jobs.py
+git commit -m "feat(jobs): add a locked snapshot of the event history"
+```
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4660,7 +4741,7 @@ class JobBusyError(RuntimeError):
 class JobRecord:
     id: str
     state: str = "running"
-    events: list[dict] = field(default_factory=list)
+    log: EventLog = field(default_factory=EventLog)
     error: str | None = None
     result_root: str | None = None
     cancel: CancelToken = field(default_factory=CancelToken)
@@ -4689,11 +4770,12 @@ class JobManager:
         job_id = uuid.uuid4().hex[:12]
         record = JobRecord(id=job_id)
         self._jobs[job_id] = record
-        log = EventLog(listener=record.events.append)
 
         def worker() -> None:
             try:
-                result = run_survey(request, progress=log, cancel=record.cancel)
+                result = run_survey(
+                    request, progress=record.log, cancel=record.cancel
+                )
                 record.result_root = str(result.paths.root)
                 record.state = "done" if result.complete else "failed"
                 if not result.complete:
@@ -4797,7 +4879,7 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
                     {
                         "id": record.id,
                         "state": record.state,
-                        "events": record.events,
+                        "events": record.log.snapshot(),
                         "error": record.error,
                         "result_root": record.result_root,
                     },
