@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from mapgen.geo import BBox
-from mapgen.jobs import CancelToken, Cancelled, EventLog
+from mapgen.jobs import CancelToken, Cancelled, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths
 from mapgen.package import (
     SurveyRequest,
@@ -128,6 +128,55 @@ class OvertureShapedStubSource:
         paths = []
         for tile in tiles:
             for overture_type in self.types:
+                path = work_dir / overture_type / f"{tile.tile_id}.geojson"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}", encoding="utf-8")
+                paths.append(path)
+            progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
+        return paths
+
+    def merge(self, parts, out_dir):
+        by_type: dict[str, list[Path]] = {}
+        for part in parts:
+            by_type.setdefault(part.parent.name, []).append(part)
+        outputs = []
+        for overture_type, type_parts in sorted(by_type.items()):
+            out = out_dir / f"{overture_type}.geojson"
+            out.write_text(
+                "\n".join(p.read_text(encoding="utf-8") for p in type_parts),
+                encoding="utf-8",
+            )
+            outputs.append(out)
+        return outputs
+
+
+class PartialOvertureStubSource:
+    """Shaped like OvertureSource: one type per subdirectory, tile-id stem.
+
+    Deliberately skips writing one (tile_id, type) pair so tests can check
+    that a tile with some but not all of its type files is not marked ok.
+    """
+
+    id = "overture"
+    display_name = "Stub Partial Overture"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self, types=("water", "building"), missing=()):
+        self.types = list(types)
+        self._missing = set(missing)
+
+    def estimate(self, bbox, tiles):
+        units = len(tiles) * len(self.types)
+        return Estimate(bytes_estimate=10 * units, seconds_estimate=1.0 * units)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        paths = []
+        for tile in tiles:
+            for overture_type in self.types:
+                if (tile.tile_id, overture_type) in self._missing:
+                    continue
                 path = work_dir / overture_type / f"{tile.tile_id}.geojson"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("{}", encoding="utf-8")
@@ -293,6 +342,28 @@ def test_a_resumed_run_only_refetches_tiles_that_previously_failed(tmp_path):
     assert source.fetch_calls[1] == ["r01_c01"]
 
 
+def test_a_successful_resume_merges_previously_fetched_tiles_too(tmp_path):
+    # ResumeAwareSource's fail_on never clears, so its second attempt always
+    # fails again and only ever exercises the force-recovery branch. This
+    # test lets the retried tile actually succeed, which is what exposes
+    # merge() being handed just the newly-fetched file instead of every
+    # output the source has ever produced for this package.
+    source = StubSource(fail_on=("r01_c01",))
+    register(source)
+
+    first = run_survey(_request(tmp_path, force=True))
+    assert first.complete is False
+
+    source._fail_on.clear()
+    second = run_survey(_request(tmp_path, force=True))
+
+    assert second.complete is True
+    assert second.paths.root == first.paths.root
+    merged_text = (second.paths.root / "stub.txt").read_text(encoding="utf-8")
+    for tile_id in ("r00_c00", "r00_c01", "r01_c00", "r01_c01"):
+        assert tile_id in merged_text
+
+
 def test_force_run_excludes_leftover_part_files_from_a_hard_kill(tmp_path):
     # fsutil's atomic writer, and OvertureSource's own download-to-temp
     # convention, both leave a .part file behind if the process is killed
@@ -320,6 +391,25 @@ def test_layer_files_are_copied_for_the_three_named_overture_layers_only(tmp_pat
     assert (result.paths.layers_dir / "vegetation.geojson").is_file()
     assert (result.paths.layers_dir / "landuse.geojson").is_file()
     assert not (result.paths.layers_dir / "building.geojson").exists()
+
+
+def test_a_tile_missing_one_of_several_type_directories_is_marked_failed(tmp_path):
+    # water/r00_c00.geojson exists but building/r00_c00.geojson does not.
+    # The tile must not be marked ok on the strength of water alone.
+    register(PartialOvertureStubSource(missing={("r00_c00", "building")}))
+    result = run_survey(_request(tmp_path, source_ids=("overture",)))
+
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    records = {record["tile_id"]: record["overture"] for record in payload["tiles"]}
+    assert records["r00_c00"] == "failed"
+    assert records["r00_c01"] == "ok"
+    assert records["r01_c00"] == "ok"
+    assert records["r01_c01"] == "ok"
+
+    # A reload must not treat the partially-fetched tile as done, or the
+    # missing type would never get another chance to be retried.
+    reloaded = JobState.load_or_create(result.paths.work_dir, list(records), ["overture"])
+    assert reloaded.is_done("r00_c00", "overture") is False
 
 
 def test_a_second_run_of_the_same_site_gets_an_02_suffix(tmp_path):

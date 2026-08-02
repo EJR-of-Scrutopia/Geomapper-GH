@@ -166,7 +166,7 @@ def run_survey(
             pending = [t for t in tiles if not state.is_done(t.tile_id, source.id)]
             fetch_succeeded = False
             try:
-                parts = source.fetch(request.bbox, pending, source_work, sink)
+                source.fetch(request.bbox, pending, source_work, sink)
                 fetch_succeeded = True
             except Exception as exc:
                 sink.emit("source_failed", source=source.id, error=str(exc))
@@ -177,7 +177,14 @@ def run_survey(
                     # work that was already done.
                     _record_tile_outcomes(state, source.id, pending, source_work, fetch_succeeded)
                     raise
-                parts = _existing_output_files(source_work)
+
+            # merge() must see every output this source has ever produced for
+            # this package, not just what fetch() returned from this call.
+            # pending is only the tiles that still needed work, and fetch()
+            # only returns paths for the tiles it was asked for, so using its
+            # return value directly would silently drop every tile that had
+            # already succeeded on an earlier, resumed-from run.
+            parts = _existing_output_files(source_work)
 
             # Refuse to merge a tile set with holes unless the caller forced
             # it. Per-tile status is recorded only once this has run, or been
@@ -254,20 +261,35 @@ def _record_tile_outcomes(
     once for all of them or raises once for all of them, which says nothing
     about which individual tiles actually got a usable file. Sources that
     name output files after the tile id, which covers OSM, Overture and the
-    test stub, get true per-tile status here: a tile is ok only if a
-    non-empty file stamped with its id exists, regardless of whether the
-    batch call raised or a later validation step did. A source with no
-    per-tile naming at all, such as elevation's single whole-area file, never
-    produces a tile-stamped match for anything; there is no finer signal than
-    the batch outcome for a source shaped like that, so it applies uniformly,
+    test stub, get true per-tile status here.
+
+    A tile is ok only if it has a non-empty, tile-stamped file in EVERY
+    directory where this source keeps tile-stamped files, not just any one
+    of them. OSM writes flat into source_work, so that is one directory.
+    Overture writes one type per subdirectory, so a tile with water but not
+    building for the same id must not be marked ok on the strength of water
+    alone: the set of directories to check is derived from what is actually
+    on disk, never hardcoded, so this generalises to any future source shape
+    without package.py knowing anything about it. A source with no per-tile
+    naming at all, such as elevation's single whole-area file, contributes
+    no tile-stamped directory at all; there is no finer signal than the
+    batch outcome for a source shaped like that, so it applies uniformly,
     which matches how such sources have always behaved.
     """
     files = _existing_output_files(source_work)
-    any_tile_stamped = any(path.stem == tile.tile_id for tile in pending for path in files)
+    pending_ids = {tile.tile_id for tile in pending}
+    tile_stamped_dirs = {path.parent for path in files if path.stem in pending_ids}
+
     for tile in pending:
-        if any_tile_stamped:
-            has_output = any(
-                path.stem == tile.tile_id and path.stat().st_size > 0 for path in files
+        if tile_stamped_dirs:
+            has_output = all(
+                any(
+                    path.parent == directory
+                    and path.stem == tile.tile_id
+                    and path.stat().st_size > 0
+                    for path in files
+                )
+                for directory in tile_stamped_dirs
             )
             status = OK if has_output else FAILED
         else:
