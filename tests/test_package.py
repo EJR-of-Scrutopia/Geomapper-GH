@@ -13,7 +13,13 @@ from mapgen.package import (
     register_default_sources,
     run_survey,
 )
-from mapgen.sources.base import Estimate, clear_registry, register
+from mapgen.sources.base import (
+    DuplicateSourceError,
+    Estimate,
+    clear_registry,
+    get_source,
+    register,
+)
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
@@ -733,3 +739,31 @@ def test_register_default_sources_registers_the_three_phase_one_sources():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == ["elevation", "osm", "overture"]
+
+
+def test_register_default_sources_called_twice_is_a_no_op():
+    register_default_sources()
+    first_osm = get_source("osm")
+    register_default_sources()
+    assert get_source("osm") is first_osm
+    from mapgen.sources.base import available_sources
+
+    assert sorted(s.id for s in available_sources()) == ["elevation", "osm", "overture"]
+
+
+def test_register_default_sources_raises_when_a_foreign_object_squats_on_a_default_id():
+    class Decoy:
+        id = "osm"
+        display_name = "Decoy, not OsmSource"
+        licence = "none"
+        attribution = "nobody"
+        requires_api_key = False
+
+    decoy = Decoy()
+    register(decoy)
+    with pytest.raises(DuplicateSourceError, match="'osm'"):
+        register_default_sources()
+    # The decoy must still be the one in the registry: register_default_sources
+    # raised before replacing anything, so a caller who ignores the exception
+    # would not silently end up with a wrong source either.
+    assert get_source("osm") is decoy

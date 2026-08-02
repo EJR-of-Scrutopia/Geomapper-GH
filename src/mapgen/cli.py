@@ -171,14 +171,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 2
-        if code != 0:
-            print(
-                "Invalid arguments. bbox format is west,south,east,north, "
-                "for example -3.29,51.38,-3.28,51.39",
-                file=sys.stderr,
-            )
-        return code
+        # argparse has already printed its own specific message to stderr,
+        # for example which required argument is missing or why --bbox
+        # failed to parse, before ever raising this. That message names the
+        # actual problem; a second, fixed message guessing it was the bbox
+        # format would be wrong for every other kind of argument error, so
+        # nothing is added here, only the traceback is stopped from escaping.
+        return exc.code if isinstance(exc.code, int) else 2
 
     try:
         return args.func(args)

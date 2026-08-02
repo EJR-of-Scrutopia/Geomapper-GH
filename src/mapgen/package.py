@@ -82,18 +82,26 @@ class SurveyResult:
 
 
 def register_default_sources() -> None:
-    """Register the three phase 1 sources, skipping any id already present.
+    """Register the three phase 1 sources, skipping only a repeat of itself.
 
     The CLI's main() calls this on every invocation, so a second call within
     the same process, for example a second main() call in one test session,
-    must be a no-op rather than a DuplicateSourceError. register() itself
-    still raises for a genuine id collision from any other caller; only this
-    convenience wrapper is made safe to repeat.
+    must be a no-op rather than a DuplicateSourceError. That is safe only
+    when the id already present is genuinely this same default source: an
+    id match alone is not enough, because a foreign object of a different
+    type squatting on, say, "osm" would then be silently kept in place and
+    get_source("osm") would go on returning it forever. Comparing by exact
+    type as well as id means a real newcomer-vs-newcomer repeat is skipped,
+    while a stranger occupying the id still reaches register() and raises
+    DuplicateSourceError, which is the loud failure the registry is meant to
+    guarantee on a genuine id collision.
     """
-    registered = {source.id for source in available_sources()}
+    by_id = {source.id: source for source in available_sources()}
     for source in (OsmSource(), OvertureSource(), ElevationSource()):
-        if source.id not in registered:
-            register(source)
+        existing = by_id.get(source.id)
+        if existing is not None and type(existing) is type(source):
+            continue
+        register(source)
 
 
 def _coordinate_stem(bbox: BBox) -> str:
