@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import pytest
 
 from mapgen.bridge import BridgeError, BridgeRequest, build_command, run_bridge
@@ -16,10 +14,12 @@ class FakeCompleted:
 class FakeRunner:
     def __init__(self, returncode=0):
         self.commands = []
+        self.calls = []
         self._returncode = returncode
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
+        self.calls.append((command, kwargs))
         return FakeCompleted(self._returncode)
 
 
@@ -108,3 +108,67 @@ def test_run_bridge_reports_a_missing_project_clearly(tmp_path):
     missing = tmp_path / "absent" / "UrbanoBridge.csproj"
     with pytest.raises(BridgeError, match="UrbanoBridge.csproj"):
         run_bridge(_request(tmp_path), missing, runner=FakeRunner())
+
+
+def test_command_passes_the_output_folder(tmp_path):
+    command = build_command(_request(tmp_path), _project(tmp_path))
+    index = command.index("--output-folder")
+    assert command[index + 1] == str(tmp_path / "out")
+
+
+def test_command_passes_granularity_with_default_and_custom_values(tmp_path):
+    command_default = build_command(_request(tmp_path), _project(tmp_path))
+    assert "--granularity" in command_default
+    index = command_default.index("--granularity")
+    assert command_default[index + 1] == "Block"
+
+    command_custom = build_command(
+        _request(tmp_path, granularity="Zone"), _project(tmp_path)
+    )
+    index = command_custom.index("--granularity")
+    assert command_custom[index + 1] == "Zone"
+
+
+def test_command_places_separator_immediately_after_project_path(tmp_path):
+    command = build_command(_request(tmp_path), _project(tmp_path))
+    project_index = command.index("--project")
+    separator_index = command.index("--")
+    assert separator_index == project_index + 2
+    assert command[project_index + 1].endswith("UrbanoBridge.csproj")
+
+
+def test_run_bridge_does_not_invoke_runner_when_project_is_missing(tmp_path):
+    runner = FakeRunner()
+    missing = tmp_path / "absent" / "UrbanoBridge.csproj"
+    with pytest.raises(BridgeError):
+        run_bridge(_request(tmp_path), missing, runner=runner)
+    assert runner.commands == []
+
+
+def test_run_bridge_missing_project_error_includes_build_command(tmp_path):
+    missing = tmp_path / "absent" / "UrbanoBridge.csproj"
+    with pytest.raises(BridgeError, match="dotnet build"):
+        run_bridge(_request(tmp_path), missing, runner=FakeRunner())
+
+
+def test_run_bridge_passes_check_false_to_subprocess(tmp_path):
+    runner = FakeRunner()
+    run_bridge(_request(tmp_path), _project(tmp_path), runner=runner)
+    assert len(runner.calls) == 1
+    command, kwargs = runner.calls[0]
+    assert kwargs.get("check") is False
+
+
+def test_command_with_mixed_skip_flags(tmp_path):
+    command = build_command(
+        _request(tmp_path, skip_blocks=True, skip_climate=False, skip_elevation=True),
+        _project(tmp_path),
+    )
+    assert "--skip-blocks" in command
+    assert "--skip-climate" not in command
+    assert "--skip-elevation" in command
+
+
+def test_command_omits_file_name_stem_when_empty_string(tmp_path):
+    command = build_command(_request(tmp_path, file_name_stem=""), _project(tmp_path))
+    assert "--file-name-stem" not in command
