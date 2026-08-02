@@ -1,5 +1,6 @@
 import http.client
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -15,6 +16,7 @@ from mapgen.jobs import EventLog
 from mapgen.package import SurveyRequest
 from mapgen.sources.base import Estimate, clear_registry, register
 from mapgen.web.server import (
+    STATIC_DIR,
     JobBusyError,
     JobManager,
     JobRecord,
@@ -794,3 +796,66 @@ def test_static_path_traversal_cannot_reach_a_prefix_sharing_sibling_directory(t
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# --- Task 16: the static interface is actually served ----------------------
+#
+# Task 16 built the map picker as plain files under static/: index.html plus
+# the vendored Leaflet, styles.css and app.js it links to. None of that is
+# exercised by a unit test, since there is no browser in this harness to
+# drive it, so a typo in a href or a file that never got committed would
+# otherwise be invisible until a person opens the page. These tests catch
+# exactly that: the page loads, and every local asset index.html references
+# is itself servable. The reference list is parsed out of index.html rather
+# than hard-coded, so it keeps checking whatever the markup actually points
+# at instead of a fixed guess that quietly stops matching reality.
+
+
+def _local_assets_referenced_by(html: str) -> list[str]:
+    """Every href/src on a <link> or <script> tag that names a local file.
+
+    A scheme prefix (http:, https:, ...) or a protocol-relative //host form
+    marks a reference as external, not a local static asset, and is
+    excluded. Nothing here is specific to Leaflet or to today's markup: any
+    local file index.html is made to depend on, now or later, is picked up.
+    """
+    tags = re.findall(r"<(?:link|script)\b[^>]*>", html, re.IGNORECASE)
+    refs = []
+    for tag in tags:
+        match = re.search(r'(?:href|src)="([^"]+)"', tag, re.IGNORECASE)
+        if not match:
+            continue
+        ref = match.group(1)
+        if ref.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", ref):
+            continue
+        refs.append(ref)
+    return sorted(set(refs))
+
+
+_INDEX_HTML_SOURCE = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+_REFERENCED_ASSETS = _local_assets_referenced_by(_INDEX_HTML_SOURCE)
+
+
+def test_index_html_references_at_least_one_local_asset():
+    # Guards the parser itself. If this were ever empty, for example because
+    # a markup rewrite stopped using href="..."/src="..." with plain double
+    # quotes, the parametrised test below would silently collect zero cases
+    # and report nothing to check instead of failing loudly.
+    assert _REFERENCED_ASSETS, "expected index.html to reference at least one local file"
+
+
+def test_root_is_served_as_html(server):
+    with urllib.request.urlopen(f"{server}/", timeout=10) as response:
+        assert response.status == 200
+        assert "html" in response.headers.get("Content-Type", "").lower()
+        body = response.read()
+        assert len(body) > 0
+        assert b"<html" in body.lower()
+
+
+@pytest.mark.parametrize("asset_path", _REFERENCED_ASSETS)
+def test_index_referenced_asset_is_served(server, asset_path):
+    with urllib.request.urlopen(f"{server}/{asset_path}", timeout=10) as response:
+        assert response.status == 200
+        body = response.read()
+        assert len(body) > 0, f"{asset_path} was served with an empty body"

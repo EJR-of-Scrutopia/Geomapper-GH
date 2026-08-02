@@ -1,5 +1,71 @@
 <!doctype html>
 <html lang="en">
-  <head><meta charset="utf-8" /><title>mapgen</title></head>
-  <body><p>The interface is built in the next task.</p></body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mapgen</title>
+    <link rel="stylesheet" href="vendor/leaflet.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>mapgen</h1>
+      <p class="tagline">Draw an extent, name it, get a folder.</p>
+    </header>
+
+    <main>
+      <section class="map-pane">
+        <div id="map"></div>
+        <div class="map-tools">
+          <button id="draw" type="button">Draw extent</button>
+          <input id="place" type="search" placeholder="Search a place name" />
+          <input id="bbox" type="text" placeholder="or paste west,south,east,north" />
+        </div>
+      </section>
+
+      <section class="form-pane">
+        <label>Region
+          <input id="region" type="text" placeholder="South Wales" />
+        </label>
+        <label>Site
+          <input id="site" type="text" placeholder="Barry Waterfront" />
+        </label>
+
+        <div class="row">
+          <label>Tile size (m)
+            <input id="tile-size" type="number" min="500" step="100" value="2000" />
+          </label>
+          <label>Overlap (m)
+            <input id="overlap" type="number" min="0" step="10" value="100" />
+          </label>
+        </div>
+
+        <fieldset>
+          <legend>Layers</legend>
+          <div id="sources"></div>
+        </fieldset>
+
+        <label>Output root
+          <input id="output-root" type="text" />
+        </label>
+
+        <label class="checkbox">
+          <input id="keep-work" type="checkbox" />
+          Keep intermediate tiles
+        </label>
+
+        <div id="estimate" class="estimate">Draw or paste an extent to see an estimate.</div>
+
+        <button id="download" type="button" class="primary" disabled>Download package</button>
+        <button id="cancel" type="button" class="danger" hidden>Cancel</button>
+      </section>
+    </main>
+
+    <footer>
+      <div id="log" class="log"></div>
+    </footer>
+
+    <script src="vendor/leaflet.js"></script>
+    <script src="app.js"></script>
+  </body>
 </html>

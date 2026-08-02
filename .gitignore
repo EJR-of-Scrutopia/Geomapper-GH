@@ -36,3 +36,7 @@ desktop.ini
 
 # SDD scratch workspace (ledger, briefs, review packages)
 .superpowers/
+
+# Vendored front-end libraries: fetched once and committed, keep despite
+# any broad rule above.
+!src/mapgen/web/static/vendor/*
