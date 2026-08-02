@@ -806,18 +806,24 @@ function ok(condition, message) {
   );
 
   await test(
-    "a failed /api/extent still shows the missing-names message rather than crashing",
+    "a failed /api/extent shows its own error alongside the missing-names message, not swallowed",
     async () => {
+      // Review round 1: this used to render ONLY the missing-fields line,
+      // discarding whatever /api/extent actually said (an absurd-tiling
+      // rejection, a zero-area box, a network hiccup), so a genuine
+      // problem with the drawn extent was invisible until both names
+      // were typed and a full /api/estimate finally surfaced it.
       const { sandbox } = await bootedSandbox((url) => {
         if (url.pathname === "/api/extent") return jsonResponse(500, { error: "boom" });
         return null;
       });
       setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
       await flush(10);
-      const text = sandbox.document.getElementById("estimate").textContent;
+      const html = sandbox.document.getElementById("estimate").innerHTML;
+      ok(/boom/i.test(html), `expected the /api/extent error itself to be shown, got: ${html}`);
       ok(
-        /region/i.test(text) && /site/i.test(text),
-        `expected the missing-names message despite the /api/extent failure, got: ${text}`
+        /region/i.test(html) && /site/i.test(html),
+        `expected the missing-names message alongside it, got: ${html}`
       );
       ok(sandbox.document.getElementById("download").disabled === true);
     }
@@ -1395,6 +1401,77 @@ function ok(condition, message) {
     // treated as the first, not the second.
     sandbox.L._mapObject.fire("click", { latlng: { lat: 52.0, lng: -4.0 } });
     ok(sandbox.document.getElementById("draw").textContent === "Click the opposite corner");
+  });
+
+  // =======================================================================
+  // Review round 1: a zero-area extent (a second click on the first
+  // point, or a degenerate pasted bbox) must be rejected at the point of
+  // entry, leaving any previously committed extent untouched, rather than
+  // silently committing a degenerate box that only the server notices.
+  // =======================================================================
+
+  await test(
+    "a second click on the same point is rejected, leaving the previous extent untouched",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      const before = sandbox.document.getElementById("bbox").value;
+      const rectanglesBefore = sandbox.L._rectangles.length;
+      sandbox.document.getElementById("draw").fire("click");
+      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.1 } });
+      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.1 } }); // same point
+      ok(
+        sandbox.document.getElementById("bbox").value === before,
+        `expected the previous extent untouched, got ${sandbox.document.getElementById("bbox").value}`
+      );
+      ok(sandbox.document.getElementById("draw").className === "", "expected disarmed, not stuck armed");
+      ok(sandbox.document.getElementById("draw").textContent === "Draw extent");
+      ok(
+        sandbox.L._rectangles.length === rectanglesBefore,
+        "expected no new committed rectangle from a degenerate click pair"
+      );
+    }
+  );
+
+  await test(
+    "a zero-width click pair (same longitude, different latitude) is also rejected",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      sandbox.document.getElementById("draw").fire("click");
+      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
+      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.3 } }); // same lng only
+      ok(sandbox.document.getElementById("bbox").value === "", "expected no bbox committed");
+      ok(sandbox.document.getElementById("draw").className === "");
+    }
+  );
+
+  await test("a pasted zero-area bbox is rejected without ever calling setBBox", async () => {
+    const { sandbox } = await bootedSandbox();
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39"); // one real rectangle committed
+    const rectanglesAfterFirstPaste = sandbox.L._rectangles.length;
+    ok(rectanglesAfterFirstPaste === 1, "expected exactly one committed rectangle so far");
+
+    setField(sandbox, "bbox", "10,20,10,25"); // west === east: zero area
+    ok(
+      sandbox.document.getElementById("estimate").className === "estimate error",
+      "expected an error state for a degenerate pasted bbox"
+    );
+    ok(sandbox.document.getElementById("download").disabled === true);
+    // The real proof that the previous extent is untouched: setBBox is
+    // the only thing that ever creates a new committed rectangle, so if
+    // the degenerate paste had reached it, this count would have grown.
+    ok(
+      sandbox.L._rectangles.length === rectanglesAfterFirstPaste,
+      "expected no new rectangle from the degenerate paste: setBBox must not have run"
+    );
+
+    // And the guard does not wedge anything: a subsequent valid paste
+    // still works normally.
+    setField(sandbox, "bbox", "-3.40,51.30,-3.30,51.40");
+    ok(
+      sandbox.L._rectangles.length === rectanglesAfterFirstPaste + 1,
+      "expected a valid paste after a rejected one to still commit normally"
+    );
   });
 
   console.log(

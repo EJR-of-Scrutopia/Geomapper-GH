@@ -128,6 +128,17 @@ map.on("click", (event) => {
   }
   const a = firstCorner;
   const b = event.latlng;
+  if (a.lat === b.lat || a.lng === b.lng) {
+    // A degenerate, zero-width or zero-height box: the server would
+    // reject this outright (BBox.validated()), and it is not something
+    // the estimate panel can safely surface while names are still
+    // incomplete (see refreshEstimate's own /api/extent error handling,
+    // fixed alongside this to stop swallowing that case too). Rejected
+    // here instead, at the click: disarm and leave whatever extent was
+    // already committed untouched, exactly like Escape.
+    disarmDrawing();
+    return;
+  }
   const finished = {
     west: Math.min(a.lng, b.lng),
     south: Math.min(a.lat, b.lat),
@@ -175,6 +186,13 @@ $("bbox").addEventListener("change", () => {
     return;
   }
   const [w, s, e, n] = parts;
+  if (w === e || s === n) {
+    // Same degenerate-box guard as the draw tool's click handler: a
+    // pasted "10,20,10,25" is exactly as zero-area as a second click on
+    // the first point, and the server would reject it the same way.
+    showEstimateError("west/east and south/north must each be different: this box has zero area.");
+    return;
+  }
   setBBox({
     west: Math.min(w, e),
     south: Math.min(s, n),
@@ -466,9 +484,15 @@ async function refreshEstimate() {
       });
       $("estimate").innerHTML = `${formatGeometryLine(geometry)}<br />${escapeHtml(missing)}`;
     } catch (error) {
-      // Geometry is a nice-to-have while the names are still incomplete;
-      // a hiccup here should not block the missing-fields message itself.
-      $("estimate").textContent = missing;
+      // A genuine problem with the extent or tiling itself (an absurd
+      // tiling, a zero-area box that slipped through some other path, a
+      // network hiccup) must not hide behind the missing-fields message:
+      // that previously left a real /api/extent failure looking
+      // identical to an ordinary "type a region and site" prompt, with
+      // nothing on screen until both names were filled in and a full
+      // /api/estimate finally surfaced the same error. Shown alongside
+      // the still-true missing-fields line, not instead of it.
+      $("estimate").innerHTML = `${escapeHtml(error.message)}<br />${escapeHtml(missing)}`;
     }
     return;
   }
