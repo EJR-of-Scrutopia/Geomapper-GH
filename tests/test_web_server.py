@@ -1139,7 +1139,19 @@ _ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org"}
 # unquoted CSS url(//host)), or "=" (an unquoted HTML src=//host). The
 # anchor set is what stops this also matching "//" as it starts an
 # ordinary line comment, which every file here otherwise has many of.
-_URL_HOST_RE = re.compile(r'(?:https?:|["\'`(=])//([a-zA-Z0-9.-]+)', re.IGNORECASE)
+#
+# Whitespace is allowed between a quote or a "(" and the "//", because a
+# browser resolves url( //host ) and "   //host" exactly as it resolves the
+# tight forms. It is deliberately NOT allowed after "=": in JavaScript,
+# `const x = //comment` is an assignment followed by a line comment, and
+# tolerating a gap there would report the comment text as a hostname. That
+# leaves `src = //host` in HTML, with spaces around the equals, unmatched.
+# It is legal markup and would evade this guard, but it is rare enough in
+# hand-written HTML to be worth less than the false failures the looser
+# pattern would cause in every JavaScript file here.
+_URL_HOST_RE = re.compile(
+    r'(?:https?:|["\'`(]\s*|=)//([a-zA-Z0-9.-]+)', re.IGNORECASE
+)
 
 
 def _authored_static_files() -> list[Path]:
