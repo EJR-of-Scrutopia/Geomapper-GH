@@ -1,0 +1,5 @@
+# Vendored third-party files must round-trip byte for byte, so the SHA256
+# recorded when they were fetched still verifies after a clone. This repo is
+# developed on Windows with core.autocrlf=true, which would otherwise rewrite
+# their line endings on checkout and change every hash.
+src/mapgen/web/static/vendor/** -text
