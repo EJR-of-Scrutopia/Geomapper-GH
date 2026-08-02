@@ -5,8 +5,16 @@ import pytest
 from mapgen.jobs import CancelToken, Cancelled, EventLog, JobState
 
 
-def _state(tmp_path, tiles=("r00_c00", "r00_c01"), sources=("osm",)):
-    return JobState.load_or_create(tmp_path, list(tiles), list(sources))
+def _state(
+    tmp_path,
+    tiles=("r00_c00", "r00_c01"),
+    sources=("osm",),
+    tile_size_m=600.0,
+    overlap_m=50.0,
+):
+    return JobState.load_or_create(
+        tmp_path, list(tiles), list(sources), tile_size_m, overlap_m
+    )
 
 
 def test_new_state_starts_every_tile_pending(tmp_path):
@@ -100,8 +108,13 @@ def test_malformed_state_file_list_gives_fresh_pending(tmp_path):
 
 
 def test_malformed_state_file_tiles_as_string_gives_fresh_pending(tmp_path):
+    # A matching tiling block is included so this exercises the "tiles" shape
+    # check specifically, not the separate tiling-mismatch discard below.
     (tmp_path / "state.json").write_text(
-        json.dumps({"tiles": "oops"}), encoding="utf-8"
+        json.dumps(
+            {"tiling": {"tile_size_m": 600.0, "overlap_m": 50.0}, "tiles": "oops"}
+        ),
+        encoding="utf-8",
     )
     state = _state(tmp_path)
     assert state.status("r00_c00", "osm") == "pending"
@@ -109,7 +122,13 @@ def test_malformed_state_file_tiles_as_string_gives_fresh_pending(tmp_path):
 
 def test_malformed_state_file_tile_value_as_string_gives_fresh_pending(tmp_path):
     (tmp_path / "state.json").write_text(
-        json.dumps({"tiles": {"r00_c00": "notadict"}}), encoding="utf-8"
+        json.dumps(
+            {
+                "tiling": {"tile_size_m": 600.0, "overlap_m": 50.0},
+                "tiles": {"r00_c00": "notadict"},
+            }
+        ),
+        encoding="utf-8",
     )
     state = _state(tmp_path)
     assert state.status("r00_c00", "osm") == "pending"
@@ -125,6 +144,44 @@ def test_malformed_state_file_empty_object_gives_fresh_pending(tmp_path):
     (tmp_path / "state.json").write_text(json.dumps({}), encoding="utf-8")
     state = _state(tmp_path)
     assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_tiling_is_recorded_in_the_saved_state(tmp_path):
+    _state(tmp_path, tile_size_m=600.0, overlap_m=50.0).mark("r00_c00", "osm", "ok")
+    payload = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert payload["tiling"] == {"tile_size_m": 600.0, "overlap_m": 50.0}
+
+
+def test_reload_keeps_saved_state_when_tiling_matches(tmp_path):
+    _state(tmp_path, tile_size_m=600.0, overlap_m=50.0).mark("r00_c00", "osm", "ok")
+    reloaded = _state(tmp_path, tile_size_m=600.0, overlap_m=50.0)
+    assert reloaded.is_done("r00_c00", "osm") is True
+
+
+def test_reload_discards_saved_state_when_tile_size_differs(tmp_path):
+    _state(tmp_path, tiles=("r00_c00",), tile_size_m=600.0, overlap_m=50.0).mark(
+        "r00_c00", "osm", "ok"
+    )
+    reloaded = _state(tmp_path, tiles=("r00_c00",), tile_size_m=1200.0, overlap_m=50.0)
+    assert reloaded.is_done("r00_c00", "osm") is False
+
+
+def test_reload_discards_saved_state_when_overlap_differs(tmp_path):
+    _state(tmp_path, tiles=("r00_c00",), tile_size_m=600.0, overlap_m=50.0).mark(
+        "r00_c00", "osm", "ok"
+    )
+    reloaded = _state(tmp_path, tiles=("r00_c00",), tile_size_m=600.0, overlap_m=75.0)
+    assert reloaded.is_done("r00_c00", "osm") is False
+
+
+def test_reload_treats_a_missing_tiling_block_as_untrusted_and_starts_fresh(tmp_path):
+    # A state.json written before tiling was tracked at all has no "tiling"
+    # key. That must not crash the loader, and must not be trusted either.
+    (tmp_path / "state.json").write_text(
+        json.dumps({"tiles": {"r00_c00": {"osm": "ok"}}}), encoding="utf-8"
+    )
+    state = _state(tmp_path, tiles=("r00_c00",))
+    assert state.is_done("r00_c00", "osm") is False
 
 
 def test_reload_with_fewer_tiles_preserves_saved_tiles_on_disk(tmp_path):

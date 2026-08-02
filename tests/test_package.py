@@ -53,6 +53,150 @@ class StubSource:
         return [out]
 
 
+class CallRecordingStubSource:
+    """Like StubSource, but records which tile ids each fetch() call
+    receives. Used to prove pending is recomputed rather than inherited
+    when the tiling changes.
+    """
+
+    id = "stub"
+    display_name = "Stub Call Recorder"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self, fail_on=()):
+        self.fetch_calls: list[list[str]] = []
+        self._fail_on = set(fail_on)
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100 * len(tiles), seconds_estimate=1.0 * len(tiles))
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.fetch_calls.append([tile.tile_id for tile in tiles])
+        paths = []
+        for tile in tiles:
+            if tile.tile_id in self._fail_on:
+                raise RuntimeError(f"stub failure on {tile.tile_id}")
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
+            paths.append(path)
+        return paths
+
+    def merge(self, parts, out_dir):
+        out = out_dir / f"{self.id}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            "\n".join(p.read_text(encoding="utf-8") for p in parts), encoding="utf-8"
+        )
+        return [out]
+
+
+class SelectivelySilentStubSource:
+    """Like StubSource, but silently omits writing a file for tiles in
+    `missing`, without raising, so the rest of the batch still succeeds.
+
+    Used to construct a tile that has genuinely never had a successful
+    output, as distinct from one that failed after some other tile's file
+    already existed. This sidesteps the fact that r00_c00 is always the
+    first tile in any grid: raising on it aborts the whole fetch() call
+    before any other tile is attempted, which cannot produce "every tile
+    but this one succeeded".
+    """
+
+    id = "stub"
+    display_name = "Stub Selectively Silent"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self, missing=()):
+        self._missing = set(missing)
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100 * len(tiles), seconds_estimate=1.0 * len(tiles))
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        paths = []
+        for tile in tiles:
+            if tile.tile_id in self._missing:
+                continue
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
+            paths.append(path)
+        return paths
+
+    def merge(self, parts, out_dir):
+        out = out_dir / f"{self.id}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            "\n".join(p.read_text(encoding="utf-8") for p in parts), encoding="utf-8"
+        )
+        return [out]
+
+
+class SucceedsButWritesNothingSource:
+    """A source whose fetch() returns cleanly without writing any file at
+    all: no per-tile output, no whole-area output, nothing.
+
+    Used to prove that a fetch() that does not raise is not, by itself,
+    evidence that anything was actually produced.
+    """
+
+    id = "stub"
+    display_name = "Stub Writes Nothing"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        return []
+
+    def merge(self, parts, out_dir):
+        out = out_dir / f"{self.id}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            "\n".join(p.read_text(encoding="utf-8") for p in parts), encoding="utf-8"
+        )
+        return [out]
+
+
+class ElevationShapedStubSource:
+    """Writes exactly one whole-area file with no tile id in its name, like
+    ElevationSource's single TIFF, regardless of how many tiles it is asked
+    about. Used to confirm whole-area output is still gathered under the
+    current-tile-id filtering added for the retiling fix.
+    """
+
+    id = "elevation"
+    display_name = "Stub Elevation"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = True
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        output = work_dir / "elevation.tif"
+        if output.exists() and output.stat().st_size > 0:
+            return [output]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("whole-area-data", encoding="utf-8")
+        progress.emit("tile_done", source=self.id, tile_id="whole-area")
+        return [output]
+
+    def merge(self, parts, out_dir):
+        return list(parts)
+
+
 class ResumeAwareSource:
     """Like StubSource, but raises if fetch() is ever asked to redo a tile
     that already has a successful output on disk.
@@ -364,6 +508,94 @@ def test_a_successful_resume_merges_previously_fetched_tiles_too(tmp_path):
         assert tile_id in merged_text
 
 
+def test_retiling_forces_a_refetch_of_a_tile_that_was_ok_under_the_old_tiling(tmp_path):
+    # Isolates the state half of the retiling fix. r01_c01 fails so the
+    # package stays incomplete and the second run reuses the same folder
+    # (a complete package would get a fresh _02 instead, which would sidestep
+    # the bug entirely). r00_c00 succeeds and is marked ok under 600m tiling.
+    # Retiling to 1200m still needs r00_c00, now covering the whole bbox
+    # rather than one quadrant of it. Without discarding the saved state on
+    # a tiling mismatch, is_done would still say true for r00_c00 and
+    # pending would be empty, so fetch() would never be asked for it at all.
+    register(CallRecordingStubSource(fail_on=("r01_c01",)))
+    first = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=50.0, force=True))
+    assert first.complete is False
+
+    clear_registry()
+    source2 = CallRecordingStubSource(fail_on=("r01_c01",))
+    register(source2)
+    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0, force=True))
+
+    assert second.paths.root == first.paths.root
+    assert source2.fetch_calls == [["r00_c00"]]
+
+
+def test_resuming_at_a_different_tile_size_does_not_mix_in_stale_tiles(tmp_path):
+    # The reviewer's exact scenario: a tile id is only (row, col), with no
+    # memory of the tiling it was computed under, so r00_c00 means something
+    # different at 600m than it does at 1200m even though the string is
+    # identical. r00_c00 is skipped rather than made to raise, because it is
+    # always the first tile attempted: raising on it would abort the whole
+    # fetch() call before r00_c01 or r01_c00 were ever attempted, and could
+    # never reproduce "every tile but this one succeeded".
+    register(SelectivelySilentStubSource(missing={"r00_c00"}))
+    first = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=50.0, force=True))
+    assert first.complete is False
+    stub_work = first.paths.work_dir / "raw" / "stub"
+    assert sorted(p.name for p in stub_work.iterdir()) == [
+        "r00_c01.txt",
+        "r01_c00.txt",
+        "r01_c01.txt",
+    ]
+
+    # Re-run the same site and date at 1200m. The whole bbox now collapses
+    # to a single tile, r00_c00, the one tile that never had a file under
+    # the old tiling either. clear_registry+register swaps in a fresh
+    # instance so nothing here depends on the first source's memory.
+    clear_registry()
+    register(SelectivelySilentStubSource(missing={"r00_c00"}))
+    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0, force=True))
+
+    assert second.paths.root == first.paths.root
+    # Not falsely reported complete: the only tile in the current plan has
+    # no output under the current tiling, so there is real missing geography.
+    assert second.complete is False
+
+    payload = json.loads(second.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["tiling"]["tile_size_m"] == 1200.0
+    # Only the current tile appears at all: the stale 600m tiles are not
+    # merely excluded from the merge, they are absent from the record.
+    assert {record["tile_id"] for record in payload["tiles"]} == {"r00_c00"}
+
+    merged_text = (second.paths.root / "stub.txt").read_text(encoding="utf-8")
+    assert merged_text == ""
+    for stale_tile_id in ("r00_c01", "r01_c00", "r01_c01"):
+        assert stale_tile_id not in merged_text
+
+
+def test_whole_area_outputs_with_no_tile_id_are_still_gathered(tmp_path):
+    # elevation.tif's stem is not shaped like a tile id at all, so the
+    # tile-id-shape filtering added for the retiling fix must not exclude
+    # it. There are four current tiles here, none of which appear in the
+    # filename, which is exactly the shape that must still be gathered.
+    register(ElevationShapedStubSource())
+    result = run_survey(_request(tmp_path, source_ids=("elevation",)))
+    assert result.complete is True
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert all(record["elevation"] == "ok" for record in payload["tiles"])
+
+
+def test_a_source_that_writes_nothing_is_marked_incomplete_not_ok(tmp_path):
+    # fetch() returning without raising is not, by itself, evidence that
+    # anything was produced. A source with no whole-area output and no
+    # per-tile output must not be vacuously marked ok.
+    register(SucceedsButWritesNothingSource())
+    result = run_survey(_request(tmp_path))
+    assert result.complete is False
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert all(record["stub"] == "failed" for record in payload["tiles"])
+
+
 def test_force_run_excludes_leftover_part_files_from_a_hard_kill(tmp_path):
     # fsutil's atomic writer, and OvertureSource's own download-to-temp
     # convention, both leave a .part file behind if the process is killed
@@ -407,8 +639,12 @@ def test_a_tile_missing_one_of_several_type_directories_is_marked_failed(tmp_pat
     assert records["r01_c01"] == "ok"
 
     # A reload must not treat the partially-fetched tile as done, or the
-    # missing type would never get another chance to be retried.
-    reloaded = JobState.load_or_create(result.paths.work_dir, list(records), ["overture"])
+    # missing type would never get another chance to be retried. Tiling must
+    # match _request()'s defaults, or the reload would trust nothing at all
+    # for an unrelated reason and this would pass without proving anything.
+    reloaded = JobState.load_or_create(
+        result.paths.work_dir, list(records), ["overture"], 600.0, 50.0
+    )
     assert reloaded.is_done("r00_c00", "overture") is False
 
 

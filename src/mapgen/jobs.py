@@ -61,10 +61,17 @@ class EventLog:
 
 class JobState:
     def __init__(
-        self, state_path: Path, tiles: Sequence[str], source_ids: Sequence[str]
+        self,
+        state_path: Path,
+        tiles: Sequence[str],
+        source_ids: Sequence[str],
+        tile_size_m: float,
+        overlap_m: float,
     ) -> None:
         self.state_path = state_path
         self.source_ids = list(source_ids)
+        self.tile_size_m = tile_size_m
+        self.overlap_m = overlap_m
         self.tiles: dict[str, dict[str, str]] = {
             tile_id: {source_id: PENDING for source_id in source_ids}
             for tile_id in tiles
@@ -73,9 +80,14 @@ class JobState:
 
     @classmethod
     def load_or_create(
-        cls, work_dir: Path, tiles: Sequence[str], source_ids: Sequence[str]
+        cls,
+        work_dir: Path,
+        tiles: Sequence[str],
+        source_ids: Sequence[str],
+        tile_size_m: float,
+        overlap_m: float,
     ) -> "JobState":
-        state = cls(work_dir / STATE_FILENAME, tiles, source_ids)
+        state = cls(work_dir / STATE_FILENAME, tiles, source_ids, tile_size_m, overlap_m)
         state._merge_saved()
         return state
 
@@ -89,6 +101,24 @@ class JobState:
         # Validate shape: must be a dict with "tiles" as a dict.
         if not isinstance(payload, dict):
             return
+
+        # A tile id is only (row, col): the string carries no memory of the
+        # tiling it was computed under, so the same id can mean a different
+        # patch of ground under a different tile_size_m or overlap_m. Saved
+        # statuses from a different tiling must never be merged in, because
+        # is_done would then look done for ground that was never actually
+        # fetched under the current plan. A state.json saved before this
+        # check existed has no "tiling" block at all, which is exactly as
+        # untrustworthy as a mismatch, not a crash: both mean start fresh.
+        saved_tiling = payload.get("tiling")
+        if not isinstance(saved_tiling, dict):
+            return
+        if (
+            saved_tiling.get("tile_size_m") != self.tile_size_m
+            or saved_tiling.get("overlap_m") != self.overlap_m
+        ):
+            return
+
         saved = payload.get("tiles", {})
         if not isinstance(saved, dict):
             return
@@ -133,5 +163,14 @@ class JobState:
         all_tiles = {**self._extra_tiles, **self.tiles}
         atomic_write_text(
             self.state_path,
-            json.dumps({"tiles": all_tiles}, indent=2),
+            json.dumps(
+                {
+                    "tiling": {
+                        "tile_size_m": self.tile_size_m,
+                        "overlap_m": self.overlap_m,
+                    },
+                    "tiles": all_tiles,
+                },
+                indent=2,
+            ),
         )

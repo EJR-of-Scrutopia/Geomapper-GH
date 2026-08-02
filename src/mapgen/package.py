@@ -7,6 +7,7 @@ individual data source, which is what makes phase 2 additive.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -142,6 +143,7 @@ def run_survey(
     token = cancel if cancel is not None else CancelToken()
 
     tiles, paths = _plan(request)
+    current_tile_ids = [t.tile_id for t in tiles]
     ensure_dir(paths.root)
     ensure_dir(paths.layers_dir)
     started_at = _now()
@@ -150,7 +152,11 @@ def run_survey(
 
     sources = [get_source(source_id) for source_id in request.source_ids]
     state = JobState.load_or_create(
-        paths.work_dir, [t.tile_id for t in tiles], [s.id for s in sources]
+        paths.work_dir,
+        current_tile_ids,
+        [s.id for s in sources],
+        request.tile_size_m,
+        request.overlap_m,
     )
     ensure_dir(paths.work_dir)
 
@@ -175,7 +181,9 @@ def run_survey(
                     # batch call failing partway through must not blame tiles
                     # that already succeeded, or the next resume would redo
                     # work that was already done.
-                    _record_tile_outcomes(state, source.id, pending, source_work, fetch_succeeded)
+                    _record_tile_outcomes(
+                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids
+                    )
                     raise
 
             # merge() must see every output this source has ever produced for
@@ -184,7 +192,7 @@ def run_survey(
             # only returns paths for the tiles it was asked for, so using its
             # return value directly would silently drop every tile that had
             # already succeeded on an earlier, resumed-from run.
-            parts = _existing_output_files(source_work)
+            parts = _existing_output_files(source_work, current_tile_ids)
 
             # Refuse to merge a tile set with holes unless the caller forced
             # it. Per-tile status is recorded only once this has run, or been
@@ -193,7 +201,9 @@ def run_survey(
             try:
                 parts = assert_inputs_present(parts, force=request.force)
             finally:
-                _record_tile_outcomes(state, source.id, pending, source_work, fetch_succeeded)
+                _record_tile_outcomes(
+                    state, source.id, pending, source_work, fetch_succeeded, current_tile_ids
+                )
             merged = source.merge(parts, paths.root)
             outputs_by_source[source.id] = merged
             sink.emit("source_done", source=source.id, outputs=[p.name for p in merged])
@@ -231,20 +241,38 @@ def run_survey(
     return SurveyResult(paths=paths, complete=state.complete, survey=survey)
 
 
-def _existing_output_files(source_work: Path) -> list[Path]:
-    """Every real file already on disk for this source, crash debris excluded.
+_TILE_ID_SHAPE = re.compile(r"^r\d+_c\d+$")
+
+
+def _existing_output_files(source_work: Path, current_tile_ids: Sequence[str]) -> list[Path]:
+    """Every real file already on disk for this source that still belongs to
+    the current plan, crash debris and stale tiling excluded.
 
     A hard kill can leave one of fsutil's atomic-write .part temp files
     behind, and OvertureSource downloads to the same kind of .part path
-    before renaming it into place. Those are not usable output. They must
-    never reach merge(), which would choke on truncated content, and must
-    never be mistaken for evidence that a tile succeeded.
+    before renaming it into place; neither is usable output, and both are
+    excluded outright.
+
+    A tile id is only (row, col): the string itself carries no memory of the
+    tile_size_m or overlap_m it was computed under. A file named after a
+    tile id from a different tiling can therefore share its name with a
+    current tile without covering the same ground, so anything shaped like a
+    tile id that is not in current_tile_ids is excluded too. A file that is
+    not shaped like a tile id at all, such as elevation's single whole-area
+    TIFF, carries no tiling assumption to begin with and always belongs.
+    current_tile_ids is passed in by the caller, which already knows the
+    current plan, rather than inferred here, so this stays correct
+    regardless of what older runs left on disk.
     """
-    return [
-        path
-        for path in sorted(source_work.rglob("*"))
-        if path.is_file() and path.suffix != ".part"
-    ]
+    current_ids = set(current_tile_ids)
+    kept: list[Path] = []
+    for path in sorted(source_work.rglob("*")):
+        if not path.is_file() or path.suffix == ".part":
+            continue
+        if _TILE_ID_SHAPE.match(path.stem) and path.stem not in current_ids:
+            continue
+        kept.append(path)
+    return kept
 
 
 def _record_tile_outcomes(
@@ -253,6 +281,7 @@ def _record_tile_outcomes(
     pending: Sequence[Tile],
     source_work: Path,
     fetch_succeeded: bool,
+    current_tile_ids: Sequence[str],
 ) -> None:
     """Mark each pending tile from what is actually on disk, not from
     whether the batch fetch() call raised.
@@ -270,13 +299,17 @@ def _record_tile_outcomes(
     building for the same id must not be marked ok on the strength of water
     alone: the set of directories to check is derived from what is actually
     on disk, never hardcoded, so this generalises to any future source shape
-    without package.py knowing anything about it. A source with no per-tile
-    naming at all, such as elevation's single whole-area file, contributes
-    no tile-stamped directory at all; there is no finer signal than the
-    batch outcome for a source shaped like that, so it applies uniformly,
-    which matches how such sources have always behaved.
+    without package.py knowing anything about it.
+
+    A source with no per-tile naming at all, such as elevation's single
+    whole-area file, contributes no tile-stamped directory at all. If it
+    still produced that whole-area file, there is no finer signal than the
+    batch outcome, so it applies uniformly, matching how such sources have
+    always behaved. But a fetch() that returns without raising while leaving
+    nothing at all on disk is not evidence of anything: that is vacuous, not
+    done, so it is always failed regardless of what the batch call reported.
     """
-    files = _existing_output_files(source_work)
+    files = _existing_output_files(source_work, current_tile_ids)
     pending_ids = {tile.tile_id for tile in pending}
     tile_stamped_dirs = {path.parent for path in files if path.stem in pending_ids}
 
@@ -292,8 +325,10 @@ def _record_tile_outcomes(
                 for directory in tile_stamped_dirs
             )
             status = OK if has_output else FAILED
-        else:
+        elif files:
             status = OK if fetch_succeeded else FAILED
+        else:
+            status = FAILED
         state.mark(tile.tile_id, source_id, status)
 
 
