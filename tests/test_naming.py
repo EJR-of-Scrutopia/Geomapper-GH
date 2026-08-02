@@ -1,3 +1,4 @@
+import json
 from datetime import date
 from pathlib import Path
 
@@ -79,8 +80,12 @@ def test_build_package_paths_uses_region_date_site_layout(tmp_path):
 
 
 def test_build_package_paths_appends_02_on_collision(tmp_path):
+    # A collision only forces a suffix when the existing folder is a
+    # genuinely finished package. See the reuse tests below for the
+    # complementary case, where an incomplete folder is reused instead.
     first = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
     first.root.mkdir(parents=True)
+    first.survey_json.write_text(json.dumps({"complete": True}), encoding="utf-8")
     second = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
     assert second.root.name == "2026-08-01_Barry-Waterfront_02"
     assert second.stem == "Barry-Waterfront_2026-08-01_02"
@@ -88,9 +93,9 @@ def test_build_package_paths_appends_02_on_collision(tmp_path):
 
 def test_build_package_paths_appends_03_on_second_collision(tmp_path):
     for _ in range(2):
-        build_package_paths(tmp_path, "South Wales", "Barry", date(2026, 8, 1)).root.mkdir(
-            parents=True
-        )
+        paths = build_package_paths(tmp_path, "South Wales", "Barry", date(2026, 8, 1))
+        paths.root.mkdir(parents=True)
+        paths.survey_json.write_text(json.dumps({"complete": True}), encoding="utf-8")
     third = build_package_paths(tmp_path, "South Wales", "Barry", date(2026, 8, 1))
     assert third.root.name == "2026-08-01_Barry_03"
 
@@ -109,11 +114,65 @@ def test_build_package_paths_appends_collision_suffix_to_stem_override(tmp_path)
         tmp_path, "South Wales", "Barry", date(2026, 8, 1), stem_override="51.39_51.38"
     )
     first.root.mkdir(parents=True)
+    first.survey_json.write_text(json.dumps({"complete": True}), encoding="utf-8")
     second = build_package_paths(
         tmp_path, "South Wales", "Barry", date(2026, 8, 1), stem_override="51.39_51.38"
     )
     assert second.stem == "51.39_51.38_02"
     assert second.project_setting.name == "51.39_51.38_02_project_setting.json"
+
+
+def test_build_package_paths_reuses_a_folder_with_no_survey_json(tmp_path):
+    # No survey.json at all means no run ever finished here, so it is
+    # treated the same as an incomplete one: reused, not suffixed past.
+    first = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    first.root.mkdir(parents=True)
+    second = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    assert second.root == first.root
+    assert second.stem == first.stem
+
+
+def test_build_package_paths_reuses_an_incomplete_package(tmp_path):
+    first = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    first.root.mkdir(parents=True)
+    first.survey_json.write_text(json.dumps({"complete": False}), encoding="utf-8")
+    second = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    assert second.root == first.root
+    assert second.stem == first.stem
+
+
+def test_build_package_paths_reuses_a_folder_with_a_corrupt_survey_json(tmp_path):
+    first = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    first.root.mkdir(parents=True)
+    first.survey_json.write_text("{not valid json at all", encoding="utf-8")
+    second = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    assert second.root == first.root
+    assert second.stem == first.stem
+
+
+def test_build_package_paths_suffixes_a_genuinely_complete_package(tmp_path):
+    first = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    first.root.mkdir(parents=True)
+    first.survey_json.write_text(json.dumps({"complete": True}), encoding="utf-8")
+    second = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    assert second.root.name == "2026-08-01_Barry-Waterfront_02"
+
+
+def test_build_package_paths_can_resume_a_suffixed_folder_too(tmp_path):
+    # The rule applies at every step of the collision walk, not just the
+    # first: a _02 that is itself incomplete must be reused rather than
+    # pushed on to _03.
+    first = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    first.root.mkdir(parents=True)
+    first.survey_json.write_text(json.dumps({"complete": True}), encoding="utf-8")
+
+    second = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    second.root.mkdir(parents=True)
+    second.survey_json.write_text(json.dumps({"complete": False}), encoding="utf-8")
+
+    third = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    assert third.root == second.root
+    assert third.root.name == "2026-08-01_Barry-Waterfront_02"
 
 
 def test_check_path_length_passes_for_a_short_root(tmp_path):

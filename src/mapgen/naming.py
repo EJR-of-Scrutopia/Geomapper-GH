@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -86,13 +87,35 @@ def build_package_paths(
     root = region_dir / base_name
     suffix = ""
     counter = 2
-    while root.exists():
+    # A candidate folder is only skipped if it is a genuinely finished
+    # package. Anything else, absent, unreadable or incomplete survey.json,
+    # means an earlier run stopped partway through, so that folder is reused:
+    # same root, same stem, same _work, which is what lets JobState find its
+    # saved progress and resume rather than restart from nothing. The same
+    # check applies to every suffixed candidate in turn, so a _02 that is
+    # itself incomplete gets reused rather than pushed on to _03.
+    while root.exists() and _survey_reports_complete(root / "survey.json"):
         suffix = f"_{counter:02d}"
         root = region_dir / f"{base_name}{suffix}"
         counter += 1
 
     stem = f"{stem_override}{suffix}" if stem_override else f"{site_slug}_{date_str}{suffix}"
     return _compose(root, stem)
+
+
+def _survey_reports_complete(survey_json: Path) -> bool:
+    """True only when survey_json exists, parses, and says complete: true.
+
+    Missing, unreadable, malformed json, or complete: false all collapse to
+    the same answer, because build_package_paths only needs to distinguish
+    "safe to reuse" from "must not touch this, it is someone else's finished
+    work", and every one of those cases is the former.
+    """
+    try:
+        payload = json.loads(survey_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("complete") is True
 
 
 def check_path_length(

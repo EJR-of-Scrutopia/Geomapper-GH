@@ -20,7 +20,7 @@ from mapgen.fsutil import (
     ensure_dir,
     work_dir_scope,
 )
-from mapgen.geo import BBox, build_tiles, extent_metres
+from mapgen.geo import BBox, Tile, build_tiles, extent_metres
 from mapgen.jobs import FAILED, OK, CancelToken, JobState
 from mapgen.merge import assert_inputs_present
 from mapgen.naming import PackagePaths, build_package_paths, check_path_length, slugify
@@ -164,20 +164,29 @@ def run_survey(
             source_work = paths.work_dir / "raw" / source.id
             ensure_dir(source_work)
             pending = [t for t in tiles if not state.is_done(t.tile_id, source.id)]
+            fetch_succeeded = False
             try:
                 parts = source.fetch(request.bbox, pending, source_work, sink)
-                for tile in pending:
-                    state.mark(tile.tile_id, source.id, OK)
+                fetch_succeeded = True
             except Exception as exc:
-                for tile in pending:
-                    state.mark(tile.tile_id, source.id, FAILED)
                 sink.emit("source_failed", source=source.id, error=str(exc))
                 if not request.force:
+                    # Record whatever genuinely landed before re-raising: a
+                    # batch call failing partway through must not blame tiles
+                    # that already succeeded, or the next resume would redo
+                    # work that was already done.
+                    _record_tile_outcomes(state, source.id, pending, source_work, fetch_succeeded)
                     raise
-                parts = [p for p in sorted(source_work.rglob("*")) if p.is_file()]
+                parts = _existing_output_files(source_work)
 
-            # Refuse to merge a tile set with holes unless the caller forced it.
-            parts = assert_inputs_present(parts, force=request.force)
+            # Refuse to merge a tile set with holes unless the caller forced
+            # it. Per-tile status is recorded only once this has run, or been
+            # attempted, so a file fetch() claimed but never materialised is
+            # never marked ok on the strength of fetch() alone.
+            try:
+                parts = assert_inputs_present(parts, force=request.force)
+            finally:
+                _record_tile_outcomes(state, source.id, pending, source_work, fetch_succeeded)
             merged = source.merge(parts, paths.root)
             outputs_by_source[source.id] = merged
             sink.emit("source_done", source=source.id, outputs=[p.name for p in merged])
@@ -213,6 +222,57 @@ def run_survey(
         best_effort_rmtree(paths.work_dir)
 
     return SurveyResult(paths=paths, complete=state.complete, survey=survey)
+
+
+def _existing_output_files(source_work: Path) -> list[Path]:
+    """Every real file already on disk for this source, crash debris excluded.
+
+    A hard kill can leave one of fsutil's atomic-write .part temp files
+    behind, and OvertureSource downloads to the same kind of .part path
+    before renaming it into place. Those are not usable output. They must
+    never reach merge(), which would choke on truncated content, and must
+    never be mistaken for evidence that a tile succeeded.
+    """
+    return [
+        path
+        for path in sorted(source_work.rglob("*"))
+        if path.is_file() and path.suffix != ".part"
+    ]
+
+
+def _record_tile_outcomes(
+    state: JobState,
+    source_id: str,
+    pending: Sequence[Tile],
+    source_work: Path,
+    fetch_succeeded: bool,
+) -> None:
+    """Mark each pending tile from what is actually on disk, not from
+    whether the batch fetch() call raised.
+
+    fetch() is one Python call for potentially many tiles: it either returns
+    once for all of them or raises once for all of them, which says nothing
+    about which individual tiles actually got a usable file. Sources that
+    name output files after the tile id, which covers OSM, Overture and the
+    test stub, get true per-tile status here: a tile is ok only if a
+    non-empty file stamped with its id exists, regardless of whether the
+    batch call raised or a later validation step did. A source with no
+    per-tile naming at all, such as elevation's single whole-area file, never
+    produces a tile-stamped match for anything; there is no finer signal than
+    the batch outcome for a source shaped like that, so it applies uniformly,
+    which matches how such sources have always behaved.
+    """
+    files = _existing_output_files(source_work)
+    any_tile_stamped = any(path.stem == tile.tile_id for tile in pending for path in files)
+    for tile in pending:
+        if any_tile_stamped:
+            has_output = any(
+                path.stem == tile.tile_id and path.stat().st_size > 0 for path in files
+            )
+            status = OK if has_output else FAILED
+        else:
+            status = OK if fetch_succeeded else FAILED
+        state.mark(tile.tile_id, source_id, status)
 
 
 def _write_layer_files(
