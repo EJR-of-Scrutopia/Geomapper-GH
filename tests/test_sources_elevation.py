@@ -72,6 +72,13 @@ def test_resolve_api_key_reads_the_legacy_variable():
     assert resolve_api_key(None, {"OPENTOPO_API_KEY": "legacy"}) == "legacy"
 
 
+def test_resolve_api_key_prefers_primary_over_legacy_variable():
+    assert (
+        resolve_api_key(None, {"OPENTOPOGRAPHY_API_KEY": "primary", "OPENTOPO_API_KEY": "legacy"})
+        == "primary"
+    )
+
+
 def test_resolve_api_key_names_the_variable_when_absent():
     with pytest.raises(MissingApiKeyError, match="OPENTOPOGRAPHY_API_KEY"):
         resolve_api_key(None, {})
@@ -96,6 +103,8 @@ def test_fetch_sends_the_bbox_and_key_as_parameters(tmp_path):
     assert params["demtype"] == "COP30"
     assert params["south"].startswith("51.38")
     assert params["north"].startswith("51.39")
+    assert params["west"].startswith("-3.29")
+    assert params["east"].startswith("-3.28")
 
 
 def test_fetch_reuses_an_existing_tiff(tmp_path):
@@ -103,6 +112,13 @@ def test_fetch_reuses_an_existing_tiff(tmp_path):
     session = FakeSession(FakeStreamResponse([]))
     ElevationSource(api_key="k", session=session).fetch(BBOX, [], tmp_path, NullProgress())
     assert session.calls == []
+
+
+def test_fetch_handles_http_errors(tmp_path):
+    session = FakeSession(FakeStreamResponse([b"Server error"], status_code=500))
+    source = ElevationSource(api_key="k", session=session)
+    with pytest.raises(ElevationError, match="HTTP 500"):
+        source.fetch(BBOX, [], tmp_path, NullProgress())
 
 
 def test_fetch_rejects_a_non_tiff_response_and_leaves_no_file(tmp_path):
@@ -125,3 +141,24 @@ def test_merge_passes_the_tiff_through(tmp_path):
     part = tmp_path / "elevation.tif"
     part.write_bytes(TIFF_LITTLE_ENDIAN)
     assert ElevationSource(api_key="k").merge([part], tmp_path / "out") == [part]
+
+
+def test_estimate_scales_with_bbox_area():
+    small_bbox = BBox.parse("-0.1,50.0,-0.05,50.05")
+    large_bbox = BBox.parse("-10.0,40.0,0.0,50.0")
+
+    source = ElevationSource(api_key="k")
+    small_est = source.estimate(small_bbox, [])
+    large_est = source.estimate(large_bbox, [])
+
+    assert large_est.bytes_estimate > small_est.bytes_estimate
+    assert large_est.seconds_estimate > small_est.seconds_estimate
+
+
+def test_estimate_returns_positive_for_tiny_bbox():
+    tiny_bbox = BBox.parse("-0.001,50.0,-0.0005,50.0005")
+    source = ElevationSource(api_key="k")
+    est = source.estimate(tiny_bbox, [])
+
+    assert est.bytes_estimate > 0
+    assert est.seconds_estimate > 0

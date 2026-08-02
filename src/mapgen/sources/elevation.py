@@ -16,7 +16,7 @@ from typing import Mapping, Sequence
 import requests
 
 from mapgen.fsutil import atomic_write_bytes
-from mapgen.geo import BBox, Tile
+from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.sources.base import Estimate, ProgressSink
 
 DEFAULT_OPENTOPOGRAPHY_URL = "https://portal.opentopography.org/API/globaldem"
@@ -74,7 +74,16 @@ class ElevationSource:
         self._environ = environ
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
-        return Estimate(bytes_estimate=12_000_000, seconds_estimate=25.0)
+        # Estimate based on bbox area. COP30 resolution is 30 m per pixel.
+        # Model: pixel_count * 2 bytes per pixel (16-bit elevation) * 1.2 for
+        # GeoTIFF overhead. Time estimate scales with data size with a sensible floor.
+        width_m, height_m = extent_metres(bbox)
+        pixel_count = (width_m / 30.0) * (height_m / 30.0)
+        # 2 bytes per pixel + 20% GeoTIFF/compression overhead
+        bytes_estimate = max(int(pixel_count * 2 * 1.2), 100_000)
+        # Rough model: 500 KB/second download rate, minimum 5 seconds
+        seconds_estimate = max(bytes_estimate / 500_000.0, 5.0)
+        return Estimate(bytes_estimate=bytes_estimate, seconds_estimate=seconds_estimate)
 
     def fetch(
         self,
@@ -99,15 +108,18 @@ class ElevationSource:
             "API_Key": api_key,
         }
 
-        with self.session.get(
-            self.url,
-            params=params,
-            headers={"User-Agent": USER_AGENT},
-            stream=True,
-            timeout=self.timeout_seconds,
-        ) as response:
-            response.raise_for_status()
-            payload = b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
+        try:
+            with self.session.get(
+                self.url,
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                stream=True,
+                timeout=self.timeout_seconds,
+            ) as response:
+                response.raise_for_status()
+                payload = b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
+        except (RuntimeError, requests.exceptions.HTTPError) as e:
+            raise ElevationError(f"Failed to download DEM: {e}") from e
 
         if not is_tiff(payload[:16]):
             preview = payload[:300].decode("utf-8", errors="replace")
