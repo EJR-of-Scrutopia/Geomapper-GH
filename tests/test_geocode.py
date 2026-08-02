@@ -265,6 +265,39 @@ def test_reverse_waits_via_the_limiter_before_calling_out():
     assert waited == [True]
 
 
+# --- a GeocodeQueueFullError from the limiter must reach the caller as
+# itself, not as a generic GeocodeError -------------------------------
+#
+# GeocodeQueueFullError is a GeocodeError subclass, so _get()'s own broad
+# `except Exception as exc: raise GeocodeError(...) from exc` around the
+# outbound request would just as happily catch and rewrap it if
+# limiter.wait() were ever called from inside that same try block instead
+# of ahead of it. server.py depends on catching GeocodeQueueFullError
+# specifically to answer 429 rather than 502; nothing before this proved
+# search()/reverse() actually deliver that exact type end to end, only
+# that the limiter raises it (test_geocode.py, above) and that a route
+# given it directly answers 429 (test_web_server.py). Nothing joined the
+# two: a limiter.wait() moved inside _get()'s try would still pass every
+# test in both of those files while quietly turning every real overload
+# into a 502.
+
+
+def test_search_lets_a_queue_full_rejection_through_as_itself():
+    limiter = GeocodeRateLimiter()
+    limiter.wait = lambda: (_ for _ in ()).throw(GeocodeQueueFullError("full"))
+    client = _client([], limiter=limiter)
+    with pytest.raises(GeocodeQueueFullError):
+        client.search("Barry")
+
+
+def test_reverse_lets_a_queue_full_rejection_through_as_itself():
+    limiter = GeocodeRateLimiter()
+    limiter.wait = lambda: (_ for _ in ()).throw(GeocodeQueueFullError("full"))
+    client = _client([], limiter=limiter)
+    with pytest.raises(GeocodeQueueFullError):
+        client.reverse(51.4, -3.3)
+
+
 # --- GeocodeRateLimiter: bounded queue -------------------------------------
 #
 # Reserving a slot with no bound on how many can queue is exactly how a
@@ -369,7 +402,7 @@ def test_rate_limiter_first_call_never_waits():
     assert slept == []
 
 
-# --- GeocodeRateLimiter: real concurrency, real threads --------------------
+# --- GeocodeRateLimiter: real concurrency -----------------------------
 #
 # The fake-clock tests above prove the reservation arithmetic is right for
 # calls made one after another, which is how mapgen.sources.osm.RateLimiter
@@ -378,71 +411,34 @@ def test_rate_limiter_first_call_never_waits():
 # and a sleeper that just records a duration without advancing anything
 # produce byte-identical results whether the reservation is written before
 # or after the "sleep" (confirmed directly: both orderings recorded the
-# same slept=[1.5] against the same two-call sequence). Only real
-# concurrent execution, a real clock actually moving while threads race
-# each other, can tell the two apart.
+# same slept=[1.5] against the same two-call sequence).
 #
-# A first version of this test used 3 threads. A review found it passed
-# even with `with self._lock:` deleted outright, keeping only the correct
-# reserve-before-sleep order: the critical section here is a handful of
-# fast operations with no I/O in it, so 3 threads contending for it almost
-# never actually get interrupted by the GIL mid-section, lock or no lock.
-# Measured directly at 24 threads instead: the unlocked build collides at
-# a ~0.00002s gap, the locked (committed) build lands at ~0.05s. This test
-# now uses enough threads and a low enough threshold to sit clearly between
-# those two numbers, so it actually discriminates a missing lock rather
-# than passing for the same reason a 3-thread version passes regardless.
-
-
-def test_rate_limiter_serialises_real_concurrent_threads():
-    thread_count = 24
-    limiter = GeocodeRateLimiter(min_interval_seconds=0.05, max_queue=thread_count)
-    finished_at = []
-    lock = threading.Lock()
-    barrier = threading.Barrier(thread_count)
-
-    def call():
-        barrier.wait(timeout=5)  # every thread starts waiting at once
-        limiter.wait()
-        with lock:
-            finished_at.append(time.monotonic())
-
-    threads = [threading.Thread(target=call) for _ in range(thread_count)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=10)
-
-    assert len(finished_at) == thread_count
-    finished_at.sort()
-    gaps = [finished_at[i + 1] - finished_at[i] for i in range(thread_count - 1)]
-    smallest_gap = min(gaps)
-    assert smallest_gap >= 0.03, (
-        f"smallest gap between {thread_count} consecutive finishers was "
-        f"{smallest_gap:.6f}s, expected each to be serialised roughly 0.05s "
-        f"apart; a near-zero gap means two threads collided"
-    )
+# An earlier version of this section used a real-threaded test at 24
+# threads instead of the deterministic one below, timed against a 0.03s
+# threshold. Re-review measured it directly against the committed, correct
+# build under load and found it failed 9 times in 25 runs, at gaps of
+# 0.0226 to 0.0297s against that threshold: a test that fails on correct
+# code nearly as often as on broken code is worse than no test, since it
+# teaches whoever inherits this to expect and ignore red. It also carried
+# a specific claim, that an unlocked build collides at a ~0.00002s gap,
+# which I did not verify against this exact mutation before writing it
+# down and which does not hold up: contradicted by measurement, and by
+# the honest account already sitting in the test below it, that this
+# machine could not reproduce a reliable collision from natural thread
+# contention at all. That test is deleted rather than re-tuned again;
+# a passing rate that depends on scheduling luck was always going to
+# fail this way eventually, on this machine or someone else's, and the
+# deterministic test below already proves the same property without it.
 
 
 def test_rate_limiter_lock_forces_a_second_caller_to_wait_for_the_first_to_finish():
-    """Deterministic version of the same property, not dependent on GIL
-    scheduling luck at all.
-
-    The test above relies on natural OS/GIL contention among real threads
-    to expose a missing lock, and re-measuring it directly on this machine
-    found that unreliable: even at 24 threads, deleting `with self._lock:`
-    while keeping the correct reserve-before-sleep order still passed 5/5
-    runs here, because the critical section is only a handful of fast,
-    non-blocking operations, too short for CPython's time-sliced thread
-    switching to reliably land inside it. That contradicts an earlier,
-    informal measurement elsewhere of a reliable collision at that thread
-    count, which this project has no way to reproduce or verify further.
-
-    Rather than tune a thread count against unreliable timing and hope,
-    this forces the exact interleaving a missing lock would allow: an
-    injected clock blocks the first caller mid-critical-section, and a
-    second caller is only released once the first is confirmed to be
-    inside. If wait() is genuinely serialised, the second caller cannot
+    """Proves the lock, not by relying on real OS/GIL scheduling to expose
+    a missing one (measured directly: unreliable, both for detecting a
+    real bug and, worse, for staying green on correct code under load, see
+    above), but by forcing the exact interleaving a missing lock would
+    allow: an injected clock blocks the first caller mid-critical-section,
+    and a second caller is only released once the first is confirmed to
+    be inside. If wait() is genuinely serialised, the second caller cannot
     even reach its own clock call, since that call sits behind the same
     lock the first caller is still holding, until the first caller has
     finished and written its reservation. If it is not serialised, the
@@ -450,7 +446,8 @@ def test_rate_limiter_lock_forces_a_second_caller_to_wait_for_the_first_to_finis
     before any reservation has been written at all. Checking what
     _next_allowed_at looks like at the exact moment the second caller's
     clock fires distinguishes the two unconditionally, with no dependence
-    on how fast either thread happens to run.
+    on how fast either thread happens to run, or on how heavily loaded the
+    machine running the suite is.
     """
     limiter = GeocodeRateLimiter(min_interval_seconds=1.0, sleeper=lambda _s: None)
     first_is_inside = threading.Event()

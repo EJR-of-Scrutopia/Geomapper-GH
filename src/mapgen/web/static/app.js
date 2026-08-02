@@ -15,8 +15,23 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
 // --- API -------------------------------------------------------------
 
+// Every /api/ route needs ?token= on its query string. Building that by
+// gluing on "?token=..." with a template literal broke the moment a route
+// itself took a query string (/api/geocode?q=..., /api/reverse?lat=&lon=):
+// the result was two "?" characters in one URL
+// (/api/geocode?q=Barry?token=abc), and a server-side query parser reads
+// everything after the FIRST "?" as the query string, so "q" comes out as
+// "Barry?token=abc" and "token" does not exist at all. Every geocode and
+// reverse call was therefore 403 on every single request, silently, since
+// _authorised() just sees a missing token like any other missing token.
+// The URL constructor merges parameters correctly regardless of whether
+// path already has any, which is what "in one place" means here: every
+// caller goes through this one function, so there is nowhere else a route
+// with its own query string could make the same mistake again.
 async function api(path, options = {}) {
-  const response = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
+  const url = new URL(path, location.origin);
+  url.searchParams.set("token", token);
+  const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
@@ -308,9 +323,28 @@ function persistFieldSettings() {
   });
 }
 
-// No separate "change" listener here: persistFieldSettings is called from
-// refreshEstimate's own success path above, deliberately, so a value the
-// estimate has just rejected is never the one saved.
+// Persisting output-root/tile-size/overlap only from refreshEstimate's
+// success path (above) closes one problem, a value the estimate rejects
+// being saved anyway, by opening another: refreshEstimate returns early,
+// before ever calling persistFieldSettings, whenever bbox, region or site
+// are not set yet. Setting a preferred output root before ever drawing an
+// extent, an entirely ordinary way to use this, would then never be saved
+// at all until some unrelated later estimate happened to succeed. There
+// is nothing to validate a field-in-isolation against before an extent
+// and names exist (check_path_length needs the region and site slugs
+// too, not just the output root), so there is nothing an early value could
+// have failed, and no reason to withhold it: persist immediately in
+// exactly that case, and defer to refreshEstimate's success path only
+// once there is an actual estimate that could reject it.
+function maybePersistFieldSettings() {
+  if (!bbox || !$("region").value.trim() || !$("site").value.trim()) {
+    persistFieldSettings();
+  }
+}
+
+["tile-size", "overlap", "output-root"].forEach((id) =>
+  $(id).addEventListener("change", maybePersistFieldSettings)
+);
 
 // --- job -------------------------------------------------------------
 

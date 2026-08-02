@@ -1104,15 +1104,40 @@ def test_build_server_wires_a_real_nominatim_client_by_default():
 # Leaflet's own source is third-party and not written here, and auditing
 # its comments or sourcemap references for incidental URL-shaped strings
 # is a different question from the one this test asks, which is whether
-# OUR code calls out to an unexpected host.
+# OUR code calls out to an unexpected host. .svg is scanned too, since it
+# is XML text that the server serves and could carry an embedded
+# <image href="https://..."> the same as HTML can; .png is not, since a
+# raster image is binary with nothing meaningfully greppable as a URL in
+# the sense that anything in this codebase's rendering path would ever
+# fetch from.
+#
+# This catches an honestly reintroduced call, the actual regression that
+# happened here, and a plain protocol-relative one in a quoted or
+# templated string. It is not a security boundary against someone
+# deliberately hiding a host: string concatenation split across literals
+# ("https:/" + "/host") and a template literal with the hostname held in
+# a variable rather than written out both defeat any text-level check,
+# since in the second case the actual host is not present as text in this
+# file at all until the page runs. Closing those needs evaluating the
+# script, not grepping it, which is a different and much larger tool than
+# a regression guard for an honest mistake warrants.
 
 _ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org"}
-_URL_HOST_RE = re.compile(r"https?://([a-zA-Z0-9.-]+)", re.IGNORECASE)
+# Matches a URL host after "http(s)://" anywhere in the text (deliberately
+# unanchored: this is what already catches a form action, a CSS url(...),
+# or an ES import, none of which need their own special case, simply
+# because the scheme makes the reference unambiguous wherever it appears),
+# or after a bare "//" specifically when it is opened by a quote or
+# backtick, which is what a protocol-relative fetch("//host/...") or
+# src="//host/..." actually looks like in source. The quote anchor is the
+# difference from also matching "//" as it starts an ordinary line
+# comment, which every file here otherwise has many of.
+_URL_HOST_RE = re.compile(r'(?:https?:|["\'`])//([a-zA-Z0-9.-]+)', re.IGNORECASE)
 
 
 def _authored_static_files() -> list[Path]:
     files: list[Path] = []
-    for pattern in ("*.html", "*.css", "*.js"):
+    for pattern in ("*.html", "*.css", "*.js", "*.svg"):
         files.extend(STATIC_DIR.rglob(pattern))
     return sorted(p for p in files if "vendor" not in p.relative_to(STATIC_DIR).parts)
 
@@ -1139,6 +1164,14 @@ def test_authored_static_files_reference_no_host_outside_the_tile_allowlist():
 # README rather than duplicated here: the README is the single source of
 # truth this test exists to keep honest, so a second, hand-copied set of
 # hashes in the test would just be one more place to forget to update.
+#
+# Driven off the actual files on disk, not off the README's rows: an
+# earlier version of this test only walked the parsed table, so deleting
+# or reformatting a row (the leaflet.js one, say) past what the regex
+# recognises would have left that file listed nowhere and checked by
+# nothing, and a tampered file with no surviving row would pass silently.
+# Every file actually in vendor/ (other than the README itself) must have
+# a row before any hash is even compared.
 
 _VENDOR_HASH_ROW_RE = re.compile(
     r"^\|\s*`([^`]+)`\s*\|.*\|\s*`([0-9a-f]{64})`\s*\|\s*$", re.IGNORECASE
@@ -1155,16 +1188,27 @@ def _vendor_readme_hash_table() -> dict[str, str]:
     return table
 
 
-def test_vendor_readme_hashes_match_the_committed_files():
+def _vendor_files_on_disk() -> list[str]:
+    vendor_dir = STATIC_DIR / "vendor"
+    return sorted(p.name for p in vendor_dir.iterdir() if p.is_file() and p.name != "README.md")
+
+
+def test_every_vendor_file_is_listed_in_the_readme_and_hashes_match():
     table = _vendor_readme_hash_table()
     assert table, "expected vendor/README.md to list at least one file/hash pair"
+    files = _vendor_files_on_disk()
+    assert files, "expected at least one vendored file on disk"
+
+    unlisted = [name for name in files if name not in table]
+    assert not unlisted, (
+        f"these vendor files exist on disk but have no row in vendor/README.md, "
+        f"so tampering with them would not be caught: {unlisted}"
+    )
+
     mismatches = []
-    for filename, expected_hash in table.items():
-        path = STATIC_DIR / "vendor" / filename
-        if not path.is_file():
-            mismatches.append(f"{filename}: listed in vendor/README.md but not found on disk")
-            continue
-        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    for filename in files:
+        expected_hash = table[filename]
+        actual_hash = hashlib.sha256((STATIC_DIR / "vendor" / filename).read_bytes()).hexdigest()
         if actual_hash != expected_hash:
             mismatches.append(
                 f"{filename}: README says {expected_hash}, actual file hashes to {actual_hash}"

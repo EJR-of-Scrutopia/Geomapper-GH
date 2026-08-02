@@ -8,7 +8,6 @@ from a single machine are how you get rate limited.
 from __future__ import annotations
 
 import json
-import math
 import re
 import secrets
 import threading
@@ -265,11 +264,13 @@ def make_handler(
                 # float() accepts "nan", "inf" and overflowing literals like
                 # "1e400" without raising, so a plain try/except above lets
                 # every one of those through to spend a rate-limit slot on
-                # a request Nominatim was never going to answer.
-                # isfinite() catches nan and inf; the range check catches
-                # an out-of-world but finite value such as lat=200.
-                if not (math.isfinite(lat) and math.isfinite(lon)):
-                    return self._send_json(400, {"error": "lat and lon must both be numbers."})
+                # a request Nominatim was never going to answer. The range
+                # check below is what actually stops them, on its own: any
+                # comparison against nan is False in Python, so
+                # -90.0 <= nan <= 90.0 is already False, and inf/-inf just
+                # fail the comparison outright. A separate isfinite() check
+                # here was redundant dead weight, asserted by nothing, and
+                # is not needed.
                 if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
                     return self._send_json(
                         400,
