@@ -9,6 +9,7 @@ from mapgen.jobs import CancelToken, Cancelled, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
     SurveyRequest,
+    estimate_geometry,
     estimate_survey,
     register_default_sources,
     run_survey,
@@ -397,6 +398,118 @@ def test_estimate_rejects_a_path_that_would_be_too_long(tmp_path):
     deep = Path("C:/") / ("x" * 200)
     with pytest.raises(PathTooLongError):
         estimate_survey(_request(tmp_path, output_root=deep))
+
+
+# --- Task 18 item 7: the folder preview must be the real composed path,
+# produced by the exact same code that later creates it -------------------
+
+
+def test_estimate_includes_the_exact_folder_naming_would_compose(tmp_path):
+    register(StubSource())
+    request = _request(tmp_path)
+    estimate = estimate_survey(request)
+    fingerprint = tiling_fingerprint(
+        *request.bbox.as_tuple(), request.tile_size_m, request.overlap_m
+    )
+    expected = build_package_paths(
+        tmp_path, request.region, request.site, request.effective_date, fingerprint
+    ).root
+    assert estimate["folder"] == str(expected)
+
+
+def test_estimate_folder_matches_the_folder_run_survey_actually_creates(tmp_path):
+    # The stronger, end-to-end version of the test above: proves the
+    # estimate's reported folder is not merely built from the same
+    # function by inspection, but is identical to what a real download of
+    # the SAME request actually creates on disk. This is the property the
+    # brief calls the one thing not to get wrong: a path that merely
+    # agrees today can still drift if the two call sites ever diverge,
+    # this test would catch that the moment it happened.
+    register(StubSource())
+    request = _request(tmp_path)
+    estimate = estimate_survey(request)
+    result = run_survey(request)
+    assert estimate["folder"] == str(result.paths.root)
+
+
+def test_estimate_folder_reflects_an_existing_02_collision(tmp_path):
+    # build_package_paths' own collision-avoidance (a genuinely complete
+    # package already sitting at the plain name) must be visible in the
+    # preview too, not just in the folder a real run would create: a
+    # preview that always showed the un-suffixed name would mislead
+    # exactly when it matters most, a second survey of the same site.
+    register(StubSource())
+    request = _request(tmp_path)
+    first = run_survey(request)
+    assert first.complete is True
+    estimate = estimate_survey(request)
+    assert estimate["folder"] == str(first.paths.root.parent / "2026-08-01_Barry-Waterfront_02")
+
+
+# --- Task 18 item 6: /api/extent's geometry, reused not reimplemented -----
+
+
+def test_estimate_geometry_matches_estimate_survey_for_the_same_inputs(tmp_path):
+    register(StubSource())
+    request = _request(tmp_path)
+    survey_estimate = estimate_survey(request)
+    geometry = estimate_geometry(request.bbox, request.tile_size_m, request.overlap_m)
+    assert geometry == {
+        "tiles": survey_estimate["tiles"],
+        "rows": survey_estimate["rows"],
+        "cols": survey_estimate["cols"],
+        "extent_km": survey_estimate["extent_km"],
+    }
+
+
+def test_estimate_geometry_needs_no_region_site_or_output_root():
+    # The whole point: this must be answerable from a bbox and a tiling
+    # alone, before a region or site exists to plan a real package path
+    # from at all.
+    geometry = estimate_geometry(BBOX, 600.0, 50.0)
+    assert geometry["tiles"] >= 1
+    assert geometry["extent_km"]["width"] > 0
+
+
+def test_estimate_geometry_varies_with_tile_size():
+    coarse = estimate_geometry(BBOX, 1200.0, 50.0)
+    fine = estimate_geometry(BBOX, 300.0, 50.0)
+    assert fine["tiles"] > coarse["tiles"]
+    # Extent is a property of the bbox alone, unaffected by tiling.
+    assert fine["extent_km"] == coarse["extent_km"]
+
+
+# --- Task 18 item 5: the estimate warns about a missing elevation key,
+# without failing the estimate itself, and generically for any source ------
+
+
+def test_estimate_has_no_warnings_by_default(tmp_path):
+    register(StubSource())
+    estimate = estimate_survey(_request(tmp_path))
+    assert estimate["warnings"] == []
+
+
+def test_estimate_warns_when_a_source_reports_a_readiness_problem(tmp_path):
+    class NeverReadySource(StubSource):
+        def readiness_problem(self):
+            return "this stub is never ready"
+
+    register(NeverReadySource())
+    estimate = estimate_survey(_request(tmp_path))
+    assert estimate["warnings"] == ["this stub is never ready"]
+    # A readiness problem is a warning, not a failure: the numeric estimate
+    # still completes normally alongside it.
+    assert estimate["tiles"] >= 1
+
+
+def test_estimate_does_not_warn_when_a_sources_readiness_problem_returns_none(tmp_path):
+    class AlwaysReadySource(StubSource):
+        def readiness_problem(self):
+            return None
+
+    register(AlwaysReadySource())
+    estimate = estimate_survey(_request(tmp_path))
+    assert estimate["warnings"] == []
 
 
 def test_run_creates_the_dated_region_folder(tmp_path):

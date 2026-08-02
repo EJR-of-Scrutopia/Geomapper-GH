@@ -138,13 +138,44 @@ def _plan(request: SurveyRequest):
     return tiles, paths
 
 
+def _geometry_summary(bbox: BBox, tiles: Sequence[Tile]) -> dict[str, object]:
+    """Tile count, rows, cols and extent: the numbers that need nothing
+    about naming or where output will land, shared verbatim by
+    estimate_survey and estimate_geometry so this tiling arithmetic is
+    written exactly once.
+    """
+    width_m, height_m = extent_metres(bbox)
+    return {
+        "tiles": len(tiles),
+        "rows": max((t.row for t in tiles), default=0) + 1,
+        "cols": max((t.col for t in tiles), default=0) + 1,
+        "extent_km": {"width": width_m / 1000.0, "height": height_m / 1000.0},
+    }
+
+
+def estimate_geometry(bbox: BBox, tile_size_m: float, overlap_m: float) -> dict[str, object]:
+    """The subset of estimate_survey's numbers that need no region, site
+    or output_root at all: how many tiles a bbox and tiling produce, and
+    its extent.
+
+    Backs the web interface's live extent feedback (Task 18): a drawn or
+    pasted rectangle has a real tile count and area before a region or
+    site has ever been typed, and the naming/path machinery in _plan()
+    would only get in the way of reporting it (it needs a region and site
+    to slugify, and can raise PathTooLongError for reasons that have
+    nothing to do with the geometry itself).
+    """
+    tiles = build_tiles(bbox, tile_size_m, overlap_m)
+    return _geometry_summary(bbox, tiles)
+
+
 def estimate_survey(request: SurveyRequest) -> dict[str, object]:
-    tiles, _paths = _plan(request)
-    width_m, height_m = extent_metres(request.bbox)
+    tiles, paths = _plan(request)
 
     total_bytes = 0
     total_seconds = 0.0
     source_summaries: list[dict[str, object]] = []
+    warnings: list[str] = []
     for source_id in request.source_ids:
         source = get_source(source_id)
         estimate = source.estimate(request.bbox, tiles)
@@ -159,16 +190,31 @@ def estimate_survey(request: SurveyRequest) -> dict[str, object]:
                 "seconds_estimate": estimate.seconds_estimate,
             }
         )
+        # readiness_problem is an optional LayerSource extension (see
+        # sources/base.py's own docstring on this convention), read
+        # defensively so a source without one, which is every source
+        # except ElevationSource today, contributes nothing here. This is
+        # deliberately generic rather than naming "elevation": any future
+        # source with its own prerequisite gets the same pre-flight
+        # warning for free.
+        check_readiness = getattr(source, "readiness_problem", None)
+        if callable(check_readiness):
+            problem = check_readiness()
+            if problem:
+                warnings.append(problem)
 
-    return {
-        "tiles": len(tiles),
-        "rows": max((t.row for t in tiles), default=0) + 1,
-        "cols": max((t.col for t in tiles), default=0) + 1,
-        "extent_km": {"width": width_m / 1000.0, "height": height_m / 1000.0},
-        "bytes_estimate": total_bytes,
-        "seconds_estimate": total_seconds,
-        "sources": source_summaries,
-    }
+    result = dict(_geometry_summary(request.bbox, tiles))
+    result["bytes_estimate"] = total_bytes
+    result["seconds_estimate"] = total_seconds
+    result["sources"] = source_summaries
+    result["warnings"] = warnings
+    # The real path build_package_paths composed for this exact request,
+    # not a guess: the interface reads this straight into a folder-path
+    # preview that Grasshopper depends on being right, so it must come
+    # from the same call _plan() already made to plan the job itself,
+    # never a second, separately-assembled path that could drift from it.
+    result["folder"] = str(paths.root)
+    return result
 
 
 def run_survey(
