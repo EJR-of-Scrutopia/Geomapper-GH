@@ -205,32 +205,142 @@ def test_fetch_prefers_the_environment_over_the_configured_key(tmp_path, monkeyp
     assert session.calls[0][1]["params"]["API_Key"] == "from-env"
 
 
-def test_fetch_http_error_never_leaks_the_api_key_via_the_request_url(tmp_path):
-    # requests' own HTTPError message includes response.url, and this
-    # endpoint sends the key as a query parameter (API_Key=...), so a
-    # bare str(exc) would put a real, rejected key into ElevationError's
-    # message, and from there into survey.json's source_failed event, the
-    # job's error field, and the log panel. This proves the fix: a
-    # genuinely leaky HTTPError message must not survive into what
-    # fetch() raises.
-    secret = "sk-real-secret-should-never-leak"
-    leaky_url = (
-        f"https://portal.opentopography.org/API/globaldem?demtype=COP30&API_Key={secret}"
-    )
+# --- Review round 1: the key must not leak through ANY exception shape,
+# not only HTTPError ------------------------------------------------------
+#
+# The round 1 finding: the previous fix wrapped only raise_for_status()
+# and caught only (RuntimeError, requests.exceptions.HTTPError).
+# session.get() itself sat outside that try, so a connection failure, a
+# read timeout, or a mid-stream drop, none of which are HTTPError, all
+# raised past the redaction entirely and reached run_survey's
+# source_failed event and JobManager's record.error with the real key
+# still in the message: the reviewer proved this end to end through a
+# real server. The fix now wraps the whole request/response cycle in one
+# broad except, and redacts by substring rather than by exception type, so
+# it holds regardless of what raises. Six scenarios below, one per named
+# failure path, each asserting the secret's ABSENCE directly rather than
+# checking message wording, which is what a redaction fix must actually
+# prove.
 
-    class LeakyHttpErrorResponse(FakeStreamResponse):
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise requests.exceptions.HTTPError(
-                    f"{self.status_code} Client Error: Forbidden for url: {leaky_url}"
-                )
+SECRET = "sk-real-secret-should-never-leak"
+LEAKY_URL = f"https://portal.opentopography.org/API/globaldem?demtype=COP30&API_Key={SECRET}"
 
-    session = FakeSession(LeakyHttpErrorResponse([], status_code=403))
-    source = ElevationSource(api_key=secret, session=session)
+
+class ConnectFailureSession:
+    """A session whose get() raises before any response exists at all, the
+    way a real requests.Session does on a refused or unreachable
+    connection. The exception message embeds the full request URL,
+    exactly like a genuine requests.exceptions.ConnectionError does.
+    """
+
+    def __init__(self, exception_cls):
+        self._exception_cls = exception_cls
+
+    def get(self, url, **kwargs):
+        raise self._exception_cls(
+            f"HTTPSConnectionPool(host='portal.opentopography.org', port=443): "
+            f"Max retries exceeded with url: {LEAKY_URL}"
+        )
+
+
+class MidStreamDropResponse(FakeStreamResponse):
+    """Yields one real chunk, then raises mid-stream, the way a dropped
+    connection during a large download actually behaves: some bytes
+    already delivered, then a ChunkedEncodingError with the request URL
+    embedded in its own message, as a genuine one would.
+    """
+
+    def __init__(self):
+        super().__init__([], status_code=200)
+
+    def iter_content(self, chunk_size=None):
+        def generator():
+            yield b"partial-tiff-bytes-before-the-drop"
+            raise requests.exceptions.ChunkedEncodingError(
+                f"Connection broken: InvalidChunkLength(got length b'', 0 bytes read) url: {LEAKY_URL}"
+            )
+
+        return generator()
+
+
+def test_fetch_never_leaks_the_key_on_a_connect_failure(tmp_path):
+    session = ConnectFailureSession(requests.exceptions.ConnectionError)
+    source = ElevationSource(api_key=SECRET, session=session)
     with pytest.raises(ElevationError) as excinfo:
         source.fetch(BBOX, [], tmp_path, NullProgress())
-    assert secret not in str(excinfo.value)
-    assert "403" in str(excinfo.value)
+    assert SECRET not in str(excinfo.value)
+
+
+def test_fetch_never_leaks_the_key_on_a_read_timeout(tmp_path):
+    session = ConnectFailureSession(requests.exceptions.ReadTimeout)
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in str(excinfo.value)
+
+
+def test_fetch_never_leaks_the_key_on_a_mid_stream_drop(tmp_path):
+    session = FakeSession(MidStreamDropResponse())
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in str(excinfo.value)
+
+
+def test_fetch_never_leaks_the_key_on_a_401(tmp_path):
+    session = FakeSession(FakeStreamResponse([], status_code=401))
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in str(excinfo.value)
+    assert "401" in str(excinfo.value)
+
+
+def test_fetch_never_leaks_the_key_on_a_500(tmp_path):
+    session = FakeSession(FakeStreamResponse([], status_code=500))
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in str(excinfo.value)
+    assert "500" in str(excinfo.value)
+
+
+def test_fetch_never_leaks_the_key_in_a_non_tiff_200_body(tmp_path):
+    # elevation.py's own non-TIFF preview dumps 300 bytes of the response
+    # body verbatim. A misconfigured gateway or an API error page that
+    # echoes the request URL back (a real, common shape for this kind of
+    # failure) would otherwise put the key in that preview.
+    leaky_body = f"<html>Bad request: {LEAKY_URL}</html>".encode("utf-8")
+    session = FakeSession(FakeStreamResponse([leaky_body], status_code=200))
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in str(excinfo.value)
+
+
+def test_fetch_redaction_also_catches_the_url_encoded_form_of_the_key(tmp_path):
+    # A key containing characters that need percent-encoding (+, /, =, as
+    # real base64-shaped tokens sometimes do) would appear URL-encoded
+    # inside a requests exception's message, not verbatim: a redaction
+    # that only stripped the raw string would miss it.
+    from urllib.parse import quote
+
+    secret_with_special_chars = "sk-real/secret+with=chars"
+    encoded_secret = quote(secret_with_special_chars, safe="")
+
+    class EncodedLeakSession:
+        def get(self, url, **kwargs):
+            leaky_url = f"{url}?API_Key={encoded_secret}&demtype=COP30"
+            raise requests.exceptions.ConnectionError(
+                f"Max retries exceeded with url: {leaky_url}"
+            )
+
+    source = ElevationSource(api_key=secret_with_special_chars, session=EncodedLeakSession())
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    message = str(excinfo.value)
+    assert secret_with_special_chars not in message
+    assert encoded_secret not in message
 
 
 def test_readiness_problem_is_none_when_a_key_is_available():

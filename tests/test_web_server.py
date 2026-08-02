@@ -11,12 +11,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+import requests
 
 from mapgen.geo import BBox
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, GeocodeResult, ReverseResult
 from mapgen.jobs import EventLog
 from mapgen.package import SurveyRequest
 from mapgen.sources.base import Estimate, clear_registry, register
+from mapgen.sources.elevation import ElevationSource
 from mapgen.web.server import (
     STATIC_DIR,
     JobBusyError,
@@ -778,6 +780,64 @@ def test_config_put_saves_and_round_trips_the_api_key(server, tmp_path, monkeypa
     status, reloaded = _get(server, "/api/config")
     assert status == 200
     assert reloaded["opentopography_api_key"] == "sk-real-key-value"
+
+
+# --- Review round 1: the key must not leak through a real job end to end --
+#
+# test_sources_elevation.py proves the redaction at the unit level: six
+# failure shapes, each asserting fetch() itself never raises with the
+# secret present. This proves the property that actually matters to the
+# owner: a real job that fails this way, driven through the real HTTP
+# routes and JobManager exactly as a browser would, must not surface the
+# key in ANYTHING /api/jobs/<id> returns, since that is what the browser
+# polls every 700ms and renders into the visible log panel.
+
+
+def test_a_leaking_elevation_failure_never_surfaces_the_key_through_a_real_job(tmp_path):
+    SECRET = "sk-real-secret-should-never-leak-anywhere"
+    leaky_url = f"https://portal.opentopography.org/API/globaldem?API_Key={SECRET}&demtype=COP30"
+
+    class LeakySession:
+        def get(self, url, **kwargs):
+            raise requests.exceptions.ConnectionError(
+                f"HTTPSConnectionPool: Max retries exceeded with url: {leaky_url}"
+            )
+
+    # Registered before build_server(): register_default_sources() skips
+    # "elevation" if a same-type instance already holds that id (see its
+    # own docstring), so this specific, leak-configured instance is the
+    # one the server actually uses, not a fresh default one.
+    register(ElevationSource(api_key=SECRET, session=LeakySession()))
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        status, payload = _post(
+            base,
+            "/api/jobs",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "sources": ["elevation"],
+                "run_bridge": False,
+            },
+        )
+        assert status == 202
+        final = _wait_for_state(base, payload["id"])
+        assert final["state"] == "failed"
+        # The whole payload, not just .error: source_failed events land in
+        # .events too, and the browser's job poller renders both into the
+        # visible log. Asserting on the dumped JSON catches the secret
+        # appearing ANYWHERE in the response, not just in the one field a
+        # narrower assertion happened to think to check.
+        dumped = json.dumps(final)
+        assert SECRET not in dumped, f"the api key leaked into the job response: {dumped}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_config_put_with_invalid_json_returns_400(server, tmp_path, monkeypatch):

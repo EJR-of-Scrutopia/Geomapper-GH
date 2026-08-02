@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import quote
 
 import requests
 
@@ -35,6 +36,32 @@ class MissingApiKeyError(ElevationError):
 
 def is_tiff(header: bytes) -> bool:
     return header.startswith(b"II*\x00") or header.startswith(b"MM\x00*")
+
+
+def _redact(text: str, secret: str | None) -> str:
+    """Removes every occurrence of secret from text, by content rather than
+    by exception type.
+
+    This is the boundary fix for a real leak: API_Key travels as a plain
+    query parameter to OpenTopography, so requests' own exception text
+    embeds it for essentially every failure shape that can happen before
+    a response exists (ConnectionError, ReadTimeout, ...) and several that
+    can happen after (ChunkedEncodingError mid-stream), not only the
+    HTTPError case a status-code check replaces. Enumerating "safe"
+    exception types is a trap: the next type nobody thought to add stays
+    unredacted. Scrubbing the secret's own text, regardless of what
+    raised or what shape it arrived in, does not have that failure mode.
+    Both the raw key and its URL-percent-encoded form are stripped, since
+    a key containing characters that need encoding would otherwise survive
+    inside a URL-shaped message unredacted.
+    """
+    if not secret:
+        return text
+    redacted = text.replace(secret, "[REDACTED]")
+    encoded = quote(secret, safe="")
+    if encoded != secret:
+        redacted = redacted.replace(encoded, "[REDACTED]")
+    return redacted
 
 
 def resolve_api_key(
@@ -157,37 +184,53 @@ class ElevationSource:
             "API_Key": api_key,
         }
 
-        # response is bound by entering the context manager, outside the
-        # try, so the except clause below can always read
-        # response.status_code regardless of what raises inside it.
-        with self.session.get(
-            self.url,
-            params=params,
-            headers={"User-Agent": USER_AGENT},
-            stream=True,
-            timeout=self.timeout_seconds,
-        ) as response:
-            try:
-                response.raise_for_status()
+        # The whole request/response cycle is inside one try, including
+        # session.get() itself: a connection refused or DNS failure raises
+        # before any response object exists at all, so a boundary that
+        # only wrapped the body-reading step (as an earlier version of
+        # this method did) never saw that failure to redact it. Review
+        # round 1 proved this end to end: a fake connection failure, read
+        # timeout and mid-stream drop, each carrying the real key in its
+        # own message the way a genuine requests exception does, all
+        # reached run_survey's source_failed event and JobManager's
+        # record.error unredacted under the previous, HTTPError-only fix.
+        # The whole request/response cycle is inside one try, including
+        # session.get() itself: a connection refused or DNS failure raises
+        # before any response object exists at all, so a boundary that
+        # only wrapped the body-reading step (as an earlier version of
+        # this method did) never saw that failure to redact it. Review
+        # round 1 proved this end to end: a fake connection failure, read
+        # timeout and mid-stream drop, each carrying the real key in its
+        # own message the way a genuine requests exception does, all
+        # reached run_survey's source_failed event and JobManager's
+        # record.error unredacted under the previous, HTTPError-only fix.
+        try:
+            with self.session.get(
+                self.url,
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                stream=True,
+                timeout=self.timeout_seconds,
+            ) as response:
+                if response.status_code >= 400:
+                    raise ElevationError(f"Failed to download DEM: HTTP {response.status_code}")
                 payload = b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
-            except (RuntimeError, requests.exceptions.HTTPError) as e:
-                # Built from the status code, not from str(e). A real
-                # requests.exceptions.HTTPError's message includes
-                # response.url, and API_Key travels as a plain query
-                # parameter on this endpoint, so echoing e verbatim would
-                # put a real OpenTopography key into this exception's
-                # message, and from there into survey.json's
-                # source_failed event, the job's error field, and the log
-                # panel that renders it. The status code is everything a
-                # caller needs to diagnose this; the key itself never
-                # appears here regardless of which exception shape raised
-                # it.
-                raise ElevationError(
-                    f"Failed to download DEM: HTTP {response.status_code}"
-                ) from e
+        except ElevationError:
+            raise
+        except Exception as exc:
+            # Deliberately broad, and deliberately not a list of specific
+            # requests exception classes: see _redact's docstring for why
+            # enumerating types is the trap this replaces. Whatever exc
+            # is, whatever it says, the key is stripped from its text
+            # before any of it is allowed into this source's own
+            # exception, which is the only thing run_survey and
+            # JobManager ever see.
+            raise ElevationError(
+                f"Failed to download DEM: {_redact(str(exc), api_key)}"
+            ) from exc
 
         if not is_tiff(payload[:16]):
-            preview = payload[:300].decode("utf-8", errors="replace")
+            preview = _redact(payload[:300].decode("utf-8", errors="replace"), api_key)
             raise ElevationError(
                 f"OpenTopography did not return a TIFF. Response began: {preview}"
             )
