@@ -50,6 +50,15 @@ class LayerSource(Protocol):
     endpoints_used (WMS server addresses), but ElevationSource has no equivalent.
     Consumers must read such attributes with getattr(source, 'attribute_name',
     default_value) to handle sources that do not expose them.
+
+    The same convention covers optional zero-argument methods, not only
+    attributes: ElevationSource defines readiness_problem() -> str | None,
+    read the same defensive way (getattr(source, 'readiness_problem', None),
+    called only if present), which package.py's estimate_survey uses to
+    surface a missing API key as a warning on the estimate without knowing
+    "elevation" by name. Any future source with its own pre-flight
+    prerequisite gets the same treatment for free by defining the same
+    method; a source with nothing to check simply omits it.
     """
 
     id: str
