@@ -491,8 +491,16 @@ def test_extent_endpoint_returns_tile_geometry_with_no_region_site_or_output_roo
         {"bbox": "-3.29,51.38,-3.28,51.39", "tile_size_m": 600, "overlap_m": 50},
     )
     assert status == 200
-    assert payload["tiles"] >= 1
     assert set(payload) == {"tiles", "rows", "cols", "extent_km"}
+    # Review round 1: "tiles >= 1" alone survives _geometry_summary
+    # returning len(tiles) + 1, or rows/cols swapped, or any other
+    # off-by-something. This exact bbox/tile_size/overlap combination is
+    # independently confirmed elsewhere in this suite (test_geo.py's own
+    # build_tiles tests) to be a 2x2 grid, four tiles named r00_c00
+    # through r01_c01: asserted against those known numbers directly.
+    assert payload["tiles"] == 4
+    assert payload["rows"] == 2
+    assert payload["cols"] == 2
 
 
 def test_extent_endpoint_defaults_tile_size_and_overlap_like_estimate_does(server):
@@ -1225,6 +1233,18 @@ def test_index_html_references_at_least_one_local_asset():
     # quotes, the parametrised test below would silently collect zero cases
     # and report nothing to check instead of failing loudly.
     assert _REFERENCED_ASSETS, "expected index.html to reference at least one local file"
+
+
+def test_api_key_field_is_type_password():
+    # Review round 1: this was previously asserted nowhere. The brief
+    # requires type="password" specifically so the key is never shown in
+    # plain text on screen; flipping it to type="text" passed every
+    # existing test in both suites.
+    match = re.search(r"<input\b[^>]*id=\"opentopo-key\"[^>]*>", _INDEX_HTML_SOURCE)
+    assert match, 'expected an <input id="opentopo-key"> element in index.html'
+    assert 'type="password"' in match.group(0), (
+        f'expected the API key field to be type="password", got: {match.group(0)}'
+    )
 
 
 def test_root_is_served_as_html(server):

@@ -450,6 +450,12 @@ def test_estimate_folder_reflects_an_existing_02_collision(tmp_path):
 
 
 def test_estimate_geometry_matches_estimate_survey_for_the_same_inputs(tmp_path):
+    # Review round 1: this compares two callers of the same shared
+    # helper, so it cannot fail on its own if that helper's maths is
+    # simply wrong in the same way for both callers (len(tiles) + 1,
+    # rows/cols swapped, ...). Kept because it genuinely does prove the
+    # two functions cannot silently diverge from each other, but paired
+    # with the test below, which pins the actual numbers independently.
     register(StubSource())
     request = _request(tmp_path)
     survey_estimate = estimate_survey(request)
@@ -460,6 +466,21 @@ def test_estimate_geometry_matches_estimate_survey_for_the_same_inputs(tmp_path)
         "cols": survey_estimate["cols"],
         "extent_km": survey_estimate["extent_km"],
     }
+
+
+def test_estimate_geometry_reports_the_exact_known_tile_count_and_grid():
+    # BBOX at 600m/50m is confirmed a 2x2 grid, four tiles named r00_c00
+    # through r01_c01, independently by test_geo.py's own build_tiles
+    # tests and by this file's per-tile tests elsewhere (e.g.
+    # test_a_failing_tile_does_not_corrupt_the_status_of_tiles_that_
+    # already_succeeded references all four by name). Asserted against
+    # those known numbers directly: "tiles >= 1" would not have caught
+    # _geometry_summary returning len(tiles) + 1, which passes every
+    # other test in both suites.
+    geometry = estimate_geometry(BBOX, 600.0, 50.0)
+    assert geometry["tiles"] == 4
+    assert geometry["rows"] == 2
+    assert geometry["cols"] == 2
 
 
 def test_estimate_geometry_needs_no_region_site_or_output_root():
