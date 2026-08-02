@@ -52,6 +52,25 @@ SEARCH_HIT = [
 # error status.
 SEARCH_NO_HIT = []
 
+# A second, distinctly different hit for the same query text: real place
+# names collide (there is more than one "Barry"/"Barrie" in the world),
+# which is exactly why the typeahead needs several results, not just one.
+SEARCH_HIT_SECOND = {
+    "place_id": 257499001,
+    "licence": "Data © OpenStreetMap contributors, ODbL 1.0. https://osm.org/copyright",
+    "osm_type": "node",
+    "osm_id": 998877,
+    "boundingbox": ["44.3600000", "44.4200000", "-79.7200000", "-79.6300000"],
+    "lat": "44.3894",
+    "lon": "-79.6903",
+    "display_name": "Barrie, Simcoe County, Ontario, Canada",
+    "class": "place",
+    "type": "town",
+    "importance": 0.55,
+}
+
+SEARCH_HITS_MULTIPLE = [SEARCH_HIT[0], SEARCH_HIT_SECOND]
+
 REVERSE_HIT = {
     "place_id": 98765432,
     "licence": "Data © OpenStreetMap contributors, ODbL 1.0. https://osm.org/copyright",
@@ -119,8 +138,16 @@ def _client(responses, **kwargs):
 
 def test_search_returns_a_bbox_from_a_real_shaped_hit():
     client = _client([FakeGeocodeResponse(payload=SEARCH_HIT)])
-    result = client.search("Barry, Wales")
-    assert result == GeocodeResult(west=-3.31, south=51.38, east=-3.25, north=51.43)
+    results = client.search("Barry, Wales")
+    assert results == [
+        GeocodeResult(
+            display_name="Barry, Vale of Glamorgan, Wales, United Kingdom",
+            west=-3.31,
+            south=51.38,
+            east=-3.25,
+            north=51.43,
+        )
+    ]
 
 
 def test_search_sends_the_query_and_a_real_user_agent():
@@ -133,6 +160,38 @@ def test_search_sends_the_query_and_a_real_user_agent():
     assert "github.com" in kwargs["headers"]["User-Agent"]
 
 
+def test_search_requests_five_results_by_default():
+    # Task 18's own named regression: this used to be limit=1, which is
+    # why place search could only ever jump to a single guess instead of
+    # behaving like a typeahead with enough hits to disambiguate.
+    client = _client([FakeGeocodeResponse(payload=SEARCH_HIT)])
+    client.search("Barry")
+    _url, kwargs = client.session.calls[0]
+    assert kwargs["params"]["limit"] == 5
+
+
+def test_search_honours_an_explicit_limit():
+    client = _client([FakeGeocodeResponse(payload=SEARCH_HIT)])
+    client.search("Barry", limit=3)
+    _url, kwargs = client.session.calls[0]
+    assert kwargs["params"]["limit"] == 3
+
+
+def test_search_returns_multiple_hits_in_nominatims_own_order():
+    client = _client([FakeGeocodeResponse(payload=SEARCH_HITS_MULTIPLE)])
+    results = client.search("Barry")
+    assert len(results) == 2
+    assert results[0].display_name == "Barry, Vale of Glamorgan, Wales, United Kingdom"
+    assert results[1].display_name == "Barrie, Simcoe County, Ontario, Canada"
+    assert results[1] == GeocodeResult(
+        display_name="Barrie, Simcoe County, Ontario, Canada",
+        west=-79.72,
+        south=44.36,
+        east=-79.63,
+        north=44.42,
+    )
+
+
 def test_search_passes_the_configured_timeout():
     client = _client([FakeGeocodeResponse(payload=SEARCH_HIT)], timeout_seconds=3.5)
     client.search("Barry")
@@ -140,9 +199,9 @@ def test_search_passes_the_configured_timeout():
     assert kwargs["timeout"] == 3.5
 
 
-def test_search_returns_none_for_no_hit():
+def test_search_returns_an_empty_list_for_no_hit():
     client = _client([FakeGeocodeResponse(payload=SEARCH_NO_HIT)])
-    assert client.search("nowhere at all") is None
+    assert client.search("nowhere at all") == []
 
 
 def test_search_raises_for_a_non_200_status():
@@ -168,6 +227,29 @@ def test_search_raises_when_boundingbox_is_missing():
     hit = [{**SEARCH_HIT[0]}]
     del hit[0]["boundingbox"]
     client = _client([FakeGeocodeResponse(payload=hit)])
+    with pytest.raises(GeocodeError, match="expected shape"):
+        client.search("Barry")
+
+
+def test_search_raises_when_display_name_is_missing():
+    # display_name is new load-bearing data as of Task 18: it is what the
+    # typeahead shows to let two hits be told apart, so a hit missing it
+    # is exactly as unusable as one missing its bounding box.
+    hit = [{**SEARCH_HIT[0]}]
+    del hit[0]["display_name"]
+    client = _client([FakeGeocodeResponse(payload=hit)])
+    with pytest.raises(GeocodeError, match="expected shape"):
+        client.search("Barry")
+
+
+def test_search_raises_when_one_hit_among_several_is_malformed():
+    # A single bad hit invalidates the whole call rather than silently
+    # dropping just that one entry, the same rule the single-hit shape
+    # checks have always applied.
+    good_hit = {**SEARCH_HIT[0]}
+    bad_hit = {**SEARCH_HIT_SECOND}
+    del bad_hit["boundingbox"]
+    client = _client([FakeGeocodeResponse(payload=[good_hit, bad_hit])])
     with pytest.raises(GeocodeError, match="expected shape"):
         client.search("Barry")
 

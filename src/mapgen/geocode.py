@@ -38,6 +38,10 @@ from mapgen import __version__
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 DEFAULT_MAX_QUEUE = 3
+# Task 18: place search became a typeahead, which needs enough hits to let
+# someone tell two similarly-named places apart, not just the single best
+# guess the old one-shot search jumped to. 5 is the brief's own figure.
+DEFAULT_SEARCH_LIMIT = 5
 
 # "AppName/version (+url)" is the conventional shape for a self-identifying
 # bot/tool User-Agent, and is explicitly acceptable under Nominatim's
@@ -150,8 +154,12 @@ class GeocodeRateLimiter:
 
 @dataclass(frozen=True)
 class GeocodeResult:
-    """A bounding box for a place-search hit. Field names match BBox's."""
+    """One place-search hit: a bounding box (field names match BBox's) plus
+    Nominatim's own display_name, which is what lets a person tell two
+    hits called the same thing apart in a typeahead list.
+    """
 
+    display_name: str
     west: float
     south: float
     east: float
@@ -213,8 +221,9 @@ class NominatimClient:
         except ValueError as exc:
             raise GeocodeError("Nominatim's response was not valid JSON.") from exc
 
-    def search(self, query: str) -> GeocodeResult | None:
-        """A bounding box for the first hit, or None if there was no hit.
+    def search(self, query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> list[GeocodeResult]:
+        """Up to `limit` matching hits, most relevant first, or an empty
+        list if nothing matched.
 
         Nominatim answers "nothing matched" with HTTP 200 and an empty
         JSON array, not an error status, so that case is distinguished
@@ -222,24 +231,34 @@ class NominatimClient:
         that is not a JSON array at all is a genuine shape mismatch and
         does raise: conflating "no results" with "the response was not
         even the right kind of thing" would hide a real break behind a
-        message that reads exactly like a normal empty search.
+        message that reads exactly like a normal empty search. A single
+        malformed hit anywhere in an otherwise-good list raises for the
+        whole call rather than silently dropping just that one entry,
+        matching how a single-hit shape mismatch has always been treated.
         """
-        payload = self._get(NOMINATIM_SEARCH_URL, {"format": "json", "limit": 1, "q": query})
+        payload = self._get(
+            NOMINATIM_SEARCH_URL, {"format": "json", "limit": limit, "q": query}
+        )
         if not isinstance(payload, list):
             raise GeocodeError("Nominatim's search response was not in the expected shape.")
-        if not payload:
-            return None
-        hit = payload[0]
-        try:
-            # Nominatim's own field order, and the values are strings, not
-            # numbers: ["south", "north", "west", "east"], each a decimal
-            # string such as "51.3800000".
-            south, north, west, east = (float(v) for v in hit["boundingbox"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise GeocodeError(
-                "Nominatim's search response was not in the expected shape."
-            ) from exc
-        return GeocodeResult(west=west, south=south, east=east, north=north)
+        results = []
+        for hit in payload:
+            try:
+                # Nominatim's own field order, and the values are strings,
+                # not numbers: ["south", "north", "west", "east"], each a
+                # decimal string such as "51.3800000".
+                south, north, west, east = (float(v) for v in hit["boundingbox"])
+                display_name = str(hit["display_name"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise GeocodeError(
+                    "Nominatim's search response was not in the expected shape."
+                ) from exc
+            results.append(
+                GeocodeResult(
+                    display_name=display_name, west=west, south=south, east=east, north=north
+                )
+            )
+        return results
 
     def reverse(self, lat: float, lon: float) -> ReverseResult:
         """Best-effort region and site names for a point.
