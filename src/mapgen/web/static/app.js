@@ -1,6 +1,16 @@
 const token = new URLSearchParams(location.search).get("token") || "";
 const $ = (id) => document.getElementById(id);
 
+// Nominatim display names are untrusted external text that ends up in
+// innerHTML rather than textContent. Escaped once, here, rather than
+// trusted at each call site.
+function escapeHtml(value) {
+  return String(value).replace(
+    /[&<>"']/g,
+    (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])
+  );
+}
+
 let bbox = null;
 let rectangle = null;
 let drawing = false;
@@ -71,34 +81,91 @@ function setBBox(next, fit = true) {
   refreshEstimate();
 }
 
+// --- draw extent: click a corner, move, click the opposite corner ------
+//
+// The button click only arms the tool; nothing is drawn by pressing it.
+// The first map click fixes one corner. Every mousemove after that
+// redraws a live preview rectangle from that corner to the cursor, the
+// way any ordinary map tool's rubber-band selection behaves; the second
+// click fixes the opposite corner and commits it via setBBox, the one
+// place that actually replaces the committed extent. The preview
+// rectangle is its own separate layer specifically so a cancelled draw
+// (Escape) can remove only the preview and never touch whatever extent
+// was already committed.
+
+let firstCorner = null;
+let previewRectangle = null;
+
+function disarmDrawing() {
+  drawing = false;
+  firstCorner = null;
+  if (previewRectangle) {
+    map.removeLayer(previewRectangle);
+    previewRectangle = null;
+  }
+  $("draw").textContent = "Draw extent";
+  $("draw").className = "";
+  map.getContainer().style.cursor = "";
+}
+
 $("draw").addEventListener("click", () => {
+  // Always starts from a clean slate: clicking the button again mid-draw
+  // discards whatever corner and preview rectangle already existed,
+  // rather than leaving them stranded with no way back short of Escape.
+  disarmDrawing();
   drawing = true;
-  $("draw").textContent = "Click two corners";
+  $("draw").textContent = "Click a corner";
+  $("draw").className = "armed";
   map.getContainer().style.cursor = "crosshair";
 });
 
-let firstCorner = null;
 map.on("click", (event) => {
   if (!drawing) return;
   if (!firstCorner) {
     firstCorner = event.latlng;
+    $("draw").textContent = "Click the opposite corner";
     return;
   }
   const a = firstCorner;
   const b = event.latlng;
-  setBBox(
-    {
-      west: Math.min(a.lng, b.lng),
-      south: Math.min(a.lat, b.lat),
-      east: Math.max(a.lng, b.lng),
-      north: Math.max(a.lat, b.lat),
-    },
-    false
-  );
-  firstCorner = null;
-  drawing = false;
-  $("draw").textContent = "Draw extent";
-  map.getContainer().style.cursor = "";
+  const finished = {
+    west: Math.min(a.lng, b.lng),
+    south: Math.min(a.lat, b.lat),
+    east: Math.max(a.lng, b.lng),
+    north: Math.max(a.lat, b.lat),
+  };
+  disarmDrawing();
+  setBBox(finished, false);
+});
+
+map.on("mousemove", (event) => {
+  if (!drawing || !firstCorner) return;
+  const bounds = [
+    [firstCorner.lat, firstCorner.lng],
+    [event.latlng.lat, event.latlng.lng],
+  ];
+  if (previewRectangle) {
+    previewRectangle.setBounds(bounds);
+  } else {
+    previewRectangle = L.rectangle(bounds, {
+      color: "#2f5d4f",
+      weight: 1,
+      dashArray: "4",
+      fillOpacity: 0.04,
+    });
+    previewRectangle.addTo(map);
+  }
+});
+
+// Escape cancels a drawing in progress and disarms, leaving any previous
+// extent untouched: disarmDrawing only ever removes the PREVIEW
+// rectangle, never the committed one setBBox owns. Bound on document
+// rather than the map container, so it fires regardless of which element
+// currently has focus, including none.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && drawing) {
+    disarmDrawing();
+  }
 });
 
 $("bbox").addEventListener("change", () => {
@@ -147,15 +214,101 @@ $("bbox").addEventListener("change", () => {
 // queue bound itself, not this, is what actually protects against a
 // failing or slow Nominatim piling up work, from any tab.
 
+// Task 18 turned this from a one-shot search (fetch one result, jump) into
+// a typeahead: as you type, up to five matches appear below the field and
+// narrow with each character. Clicking one, or choosing it with the arrow
+// keys and Enter, moves the map and sets the extent. The request shape and
+// staleness guards below are unchanged from the one-shot version; only
+// what happens with the response (a list to browse, not a single bbox to
+// jump to immediately) is new.
+
 const PLACE_DEBOUNCE_MS = 400;
 let placeDebounce = null;
 let placeSearchController = null;
+let placeMatches = [];
+let placeHighlighted = -1;
 
-$("place").addEventListener("change", () => {
+function closePlaceResults() {
+  placeMatches = [];
+  placeHighlighted = -1;
+  const list = $("place-results");
+  list.hidden = true;
+  list.innerHTML = "";
+}
+
+function renderPlaceResults() {
+  const list = $("place-results");
+  list.innerHTML = placeMatches
+    .map(
+      (match, index) =>
+        `<li data-index="${index}" class="${index === placeHighlighted ? "active" : ""}">` +
+        `${escapeHtml(match.display_name)}</li>`
+    )
+    .join("");
+  list.hidden = false;
+}
+
+function showPlaceMessage(message) {
+  const list = $("place-results");
+  list.innerHTML = `<li class="empty">${escapeHtml(message)}</li>`;
+  list.hidden = false;
+}
+
+function choosePlaceMatch(match) {
+  $("place").value = match.display_name;
+  closePlaceResults();
+  setBBox({ west: match.west, south: match.south, east: match.east, north: match.north });
+}
+
+$("place").addEventListener("input", () => {
   clearTimeout(placeDebounce);
   const query = $("place").value.trim();
-  if (!query) return;
+  if (!query) {
+    closePlaceResults();
+    return;
+  }
   placeDebounce = setTimeout(() => runPlaceSearch(query), PLACE_DEBOUNCE_MS);
+});
+
+$("place").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    // Cancels a pending debounced search too, not just the visible list:
+    // otherwise a query typed right before Escape still fires moments
+    // later with nothing on screen to explain why the map just moved.
+    clearTimeout(placeDebounce);
+    if (placeSearchController) placeSearchController.abort();
+    closePlaceResults();
+    return;
+  }
+  if (!placeMatches.length) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    placeHighlighted = (placeHighlighted + 1) % placeMatches.length;
+    renderPlaceResults();
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    placeHighlighted = (placeHighlighted - 1 + placeMatches.length) % placeMatches.length;
+    renderPlaceResults();
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    choosePlaceMatch(placeMatches[placeHighlighted >= 0 ? placeHighlighted : 0]);
+  }
+});
+
+// Clicking away closes the list. A plain blur-closes-immediately would
+// fire before a click on a result finishes registering (blur precedes
+// click when the click target is outside the field), so this waits a
+// moment first; choosePlaceMatch, above, closes the list itself the
+// instant a choice is made, so the delay is never visible on the
+// successful path.
+$("place").addEventListener("blur", () => {
+  setTimeout(closePlaceResults, 150);
+});
+
+$("place-results").addEventListener("click", (event) => {
+  const item = event.target.closest("li[data-index]");
+  if (!item) return;
+  choosePlaceMatch(placeMatches[Number(item.dataset.index)]);
 });
 
 async function runPlaceSearch(query) {
@@ -163,22 +316,32 @@ async function runPlaceSearch(query) {
   const controller = new AbortController();
   placeSearchController = controller;
   try {
-    const result = await api(`/api/geocode?q=${encodeURIComponent(query)}`, {
+    const results = await api(`/api/geocode?q=${encodeURIComponent(query)}`, {
       signal: controller.signal,
     });
-    setBBox({ west: result.west, south: result.south, east: result.east, north: result.north });
+    placeMatches = results;
+    placeHighlighted = -1;
+    if (placeMatches.length) {
+      renderPlaceResults();
+    } else {
+      showPlaceMessage(`No matches for "${query}"`);
+    }
   } catch (error) {
     if (error.name === "AbortError") return; // superseded by a newer search
+    placeMatches = [];
+    placeHighlighted = -1;
     if (error.status === 404) {
       // The server's own "no match for ..." message, worth showing as is.
-      showEstimateError(error.message);
+      showPlaceMessage(error.message);
     } else if (error.status === 429) {
-      showEstimateError("Too many geocoding requests right now. Try again in a moment.");
+      showPlaceMessage("Too many searches right now. Try again in a moment.");
     } else {
       // Geocoding is down, rate-limited, or slow enough to have timed out
       // server-side. The map is exactly as usable as before the search:
-      // draw the extent or paste coordinates.
-      showEstimateError("Place search is unavailable right now. Draw the extent or paste coordinates instead.");
+      // draw the extent or paste coordinates. Shown in the results list,
+      // not the estimate panel: a place-search hiccup should not disable
+      // an otherwise-valid download.
+      showPlaceMessage("Place search is unavailable right now. Draw the extent or paste coordinates instead.");
     }
   } finally {
     if (placeSearchController === controller) placeSearchController = null;
@@ -229,7 +392,39 @@ function payload() {
     overlap_m: parseFloat($("overlap").value),
     keep_work: $("keep-work").checked,
     sources: [...document.querySelectorAll("#sources input:checked")].map((i) => i.value),
+    // The OpenTopography key deliberately never travels through here.
+    // ElevationSource reads it server-side from the saved config (or the
+    // environment) at estimate/fetch time, so it never needs to appear in
+    // a job's request payload, and from there never in survey.json or the
+    // job log the payload's fields could otherwise end up echoed into.
   };
+}
+
+// Names the field or fields actually missing, rather than a fixed message
+// regardless of which ones are empty: a region already filled by the
+// reverse lookup must not be told to "enter a region" alongside a genuinely
+// empty site. Returns null once bbox, region and site are all present.
+function missingFieldsMessage() {
+  const clauses = [];
+  if (!bbox) clauses.push("draw or paste an extent");
+  const namesMissing = [];
+  if (!$("region").value.trim()) namesMissing.push("region");
+  if (!$("site").value.trim()) namesMissing.push("site");
+  if (namesMissing.length) clauses.push(`enter a ${namesMissing.join(" and ")}`);
+  if (!clauses.length) return null;
+  const sentence = `${clauses.join(" and ")} to see an estimate.`;
+  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
+}
+
+function formatGeometryLine(geometry) {
+  const area = (geometry.extent_km.width * geometry.extent_km.height).toFixed(2);
+  const tileWord = geometry.tiles === 1 ? "tile" : "tiles";
+  return `${area} km² · ${geometry.tiles} ${tileWord} (${geometry.rows} x ${geometry.cols})`;
+}
+
+function hideFolderPreview() {
+  $("folder-preview").hidden = true;
+  $("folder-preview-path").textContent = "";
 }
 
 function showEstimateError(message) {
@@ -237,15 +432,47 @@ function showEstimateError(message) {
   box.className = "estimate error";
   box.textContent = message;
   $("download").disabled = true;
+  hideFolderPreview();
 }
 
 async function refreshEstimate() {
-  if (!bbox || !$("region").value.trim() || !$("site").value.trim()) {
+  const missing = missingFieldsMessage();
+
+  if (!bbox) {
     $("estimate").className = "estimate";
-    $("estimate").textContent = "Enter a region and site to see an estimate.";
+    $("estimate").textContent = missing;
     $("download").disabled = true;
+    hideFolderPreview();
     return;
   }
+
+  if (missing) {
+    // A region or site is still missing, but the extent alone is enough
+    // for a live geometry preview: tile count and area, the same numbers
+    // a full estimate would report, from the one endpoint that needs no
+    // name at all. Drawing a rectangle used to tell you nothing until a
+    // region and site were typed; this is what fixes that.
+    $("estimate").className = "estimate";
+    $("download").disabled = true;
+    hideFolderPreview();
+    try {
+      const geometry = await api("/api/extent", {
+        method: "POST",
+        body: JSON.stringify({
+          bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
+          tile_size_m: parseFloat($("tile-size").value),
+          overlap_m: parseFloat($("overlap").value),
+        }),
+      });
+      $("estimate").innerHTML = `${formatGeometryLine(geometry)}<br />${escapeHtml(missing)}`;
+    } catch (error) {
+      // Geometry is a nice-to-have while the names are still incomplete;
+      // a hiccup here should not block the missing-fields message itself.
+      $("estimate").textContent = missing;
+    }
+    return;
+  }
+
   try {
     const data = await api("/api/estimate", {
       method: "POST",
@@ -253,11 +480,25 @@ async function refreshEstimate() {
     });
     const minutes = Math.max(1, Math.round(data.seconds_estimate / 60));
     $("estimate").className = "estimate";
-    $("estimate").innerHTML =
+    let html =
       `<strong>${data.extent_km.width.toFixed(2)} x ${data.extent_km.height.toFixed(2)} km</strong><br />` +
       `${data.tiles} tiles (${data.rows} x ${data.cols})<br />` +
       `around ${Math.round(data.bytes_estimate / 1e6)} MB, about ${minutes} min`;
+    if (data.warnings && data.warnings.length) {
+      html += `<span class="estimate-warning">${data.warnings.map(escapeHtml).join("<br />")}</span>`;
+    }
+    $("estimate").innerHTML = html;
     $("download").disabled = false;
+    // The exact path naming.build_package_paths composed for this request,
+    // not a guess assembled here: this is read straight into Grasshopper,
+    // so it has to be the same path the download itself will create, from
+    // the same server-side code that creates it.
+    if (data.folder) {
+      $("folder-preview-path").textContent = data.folder;
+      $("folder-preview").hidden = false;
+    } else {
+      hideFolderPreview();
+    }
     // Only persist output-root/tile-size/overlap once they have actually
     // passed an estimate, which is the same call that would reject, for
     // example, an output root too long for Windows' path limit. Wiring
@@ -272,7 +513,7 @@ async function refreshEstimate() {
   }
 }
 
-["region", "site", "tile-size", "overlap", "output-root"].forEach((id) =>
+["region", "site", "tile-size", "overlap", "output-root", "opentopo-key"].forEach((id) =>
   $(id).addEventListener("change", refreshEstimate)
 );
 
@@ -346,6 +587,15 @@ function maybePersistFieldSettings() {
   $(id).addEventListener("change", maybePersistFieldSettings)
 );
 
+// The API key has no equivalent to check_path_length: estimate_survey
+// never rejects the estimate over it, only adds a warning alongside a
+// still-successful one (see readiness_problem in mapgen.sources.elevation),
+// so there is no "value the estimate just rejected" case to defer past.
+// Persisted immediately, unconditionally, unlike the three fields above.
+$("opentopo-key").addEventListener("change", () => {
+  persistConfig({ opentopography_api_key: $("opentopo-key").value });
+});
+
 // --- job -------------------------------------------------------------
 
 function log(message, failed = false) {
@@ -417,15 +667,22 @@ $("cancel").addEventListener("click", async () => {
     $("output-root").value = config.output_root;
     $("tile-size").value = config.tile_size_m;
     $("overlap").value = config.overlap_m;
+    $("opentopo-key").value = config.opentopography_api_key || "";
     if (config.last_region) $("region").value = config.last_region;
     savedConfig = config;
 
     const sources = await api("/api/sources");
+    // Every source, elevation included, is ticked by default. Elevation
+    // needing a key is not a reason to untick it here: the owner's own
+    // ruling was to keep it selected and surface a plain warning on the
+    // estimate instead (see readiness_problem/estimate_survey), so a key
+    // typed in the field just above takes effect without ever having to
+    // remember to re-tick a layer that was silently switched off.
     $("sources").innerHTML = sources
       .map(
         (s) => `
         <label title="${s.licence}">
-          <input type="checkbox" value="${s.id}" ${s.id === "elevation" ? "" : "checked"} />
+          <input type="checkbox" value="${s.id}" checked />
           <span>${s.display_name}${s.requires_api_key ? " (needs an API key)" : ""}</span>
         </label>`
       )

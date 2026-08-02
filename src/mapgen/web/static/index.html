@@ -29,7 +29,10 @@
         <div id="map"></div>
         <div class="map-tools">
           <button id="draw" type="button">Draw extent</button>
-          <input id="place" type="search" placeholder="Search a place name" />
+          <div class="place-search">
+            <input id="place" type="search" placeholder="Search a place name" autocomplete="off" />
+            <ul id="place-results" class="place-results" hidden></ul>
+          </div>
           <input id="bbox" type="text" placeholder="or paste west,south,east,north" />
         </div>
       </section>
@@ -45,9 +48,11 @@
         <div class="row">
           <label>Tile size (m)
             <input id="tile-size" type="number" min="500" step="100" value="2000" />
+            <span class="hint">Cuts the extent into tiles this many metres across. The OSM map API refuses any request over 50000 nodes, and a tile that dense fails rather than retrying automatically, so smaller tiles trade more requests for a lower chance of hitting that limit. 2000 m suits most sites; dense city centres want 1000 m or less.</span>
           </label>
           <label>Overlap (m)
             <input id="overlap" type="number" min="0" step="10" value="100" />
+            <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
           </label>
         </div>
 
@@ -55,6 +60,10 @@
           <legend>Layers</legend>
           <div id="sources"></div>
         </fieldset>
+
+        <label>OpenTopography API key
+          <input id="opentopo-key" type="password" placeholder="Only needed for the elevation layer" autocomplete="off" />
+        </label>
 
         <label>Output root
           <input id="output-root" type="text" />
@@ -66,6 +75,11 @@
         </label>
 
         <div id="estimate" class="estimate">Draw or paste an extent to see an estimate.</div>
+
+        <div id="folder-preview" class="folder-preview" hidden>
+          <span class="folder-preview-label">Will create</span>
+          <code id="folder-preview-path"></code>
+        </div>
 
         <button id="download" type="button" class="primary" disabled>Download package</button>
         <button id="cancel" type="button" class="danger" hidden>Cancel</button>
