@@ -1104,17 +1104,25 @@ def test_build_server_wires_a_real_nominatim_client_by_default():
 # Leaflet's own source is third-party and not written here, and auditing
 # its comments or sourcemap references for incidental URL-shaped strings
 # is a different question from the one this test asks, which is whether
-# OUR code calls out to an unexpected host. .svg is scanned too, since it
-# is XML text that the server serves and could carry an embedded
-# <image href="https://..."> the same as HTML can; .png is not, since a
+# OUR code calls out to an unexpected host. .svg and .json are scanned
+# too: .svg is XML text the server serves and could carry an embedded
+# <image href="https://..."> the same as HTML can, and .json is served by
+# _serve_static the same as any other extension even though nothing under
+# static/ happens to be JSON today (like .svg, this is inert until one
+# exists, which is fine: the point is that adding one does not also
+# require remembering to extend this list). .png is not scanned, since a
 # raster image is binary with nothing meaningfully greppable as a URL in
 # the sense that anything in this codebase's rendering path would ever
 # fetch from.
 #
 # This catches an honestly reintroduced call, the actual regression that
-# happened here, and a plain protocol-relative one in a quoted or
-# templated string. It is not a security boundary against someone
-# deliberately hiding a host: string concatenation split across literals
+# happened here, and a protocol-relative host in any of its ordinary
+# forms: quoted ("//host", '//host', `//host`), an unquoted HTML
+# attribute (src=//host), or an unquoted CSS url(//host). Those three are
+# honest, common ways to write a URL, not concealment, so leaving them
+# unmatched was a gap more likely to be hit by accident than found by
+# someone hiding something. It is still not a security boundary against
+# actual concealment: string concatenation split across literals
 # ("https:/" + "/host") and a template literal with the hostname held in
 # a variable rather than written out both defeat any text-level check,
 # since in the second case the actual host is not present as text in this
@@ -1127,17 +1135,16 @@ _ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org"}
 # unanchored: this is what already catches a form action, a CSS url(...),
 # or an ES import, none of which need their own special case, simply
 # because the scheme makes the reference unambiguous wherever it appears),
-# or after a bare "//" specifically when it is opened by a quote or
-# backtick, which is what a protocol-relative fetch("//host/...") or
-# src="//host/..." actually looks like in source. The quote anchor is the
-# difference from also matching "//" as it starts an ordinary line
-# comment, which every file here otherwise has many of.
-_URL_HOST_RE = re.compile(r'(?:https?:|["\'`])//([a-zA-Z0-9.-]+)', re.IGNORECASE)
+# or after a bare "//" opened by a quote, a backtick, an unescaped "(" (an
+# unquoted CSS url(//host)), or "=" (an unquoted HTML src=//host). The
+# anchor set is what stops this also matching "//" as it starts an
+# ordinary line comment, which every file here otherwise has many of.
+_URL_HOST_RE = re.compile(r'(?:https?:|["\'`(=])//([a-zA-Z0-9.-]+)', re.IGNORECASE)
 
 
 def _authored_static_files() -> list[Path]:
     files: list[Path] = []
-    for pattern in ("*.html", "*.css", "*.js", "*.svg"):
+    for pattern in ("*.html", "*.css", "*.js", "*.svg", "*.json"):
         files.extend(STATIC_DIR.rglob(pattern))
     return sorted(p for p in files if "vendor" not in p.relative_to(STATIC_DIR).parts)
 

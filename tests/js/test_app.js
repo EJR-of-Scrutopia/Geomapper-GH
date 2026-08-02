@@ -25,8 +25,21 @@ const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
 
-const APP_JS_PATH = path.join(__dirname, "..", "..", "src", "mapgen", "web", "static", "app.js");
+const STATIC_DIR = path.join(__dirname, "..", "..", "src", "mapgen", "web", "static");
+const APP_JS_PATH = path.join(STATIC_DIR, "app.js");
+const INDEX_HTML_PATH = path.join(STATIC_DIR, "index.html");
 const SOURCE = fs.readFileSync(APP_JS_PATH, "utf8");
+
+// Every id $() is allowed to find, read from the real, committed markup
+// rather than hand-listed here, the same "derive, don't duplicate"
+// reasoning as the Python asset-reference test. This is what closes the
+// gap a re-review found: a mock getElementById that invents an element
+// for any id it is asked for cannot tell a typo'd $("draww") from a real
+// $("draw"), so a typo that would throw and blank the whole page in a
+// real browser instead ran clean here, 12/12, exit 0.
+const KNOWN_IDS = new Set(
+  Array.from(fs.readFileSync(INDEX_HTML_PATH, "utf8").matchAll(/\bid="([^"]+)"/g), (m) => m[1])
+);
 
 // --- minimal DOM -----------------------------------------------------
 
@@ -70,6 +83,16 @@ function makeDocument() {
   const elements = new Map();
   return {
     getElementById(id) {
+      // A real getElementById returns null, not a fresh element, for an
+      // id nothing in the document defines. Checking against KNOWN_IDS
+      // (parsed from the real index.html) rather than auto-vivifying
+      // whatever app.js asks for means a typo in a $("...") call is
+      // handed a null here exactly as a browser would, and app.js's own
+      // top-level `$(id).addEventListener(...)` calls throw on it
+      // immediately, which fails every test in this file at once: the
+      // same "kills the whole page" severity a real typo has, not a
+      // single quiet gap.
+      if (!KNOWN_IDS.has(id)) return null;
       if (!elements.has(id)) elements.set(id, makeElement(id));
       return elements.get(id);
     },
@@ -123,6 +146,21 @@ function makeFetchStub(router) {
   const calls = [];
   const fetchFn = async (input, options = {}) => {
     const url = input instanceof URL ? input : new URL(String(input), FETCH_ORIGIN);
+    // The Leaflet mock never touches fetch() at all (tile loading is
+    // stubbed away entirely, see makeLeaflet), so every call that ever
+    // reaches here comes from app.js's own api() and must be loopback:
+    // there is no legitimate case in this harness for a different
+    // origin. Asserted on the parsed origin, not the raw string, so a
+    // host assembled at runtime (["evil","example","net"].join(".")) is
+    // still caught: by the time it is a URL object, the pieces have
+    // already been joined, whether they were ever one literal or not.
+    if (url.origin !== FETCH_ORIGIN) {
+      throw new Error(
+        `fetch() called ${url.origin}, not the page's own origin (${FETCH_ORIGIN}). ` +
+          `The page must never talk to anything but this origin and the map tile servers ` +
+          `(which this harness never routes through fetch() at all).`
+      );
+    }
     const call = { url, options };
     calls.push(call);
     const response = await router(url, options, call);
@@ -298,8 +336,18 @@ function ok(condition, message) {
       const call = fetchCalls.find((c) => c.url.pathname === "/api/reverse");
       ok(call, "expected a /api/reverse call");
       ok(call.url.searchParams.get("token") === DEFAULT_TOKEN);
-      ok(call.url.searchParams.get("lat") !== null, "lat missing or corrupted");
-      ok(call.url.searchParams.get("lon") !== null, "lon missing or corrupted");
+      // "!== null" alone passes on corrupted data too: the original bug's
+      // failure mode was lon coming back as the non-null string
+      // "-3.285?token=abc", the token glued onto it rather than missing.
+      // A clean-decimal-number check, plus the actual expected value
+      // (the bbox's centre), catches that a null check cannot.
+      const lat = call.url.searchParams.get("lat");
+      const lon = call.url.searchParams.get("lon");
+      const CLEAN_DECIMAL = /^-?\d+(\.\d+)?$/;
+      ok(lat !== null && CLEAN_DECIMAL.test(lat), `lat was ${JSON.stringify(lat)}, expected a clean decimal`);
+      ok(lon !== null && CLEAN_DECIMAL.test(lon), `lon was ${JSON.stringify(lon)}, expected a clean decimal`);
+      ok(Math.abs(parseFloat(lat) - 51.385) < 1e-9, `lat was ${lat}, expected the bbox centre 51.385`);
+      ok(Math.abs(parseFloat(lon) - -3.285) < 1e-9, `lon was ${lon}, expected the bbox centre -3.285`);
     }
   );
 
@@ -523,7 +571,8 @@ function ok(condition, message) {
       ok(sandbox.document.getElementById("cancel").hidden === false, "expected cancel showing once started");
       ok(sandbox.document.getElementById("download").disabled === true, "expected download disabled once started");
       await flush(900); // past one 700ms poll interval, which fails
-      ok(pollCount >= 1, "expected at least one poll attempt");
+      const pollCountAfterFailure = pollCount;
+      ok(pollCountAfterFailure >= 1, "expected at least one poll attempt");
       ok(sandbox.document.getElementById("cancel").hidden === true, "expected cancel to hide after the poll failed");
       ok(
         sandbox.document.getElementById("download").disabled === false,
@@ -532,6 +581,17 @@ function ok(condition, message) {
       const logLines = sandbox.document.getElementById("log").children;
       const failLine = logLines.find((l) => l.className === "fail" && /lost contact/i.test(l.textContent));
       ok(failLine, `expected a "lost contact" log line; got: ${logLines.map((l) => l.textContent).join(" | ")}`);
+      // pollCount >= 1 alone is satisfied equally by "polled once, then
+      // stopped" and "polls forever": exactly the leak the comment next
+      // to clearInterval(poller) in app.js claims to prevent, and exactly
+      // what removing that one call would not have been caught by above.
+      // Waiting for another full interval and requiring the count to be
+      // unchanged is what actually proves the interval stopped.
+      await flush(800); // long enough for another 700ms tick, if not stopped
+      ok(
+        pollCount === pollCountAfterFailure,
+        `expected no further polls after the failure; had ${pollCountAfterFailure}, now ${pollCount}`
+      );
     }
   );
 
