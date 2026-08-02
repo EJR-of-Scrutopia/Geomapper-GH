@@ -1004,6 +1004,53 @@ function ok(condition, message) {
     ok(body.opentopography_api_key === "sk-new-key", `unexpected PUT body: ${putCall.options.body}`);
   });
 
+  await test(
+    "the API key is saved before the next estimate re-checks readiness, not raced against it",
+    async () => {
+      // Review round 1: refreshEstimate and the persist handler used to
+      // be two independent "change" listeners on the same field. Both
+      // fire, but the server's own readiness check reads the SAVED
+      // config file, not this field's live value, so the estimate
+      // dispatched by refreshEstimate could reach the server before the
+      // PUT did, reporting "no key configured" for a key just typed in.
+      const callOrder = [];
+      const { sandbox } = await bootedSandbox((url, options) => {
+        if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
+          callOrder.push("PUT config");
+          return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-new-key" });
+        }
+        if (url.pathname === "/api/estimate") {
+          callOrder.push("estimate");
+          return jsonResponse(200, {
+            tiles: 1,
+            rows: 1,
+            cols: 1,
+            extent_km: { width: 1, height: 1 },
+            bytes_estimate: 1000,
+            seconds_estimate: 60,
+            warnings: [],
+            folder: "C:\\out",
+          });
+        }
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      await flush(10);
+      setField(sandbox, "region", "R");
+      setField(sandbox, "site", "S");
+      await flush(10);
+      callOrder.length = 0;
+      setField(sandbox, "opentopo-key", "sk-new-key");
+      await flush(10);
+      ok(callOrder.includes("PUT config"), `expected a PUT config call, got: ${callOrder}`);
+      ok(callOrder.includes("estimate"), `expected a follow-up estimate call, got: ${callOrder}`);
+      ok(
+        callOrder.indexOf("PUT config") < callOrder.indexOf("estimate"),
+        `expected the key saved before the next estimate, got order: ${callOrder}`
+      );
+    }
+  );
+
   await test("an estimate warning is shown alongside the numbers without disabling download", async () => {
     const { sandbox } = await bootedSandbox((url) => {
       if (url.pathname === "/api/estimate") {
@@ -1125,21 +1172,47 @@ function ok(condition, message) {
     ok(list.innerHTML.includes("Barrie, Ontario"), `expected Barrie, Ontario in: ${list.innerHTML}`);
   });
 
-  await test("typeahead shows a message in the list, not the estimate panel, for zero matches", async () => {
-    const { sandbox } = await bootedSandbox((url) => {
-      if (url.pathname === "/api/geocode") return jsonResponse(404, { error: 'No match for "zzz"' });
-      return null;
-    });
-    typeIntoPlace(sandbox, "zzz");
-    await flush(500);
-    const list = sandbox.document.getElementById("place-results");
-    ok(list.hidden === false, "expected a message in the list rather than it staying empty");
-    ok(/no match/i.test(list.innerHTML), `expected a no-match message, got: ${list.innerHTML}`);
-    ok(
-      sandbox.document.getElementById("estimate").className !== "estimate error",
-      "a place with no matches must not surface as an estimate error"
-    );
-  });
+  await test(
+    "typeahead shows a message in the list, not the estimate panel, for the real server's 404 no-match response",
+    async () => {
+      const { sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/geocode") return jsonResponse(404, { error: 'No match for "zzz"' });
+        return null;
+      });
+      typeIntoPlace(sandbox, "zzz");
+      await flush(500);
+      const list = sandbox.document.getElementById("place-results");
+      ok(list.hidden === false, "expected a message in the list rather than it staying empty");
+      ok(/no match/i.test(list.innerHTML), `expected a no-match message, got: ${list.innerHTML}`);
+      ok(
+        sandbox.document.getElementById("estimate").className !== "estimate error",
+        "a place with no matches must not surface as an estimate error"
+      );
+    }
+  );
+
+  await test(
+    "typeahead also shows a message for a 200 with zero results (defensive: the real server always 404s that case instead)",
+    async () => {
+      // Review round 1: server.py:256 (if not results: return 404) means
+      // a 200 with an empty array cannot happen against the real server
+      // today, so runPlaceSearch's own `if (placeMatches.length) {...}
+      // else {...}` branch for that shape had no test reaching it at
+      // all: the test above only ever exercised the catch block's 404
+      // handling. This exercises the try block's own empty-list branch
+      // directly, so app.js keeps behaving correctly (a message, not an
+      // empty open dropdown) even if that contract were ever to change.
+      const { sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/geocode") return jsonResponse(200, []);
+        return null;
+      });
+      typeIntoPlace(sandbox, "zzz");
+      await flush(500);
+      const list = sandbox.document.getElementById("place-results");
+      ok(list.hidden === false, "expected a message rather than an empty, open dropdown");
+      ok(/no match/i.test(list.innerHTML), `expected a no-match message, got: ${list.innerHTML}`);
+    }
+  );
 
   await test("typeahead shows a rate-limit message without disabling an existing valid estimate", async () => {
     const { sandbox } = await bootedSandbox((url) => {

@@ -537,9 +537,12 @@ async function refreshEstimate() {
   }
 }
 
-["region", "site", "tile-size", "overlap", "output-root", "opentopo-key"].forEach((id) =>
+["region", "site", "tile-size", "overlap", "output-root"].forEach((id) =>
   $(id).addEventListener("change", refreshEstimate)
 );
+// opentopo-key is deliberately not in the list above: see its own
+// dedicated listener further down, which must persist before refreshing,
+// not alongside it as an independent, unordered listener.
 
 // --- settings persistence ---------------------------------------------
 //
@@ -616,8 +619,17 @@ function maybePersistFieldSettings() {
 // still-successful one (see readiness_problem in mapgen.sources.elevation),
 // so there is no "value the estimate just rejected" case to defer past.
 // Persisted immediately, unconditionally, unlike the three fields above.
-$("opentopo-key").addEventListener("change", () => {
-  persistConfig({ opentopography_api_key: $("opentopo-key").value });
+//
+// Persisted AND AWAITED before refreshEstimate re-checks readiness, not
+// fired as a second, independent "change" listener racing it: the
+// server's own readiness check reads the SAVED config file, not this
+// field's live value, so a key typed in for the first time could
+// otherwise still be reported as "not configured" by the very estimate
+// meant to reflect it, if that estimate's request happened to reach the
+// server before this one's PUT did.
+$("opentopo-key").addEventListener("change", async () => {
+  await persistConfig({ opentopography_api_key: $("opentopo-key").value });
+  refreshEstimate();
 });
 
 // --- job -------------------------------------------------------------
@@ -702,12 +714,17 @@ $("cancel").addEventListener("click", async () => {
     // estimate instead (see readiness_problem/estimate_survey), so a key
     // typed in the field just above takes effect without ever having to
     // remember to re-tick a layer that was silently switched off.
+    // Escaped even though /api/sources is this same server's own data,
+    // not third-party input: it costs nothing here, and it is one fewer
+    // thing to have to reason about correctly if a future source's
+    // licence or display_name string ever comes from somewhere less
+    // trusted than a hardcoded class attribute.
     $("sources").innerHTML = sources
       .map(
         (s) => `
-        <label title="${s.licence}">
-          <input type="checkbox" value="${s.id}" checked />
-          <span>${s.display_name}${s.requires_api_key ? " (needs an API key)" : ""}</span>
+        <label title="${escapeHtml(s.licence)}">
+          <input type="checkbox" value="${escapeHtml(s.id)}" checked />
+          <span>${escapeHtml(s.display_name)}${s.requires_api_key ? " (needs an API key)" : ""}</span>
         </label>`
       )
       .join("");

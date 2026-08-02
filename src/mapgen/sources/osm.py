@@ -1,8 +1,15 @@
 """OpenStreetMap as a LayerSource.
 
 Standard .osm XML comes from the OSM map API, which caps a request at 50000
-nodes. Overpass is the fallback for tiles that exceed that limit. Both are
-free public services, so requests are spaced out and back off on failure.
+nodes. Overpass is available as an alternative (use_overpass=True), but
+only as a whole-run constructor choice, not an automatic per-tile
+fallback: a tile that exceeds the OSM API's limit fails outright (see
+_download_tile's "too many nodes" branch below) rather than retrying
+against Overpass on its own. Task 18's interface help text was corrected
+to say this plainly after review found the same false "automatic
+fallback" claim here, in the one file that should have been the source
+of truth for it. Both are free public services, so requests are spaced
+out and back off on failure.
 """
 
 from __future__ import annotations
