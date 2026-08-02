@@ -4469,8 +4469,8 @@ change under the reader.
 
 - [ ] **Step 0a: Write the failing test for the locked snapshot**
 
-Add to `tests/test_jobs.py`. It already imports `json` and `EventLog`; add
-`import threading` to the top of the file.
+Add to `tests/test_jobs.py`, which already imports `EventLog`. No new imports
+are needed.
 
 ```python
 def test_snapshot_is_a_copy_taken_under_the_lock():
@@ -4483,26 +4483,38 @@ def test_snapshot_is_a_copy_taken_under_the_lock():
     assert [event["event"] for event in log.snapshot()] == ["one", "two"]
 
 
-def test_snapshot_survives_concurrent_emits():
+class _RecordingLock:
+    """Stands in for threading.Lock and records whether it was entered."""
+
+    def __init__(self) -> None:
+        self.entered = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+
+def test_snapshot_acquires_the_lock():
     log = EventLog()
-    stop = threading.Event()
+    log.emit("one", index=1)
+    recording_lock = _RecordingLock()
+    log._lock = recording_lock
 
-    def writer():
-        index = 0
-        while not stop.is_set():
-            log.emit("tick", index=index)
-            index += 1
+    log.snapshot()
 
-    thread = threading.Thread(target=writer, daemon=True)
-    thread.start()
-    try:
-        for _ in range(200):
-            # json.dumps iterates the list; a live list would be a race.
-            json.dumps(log.snapshot())
-    finally:
-        stop.set()
-        thread.join(timeout=5)
+    assert recording_lock.entered is True
 ```
+
+**Do not write a concurrent stress test here.** An earlier draft of this plan
+mandated one: a thread emitting continuously while the main thread serialised
+snapshots. It was removed because it proves nothing. Under CPython's GIL an
+unguarded `list.append` racing list iteration neither corrupts memory nor
+raises, so the test passes just as happily with `with self._lock:` deleted, and
+it cost roughly 85% of the whole suite's runtime to do it. The recording lock
+above proves the lock is used, directly, with no timing involved.
 
 Run: `python -m pytest tests/test_jobs.py -k snapshot -v`
 Expected: FAIL with `AttributeError: 'EventLog' object has no attribute 'snapshot'`
