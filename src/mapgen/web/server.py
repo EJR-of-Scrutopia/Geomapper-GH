@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from mapgen.config import load_config, save_config
 from mapgen.geo import BBox, BBoxError
+from mapgen.geocode import GeocodeError, NominatimClient
 from mapgen.jobs import CancelToken, Cancelled, EventLog
 from mapgen.naming import NamingError
 from mapgen.package import (
@@ -141,7 +142,14 @@ def _survey_request(payload: dict) -> SurveyRequest:
     )
 
 
-def make_handler(manager: JobManager, token: str, static_dir: Path):
+def make_handler(
+    manager: JobManager,
+    token: str,
+    static_dir: Path,
+    geocode_client: NominatimClient | None = None,
+):
+    geocode_client = geocode_client if geocode_client is not None else NominatimClient()
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -221,6 +229,42 @@ def make_handler(manager: JobManager, token: str, static_dir: Path):
                         }
                         for s in available_sources()
                     ],
+                )
+
+            if parsed.path == "/api/geocode":
+                search_query = (query.get("q", [None])[0] or "").strip()
+                if not search_query:
+                    return self._send_json(400, {"error": "q is required."})
+                try:
+                    result = geocode_client.search(search_query)
+                except GeocodeError as exc:
+                    return self._send_json(502, {"error": str(exc)})
+                if result is None:
+                    return self._send_json(
+                        404, {"error": f'No match for "{search_query}"'}
+                    )
+                return self._send_json(
+                    200,
+                    {
+                        "west": result.west,
+                        "south": result.south,
+                        "east": result.east,
+                        "north": result.north,
+                    },
+                )
+
+            if parsed.path == "/api/reverse":
+                try:
+                    lat = float(query.get("lat", [None])[0])
+                    lon = float(query.get("lon", [None])[0])
+                except (TypeError, ValueError):
+                    return self._send_json(400, {"error": "lat and lon must both be numbers."})
+                try:
+                    reverse_result = geocode_client.reverse(lat, lon)
+                except GeocodeError as exc:
+                    return self._send_json(502, {"error": str(exc)})
+                return self._send_json(
+                    200, {"region": reverse_result.region, "site": reverse_result.site}
                 )
 
             match = _JOB_STATUS_RE.match(parsed.path)
@@ -338,10 +382,16 @@ def build_server(
     register_default_sources()
     resolved_token = token or secrets.token_urlsafe(24)
     manager = JobManager()
-    handler = make_handler(manager, resolved_token, STATIC_DIR)
+    # One NominatimClient per server process, not per request: its
+    # GeocodeRateLimiter must be shared by every request-handling thread
+    # for the one-per-second limit to hold across page reloads and across
+    # two tabs, which it cannot do if a new one is built per call.
+    geocode_client = NominatimClient()
+    handler = make_handler(manager, resolved_token, STATIC_DIR, geocode_client)
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.token = resolved_token
     httpd.manager = manager
+    httpd.geocode_client = geocode_client
     return httpd
 
 

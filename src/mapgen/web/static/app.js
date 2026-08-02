@@ -21,62 +21,12 @@ async function api(path, options = {}) {
     ...options,
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-  return payload;
-}
-
-// --- Nominatim ---------------------------------------------------------
-//
-// Place search and the region/site auto-suggest both call Nominatim
-// (nominatim.openstreetmap.org). That is a second host beyond the map
-// tile servers, but Nominatim is OpenStreetMap's own geocoder, the same
-// project as the basemap tiles, so it is treated as within the same
-// allowance. Its usage policy is binding and is enforced here, not just
-// noted:
-//
-// - At most one request per second. nominatimFetch() enforces this across
-//   both callers with a single shared reservation clock, since the policy
-//   limits total load on their server, not a per-feature budget. The
-//   reservation is made synchronously, before the wait, so two calls
-//   arriving together queue one after another instead of both reading the
-//   same stale "ready at" time and firing together.
-// - The place field is additionally debounced (see placeDebounce below)
-//   so committing a search cannot itself fire in a tight burst, for
-//   example from mashing Enter. It already only listens for "change", not
-//   "input", so it was never firing on every keystroke.
-// - Identify the calling application. The policy accepts a descriptive
-//   User-Agent or a valid HTTP Referer. Browsers do not let a script set
-//   the User-Agent header (it is a forbidden header name in the Fetch
-//   standard; setting it is silently dropped and the browser's own value
-//   goes out unchanged, on every current engine), so this relies on
-//   Referer instead. referrerPolicy is pinned to "origin" so only
-//   http://127.0.0.1:<port> is ever sent, never the page's full URL. The
-//   full URL carries the per-launch token in its query string, and that
-//   must never reach a third party.
-// - Never let the interface break because Nominatim is slow, down, or
-//   rate-limiting us. Both call sites below fail into a plain, recoverable
-//   state instead of an unhandled rejection, and a request that just never
-//   answers is cut off by NOMINATIM_TIMEOUT_MS rather than left to hang
-//   forever: a slow server should look like a failure, not a stall.
-
-const NOMINATIM_MIN_INTERVAL_MS = 1000;
-const NOMINATIM_TIMEOUT_MS = 8000;
-let nominatimReadyAt = 0;
-
-async function nominatimFetch(url) {
-  const now = Date.now();
-  const wait = Math.max(0, nominatimReadyAt - now);
-  nominatimReadyAt = now + wait + NOMINATIM_MIN_INTERVAL_MS;
-  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), NOMINATIM_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, { referrerPolicy: "origin", signal: controller.signal });
-    if (!response.ok) throw new Error(`Nominatim returned HTTP ${response.status}`);
-    return await response.json();
-  } finally {
-    clearTimeout(timeout);
+  if (!response.ok) {
+    const error = new Error(payload.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
+  return payload;
 }
 
 // --- extent selection ------------------------------------------------
@@ -141,6 +91,23 @@ $("bbox").addEventListener("change", () => {
   });
 });
 
+// Place search and the region/site auto-suggest both need a geocoder, but
+// neither calls Nominatim directly any more: /api/geocode and
+// /api/reverse proxy it server-side instead. A browser script cannot set
+// a real User-Agent (it is a forbidden header name in the Fetch
+// standard), and a rate limit held in this page's own JavaScript resets
+// on every reload and does not exist for a second tab; both are real
+// requirements of Nominatim's usage policy, not just politeness, and the
+// server, one process shared by every tab and every reload, is the only
+// place that can actually enforce them. See mapgen.geocode for the
+// enforcement itself. This also means the page's own network footprint
+// is exactly loopback plus the map tile servers, nothing else.
+//
+// The debounce here is a separate, client-only concern: it stops a
+// committed search firing in a burst (mashing Enter), which is not the
+// same problem as the server's own one-per-second gate and is not
+// replaced by it.
+
 const PLACE_DEBOUNCE_MS = 400;
 let placeDebounce = null;
 
@@ -153,15 +120,18 @@ $("place").addEventListener("change", () => {
 
 async function runPlaceSearch(query) {
   try {
-    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
-    const [hit] = await nominatimFetch(url);
-    if (!hit) return showEstimateError(`No match for "${query}"`);
-    const [south, north, west, east] = hit.boundingbox.map(parseFloat);
-    setBBox({ west, south, east, north });
+    const result = await api(`/api/geocode?q=${encodeURIComponent(query)}`);
+    setBBox({ west: result.west, south: result.south, east: result.east, north: result.north });
   } catch (error) {
-    // Nominatim down, rate-limited, or unreachable. The map is exactly as
-    // usable as before the search: draw the extent or paste coordinates.
-    showEstimateError("Place search is unavailable right now. Draw the extent or paste coordinates instead.");
+    if (error.status === 404) {
+      // The server's own "no match for ..." message, worth showing as is.
+      showEstimateError(error.message);
+    } else {
+      // Geocoding is down, rate-limited, or slow enough to have timed out
+      // server-side. The map is exactly as usable as before the search:
+      // draw the extent or paste coordinates.
+      showEstimateError("Place search is unavailable right now. Draw the extent or paste coordinates instead.");
+    }
   }
 }
 
@@ -170,9 +140,9 @@ async function runPlaceSearch(query) {
 // user to fill by hand rather than surfacing as an error: this runs in
 // the background on every extent change, not on an action the user is
 // explicitly waiting on. requestedBBox is captured up front and checked
-// again after the (possibly queued, possibly slow) request returns, so a
-// reply for an extent the user has since replaced can't overwrite a
-// newer, already-filled suggestion.
+// again after the (possibly slow) request returns, so a reply for an
+// extent the user has since replaced can't overwrite a newer,
+// already-filled suggestion.
 async function suggestNames() {
   if (!bbox) return;
   if ($("region").value && $("site").value) return;
@@ -180,12 +150,10 @@ async function suggestNames() {
   const lat = (requestedBBox.south + requestedBBox.north) / 2;
   const lon = (requestedBBox.west + requestedBBox.east) / 2;
   try {
-    const url = `https://nominatim.openstreetmap.org/reverse?format=json&zoom=12&lat=${lat}&lon=${lon}`;
-    const data = await nominatimFetch(url);
+    const result = await api(`/api/reverse?lat=${lat}&lon=${lon}`);
     if (bbox !== requestedBBox) return;
-    const a = data.address || {};
-    if (!$("site").value) $("site").value = a.suburb || a.town || a.village || a.city || "";
-    if (!$("region").value) $("region").value = a.county || a.state_district || a.state || "";
+    if (!$("site").value) $("site").value = result.site || "";
+    if (!$("region").value) $("region").value = result.region || "";
   } catch (error) {
     // Quiet on purpose, see the comment above.
   }

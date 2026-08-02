@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from mapgen.geo import BBox
+from mapgen.geocode import GeocodeError, GeocodeResult, ReverseResult
 from mapgen.jobs import EventLog
 from mapgen.package import SurveyRequest
 from mapgen.sources.base import Estimate, clear_registry, register
@@ -112,6 +113,38 @@ class _CountingEventLog(EventLog):
         return super().snapshot()
 
 
+class StubGeocodeClient:
+    """A geocode_client double that returns or raises a canned result.
+
+    Mirrors what StubSource is for LayerSource: server.py's routing and
+    status-code translation is tested here, independent of NominatimClient's
+    own HTTP call and Nominatim-shape parsing, which have their own tests in
+    test_geocode.py. search_result/reverse_result and search_error/
+    reverse_error are read per call, not snapshotted at construction, so a
+    test can flip them between requests against the same running server.
+    """
+
+    def __init__(self):
+        self.search_result: GeocodeResult | None = None
+        self.search_error: Exception | None = None
+        self.reverse_result: ReverseResult = ReverseResult(region="", site="")
+        self.reverse_error: Exception | None = None
+        self.search_calls: list[str] = []
+        self.reverse_calls: list[tuple[float, float]] = []
+
+    def search(self, query: str) -> GeocodeResult | None:
+        self.search_calls.append(query)
+        if self.search_error is not None:
+            raise self.search_error
+        return self.search_result
+
+    def reverse(self, lat: float, lon: float) -> ReverseResult:
+        self.reverse_calls.append((lat, lon))
+        if self.reverse_error is not None:
+            raise self.reverse_error
+        return self.reverse_result
+
+
 @pytest.fixture(autouse=True)
 def _isolated_registry():
     clear_registry()
@@ -128,6 +161,25 @@ def server():
     yield f"http://127.0.0.1:{httpd.server_address[1]}"
     httpd.shutdown()
     httpd.server_close()
+
+
+@pytest.fixture
+def geocode_server():
+    """Like `server`, but wires in a StubGeocodeClient instead of a real
+    NominatimClient, and hands the test the stub so it can set up a canned
+    result or error before making a request.
+    """
+    manager = JobManager()
+    stub = StubGeocodeClient()
+    handler = make_handler(manager, TOKEN, STATIC_DIR, stub)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}", stub
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def _post(base, path, payload, token=TOKEN):
@@ -859,3 +911,121 @@ def test_index_referenced_asset_is_served(server, asset_path):
         assert response.status == 200
         body = response.read()
         assert len(body) > 0, f"{asset_path} was served with an empty body"
+
+
+# --- geocoding moved server-side --------------------------------------------
+#
+# app.js used to call Nominatim directly from the browser. That made the
+# page's own network footprint bigger than "localhost plus the map tile
+# servers", and a browser script cannot set a real User-Agent (it is a
+# forbidden header name in the Fetch standard) or hold a rate limit that
+# means anything across two tabs. Both endpoints below are routed through
+# geocode_client, a StubGeocodeClient here so what is under test is
+# server.py's own routing, auth and status-code translation, not
+# NominatimClient's HTTP handling, which is covered on its own in
+# test_geocode.py.
+
+
+def test_geocode_requires_a_token(geocode_server):
+    base, _stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/geocode?q=Barry", timeout=10)
+    assert excinfo.value.code == 403
+
+
+def test_geocode_requires_a_query(geocode_server):
+    base, _stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/geocode?token={TOKEN}", timeout=10)
+    assert excinfo.value.code == 400
+
+
+def test_geocode_returns_a_bbox_for_a_match(geocode_server):
+    base, stub = geocode_server
+    stub.search_result = GeocodeResult(west=-3.31, south=51.38, east=-3.25, north=51.43)
+    with urllib.request.urlopen(
+        f"{base}/api/geocode?q=Barry%2C+Wales&token={TOKEN}", timeout=10
+    ) as response:
+        assert response.status == 200
+        payload = json.loads(response.read().decode("utf-8"))
+    assert payload == {"west": -3.31, "south": 51.38, "east": -3.25, "north": 51.43}
+    assert stub.search_calls == ["Barry, Wales"]
+
+
+def test_geocode_returns_404_for_no_match(geocode_server):
+    base, stub = geocode_server
+    stub.search_result = None
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/geocode?q=nowhere&token={TOKEN}", timeout=10)
+    assert excinfo.value.code == 404
+    payload = json.loads(excinfo.value.read().decode("utf-8"))
+    assert "nowhere" in payload["error"]
+
+
+def test_geocode_returns_502_when_nominatim_is_unreachable(geocode_server):
+    base, stub = geocode_server
+    stub.search_error = GeocodeError("Could not reach Nominatim: connection refused")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/geocode?q=Barry&token={TOKEN}", timeout=10)
+    assert excinfo.value.code == 502
+    payload = json.loads(excinfo.value.read().decode("utf-8"))
+    assert "error" in payload
+
+
+def test_reverse_requires_a_token(geocode_server):
+    base, _stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/reverse?lat=51.4&lon=-3.3", timeout=10)
+    assert excinfo.value.code == 403
+
+
+def test_reverse_requires_numeric_lat_and_lon(geocode_server):
+    base, _stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            f"{base}/api/reverse?lat=nope&lon=-3.3&token={TOKEN}", timeout=10
+        )
+    assert excinfo.value.code == 400
+
+
+def test_reverse_requires_both_lat_and_lon(geocode_server):
+    base, _stub = geocode_server
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{base}/api/reverse?lat=51.4&token={TOKEN}", timeout=10)
+    assert excinfo.value.code == 400
+
+
+def test_reverse_returns_region_and_site(geocode_server):
+    base, stub = geocode_server
+    stub.reverse_result = ReverseResult(region="Vale of Glamorgan", site="Barry")
+    with urllib.request.urlopen(
+        f"{base}/api/reverse?lat=51.405&lon=-3.283&token={TOKEN}", timeout=10
+    ) as response:
+        assert response.status == 200
+        payload = json.loads(response.read().decode("utf-8"))
+    assert payload == {"region": "Vale of Glamorgan", "site": "Barry"}
+    assert stub.reverse_calls == [(51.405, -3.283)]
+
+
+def test_reverse_returns_502_when_nominatim_is_unreachable(geocode_server):
+    base, stub = geocode_server
+    stub.reverse_error = GeocodeError("Nominatim returned HTTP 429")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            f"{base}/api/reverse?lat=51.4&lon=-3.3&token={TOKEN}", timeout=10
+        )
+    assert excinfo.value.code == 502
+
+
+def test_build_server_wires_a_real_nominatim_client_by_default():
+    # Regression guard for make_handler's geocode_client=None default: a
+    # server built the normal way (build_server, or the CLI's `mapgen ui`)
+    # must not silently end up with no geocode client at all just because
+    # nothing was passed in explicitly.
+    from mapgen.geocode import NominatimClient
+
+    httpd = build_server(port=0, token=TOKEN)
+    try:
+        assert isinstance(httpd.geocode_client, NominatimClient)
+    finally:
+        httpd.server_close()
