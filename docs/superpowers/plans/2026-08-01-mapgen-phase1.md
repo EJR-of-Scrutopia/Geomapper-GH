@@ -4969,14 +4969,15 @@ def build_server(host: str = "127.0.0.1", port: int = 0, token: str | None = Non
     manager = JobManager()
     handler = make_handler(manager, resolved_token, STATIC_DIR)
     httpd = ThreadingHTTPServer((host, port), handler)
-    httpd.mapgen_token = resolved_token
+    httpd.token = resolved_token
+    httpd.manager = manager
     return httpd
 
 
 def serve(open_browser: bool = True, port: int = 0, host: str = "127.0.0.1") -> None:
     httpd = build_server(host=host, port=port)
     actual_port = httpd.server_address[1]
-    url = f"http://{host}:{actual_port}/?token={httpd.mapgen_token}"
+    url = f"http://{host}:{actual_port}/?token={httpd.token}"
     print(f"mapgen UI: {url}")
     print("Press Ctrl+C to stop.")
     if open_browser:
