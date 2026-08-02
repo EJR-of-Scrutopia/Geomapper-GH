@@ -61,17 +61,10 @@ class EventLog:
 
 class JobState:
     def __init__(
-        self,
-        state_path: Path,
-        tiles: Sequence[str],
-        source_ids: Sequence[str],
-        tile_size_m: float,
-        overlap_m: float,
+        self, state_path: Path, tiles: Sequence[str], source_ids: Sequence[str]
     ) -> None:
         self.state_path = state_path
         self.source_ids = list(source_ids)
-        self.tile_size_m = tile_size_m
-        self.overlap_m = overlap_m
         self.tiles: dict[str, dict[str, str]] = {
             tile_id: {source_id: PENDING for source_id in source_ids}
             for tile_id in tiles
@@ -80,18 +73,19 @@ class JobState:
 
     @classmethod
     def load_or_create(
-        cls,
-        work_dir: Path,
-        tiles: Sequence[str],
-        source_ids: Sequence[str],
-        tile_size_m: float,
-        overlap_m: float,
+        cls, work_dir: Path, tiles: Sequence[str], source_ids: Sequence[str]
     ) -> "JobState":
-        state = cls(work_dir / STATE_FILENAME, tiles, source_ids, tile_size_m, overlap_m)
+        state = cls(work_dir / STATE_FILENAME, tiles, source_ids)
         state._merge_saved()
         return state
 
     def _merge_saved(self) -> None:
+        # work_dir is keyed by a fingerprint of the tiling (bbox, tile_size_m,
+        # overlap_m), computed by the caller before this state.json's path is
+        # ever formed. Two different tilings therefore never share a work_dir
+        # to begin with, so there is nothing to compare here: any state.json
+        # found at this exact path was, by construction, written under this
+        # exact tiling.
         if not self.state_path.exists():
             return
         try:
@@ -101,24 +95,6 @@ class JobState:
         # Validate shape: must be a dict with "tiles" as a dict.
         if not isinstance(payload, dict):
             return
-
-        # A tile id is only (row, col): the string carries no memory of the
-        # tiling it was computed under, so the same id can mean a different
-        # patch of ground under a different tile_size_m or overlap_m. Saved
-        # statuses from a different tiling must never be merged in, because
-        # is_done would then look done for ground that was never actually
-        # fetched under the current plan. A state.json saved before this
-        # check existed has no "tiling" block at all, which is exactly as
-        # untrustworthy as a mismatch, not a crash: both mean start fresh.
-        saved_tiling = payload.get("tiling")
-        if not isinstance(saved_tiling, dict):
-            return
-        if (
-            saved_tiling.get("tile_size_m") != self.tile_size_m
-            or saved_tiling.get("overlap_m") != self.overlap_m
-        ):
-            return
-
         saved = payload.get("tiles", {})
         if not isinstance(saved, dict):
             return
@@ -163,14 +139,5 @@ class JobState:
         all_tiles = {**self._extra_tiles, **self.tiles}
         atomic_write_text(
             self.state_path,
-            json.dumps(
-                {
-                    "tiling": {
-                        "tile_size_m": self.tile_size_m,
-                        "overlap_m": self.overlap_m,
-                    },
-                    "tiles": all_tiles,
-                },
-                indent=2,
-            ),
+            json.dumps({"tiles": all_tiles}, indent=2),
         )

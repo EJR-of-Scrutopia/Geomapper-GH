@@ -6,7 +6,7 @@ import pytest
 
 from mapgen.geo import BBox
 from mapgen.jobs import CancelToken, Cancelled, EventLog, JobState
-from mapgen.naming import PathTooLongError, build_package_paths
+from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
     SurveyRequest,
     estimate_survey,
@@ -94,26 +94,28 @@ class CallRecordingStubSource:
         return [out]
 
 
-class SelectivelySilentStubSource:
-    """Like StubSource, but silently omits writing a file for tiles in
-    `missing`, without raising, so the rest of the batch still succeeds.
+class SkipIfExistsStubSource:
+    """Mimics OsmSource's and OvertureSource's real behaviour: if a tile's
+    output file already exists and is non-empty, skip fetching it and reuse
+    the file untouched, whatever it contains.
 
-    Used to construct a tile that has genuinely never had a successful
-    output, as distinct from one that failed after some other tile's file
-    already existed. This sidesteps the fact that r00_c00 is always the
-    first tile in any grid: raising on it aborts the whole fetch() call
-    before any other tile is attempted, which cannot produce "every tile
-    but this one succeeded".
+    This is exactly the behaviour that defeated the tile-id-filtering fix:
+    a stale file from a different tiling, sitting at a path named only
+    after (row, col), looks identical to a fresh one, so a source shaped
+    like this "skips" ground it never actually covered. Content is stamped
+    with a caller-provided run label so a test can tell which run's fetch()
+    actually wrote a given file, as opposed to merely reused it.
     """
 
     id = "stub"
-    display_name = "Stub Selectively Silent"
+    display_name = "Stub Skip If Exists"
     licence = "CC0"
     attribution = "nobody"
     requires_api_key = False
 
-    def __init__(self, missing=()):
-        self._missing = set(missing)
+    def __init__(self, run_label, fail_on=()):
+        self.run_label = run_label
+        self._fail_on = set(fail_on)
 
     def estimate(self, bbox, tiles):
         return Estimate(bytes_estimate=100 * len(tiles), seconds_estimate=1.0 * len(tiles))
@@ -121,11 +123,15 @@ class SelectivelySilentStubSource:
     def fetch(self, bbox, tiles, work_dir, progress):
         paths = []
         for tile in tiles:
-            if tile.tile_id in self._missing:
-                continue
             path = work_dir / f"{tile.tile_id}.txt"
+            if path.exists() and path.stat().st_size > 0:
+                progress.emit("tile_skipped", source=self.id, tile_id=tile.tile_id)
+                paths.append(path)
+                continue
+            if tile.tile_id in self._fail_on:
+                raise RuntimeError(f"stub failure on {tile.tile_id}")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(tile.tile_id, encoding="utf-8")
+            path.write_text(f"{self.run_label}:{tile.tile_id}", encoding="utf-8")
             progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
             paths.append(path)
         return paths
@@ -478,6 +484,10 @@ def test_a_resumed_run_only_refetches_tiles_that_previously_failed(tmp_path):
     # Same folder, not a fresh _02: an incomplete package is resumed.
     assert second.paths.root == first.paths.root
     assert second.paths.root.name == "2026-08-01_Barry-Waterfront"
+    # Identical bbox, tile_size_m and overlap_m fingerprint identically, so
+    # the second run's work_dir is not just under the same root, it is the
+    # exact same directory, which is what lets it find the saved state.
+    assert second.paths.work_dir == first.paths.work_dir
     # The first run attempted every tile; the second only the one that had
     # not yet succeeded. If resume were broken, fetch_calls[1] would list
     # all four tiles again, and ResumeAwareSource would have raised instead
@@ -508,69 +518,56 @@ def test_a_successful_resume_merges_previously_fetched_tiles_too(tmp_path):
         assert tile_id in merged_text
 
 
-def test_retiling_forces_a_refetch_of_a_tile_that_was_ok_under_the_old_tiling(tmp_path):
-    # Isolates the state half of the retiling fix. r01_c01 fails so the
-    # package stays incomplete and the second run reuses the same folder
-    # (a complete package would get a fresh _02 instead, which would sidestep
-    # the bug entirely). r00_c00 succeeds and is marked ok under 600m tiling.
-    # Retiling to 1200m still needs r00_c00, now covering the whole bbox
-    # rather than one quadrant of it. Without discarding the saved state on
-    # a tiling mismatch, is_done would still say true for r00_c00 and
-    # pending would be empty, so fetch() would never be asked for it at all.
+def test_a_different_tile_size_gets_its_own_fingerprint_directory_and_refetches_everything(
+    tmp_path,
+):
+    # r01_c01 fails so the package stays incomplete and the second run
+    # reuses the same root (a complete package would get a fresh _02
+    # instead). The 1200m retiling collapses the bbox to a single tile,
+    # r00_c00, which gets its own work_dir, distinct from the 600m one, and
+    # is fetched fresh rather than inherited from whatever the 600m run
+    # left behind at the same tile id.
     register(CallRecordingStubSource(fail_on=("r01_c01",)))
     first = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=50.0, force=True))
     assert first.complete is False
 
     clear_registry()
-    source2 = CallRecordingStubSource(fail_on=("r01_c01",))
+    source2 = CallRecordingStubSource()
     register(source2)
-    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0, force=True))
+    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0))
 
     assert second.paths.root == first.paths.root
+    assert second.paths.work_dir != first.paths.work_dir
+    assert second.complete is True
     assert source2.fetch_calls == [["r00_c00"]]
+    merged_text = (second.paths.root / "stub.txt").read_text(encoding="utf-8")
+    assert merged_text == "r00_c00"
 
 
-def test_resuming_at_a_different_tile_size_does_not_mix_in_stale_tiles(tmp_path):
-    # The reviewer's exact scenario: a tile id is only (row, col), with no
-    # memory of the tiling it was computed under, so r00_c00 means something
-    # different at 600m than it does at 1200m even though the string is
-    # identical. r00_c00 is skipped rather than made to raise, because it is
-    # always the first tile attempted: raising on it would abort the whole
-    # fetch() call before r00_c01 or r01_c00 were ever attempted, and could
-    # never reproduce "every tile but this one succeeded".
-    register(SelectivelySilentStubSource(missing={"r00_c00"}))
+def test_retiling_does_not_reuse_a_stale_file_from_a_skip_if_exists_source(tmp_path):
+    # This is the specific case that defeated the previous, detection-based
+    # fix: a source shaped like the real ones checks "does this tile's file
+    # already exist" and reuses it untouched if so. A file named only after
+    # (row, col) cannot tell a 600m tile from a 1200m tile at the same
+    # position apart, so the earlier fix's tile-id filtering could not stop
+    # a stale 600m file from being silently treated as the 1200m tile's
+    # output. Giving each tiling its own fingerprinted directory means the
+    # 1200m run's "does this file exist" check is asked about a path the
+    # 600m run never wrote to in the first place.
+    register(SkipIfExistsStubSource(run_label="RUN600", fail_on=("r01_c01",)))
     first = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=50.0, force=True))
     assert first.complete is False
-    stub_work = first.paths.work_dir / "raw" / "stub"
-    assert sorted(p.name for p in stub_work.iterdir()) == [
-        "r00_c01.txt",
-        "r01_c00.txt",
-        "r01_c01.txt",
-    ]
 
-    # Re-run the same site and date at 1200m. The whole bbox now collapses
-    # to a single tile, r00_c00, the one tile that never had a file under
-    # the old tiling either. clear_registry+register swaps in a fresh
-    # instance so nothing here depends on the first source's memory.
     clear_registry()
-    register(SelectivelySilentStubSource(missing={"r00_c00"}))
-    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0, force=True))
+    register(SkipIfExistsStubSource(run_label="RUN1200"))
+    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0))
 
     assert second.paths.root == first.paths.root
-    # Not falsely reported complete: the only tile in the current plan has
-    # no output under the current tiling, so there is real missing geography.
-    assert second.complete is False
-
-    payload = json.loads(second.paths.survey_json.read_text(encoding="utf-8"))
-    assert payload["tiling"]["tile_size_m"] == 1200.0
-    # Only the current tile appears at all: the stale 600m tiles are not
-    # merely excluded from the merge, they are absent from the record.
-    assert {record["tile_id"] for record in payload["tiles"]} == {"r00_c00"}
-
+    assert second.paths.work_dir != first.paths.work_dir
+    assert second.complete is True
     merged_text = (second.paths.root / "stub.txt").read_text(encoding="utf-8")
-    assert merged_text == ""
-    for stale_tile_id in ("r00_c01", "r01_c00", "r01_c01"):
-        assert stale_tile_id not in merged_text
+    assert merged_text == "RUN1200:r00_c00"
+    assert "RUN600" not in merged_text
 
 
 def test_whole_area_outputs_with_no_tile_id_are_still_gathered(tmp_path):
@@ -601,7 +598,10 @@ def test_force_run_excludes_leftover_part_files_from_a_hard_kill(tmp_path):
     # convention, both leave a .part file behind if the process is killed
     # mid-write. A force-mode recovery sweep must not pick that debris up.
     register(StubSource(fail_on=("r01_c01",)))
-    paths = build_package_paths(tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1))
+    fingerprint = tiling_fingerprint(*BBOX.as_tuple(), 600.0, 50.0)
+    paths = build_package_paths(
+        tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1), fingerprint
+    )
     stub_work = paths.work_dir / "raw" / "stub"
     stub_work.mkdir(parents=True, exist_ok=True)
     (stub_work / "r01_c01.txt.9999.1.deadbeef.part").write_text(
@@ -639,12 +639,8 @@ def test_a_tile_missing_one_of_several_type_directories_is_marked_failed(tmp_pat
     assert records["r01_c01"] == "ok"
 
     # A reload must not treat the partially-fetched tile as done, or the
-    # missing type would never get another chance to be retried. Tiling must
-    # match _request()'s defaults, or the reload would trust nothing at all
-    # for an unrelated reason and this would pass without proving anything.
-    reloaded = JobState.load_or_create(
-        result.paths.work_dir, list(records), ["overture"], 600.0, 50.0
-    )
+    # missing type would never get another chance to be retried.
+    reloaded = JobState.load_or_create(result.paths.work_dir, list(records), ["overture"])
     assert reloaded.is_done("r00_c00", "overture") is False
 
 

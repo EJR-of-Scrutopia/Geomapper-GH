@@ -24,7 +24,13 @@ from mapgen.fsutil import (
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
 from mapgen.jobs import FAILED, OK, CancelToken, JobState
 from mapgen.merge import assert_inputs_present
-from mapgen.naming import PackagePaths, build_package_paths, check_path_length, slugify
+from mapgen.naming import (
+    PackagePaths,
+    build_package_paths,
+    check_path_length,
+    slugify,
+    tiling_fingerprint,
+)
 from mapgen.sources.base import NullProgress, ProgressSink, get_source, register
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.osm import OsmSource
@@ -89,11 +95,20 @@ def _now() -> str:
 def _plan(request: SurveyRequest):
     tiles = build_tiles(request.bbox, request.tile_size_m, request.overlap_m)
     stem_override = _coordinate_stem(request.bbox) if request.coordinate_stem else None
+    fingerprint = tiling_fingerprint(
+        request.bbox.west,
+        request.bbox.south,
+        request.bbox.east,
+        request.bbox.north,
+        request.tile_size_m,
+        request.overlap_m,
+    )
     paths = build_package_paths(
         request.output_root,
         request.region,
         request.site,
         request.effective_date,
+        fingerprint,
         stem_override=stem_override,
     )
     check_path_length(paths, request.effective_overture_types)
@@ -151,12 +166,12 @@ def run_survey(
     sink.emit("job_started", tiles=len(tiles), root=str(paths.root))
 
     sources = [get_source(source_id) for source_id in request.source_ids]
+    # work_dir is fingerprinted by tiling (see _plan), so the state.json
+    # found here, if any, was written under this exact bbox, tile_size_m and
+    # overlap_m. A different tiling gets an entirely separate work_dir and
+    # can never be seen from here.
     state = JobState.load_or_create(
-        paths.work_dir,
-        current_tile_ids,
-        [s.id for s in sources],
-        request.tile_size_m,
-        request.overlap_m,
+        paths.work_dir, current_tile_ids, [s.id for s in sources]
     )
     ensure_dir(paths.work_dir)
 

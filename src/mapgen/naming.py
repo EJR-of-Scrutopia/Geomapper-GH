@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import unicodedata
@@ -12,6 +13,7 @@ from typing import Sequence
 
 MAX_COMPONENT_LENGTH = 40
 DEFAULT_PATH_LIMIT = 240
+FINGERPRINT_LENGTH = 8
 
 _DISALLOWED = re.compile(r"[^A-Za-z0-9-]")
 _REPEATED_HYPHEN = re.compile(r"-{2,}")
@@ -49,6 +51,39 @@ def slugify(value: str, field: str, max_length: int = MAX_COMPONENT_LENGTH) -> s
     return capped
 
 
+def tiling_fingerprint(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    tile_size_m: float,
+    overlap_m: float,
+) -> str:
+    """Short, stable identifier for a specific tiling.
+
+    A tile id such as r00_c00 names a row and column of some grid, but the
+    string carries no memory of which grid: that depends on the bbox,
+    tile_size_m and overlap_m, and two different tilings can and do produce
+    the same row/column names for different ground. This fingerprint is
+    what tells them apart at the filesystem level, so they are never able
+    to share a directory in the first place, rather than being detected and
+    rejected after the fact.
+
+    The canonical string is built with fixed-precision formatting rather
+    than repr() or str(), which are not guaranteed stable across floats
+    that are numerically equal but differently represented. The digest is
+    truncated to FINGERPRINT_LENGTH hex characters: short enough to keep
+    paths well inside the Windows limit, long enough that an accidental
+    collision between genuinely different tilings is not a realistic
+    concern for this tool's scale.
+    """
+    canonical = "|".join(
+        f"{value:.7f}" for value in (west, south, east, north, tile_size_m, overlap_m)
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest[:FINGERPRINT_LENGTH]
+
+
 @dataclass(frozen=True)
 class PackagePaths:
     root: Path
@@ -59,12 +94,12 @@ class PackagePaths:
     project_setting: Path
 
 
-def _compose(root: Path, stem: str) -> PackagePaths:
+def _compose(root: Path, stem: str, fingerprint: str) -> PackagePaths:
     return PackagePaths(
         root=root,
         stem=stem,
         layers_dir=root / "layers",
-        work_dir=root / "_work",
+        work_dir=root / "_work" / fingerprint,
         survey_json=root / "survey.json",
         project_setting=root / f"{stem}_project_setting.json",
     )
@@ -75,6 +110,7 @@ def build_package_paths(
     region: str,
     site: str,
     survey_date: date,
+    fingerprint: str,
     stem_override: str | None = None,
 ) -> PackagePaths:
     region_slug = slugify(region, "region")
@@ -90,17 +126,19 @@ def build_package_paths(
     # A candidate folder is only skipped if it is a genuinely finished
     # package. Anything else, absent, unreadable or incomplete survey.json,
     # means an earlier run stopped partway through, so that folder is reused:
-    # same root, same stem, same _work, which is what lets JobState find its
-    # saved progress and resume rather than restart from nothing. The same
-    # check applies to every suffixed candidate in turn, so a _02 that is
-    # itself incomplete gets reused rather than pushed on to _03.
+    # same root, same stem. work_dir is keyed by fingerprint underneath that
+    # root, so a reused root with a different tiling gets its own, entirely
+    # separate _work/<fingerprint>/ rather than colliding with whatever an
+    # earlier, differently-tiled attempt left behind. The completeness check
+    # applies to every suffixed candidate in turn, so a _02 that is itself
+    # incomplete gets reused rather than pushed on to _03.
     while root.exists() and _survey_reports_complete(root / "survey.json"):
         suffix = f"_{counter:02d}"
         root = region_dir / f"{base_name}{suffix}"
         counter += 1
 
     stem = f"{stem_override}{suffix}" if stem_override else f"{site_slug}_{date_str}{suffix}"
-    return _compose(root, stem)
+    return _compose(root, stem, fingerprint)
 
 
 def _survey_reports_complete(survey_json: Path) -> bool:
