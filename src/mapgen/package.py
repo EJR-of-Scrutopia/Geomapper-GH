@@ -250,8 +250,12 @@ def run_survey(
 
     # Removed only on a clean, complete run. A failed or partial job keeps its
     # tiles, because that is what makes the next run resume rather than restart.
+    # The whole _work/ parent goes, not just this tiling's fingerprint
+    # subdirectory: a complete root is never reused (a later request lands on
+    # a fresh _02), so a sibling tiling's abandoned scratch tree left inside
+    # _work/ would otherwise survive forever with nothing left to remove it.
     if state.complete and not request.keep_work:
-        best_effort_rmtree(paths.work_dir)
+        best_effort_rmtree(paths.work_dir.parent)
 
     return SurveyResult(paths=paths, complete=state.complete, survey=survey)
 

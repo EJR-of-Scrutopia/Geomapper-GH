@@ -435,6 +435,10 @@ def test_work_dir_is_removed_on_success(tmp_path):
     register(StubSource())
     result = run_survey(_request(tmp_path))
     assert not result.paths.work_dir.exists()
+    # work_dir is the fingerprint leaf (_work/<fp>/); the shared _work/
+    # parent must go too, or a complete root, which is never reused, would
+    # permanently carry an empty _work/ with nothing left to clean it up.
+    assert not result.paths.work_dir.parent.exists()
 
 
 def test_work_dir_is_kept_when_requested(tmp_path):
@@ -568,6 +572,55 @@ def test_retiling_does_not_reuse_a_stale_file_from_a_skip_if_exists_source(tmp_p
     merged_text = (second.paths.root / "stub.txt").read_text(encoding="utf-8")
     assert merged_text == "RUN1200:r00_c00"
     assert "RUN600" not in merged_text
+
+
+def test_a_different_overlap_also_gets_its_own_fingerprint_directory_and_refetches(tmp_path):
+    # The retiling tests above only ever vary tile_size_m. overlap_m feeds
+    # the fingerprint too but, unlike tile_size_m, never changes the grid:
+    # build_tiles's row and column count depends only on tile_size_m, so
+    # all four tile ids are identical between the two runs here. That makes
+    # this the sterner test of the two: every single tile id collides
+    # between the 50m and 75m overlap runs, not just one of four.
+    register(CallRecordingStubSource(fail_on=("r01_c01",)))
+    first = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=50.0, force=True))
+    assert first.complete is False
+
+    clear_registry()
+    source2 = CallRecordingStubSource()
+    register(source2)
+    second = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=75.0))
+
+    assert second.paths.root == first.paths.root
+    assert second.paths.work_dir != first.paths.work_dir
+    assert second.complete is True
+    # Same grid as the 50m-overlap run, so all four tiles are current, and
+    # all four are fetched fresh rather than three of them being silently
+    # inherited from the sibling tiling's work_dir.
+    assert source2.fetch_calls == [["r00_c00", "r00_c01", "r01_c00", "r01_c01"]]
+
+
+def test_a_later_success_at_a_different_tiling_cleans_up_a_failed_siblings_scratch(tmp_path):
+    # Consequence 2 of the cleanup gap: a complete root is never reused (a
+    # later request lands on a fresh _02), so if a failed sibling tiling's
+    # scratch tree survived a later, different tiling's success on the same
+    # root, nothing would ever remove it.
+    register(StubSource(fail_on=("r01_c01",)))
+    first = run_survey(_request(tmp_path, tile_size_m=600.0, overlap_m=50.0, force=True))
+    assert first.complete is False
+    assert (first.paths.work_dir / "raw" / "stub").is_dir()
+
+    clear_registry()
+    register(StubSource())
+    second = run_survey(_request(tmp_path, tile_size_m=1200.0, overlap_m=50.0))
+
+    assert second.paths.root == first.paths.root
+    assert second.paths.work_dir != first.paths.work_dir
+    assert second.complete is True
+    # The abandoned 600m sibling's scratch tree is gone, not just the 1200m
+    # run's own, now-also-cleaned-up fingerprint directory.
+    assert not first.paths.work_dir.exists()
+    assert not second.paths.work_dir.exists()
+    assert not second.paths.work_dir.parent.exists()
 
 
 def test_whole_area_outputs_with_no_tile_id_are_still_gathered(tmp_path):
