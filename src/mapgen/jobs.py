@@ -69,6 +69,7 @@ class JobState:
             tile_id: {source_id: PENDING for source_id in source_ids}
             for tile_id in tiles
         }
+        self._extra_tiles: dict[str, dict[str, str]] = {}
 
     @classmethod
     def load_or_create(
@@ -85,12 +86,24 @@ class JobState:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return
+        # Validate shape: must be a dict with "tiles" as a dict.
+        if not isinstance(payload, dict):
+            return
         saved = payload.get("tiles", {})
+        if not isinstance(saved, dict):
+            return
         for tile_id, sources in self.tiles.items():
             saved_sources = saved.get(tile_id, {})
+            if not isinstance(saved_sources, dict):
+                continue
             for source_id in sources:
                 if saved_sources.get(source_id) in (OK, FAILED):
                     sources[source_id] = saved_sources[source_id]
+        # Preserve saved entries not in the current tile list to avoid data loss
+        # when a job is reloaded with a narrower tile set.
+        for tile_id, saved_sources in saved.items():
+            if tile_id not in self.tiles and isinstance(saved_sources, dict):
+                self._extra_tiles[tile_id] = saved_sources
 
     def mark(self, tile_id: str, source_id: str, status: str) -> None:
         self.tiles.setdefault(tile_id, {})[source_id] = status
@@ -117,7 +130,8 @@ class JobState:
         ]
 
     def save(self) -> None:
+        all_tiles = {**self._extra_tiles, **self.tiles}
         atomic_write_text(
             self.state_path,
-            json.dumps({"tiles": self.tiles}, indent=2),
+            json.dumps({"tiles": all_tiles}, indent=2),
         )

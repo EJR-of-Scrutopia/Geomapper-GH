@@ -76,11 +76,14 @@ def test_complete_is_true_when_everything_is_ok(tmp_path):
 
 
 def test_as_tile_records_matches_the_survey_json_shape(tmp_path):
-    state = _state(tmp_path, tiles=("r00_c00",), sources=("osm", "overture"))
+    state = _state(tmp_path, tiles=("r00_c01", "r00_c00"), sources=("osm", "overture"))
+    state.mark("r00_c01", "osm", "ok")
+    state.mark("r00_c01", "overture", "failed")
     state.mark("r00_c00", "osm", "ok")
     state.mark("r00_c00", "overture", "failed")
     assert state.as_tile_records() == [
-        {"tile_id": "r00_c00", "osm": "ok", "overture": "failed"}
+        {"tile_id": "r00_c00", "osm": "ok", "overture": "failed"},
+        {"tile_id": "r00_c01", "osm": "ok", "overture": "failed"}
     ]
 
 
@@ -88,6 +91,58 @@ def test_a_corrupt_state_file_is_discarded_rather_than_crashing(tmp_path):
     (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
     state = _state(tmp_path)
     assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_malformed_state_file_list_gives_fresh_pending(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    state = _state(tmp_path)
+    assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_malformed_state_file_tiles_as_string_gives_fresh_pending(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"tiles": "oops"}), encoding="utf-8"
+    )
+    state = _state(tmp_path)
+    assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_malformed_state_file_tile_value_as_string_gives_fresh_pending(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"tiles": {"r00_c00": "notadict"}}), encoding="utf-8"
+    )
+    state = _state(tmp_path)
+    assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_malformed_state_file_null_gives_fresh_pending(tmp_path):
+    (tmp_path / "state.json").write_text("null", encoding="utf-8")
+    state = _state(tmp_path)
+    assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_malformed_state_file_empty_object_gives_fresh_pending(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({}), encoding="utf-8")
+    state = _state(tmp_path)
+    assert state.status("r00_c00", "osm") == "pending"
+
+
+def test_reload_with_fewer_tiles_preserves_saved_tiles_on_disk(tmp_path):
+    _state(tmp_path, tiles=("r00_c00", "r00_c01")).mark("r00_c00", "osm", "ok")
+    _state(tmp_path, tiles=("r00_c00", "r00_c01")).mark("r00_c01", "osm", "ok")
+    narrowed = _state(tmp_path, tiles=("r00_c00",))
+    narrowed.mark("r00_c00", "osm", "failed")
+    payload = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert "r00_c01" in payload["tiles"]
+    assert payload["tiles"]["r00_c01"]["osm"] == "ok"
+
+
+def test_reload_with_fewer_tiles_complete_reflects_only_current_tiles(tmp_path):
+    _state(tmp_path, tiles=("r00_c00", "r00_c01")).mark("r00_c00", "osm", "ok")
+    _state(tmp_path, tiles=("r00_c00", "r00_c01")).mark("r00_c01", "osm", "ok")
+    narrowed = _state(tmp_path, tiles=("r00_c00",))
+    narrowed.mark("r00_c00", "osm", "ok")
+    assert narrowed.complete is True
 
 
 def test_cancel_token_starts_uncancelled():
