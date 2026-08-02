@@ -678,6 +678,27 @@ def test_a_non_numeric_content_length_does_not_crash_the_handler(server):
         conn.close()
 
 
+def test_a_body_that_is_not_utf8_does_not_crash_the_handler(server):
+    # A correct Content-Length with undecodable bytes reaches the decode in
+    # _parse_json, where a UnicodeDecodeError would kill the handler thread
+    # and drop the connection. json.JSONDecodeError never fires here: the
+    # bytes fail to become a string at all.
+    body = b"\xff\xfe\x00invalid"
+    parsed = urlsplit(server)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+    try:
+        conn.putrequest("POST", f"/api/estimate?token={TOKEN}")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        conn.send(body)
+        response = conn.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read())["error"] == "Body was not valid JSON."
+    finally:
+        conn.close()
+
+
 def test_build_server_defaults_to_loopback_only():
     httpd = build_server(port=0, token=TOKEN)
     try:
