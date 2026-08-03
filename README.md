@@ -128,11 +128,19 @@ simultaneous Overpass requests from one machine are how you get rate limited.
 
 Creates (or refreshes) a `mapgen.lnk` on the Desktop that launches
 `pythonw.exe -m mapgen ui --windowless`: no console window, and the server
-stops itself once the page has been closed for a while (a heartbeat ping
-from the page every 5 seconds; the server waits 20 seconds of silence, long
-enough to survive a reload, before deciding the page is genuinely gone). The
-Stop server button on the page ends it immediately either way, so a crashed
-browser does not leave a process behind waiting out the full grace period.
+stops itself once the page is genuinely gone.
+
+Genuinely gone is decided from three signals, not one. Closing the tab
+reports itself immediately, so a real close does not wait. Returning to the
+page from another window pings at once. Failing both, 90 seconds of complete
+silence is taken as the page having gone away. That last number is high on
+purpose: browsers throttle background tabs to roughly one timer tick a
+minute, so a shorter timeout means "you looked at another window for half a
+minute", not "the page is closed". A download in progress holds the server
+open regardless of any of this, because killing a job someone is waiting for
+is worse than leaving a process running. The Stop server button on the page
+ends it immediately either way, so a crashed browser does not leave a
+process behind waiting out the full grace period.
 Safe to re-run any time: it overwrites the existing shortcut rather than
 needing to be deleted first, which is what makes the shortcut itself safe to
 regenerate instead of hand-edited.
