@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from mapgen import __version__
-from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES
+from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES, UnknownCategoryError
 from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
@@ -26,6 +26,9 @@ from mapgen.package import (
     run_survey,
 )
 from mapgen.sources.base import UnknownSourceError, available_sources
+from mapgen.sources.elevation import ElevationError
+from mapgen.sources.osm import OsmDownloadError
+from mapgen.sources.overture import OvertureError
 
 # Task 19 item 4: where a windowless launch's own errors go when there is
 # no console to print them to. Alongside ~/.mapgen/config.json, the same
@@ -327,7 +330,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return args.func(args)
-    except (NamingError, UnknownSourceError, BBoxError, TilingError) as exc:
+    except (
+        NamingError,
+        UnknownSourceError,
+        BBoxError,
+        TilingError,
+        UnknownCategoryError,
+        OsmDownloadError,
+        OvertureError,
+        ElevationError,
+    ) as exc:
+        # A coordinator review's Important 2: this tuple covered a request
+        # that could never be BUILT (a bad name, bbox, source id or
+        # tiling), but not one that failed once it started actually
+        # downloading. OsmDownloadError (NodeCapExceededError included, it
+        # subclasses this), OvertureError and ElevationError, plus the new
+        # UnknownCategoryError, all used to escape here as a raw, 20-line
+        # Python traceback on the terminal instead of the same plain,
+        # one-line message the browser path already gave the same
+        # failures (JobManager's own except Exception: record.error =
+        # str(exc) never had this gap; only this CLI path did). Every one
+        # of these is already a deliberately plain, one-line message
+        # written for exactly this purpose (see each class's own raise
+        # sites); str(exc) here is not a fallback, it is what they were
+        # always for.
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

@@ -7,6 +7,9 @@ import pytest
 import mapgen.cli as cli
 from mapgen.cli import build_parser, main
 from mapgen.sources.base import Estimate, clear_registry, register
+from mapgen.sources.elevation import ElevationError
+from mapgen.sources.osm import NodeCapExceededError, OsmDownloadError
+from mapgen.sources.overture import OvertureError
 
 
 class StubSource:
@@ -204,6 +207,163 @@ def test_estimate_reports_a_zero_tile_size_without_a_traceback(tmp_path, capsys)
     )
     assert exit_code == 1
     assert "greater than zero" in capsys.readouterr().err
+
+
+# --- A coordinator review's Important 2: main()'s except tuple covered a
+# request that could never be BUILT (a bad name, bbox, source id or
+# tiling), but not one that failed once it started actually downloading.
+# OsmDownloadError (NodeCapExceededError included, it subclasses this),
+# OvertureError, ElevationError and UnknownCategoryError all used to
+# escape as a raw, unhandled Python traceback instead of the same plain,
+# one-line message the browser path already gave the same failures. Each
+# fake source below uses its own made-up id (never "osm"/"overture"/
+# "elevation") so it sits alongside, not instead of, the real default
+# sources main() itself registers, the same way StubSource and
+# AlwaysFailsStubSource above already do. -------------------------------
+
+
+class _RaisesOsmDownloadErrorSource:
+    id = "raises-osm-download-error"
+    display_name = "Raises OsmDownloadError"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        raise OsmDownloadError("a distinctive OsmDownloadError from a test source")
+
+    def merge(self, parts, out_dir, stem):
+        return []
+
+
+class _RaisesNodeCapExceededErrorSource:
+    """NodeCapExceededError specifically, not just its OsmDownloadError
+    parent: this is the one main() would actually meet in practice (a
+    dense tile at the smallest rung of the retry ladder), so it gets its
+    own test rather than trusting the inheritance relationship alone.
+    """
+
+    id = "raises-node-cap-error"
+    display_name = "Raises NodeCapExceededError"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        raise NodeCapExceededError("a distinctive NodeCapExceededError from a test source")
+
+    def merge(self, parts, out_dir, stem):
+        return []
+
+
+class _RaisesOvertureErrorSource:
+    id = "raises-overture-error"
+    display_name = "Raises OvertureError"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        raise OvertureError("a distinctive OvertureError from a test source")
+
+    def merge(self, parts, out_dir, stem):
+        return []
+
+
+class _RaisesElevationErrorSource:
+    id = "raises-elevation-error"
+    display_name = "Raises ElevationError"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        raise ElevationError("a distinctive ElevationError from a test source")
+
+    def merge(self, parts, out_dir, stem):
+        return []
+
+
+def _survey_error_case_args(tmp_path, source_id, **extra):
+    args = [
+        "survey",
+        "--bbox=-3.29,51.38,-3.28,51.39",
+        "--region=South Wales",
+        "--site=Barry Waterfront",
+        "--output-root",
+        str(tmp_path),
+        "--source",
+        source_id,
+        "--skip-bridge",
+    ]
+    for flag, value in extra.items():
+        args.extend([f"--{flag.replace('_', '-')}", str(value)])
+    return args
+
+
+def test_survey_reports_an_osm_download_error_without_a_traceback(tmp_path, capsys):
+    register(_RaisesOsmDownloadErrorSource())
+    exit_code = main(_survey_error_case_args(tmp_path, "raises-osm-download-error"))
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "a distinctive OsmDownloadError from a test source" in err
+    assert "Traceback" not in err
+
+
+def test_survey_reports_a_node_cap_exceeded_error_without_a_traceback(tmp_path, capsys):
+    # The realistic case: a node-cap failure with no smaller tile size
+    # left to retry (the ladder in package.py only retries automatically;
+    # once it is exhausted, this is what main() actually has to catch).
+    register(_RaisesNodeCapExceededErrorSource())
+    exit_code = main(_survey_error_case_args(tmp_path, "raises-node-cap-error", tile_size_m=1000))
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "a distinctive NodeCapExceededError from a test source" in err
+    assert "Traceback" not in err
+
+
+def test_survey_reports_an_overture_error_without_a_traceback(tmp_path, capsys):
+    register(_RaisesOvertureErrorSource())
+    exit_code = main(_survey_error_case_args(tmp_path, "raises-overture-error"))
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "a distinctive OvertureError from a test source" in err
+    assert "Traceback" not in err
+
+
+def test_survey_reports_an_elevation_error_without_a_traceback(tmp_path, capsys):
+    register(_RaisesElevationErrorSource())
+    exit_code = main(_survey_error_case_args(tmp_path, "raises-elevation-error"))
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "a distinctive ElevationError from a test source" in err
+    assert "Traceback" not in err
+
+
+def test_survey_reports_an_unknown_category_without_a_traceback(tmp_path, capsys):
+    # No fake source needed: this is raised by SurveyRequest.__post_init__
+    # (see mapgen.categories.validate_categories) before any source is
+    # ever touched, from the CLI's own --category flag, the exact live
+    # reproduction a coordinator review used for Critical 1 ("building"
+    # for the real id "buildings").
+    exit_code = main(_survey_error_case_args(tmp_path, "stub", category="building"))
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Unknown category" in err
+    assert "buildings" in err
+    assert "Traceback" not in err
 
 
 def test_categories_command_lists_every_leaf_id(capsys):
