@@ -310,6 +310,23 @@ def resolve_api_key(
     return key
 
 
+def _redact_response_urls(response: object, secret: str) -> None:
+    """Redacts .url on response and on response.request, in place.
+
+    Factored out because review round 4 found the first of what would
+    otherwise have been three near-identical copies of this loop: one in
+    fetch()'s status-check branch, one in its non-TIFF branch, both
+    reachable with no exception in play, so _scrub_exception_chain (which
+    only ever walks an exception's own chain) never gets a chance at
+    either. One function used twice cannot drift out of step with itself
+    the way two independently maintained copies eventually would.
+    """
+    for holder in (response, getattr(response, "request", None)):
+        url = getattr(holder, "url", None) if holder is not None else None
+        if isinstance(url, str):
+            holder.url = _redact(url, secret)
+
+
 class ElevationSource:
     id = "elevation"
     display_name = "Elevation (OpenTopography COP30)"
@@ -409,6 +426,22 @@ class ElevationSource:
         # own message the way a genuine requests exception does, all
         # reached run_survey's source_failed event and JobManager's
         # record.error unredacted under the previous, HTTPError-only fix.
+        #
+        # A bad status is deliberately NOT raised from inside this try.
+        # Review round 4's finding: it used to be, and the
+        # except (ElevationError, ...): raise clause immediately below
+        # re-raised it with api_key and params still bound in this frame,
+        # because a bare `raise` re-raises the exception unchanged and
+        # must not run cleanup code of its own, that being exactly what
+        # "re-raise unchanged" means. Three rounds of work fixed the
+        # other two raise sites in this method and missed this one
+        # precisely because it did not look like a third site: it was
+        # hiding inside a try/except that reads, at a glance, as already
+        # handled. Only status_code, a plain int with nothing in it to
+        # redact, is captured here; the actual raise happens below, after
+        # the try, in the same straight-line shape as the non-TIFF check
+        # beneath it, so every raise site in this method now looks the
+        # same and none of them hide inside a catch-and-reraise clause.
         try:
             with self.session.get(
                 self.url,
@@ -417,19 +450,24 @@ class ElevationSource:
                 stream=True,
                 timeout=self.timeout_seconds,
             ) as response:
-                if response.status_code >= 400:
-                    raise ElevationError(f"Failed to download DEM: HTTP {response.status_code}")
-                payload = b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
+                status_code = response.status_code
+                payload = (
+                    b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
+                    if status_code < 400
+                    else b""
+                )
         except (ElevationError, Cancelled, KeyboardInterrupt):
-            # Left exactly as raised. Cancelled is this project's own
-            # cooperative-cancellation signal and KeyboardInterrupt is
-            # Python's; neither is raised anywhere inside the block above
-            # today, but that must stay true because nothing in this
-            # method calls anything that raises them, not because the
-            # broad except below happens not to catch them. Named here
-            # explicitly, so a future change to what this block calls
-            # cannot silently start swallowing either one into an
-            # ElevationError.
+            # Left exactly as raised. Nothing inside the block above
+            # raises any of these three today: the one thing that used to
+            # raise ElevationError from in here, the status check, has
+            # moved below, out of this try entirely, precisely so it
+            # stops needing this clause's protection, which cannot clean
+            # up a frame on its way through. Kept anyway, for
+            # ElevationError alongside Cancelled (this project's own
+            # cooperative-cancellation signal) and KeyboardInterrupt
+            # (Python's), so a future change to what this block calls
+            # cannot silently start swallowing any of the three into a
+            # new, differently-worded ElevationError.
             raise
         except Exception as exc:
             # Deliberately broad, and deliberately not a list of specific
@@ -468,6 +506,29 @@ class ElevationSource:
             del api_key, params
             raise ElevationError(message) from None
 
+        if status_code >= 400:
+            # Review round 4's finding, closed here, moved from inside
+            # the try above. response and response.request are still
+            # bound in this frame (the `with` block only closes the
+            # connection, it does not unbind the name), and .url on each
+            # is the literal request URL, API_Key included. No exception
+            # exists in this branch for _scrub_exception_chain to ever
+            # reach, so it is redacted in place directly through the same
+            # helper the non-TIFF branch below uses. api_key and params
+            # are deleted before the raise for the same reason as every
+            # other raise site in this method: pytest --showlocals,
+            # Sentry's local-variable capture, and a debugger's
+            # postmortem all read a frame's locals directly, bypassing
+            # _redact and _scrub_exception_chain entirely, neither of
+            # which touches a frame's own variables. This is also, in
+            # practice, the single most frequently reached failure path
+            # in the whole module: a wrong or expired key produces a 401
+            # on every attempt, which is exactly what made this the
+            # finding worth catching before a fifth round had to.
+            _redact_response_urls(response, api_key)
+            del api_key, params
+            raise ElevationError(f"Failed to download DEM: HTTP {status_code}")
+
         if not is_tiff(payload[:16]):
             # Redacted before truncating, not after: truncating to a
             # fixed byte window first can cut a real key in half (enough
@@ -486,12 +547,9 @@ class ElevationSource:
             # URL, API_Key included, entirely untouched by the preview
             # redaction two lines up. No exception exists yet at this
             # point for _scrub_exception_chain to have a chance to reach,
-            # so it is scrubbed in place directly, the same way that
-            # function scrubs it when one does exist.
-            for holder in (response, getattr(response, "request", None)):
-                url = getattr(holder, "url", None) if holder is not None else None
-                if isinstance(url, str):
-                    holder.url = _redact(url, api_key)
+            # so it is scrubbed in place directly, the same way the
+            # status-check branch above it does.
+            _redact_response_urls(response, api_key)
             # api_key and params for the same reason as the except
             # branch above; payload and decoded because both are the
             # raw, un-redacted response body, which can itself echo the

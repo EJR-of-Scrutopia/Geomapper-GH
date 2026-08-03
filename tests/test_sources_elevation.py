@@ -632,6 +632,26 @@ def test_fetch_never_leaks_a_trailing_space_key_encoded_by_a_real_prepared_reque
     # one instead calls requests' own Request(...).prepare(), so
     # whatever encoding requests actually uses for a trailing space is
     # whatever ends up in the exception message, with no guessing at all.
+    #
+    # Review round 4's correction: this is the end-to-end proof that the
+    # real-world scenario is fixed, and nothing more than that. It is NOT
+    # a pin on either redaction layer individually, because "API_Key=...+"
+    # is a shape BOTH layers independently recognise (the primary regex
+    # because it starts with "API_Key=" regardless of what follows;
+    # quote_plus(secret) because it is a byte-for-byte match), so this
+    # test still passes with either layer disabled on its own and only
+    # fails if both are gone at once. It reads like a pin on both layers
+    # and is not one. The actual per-layer pins live elsewhere:
+    # test_redact_parameter_pattern_catches_an_encoding_nobody_added_a_
+    # candidate_for and test_redact_strips_the_parameter_pattern_even_
+    # when_no_secret_is_known (plus, incidentally, both logging-filter
+    # tests below, since the filter has no secret to fall back on) pin
+    # the primary regex; test_redact_backstop_catches_the_plus_encoded_
+    # form_of_a_trailing_space_key pins the quote_plus backstop on its
+    # own, using text with no "API_Key=" in it at all so the primary
+    # regex has nothing to catch. Confirmed by mutation: disabling the
+    # primary regex fails four tests (the two above plus both logging
+    # filter tests); disabling quote_plus fails exactly the one.
     secret_with_trailing_space = "sk-real-secret-with-trailing-space "
     prepared = requests.Request(
         "GET",
@@ -923,3 +943,82 @@ def test_urllib3_debug_logging_never_reveals_the_key(local_http_server, caplog):
         "line at all, so this test cannot be proving the filter works"
     )
     assert real_key not in caplog.text, f"the key leaked into urllib3's own debug log: {caplog.text}"
+
+
+# --- Review round 4: a fourth reviewer found the leak this module's own
+# test file should already have caught. fetch() has three raise sites, not
+# two: the status check used to raise from INSIDE the try block, where the
+# bare `raise` in except (ElevationError, Cancelled, KeyboardInterrupt):
+# re-raised it with api_key and params both still bound in this frame, since
+# a bare `raise` must re-raise unchanged and so cannot run cleanup of its
+# own. Round 3 added a frame-locals test for the broad-except path and one
+# for the non-TIFF path, and none for this one, so the gap between "two
+# raise sites are fixed" and "there are three" walked straight past three
+# rounds of otherwise-thorough work. str(exc) was never affected (this
+# path never builds a message from anything containing the key), so CLI
+# stdout, CLI stderr and the browser's polled job record were never at
+# risk; the exposure was always limited to pytest --showlocals, Sentry-style
+# local capture and a postmortem debugger, which is exactly why three
+# rounds of mutation-testing str(exc)/traceback text never surfaced it.
+#
+# Fixed by restructuring rather than by adding a fourth `del`: the status
+# check now happens AFTER the try, in the same straight-line
+# compute-then-delete-then-raise shape as the non-TIFF check beneath it,
+# so it no longer hides inside a catch-and-reraise clause that cannot clean
+# up on its way through. See _redact_response_urls and the status_code
+# handling in fetch() for the actual fix; the two tests below are its
+# frame-locals proof, mirroring round 3's own two tests for the other
+# raise sites exactly, so this class of gap cannot recur silently: any
+# future raise site added to fetch() without a matching frame-locals test
+# is now the odd one out against a pattern of three, not one exception
+# alongside two.
+
+
+def test_fetch_redacts_the_response_url_on_a_bad_status_before_it_can_survive_as_a_frame_local(
+    tmp_path,
+):
+    # Same property, and the same reason, as
+    # test_fetch_redacts_the_response_url_before_it_can_survive_as_a_frame_local
+    # above, for the status-check raise site instead of the non-TIFF one:
+    # response (and response.request) are still bound in fetch()'s frame
+    # after the `with` block closes the connection, and .url on each is
+    # the literal request URL, API_Key included. If fetch() did not scrub
+    # them in place, the SAME object this test holds a reference to would
+    # still carry the raw key long after the call returns, regardless of
+    # what the raised exception's own message says.
+    leaky_url = f"https://portal.opentopography.org/API/globaldem?demtype=COP30&API_Key={SECRET}"
+    response = _UrlAwareStreamResponse([], url=leaky_url, status_code=401)
+    source = ElevationSource(api_key=SECRET, session=FakeSession(response))
+    with pytest.raises(ElevationError, match="HTTP 401"):
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in response.url
+    assert SECRET not in response.request.url
+
+
+def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_bad_status_path(tmp_path):
+    # The missing third test review round 4 asked for, mirroring the
+    # broad-except and non-TIFF versions above exactly. A 401 is the
+    # scenario the coordinator singled out deliberately: a wrong or
+    # expired key produces one on every single attempt, which makes this
+    # the most frequently reached failure path in the whole module, not
+    # an edge case.
+    session = FakeSession(FakeStreamResponse([], status_code=401))
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+
+    tb = excinfo.tb
+    checked_fetch_frame = False
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_name == "fetch":
+            checked_fetch_frame = True
+            for name, value in frame.f_locals.items():
+                if isinstance(value, str):
+                    assert SECRET not in value, f"local {name!r} in fetch() still holds the key"
+                elif isinstance(value, dict):
+                    assert not any(
+                        isinstance(v, str) and SECRET in v for v in value.values()
+                    ), f"local {name!r} in fetch() still holds the key in a dict value"
+        tb = tb.tb_next
+    assert checked_fetch_frame, "the traceback did not include elevation.py's fetch() frame"
