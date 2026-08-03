@@ -1031,21 +1031,32 @@ def test_a_stopped_run_merges_the_tile_it_has_and_writes_a_truthful_survey_json(
     assert payload["complete"] is False
     assert payload["stopped"] is True
     records = {record["tile_id"]: record["stub"] for record in payload["tiles"]}
-    # The tile actually fetched says so; the three the stop caught before
-    # they were reached say so too, truthfully, not "ok".
+    # The tile actually fetched says so. The three the stop caught before
+    # they were reached read "pending", not "failed": a coordinator
+    # review's finding is that this is what "truthful" actually requires
+    # here, since nothing about those three tiles ever failed, they were
+    # simply never attempted. "failed" is reserved for a real attempt
+    # that came up short, the same claim it makes on any other run.
     assert records["r00_c00"] == "ok"
-    assert records["r00_c01"] == "failed"
-    assert records["r01_c00"] == "failed"
-    assert records["r01_c01"] == "failed"
+    assert records["r00_c01"] == "pending"
+    assert records["r01_c00"] == "pending"
+    assert records["r01_c01"] == "pending"
 
 
-def test_a_stopped_run_emits_tile_failed_for_every_tile_it_never_reached(tmp_path):
+def test_a_stopped_run_emits_no_tile_failed_for_tiles_it_never_reached(tmp_path):
+    # The other half of the same finding: a tile the stop caught before it
+    # was reached must not drive the browser's tile grid into its red,
+    # sticky "failed" state either, since nothing about it actually
+    # failed. tile_failed is reserved for the same real-attempt-came-up-
+    # short case survey.json's own "failed" status now means.
     source = CancelAwareStubSource()
     register(source)
     log = EventLog()
     run_survey(_request(tmp_path), progress=log)
     failed_tile_ids = {e["tile_id"] for e in log.events if e["event"] == "tile_failed"}
-    assert failed_tile_ids == {"r00_c01", "r01_c00", "r01_c01"}
+    assert failed_tile_ids == set(), (
+        f"expected no tile_failed events for tiles the stop never reached, got {failed_tile_ids}"
+    )
 
 
 def test_a_stopped_run_does_not_sweep_stale_outputs(tmp_path):
@@ -1155,7 +1166,12 @@ def test_a_source_with_no_cancel_parameter_still_stops_the_run_between_sources(t
     # The second source never started at all: the between-sources check
     # caught the cancellation the legacy source itself triggered. Its
     # tiles are honestly "pending" (never attempted), not "failed" (which
-    # would claim an attempt was made and came up short).
+    # would claim an attempt was made and came up short). This is the same
+    # rule test_a_stopped_run_merges_the_tile_it_has_and_writes_a_truthful_
+    # survey_json pins for a source interrupted PARTWAY through: whether a
+    # source never got a turn at all or was cut off mid-fetch, a tile it
+    # never touched is never-attempted either way, and the two cases must
+    # not disagree about what that reads as.
     assert not (result.paths.root / "second.txt").exists()
     payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
     second_records = {r["tile_id"]: r["second"] for r in payload["tiles"]}

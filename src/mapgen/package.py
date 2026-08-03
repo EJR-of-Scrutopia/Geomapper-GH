@@ -24,7 +24,7 @@ from mapgen.fsutil import (
     work_dir_scope,
 )
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
-from mapgen.jobs import FAILED, OK, CancelToken, Cancelled, JobState
+from mapgen.jobs import FAILED, OK, PENDING, CancelToken, Cancelled, JobState
 from mapgen.merge import assert_inputs_present
 from mapgen.naming import (
     PackagePaths,
@@ -554,8 +554,21 @@ def _run_survey_once(
             try:
                 parts = assert_inputs_present(parts, force=request.force or stopped)
             finally:
+                # stopped, not force, decides whether a tile lacking
+                # output here reads FAILED or PENDING: this is the one
+                # call site reached by a Cancelled-interrupted fetch (see
+                # _record_tile_outcomes's own docstring for why that
+                # implies every such tile was genuinely never attempted,
+                # not attempted and found wanting).
                 _record_tile_outcomes(
-                    state, source.id, pending, source_work, fetch_succeeded, current_tile_ids, sink
+                    state,
+                    source.id,
+                    pending,
+                    source_work,
+                    fetch_succeeded,
+                    current_tile_ids,
+                    sink,
+                    stopped=stopped,
                 )
             merged = source.merge(parts, paths.root, paths.stem)
             outputs_by_source[source.id] = merged
@@ -713,22 +726,42 @@ def _record_tile_outcomes(
     fetch_succeeded: bool,
     current_tile_ids: Sequence[str],
     sink: ProgressSink,
+    stopped: bool = False,
 ) -> None:
     """Mark each pending tile from what is actually on disk, not from
     whether the batch fetch() call raised.
 
     Also emits a tile_failed progress event for every tile this call
-    resolves to FAILED (Task 22), whatever the reason: an ordinary
-    per-tile error, a source that never got its turn because the run was
-    stopped first, or a stop that landed mid-source and left some of its
-    tiles untouched. This is deliberately the ONE place that decides a
-    tile has failed, since it is the one place that already has to reason
-    about what is genuinely on disk rather than trust a batch call's own
-    return value; the browser's tile grid reads this event to show a
-    failed tile as visibly distinct from one that is merely still
-    pending, which matters more here than for the other three grid
-    states, since it is the one the owner would want to know about before
-    deciding they have enough.
+    resolves to FAILED (Task 22), never for one it resolves to PENDING.
+    This is deliberately the ONE place that decides a tile has failed,
+    since it is the one place that already has to reason about what is
+    genuinely on disk rather than trust a batch call's own return value;
+    the browser's tile grid reads this event to show a failed tile as
+    visibly distinct from one that is merely still pending, which matters
+    more here than for the other three grid states, since it is the one
+    the owner would want to know about before deciding they have enough.
+    Precisely because it matters more, it must mean a real attempt came
+    up short, never merely "not reached yet" (a coordinator review's
+    finding: this call site marked a whole stopped source's untouched
+    tail of tiles FAILED, which painted most of a 16-tile grid red the
+    instant a clean Stop landed on tile 2, and made the owner distrust a
+    package that was, in fact, fine).
+
+    stopped tells this apart from an ordinary failure: it is true only
+    when THIS call is the one running because this source's own fetch()
+    raised Cancelled just now (see _run_survey_once's own local `stopped`
+    flag, passed straight through), never for a genuine per-tile error or
+    a plain, complete success. Cancelled and any other exception cannot
+    both come out of the same fetch() call (Python raises one exception
+    at a time, and none of the three real sources catch and continue past
+    an internal failure), so a tile lacking output here, on a call where
+    stopped is true, was never attempted at all, not attempted and found
+    wanting: it is marked PENDING, matching the status a source that
+    never got a turn at all already carries, and no tile_failed event is
+    emitted for it. A tile that already has real output (the one in
+    flight when the stop landed, kept per the LayerSource protocol's own
+    cancel convention) is unaffected: it is still marked OK from the
+    checks below exactly as it always was.
 
     fetch() is one Python call for potentially many tiles: it either returns
     once for all of them or raises once for all of them, which says nothing
@@ -751,11 +784,15 @@ def _record_tile_outcomes(
     batch outcome, so it applies uniformly, matching how such sources have
     always behaved. But a fetch() that returns without raising while leaving
     nothing at all on disk is not evidence of anything: that is vacuous, not
-    done, so it is always failed regardless of what the batch call reported.
+    done, so it is always failed regardless of what the batch call reported
+    (this can never coincide with stopped=True: Cancelled is what sets
+    stopped, and Cancelled means fetch() never reached its own return at
+    all, so fetch_succeeded is always False whenever stopped is True).
     """
     files = _existing_output_files(source_work, current_tile_ids)
     pending_ids = {tile.tile_id for tile in pending}
     tile_stamped_dirs = {path.parent for path in files if path.stem in pending_ids}
+    not_attempted_status = PENDING if stopped else FAILED
 
     for tile in pending:
         if tile_stamped_dirs:
@@ -768,11 +805,11 @@ def _record_tile_outcomes(
                 )
                 for directory in tile_stamped_dirs
             )
-            status = OK if has_output else FAILED
+            status = OK if has_output else not_attempted_status
         elif files:
-            status = OK if fetch_succeeded else FAILED
+            status = OK if fetch_succeeded else not_attempted_status
         else:
-            status = FAILED
+            status = not_attempted_status
         state.mark(tile.tile_id, source_id, status)
         if status == FAILED:
             sink.emit("tile_failed", source=source_id, tile_id=tile.tile_id)
@@ -948,9 +985,11 @@ def _build_survey_json(
         # see run_survey's own handling of that exact race). Read this
         # alongside `tiles`, which already carries the true per-tile
         # picture this field is a one-word summary of: complete=false,
-        # stopped=true, some tiles "failed" is not a contradiction, it is
-        # this file correctly saying which tiles the stop caught before
-        # they were reached.
+        # stopped=true, the tiles the stop caught before they were
+        # reached read "pending" there, not "failed" (see
+        # _record_tile_outcomes's own docstring); "failed" on a stopped
+        # run still means a real attempt came up short, exactly as it
+        # does on any other run.
         "stopped": stopped,
         "bridge": {
             "attempted": bridge_attempted,
