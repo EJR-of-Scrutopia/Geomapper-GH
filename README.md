@@ -1,23 +1,319 @@
-# Geomapper-GH
-Map builder from different repositories for use in map creation using ubano and other grasshopper visualising techniques
+# mapgen
+
+A site survey data tool for architectural work. Draw an extent on a map, name
+it, and get back a folder of OpenStreetMap, Overture Maps and elevation data
+that Grasshopper and Urbano 2 can read directly.
+
+## What it does
+
+You give it a bounding box, a region name and a site name. It splits the
+extent into overlapping tiles, downloads OpenStreetMap and Overture Maps data
+(and, if you have an OpenTopography key, a Copernicus elevation model) for
+every tile, deduplicates the overlap, merges everything into single per-source
+files, and writes it all into a dated, named package folder alongside a
+`survey.json` audit trail and an Urbano 2 project setting file. A failed or
+interrupted job resumes rather than restarting.
+
+It replaces an earlier script, `osm_overture_tiles.py`, that did the same job
+by hand-composed command line. Everything that script did is either here
+under a real command, or is called out below as intentionally dropped.
+
+## Setup
+
+Requires Python 3.11 or newer.
+
+```powershell
+git clone https://github.com/EJR-of-Scrutopia/Geomapper-GH.git mapgen
+cd mapgen
+.\bootstrap.ps1
+.\.venv\Scripts\Activate.ps1
+```
+
+`bootstrap.ps1` creates `.venv` and installs mapgen into it in editable mode,
+along with its two pinned dependencies, `requests` and `overturemaps`.
+`overturemaps` is a normal Python dependency, not a separate install: pip
+puts its `overturemaps` command on `.venv\Scripts` alongside `mapgen` itself,
+and mapgen's Overture source calls it as a subprocess. There is nothing
+further to install for Overture to work.
+
+The Urbano 2 bridge is a separate, optional piece (see "The Urbano bridge"
+below). It needs the .NET SDK to build and a working Urbano 2 install to run
+against, and its absence does not stop the rest of mapgen from working.
+
+### The OpenTopography key
+
+The elevation layer (Copernicus DEM, via OpenTopography) needs a free API key
+from [portal.opentopography.org](https://portal.opentopography.org). Without
+one, every other layer still works; elevation is simply left out, and the web
+interface tells you why if you try to select it.
+
+Set it as an environment variable:
+
+```powershell
+$env:OPENTOPOGRAPHY_API_KEY = "your-key"
+```
+
+or paste it into the "OpenTopography API key" field in the web interface,
+which saves it to `~/.mapgen/config.json`. The environment variable always
+wins if both are set. `OPENTOPO_API_KEY` is accepted as an older alias for
+the same variable.
+
+## Running it
+
+### Browser
+
+```powershell
+mapgen ui
+```
+
+(or `python -m mapgen ui` if the console script is not yet on `PATH`). This
+opens a local page, served on `127.0.0.1` with a per-launch access token in
+the URL, so nothing else on the machine can drive it. On the page:
+
+- Draw a rectangle on the map, paste a `west,south,east,north` bbox string, or
+  search a place name and pick a result. Whichever way you set it, the extent
+  always shows as a rectangle.
+- Fill in Region and Site. These name the output folder.
+- Tile size and overlap default to 2000 m and 100 m and rarely need changing;
+  the hint text under each field explains what they trade off.
+- Tick which layers you want (OpenStreetMap, Overture Maps, elevation).
+- Set the output root, or accept the remembered one.
+- Above the Download button you get the extent in kilometres, tile count,
+  and an estimated download size and duration, computed before anything is
+  fetched, so a mis-drawn box over the wrong country is obvious immediately.
+- The download runs with a live per-tile log and a Cancel button that stops
+  cleanly at the next tile boundary.
+
+Only one download runs at a time; starting a second while one is in progress
+is refused with a clear message rather than run concurrently, because
+simultaneous Overpass requests from one machine are how you get rate limited.
+
+### Command line
+
+The real command used to verify this tool, kept here because it is a working
+example, not an invented one:
+
+```powershell
+mapgen survey `
+  --bbox=-3.29,51.38,-3.28,51.39 `
+  --region "South Wales" `
+  --site "Barry Waterfront" `
+  --tile-size-m 1000 `
+  --overlap-m 50 `
+  --source osm --source overture `
+  --overture-type building --overture-type water
+```
+
+`--source` is repeatable and defaults to `osm` and `overture` if omitted.
+`--overture-type` is repeatable and defaults to a map-oriented set of eight
+types (building, place, segment, connector, infrastructure, land_use,
+land_cover, water) if omitted. `--region` and `--site` are always required.
+
+Other commands:
+
+```powershell
+# Same arguments as survey, but reports tiles, size and duration without downloading.
+mapgen estimate --bbox=-3.29,51.38,-3.28,51.39 --region "South Wales" --site "Barry Waterfront"
+
+# Lists every registered data source and its licence.
+mapgen sources
+```
+
+`mapgen survey` exits 0 on a complete package and 1 if any tile failed
+(`--force` continues past a failed tile instead of stopping, and marks the
+package incomplete in `survey.json` rather than pretending it finished).
+`plan`, `download`, `merge` and `urbano-package` still exist as command
+names, for muscle memory, but they are aliases for `survey`/`estimate` with
+the current flag set, not the old script's flags: `--output-dir`, `--tile-id`
+and `--max-tiles` are gone, and an old invocation using them fails with a
+plain argument error rather than doing something subtly different.
+
+## What a survey folder contains
+
+A survey of "Barry Waterfront" in region "South Wales" produces:
+
+```text
+<output root>/South-Wales/2026-08-03_Barry-Waterfront/
+  Barry-Waterfront_2026-08-03.osm                    merged OpenStreetMap XML
+  Barry-Waterfront_2026-08-03_building.geojson        one file per requested Overture type
+  Barry-Waterfront_2026-08-03_water.geojson
+  Barry-Waterfront_2026-08-03.tif                     elevation, only if selected
+  Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here
+  survey.json                                         audit trail, read this first
+  layers/
+    water.geojson                                     friendly-named copies of
+    vegetation.geojson                                three specific Overture types,
+    landuse.geojson                                   for direct use outside Urbano
+```
+
+A real run over a small extent of Barry Waterfront's docks (`osm` only)
+produced 3375 nodes across 69 ways, including 19 tagged buildings, landing
+correctly around 51.385 N, 3.28 W. Coordinate ranges in the merged file
+usually extend a little beyond the bbox you asked for: the OSM map API
+returns whole ways, not clipped fragments, so a way that crosses your
+boundary comes back complete. That is correct behaviour, not a bug.
+
+Each file:
+
+- **`<stem>.osm`**: every OSM node, way and relation in the extent, tiles
+  merged and deduplicated by id, highest version wins at a seam. This is the
+  file the Urbano bridge reads for OSM geometry.
+- **`<stem>_<type>.geojson`**: one deduplicated GeoJSON FeatureCollection per
+  requested Overture type, sitting in the package root regardless of which
+  types you asked for.
+- **`layers/water.geojson`, `layers/vegetation.geojson`, `layers/landuse.geojson`**:
+  copies of the Overture `water`, `land_cover` and `land_use` types
+  specifically, under names meant to be read straight into Grasshopper
+  without knowing which Overture type produced them. Only these three are
+  copied here; every other requested type is still available as the
+  `<stem>_<type>.geojson` file above.
+- **`<stem>.tif`**: the whole-area Copernicus DEM GeoTIFF, if an elevation
+  source was selected and an OpenTopography key was available.
+- **`<stem>_project_setting.json`**: written by the Urbano bridge, only when
+  the bridge succeeds. This is the single file to point Urbano 2 at.
+- **`survey.json`**: see below.
+- **`_work/`**: the in-progress scratch folder, keyed by a fingerprint of the
+  exact bbox, tile size and overlap. It is only present while a job is
+  incomplete, or if `--keep-work` was passed. A clean, complete run removes
+  it automatically. Re-running the same survey with the same tiling resumes
+  from whatever is already in here rather than restarting.
+
+### survey.json
+
+The audit trail. If this data ends up informing real project work, being able
+to say where every polygon came from, under what licence, is not optional.
+Fields, as actually written:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Currently `1`. Bump only on a breaking change to this shape. |
+| `tool_version` | The mapgen version that produced this package. |
+| `site`, `region` | Exactly as typed. |
+| `slug.site`, `slug.region` | The versions used to build the folder path. |
+| `date` | The survey date, ISO format. Defaults to today, overridable with `--date`. |
+| `urbano_stem` | The file stem used for every named output in this package. |
+| `bbox` | The requested extent, `west`/`south`/`east`/`north`. |
+| `extent_km` | Width and height of that bbox in kilometres. |
+| `tiling` | `tile_size_m`, `overlap_m`, and the resulting `rows`/`cols`. |
+| `sources` | One entry per requested source: `id`, `licence`, `attribution`, and `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record). |
+| `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"` status per source. |
+| `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
+| `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely. |
+| `started_at`, `finished_at` | UTC timestamps. |
+
+## Using the output in Grasshopper, with Urbano 2
+
+This is the point of the tool. In Grasshopper, place the Urbano 2 component
+that consumes a project setting file and point its file path input at
+`<stem>_project_setting.json`. That one file already carries absolute paths
+to the OSM file and, if generated, the elevation GeoTIFF and an Overture
+buildings geoparquet that the bridge fetches on its own account, separate
+from the `.geojson` files described above.
+
+The `layers/*.geojson` files (and the `<stem>_<type>.geojson` files in the
+package root) are independent of Urbano and read directly into any
+Grasshopper component that understands GeoJSON. This matters because Urbano
+may or may not do anything with paths placed in its own `Layers` array; both
+outcomes are fine, since these files work as standalone inputs either way.
+
+## Data sources, licences and attribution
+
+These are legal obligations, not decoration. `survey.json`'s `sources` array
+records the exact licence and attribution string for every layer in a given
+package; carry that text forward into anything published from this data,
+including drawing sheets.
+
+| Source | Licence | Attribution string |
+| --- | --- | --- |
+| OpenStreetMap | Open Database License (ODbL) 1.0 | (c) OpenStreetMap contributors |
+| Overture Maps | Mixed by theme: Open Database License (ODbL) and CDLA-Permissive-2.0 | (c) Overture Maps Foundation |
+| Copernicus DEM, via OpenTopography | Free for any use, with attribution | (c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH |
+
+ODbL requires attribution and, if you redistribute the data itself (as
+opposed to a map or drawing derived from it), requires any substantial
+extract to stay under an ODbL-compatible licence. See
+[osm.org/copyright](https://www.openstreetmap.org/copyright) and the
+[Overture Maps licensing page](https://overturemaps.org/documentation/attribution/)
+for the current, authoritative text; the table above is a working summary,
+not a substitute for reading either.
+
+## Limits worth knowing about
+
+**The OSM node cap.** The OSM map API refuses any single request over 50000
+nodes. A tile that dense fails outright, with a message telling you to
+reduce `--tile-size-m` (1500 or 2000 m usually clears it in a dense urban
+core). There is no automatic fallback to Overpass, and no automatic retry at
+a smaller tile size: mapgen fails once, clearly, and leaves the retry to you.
+The old script's `urbano-package` command did retry automatically, silently
+stepping down through 2000, 1500 and 1000 m tiles on this exact failure; that
+behaviour was not carried over. Given mapgen's default tile size is already
+2000 m (down from the old script's 5000 m default, chosen because of this
+same failure mode), it should be rarer to hit in practice, but it can still
+happen in dense areas and now needs a manual `--tile-size-m` on the next
+attempt. `use_overpass=True` remains available as a whole-run constructor
+choice for Python callers, querying Overpass instead of the OSM map API from
+the start, but it is not wired to the CLI or web interface, and it is a
+different, separately-configured run, not a per-tile fallback triggered by
+this failure.
+
+**Windows path length.** Windows resolves a path at 260 characters by
+default, and this repository's own OneDrive-synced location is already
+around 110 of those before a survey folder even starts. mapgen computes the
+worst-case path a job would produce, including the tiling work folder, and
+refuses the job before any network call if that exceeds 240 characters,
+naming the longest path it would have written and suggesting a shorter
+output root or region/site name. This is a real limit, already hit once
+during development, not a theoretical one: choose output roots and site
+names accordingly if you are working from a deeply nested folder.
+
+**The Urbano bridge.** Urbano 2 is optional. If it is not installed, or the
+bridge fails for any other reason, mapgen records the failure as a plain
+sentence in `survey.json`'s `bridge.error`, prints it to the console, and
+still finishes the rest of the package: the OSM, Overture and elevation data
+on disk are unaffected, only `<stem>_project_setting.json` is missing. Pass
+`--skip-bridge` to skip the step outright rather than have it attempt and
+fail. To build the bridge once Urbano 2 is installed:
+
+```powershell
+dotnet build tools/UrbanoBridge/UrbanoBridge.csproj
+```
 
 ## Tests
 
 Python:
 
-```
+```powershell
 .venv\Scripts\python.exe -m pytest
 ```
 
-The map picker's front end (`src/mapgen/web/static/app.js`) is plain
-JavaScript with no build step and no bundler, so it is tested separately
-with a small, dependency-free Node script rather than a JS framework:
+One test, `tests/test_live_smoke.py`, hits the real OpenStreetMap API and is
+excluded from the default run (`pyproject.toml` sets `addopts = "-m 'not live'"`).
+Run it deliberately when you want to confirm live network access still works:
 
+```powershell
+.venv\Scripts\python.exe -m pytest -m live -v
 ```
+
+The map picker's front end (`src/mapgen/web/static/app.js`) is plain
+JavaScript with no build step and no bundler, so it is tested separately with
+a small, dependency-free Node script rather than a JS framework:
+
+```powershell
 node tests/js/test_app.js
 ```
 
-Requires Node (developed against v22). It runs the real, committed
-`app.js` inside a minimal DOM and `fetch` stub and checks its behaviour
-directly; it does not open a browser and cannot check map rendering or
-tile loading, which still need a human looking at the page.
+Requires Node (developed against v22). It runs the real, committed `app.js`
+inside a minimal DOM and `fetch` stub and checks its behaviour directly; it
+does not open a browser and cannot check map rendering or tile loading, which
+still need a human looking at the page.
+
+## Roadmap
+
+Phase 2 adds UK survey-grade layers behind the same `LayerSource` interface
+used by `osm`, `overture` and `elevation`: NRW LiDAR at up to 25 cm via
+DataMapWales (Open Government Licence, and a far better elevation and
+building-height source than Copernicus DEM anywhere in Wales), OS NGD
+buildings and water network, and open drainage data (sewer catchments, storm
+overflow points and treatment works locations; a bulk sewer network dataset
+is not openly available). See `docs/superpowers/specs/` for the full design
+record.
