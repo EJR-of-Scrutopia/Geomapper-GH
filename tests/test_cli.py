@@ -242,6 +242,93 @@ def test_survey_reports_an_incomplete_package_on_stderr_and_exits_1(tmp_path, ca
     assert "incomplete" in capsys.readouterr().err.lower()
 
 
+# --- Coordinator follow-up on Task 20 finding 1: the summary must describe
+# what is actually on disk, not what the bridge would have produced if it
+# had succeeded. run_survey is faked here (rather than a real dotnet
+# invocation) so this exercises exactly command_survey's own branching,
+# fast and independent of whether dotnet or Urbano are present at all. ------
+
+
+class _FakePaths:
+    def __init__(self, root, project_setting):
+        self.root = root
+        self.project_setting = project_setting
+
+
+class _FakeSurveyResult:
+    def __init__(self, paths, complete, survey):
+        self.paths = paths
+        self.complete = complete
+        self.survey = survey
+
+
+def _survey_args(tmp_path):
+    return [
+        "survey",
+        "--bbox=-3.29,51.38,-3.28,51.39",
+        "--region=R",
+        "--site=S",
+        "--output-root",
+        str(tmp_path),
+        "--source",
+        "stub",
+    ]
+
+
+def test_survey_summary_names_the_project_setting_when_the_bridge_succeeded(
+    tmp_path, capsys, monkeypatch
+):
+    project_setting = tmp_path / "S_2026-08-01_project_setting.json"
+    fake_result = _FakeSurveyResult(
+        paths=_FakePaths(root=tmp_path, project_setting=project_setting),
+        complete=True,
+        survey={"bridge": {"attempted": True, "ok": True, "error": None}},
+    )
+    monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
+    exit_code = main(_survey_args(tmp_path))
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert f"Urbano project setting: {project_setting.name}" in out
+
+
+def test_survey_summary_does_not_claim_a_project_setting_when_the_bridge_failed(
+    tmp_path, capsys, monkeypatch
+):
+    # The exact bug reported: after a failed bridge, the directory holds
+    # only survey.json and the merged data, never the project setting, but
+    # the old summary printed its name anyway.
+    project_setting = tmp_path / "S_2026-08-01_project_setting.json"
+    error = "The Urbano bridge failed with exit code 1. See the output above for details."
+    fake_result = _FakeSurveyResult(
+        paths=_FakePaths(root=tmp_path, project_setting=project_setting),
+        complete=True,
+        survey={"bridge": {"attempted": True, "ok": False, "error": error}},
+    )
+    monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
+    exit_code = main(_survey_args(tmp_path))
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert project_setting.name not in captured.out
+    assert "not produced" in captured.out
+    assert f"Urbano bridge step failed: {error}" in captured.err
+
+
+def test_survey_summary_says_the_bridge_was_skipped_when_it_was(tmp_path, capsys, monkeypatch):
+    project_setting = tmp_path / "S_2026-08-01_project_setting.json"
+    fake_result = _FakeSurveyResult(
+        paths=_FakePaths(root=tmp_path, project_setting=project_setting),
+        complete=True,
+        survey={"bridge": {"attempted": False, "ok": None, "error": None}},
+    )
+    monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
+    exit_code = main(_survey_args(tmp_path))
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert project_setting.name not in captured.out
+    assert "skipped" in captured.out
+    assert captured.err == ""
+
+
 def test_estimate_with_no_output_root_survives_a_corrupt_config(tmp_path, capsys, monkeypatch):
     # The seam under test is _request_from_args falling through to
     # load_config() when --output-root is not passed. estimate is used

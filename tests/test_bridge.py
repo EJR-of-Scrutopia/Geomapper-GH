@@ -1,26 +1,50 @@
 import pytest
 
-from mapgen.bridge import BridgeError, BridgeRequest, build_command, run_bridge
+from mapgen.bridge import (
+    BridgeError,
+    BridgeRequest,
+    _missing_urbano_directory,
+    build_command,
+    run_bridge,
+)
 from mapgen.geo import BBox
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
+# The real text UrbanoBridge's Program.cs prints, captured verbatim from a
+# real run on a machine with no Urbano install, stack trace included.
+REAL_MISSING_URBANO_OUTPUT = (
+    "System.IO.DirectoryNotFoundException: No installed Urbano package with "
+    "Urbano.Core.dll and ProjectSetup.dll was found under "
+    "C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2.\n"
+    "   at Program.<<Main>$>g__ResolvePackageDirectory|0_23(String explicitPackageDir)"
+    " in C:\\Users\\Param\\mapgen-phase1\\tools\\UrbanoBridge\\Program.cs:line 924\n"
+    "   at Program.<<Main>$>g__Execute|0_1(Options options) in "
+    "C:\\Users\\Param\\mapgen-phase1\\tools\\UrbanoBridge\\Program.cs:line 43\n"
+    "   at Program.<<Main>$>g__Run|0_0(String[] args) in "
+    "C:\\Users\\Param\\mapgen-phase1\\tools\\UrbanoBridge\\Program.cs:line 21\n"
+)
+
 
 class FakeCompleted:
-    def __init__(self, returncode=0):
+    def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class FakeRunner:
-    def __init__(self, returncode=0):
+    def __init__(self, returncode=0, stdout="", stderr=""):
         self.commands = []
         self.calls = []
         self._returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
 
     def __call__(self, command, **kwargs):
         self.commands.append(command)
         self.calls.append((command, kwargs))
-        return FakeCompleted(self._returncode)
+        return FakeCompleted(self._returncode, stdout=self._stdout, stderr=self._stderr)
 
 
 def _request(tmp_path, **overrides):
@@ -102,6 +126,75 @@ def test_run_bridge_invokes_the_runner(tmp_path):
 def test_run_bridge_raises_on_a_non_zero_exit(tmp_path):
     with pytest.raises(BridgeError, match="exit code 1"):
         run_bridge(_request(tmp_path), _project(tmp_path), runner=FakeRunner(returncode=1))
+
+
+# --- Coordinator follow-up on Task 20 finding 1: the owner has no Urbano
+# and is not about to install it, so the raw DirectoryNotFoundException and
+# C# stack trace would otherwise print before the clean message on EVERY
+# single survey. UrbanoBridge already names this exact case; run_bridge now
+# recognises it and reports one plain sentence instead of raw C# output. ---
+
+
+def test_missing_urbano_directory_extracts_the_path_from_the_real_message():
+    directory = _missing_urbano_directory(REAL_MISSING_URBANO_OUTPUT)
+    assert directory == (
+        "C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2"
+    )
+
+
+def test_missing_urbano_directory_keeps_a_period_that_is_genuinely_part_of_the_path():
+    # The real directory contains "8.0", a period that is not the sentence's
+    # own terminator. A non-greedy match would stop at "...packages\8" and
+    # silently drop "0\Urbano2" from the reported path.
+    directory = _missing_urbano_directory(
+        "No installed Urbano package with Urbano.Core.dll and ProjectSetup.dll "
+        "was found under C:\\pkgs\\8.0\\Urbano2."
+    )
+    assert directory == "C:\\pkgs\\8.0\\Urbano2"
+
+
+def test_missing_urbano_directory_returns_none_for_an_unrelated_failure():
+    assert _missing_urbano_directory("Segmentation fault (core dumped)\n") is None
+
+
+def test_run_bridge_reports_a_missing_urbano_install_as_one_plain_sentence(tmp_path):
+    runner = FakeRunner(returncode=1, stderr=REAL_MISSING_URBANO_OUTPUT)
+    with pytest.raises(BridgeError) as excinfo:
+        run_bridge(_request(tmp_path), _project(tmp_path), runner=runner)
+    message = str(excinfo.value)
+    assert "Urbano is not installed" in message
+    assert (
+        "C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2"
+        in message
+    )
+    assert "optional" in message
+    # No C# framing anywhere in the message the caller actually raises with.
+    assert "DirectoryNotFoundException" not in message
+    assert "Program.cs" not in message
+    assert "at Program" not in message
+
+
+def test_run_bridge_does_not_print_the_raw_trace_for_a_recognised_missing_urbano_install(
+    tmp_path, capsys
+):
+    runner = FakeRunner(returncode=1, stderr=REAL_MISSING_URBANO_OUTPUT)
+    with pytest.raises(BridgeError):
+        run_bridge(_request(tmp_path), _project(tmp_path), runner=runner)
+    captured = capsys.readouterr()
+    assert "DirectoryNotFoundException" not in captured.out
+    assert "DirectoryNotFoundException" not in captured.err
+    assert "Program.cs" not in captured.out
+    assert "Program.cs" not in captured.err
+
+
+def test_run_bridge_still_prints_raw_output_for_an_unrecognised_failure(tmp_path, capsys):
+    # The one thing that must NOT happen: an unexpected failure must not be
+    # silently swallowed the way the recognised case deliberately is.
+    runner = FakeRunner(returncode=1, stderr="Some other totally unexpected C# crash\n")
+    with pytest.raises(BridgeError, match="exit code 1"):
+        run_bridge(_request(tmp_path), _project(tmp_path), runner=runner)
+    captured = capsys.readouterr()
+    assert "Some other totally unexpected C# crash" in captured.err
 
 
 def test_run_bridge_reports_a_missing_project_clearly(tmp_path):

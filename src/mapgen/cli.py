@@ -106,12 +106,21 @@ def command_estimate(args: argparse.Namespace) -> int:
 def command_survey(args: argparse.Namespace) -> int:
     result = run_survey(_request_from_args(args), progress=ConsoleProgress())
     print(f"\nPackage: {result.paths.root}")
-    print(f"Urbano project setting: {result.paths.project_setting.name}")
     bridge = result.survey.get("bridge") or {}
-    if bridge.get("attempted") and not bridge.get("ok"):
+    if bridge.get("ok"):
+        print(f"Urbano project setting: {result.paths.project_setting.name}")
+    elif bridge.get("attempted"):
+        # Urbano itself writes this file as part of a successful bridge run;
+        # a failed bridge never produced it, whatever name survey.json's
+        # stem predicts it would have had. Naming a file that does not
+        # exist here would send the owner looking for it, or worse, into
+        # Grasshopper pointed at nothing.
+        print("Urbano project setting: not produced, the Urbano bridge step failed.")
         # A plain sentence, already produced by bridge.py or package.py, never
         # a stack trace: the survey data itself is unaffected by this failure.
         print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
+    else:
+        print("Urbano project setting: not produced, the bridge step was skipped.")
     if not result.complete:
         print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
         return 1

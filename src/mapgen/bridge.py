@@ -7,7 +7,9 @@ reimplementing any of that.
 
 from __future__ import annotations
 
+import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -17,6 +19,25 @@ from mapgen.geo import BBox
 DEFAULT_PROJECT_PATH = (
     Path(__file__).resolve().parents[2] / "tools" / "UrbanoBridge" / "UrbanoBridge.csproj"
 )
+
+# UrbanoBridge's OWN diagnostic (Program.cs's ResolvePackageDirectory), quoted
+# here verbatim, for the one failure this bridge can already name precisely:
+# no Urbano install at all. Greedy up to the LAST period on the line, not the
+# first: the real directory always contains one itself (...packages\8.0\...),
+# so a non-greedy match would truncate the path at "8" and drop "0\Urbano2".
+_MISSING_URBANO_RE = re.compile(
+    r"No installed Urbano package with Urbano\.Core\.dll and ProjectSetup\.dll "
+    r"was found under (.+)\.\s*$",
+    re.MULTILINE,
+)
+
+
+def _missing_urbano_directory(output: str) -> str | None:
+    """The directory UrbanoBridge looked in, if its output says plainly that
+    no Urbano install was found there; None for any other failure shape.
+    """
+    match = _MISSING_URBANO_RE.search(output)
+    return match.group(1).strip() if match else None
 
 
 class BridgeError(RuntimeError):
@@ -86,8 +107,41 @@ def run_bridge(
             f"  dotnet build tools/UrbanoBridge/UrbanoBridge.csproj"
         )
 
-    result = runner(build_command(request, project), check=False)
+    # Captured rather than left to inherit this process's stdout/stderr, so
+    # it can be inspected for the one failure UrbanoBridge already names
+    # precisely (see _missing_urbano_directory) before deciding whether the
+    # owner needs to see it at all.
+    result = runner(
+        build_command(request, project),
+        check=False,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     if result.returncode != 0:
+        stdout = getattr(result, "stdout", "") or ""
+        stderr = getattr(result, "stderr", "") or ""
+        missing_dir = _missing_urbano_directory(stdout + stderr)
+        if missing_dir:
+            # Expected and harmless on a machine with no Urbano installed,
+            # which is every run this owner makes today: reported as a
+            # plain sentence, not the DirectoryNotFoundException and C#
+            # stack trace that would otherwise print before it on every
+            # single survey. The raw output is deliberately NOT printed
+            # here, unlike the genuinely-unexpected branch below.
+            raise BridgeError(
+                f"Urbano is not installed: no Urbano.Core.dll or ProjectSetup.dll "
+                f"was found under {missing_dir}. Urbano is optional; the rest of "
+                f"the package does not need it."
+            )
+        # A genuinely unexpected failure: nothing here recognises it, so the
+        # raw subprocess output is the only place the real detail lives.
+        # Printed rather than swallowed, exactly where "see the output
+        # above" below still points.
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        if stderr:
+            print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr)
         raise BridgeError(
             f"The Urbano bridge failed with exit code {result.returncode}. "
             f"See the output above for details."
