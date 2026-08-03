@@ -1,8 +1,25 @@
 """Overture Maps as a LayerSource.
 
 Downloads run through the overturemaps CLI, which handles the cloud-hosted
-parquet release. Each type is fetched separately per tile, then merged into one
-GeoJSON per type.
+parquet release. Each type is fetched once, over the whole request bbox, and
+merged into one GeoJSON per type.
+
+Not tiled, unlike OsmSource (Task 23). OSM is tiled because the OSM map API
+has a hard 50,000-node cap per request, and the whole node-cap retry ladder
+in package.py exists to service that cap. Overture is a bbox-filtered read of
+cloud-hosted parquet with no equivalent cap; it only ever inherited OSM's
+constraint because it was added alongside it. Measured on this machine over
+the same extent, same type, 16 tiles at 600 m with 20 m overlap, in two
+independent samples: one whole-bbox call took 4.66s and 4.51s, the 16 tiled
+calls took 68.78s and 93.38s, and both returned the identical 9,910 unique
+features while the tiled version wrote 956,404 extra bytes of overlapping
+duplicate data. The counts match exactly because geo.build_tiles clamps every
+tile's query_bbox to the parent extent on all four sides, so the tiled union
+covers exactly the parent bbox and never more. Per-call cost is dominated by
+fixed overhead (process spawn, parquet metadata read, connection setup), not
+data volume: a 10 km x 14 km bbox returning 89,722 features and 55 MB still
+completed in one call in 43.73s, so a single call scales to real survey
+extents comfortably.
 """
 
 from __future__ import annotations
@@ -12,8 +29,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Sequence
 
-from mapgen.fsutil import ensure_dir
-from mapgen.geo import BBox, Tile
+from mapgen.fsutil import best_effort_rmtree, ensure_dir
+from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.jobs import CancelToken
 from mapgen.merge import merge_geojson
 from mapgen.procutil import run_hidden
@@ -37,8 +54,20 @@ LAYER_FILENAMES = {
     "land_use": "landuse.geojson",
 }
 
-BYTES_PER_TILE_TYPE_ESTIMATE = 900_000
-SECONDS_PER_TILE_TYPE_ESTIMATE = 6.0
+# Two real measurements on this machine against the live release, not a
+# model: 4.5s and about 6 MB for one type over a 2.0 km x 1.8 km extent,
+# 43.73s and 55 MB for one type over a 10 km x 14 km extent. A straight
+# line through exactly two points is all these four constants are, which
+# is why they are a fixed per-type cost plus a mild area term and nothing
+# more elaborate. No more precision than that is claimed, and none would
+# be honest: run-to-run variance on the SAME query has been seen at 4.66s
+# against 28.48s, an order of magnitude wider than any refinement two
+# samples could justify. Treat the output as "seconds, not minutes" or
+# "minutes, not hours", never as a countdown.
+BASE_SECONDS_PER_TYPE = 3.7
+SECONDS_PER_TYPE_PER_SQ_KM = 0.29
+BASE_BYTES_PER_TYPE = 5_000_000
+BYTES_PER_TYPE_PER_SQ_KM = 357_000
 
 
 class OvertureError(RuntimeError):
@@ -79,10 +108,33 @@ class OvertureSource:
         self._find = executable_finder
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
-        units = len(tiles) * len(self.types)
+        """One unit per type, not per tile per type (Task 23).
+
+        fetch() makes exactly one overturemaps call per type over the whole
+        bbox, so tiles no longer multiplies anything here. It stays in the
+        signature because the LayerSource protocol defines it and OsmSource
+        genuinely needs it; this source simply has nothing to do with it.
+
+        The shape is a fixed per-type cost plus a mild area term, because
+        that is what the two measurements behind BASE_SECONDS_PER_TYPE and
+        its three companions actually show: per-call overhead dominates,
+        and area matters but only mildly. See those constants for how few
+        data points support them and how wide the run-to-run variance is.
+        """
+        width_m, height_m = extent_metres(bbox)
+        area_sq_km = (width_m / 1000.0) * (height_m / 1000.0)
+        # Rounded to whole bytes once, per type, and only then multiplied.
+        # Rounding the product instead would make the estimate for two
+        # types differ from twice the estimate for one by a byte or two,
+        # which is meaningless in itself but makes the "one call per type"
+        # shape impossible to assert cleanly and invites a future reader to
+        # go looking for a scaling subtlety that is not there.
+        per_type_bytes = int(BASE_BYTES_PER_TYPE + BYTES_PER_TYPE_PER_SQ_KM * area_sq_km)
+        per_type_seconds = BASE_SECONDS_PER_TYPE + SECONDS_PER_TYPE_PER_SQ_KM * area_sq_km
+        type_count = len(self.types)
         return Estimate(
-            bytes_estimate=BYTES_PER_TILE_TYPE_ESTIMATE * units,
-            seconds_estimate=SECONDS_PER_TILE_TYPE_ESTIMATE * units,
+            bytes_estimate=per_type_bytes * type_count,
+            seconds_estimate=per_type_seconds * type_count,
         )
 
     def configure(self, types: Sequence[str]) -> "OvertureSource":
@@ -122,38 +174,93 @@ class OvertureSource:
         progress: ProgressSink,
         cancel: CancelToken | None = None,
     ) -> list[Path]:
+        """One download per type, over the whole request bbox.
+
+        bbox, not each tile's query_bbox: this source is not tiled (see the
+        module docstring for the measurements). tiles is still used, for
+        progress reporting only.
+
+        Progress events stay per tile AND per type, exactly as they were
+        when the download itself was per tile and per type. tile_done (or
+        tile_skipped on a resume) is emitted once per tile for a type, after
+        that type's single whole-extent download lands, which is a truthful
+        claim: once the whole extent for a type is on disk, every tile's
+        area genuinely does have that type's data.
+
+        Deliberately NOT switched to ElevationSource's tile_id="whole-area"
+        convention, which would look like the tidier match for a source
+        that no longer tiles. The browser's classifyTiles (web/static/
+        app.js) ignores any event whose tile_id is not in the grid it built
+        from the plan, so "whole-area" would be silently dropped and an
+        Overture-only run, which the owner can and does select, would show
+        a dead grid from the first second to the last. classifyTiles also
+        only ever promotes a tile pending -> active on tile_done/
+        tile_skipped, and settles active -> done only once every selected
+        source has emitted source_done, so emitting per tile per type does
+        not make a tile look finished after the first of eight types.
+        """
+        # Debris from the superseded per-tile layout, swept once, up front,
+        # before anything is downloaded or read (Task 23). Not migration:
+        # nothing here reuses those files, and the fresh whole-extent
+        # download below covers every one of them. They are removed because
+        # leaving them in place actively corrupts this package. work_dir is
+        # fingerprinted on the type selection (naming.tiling_fingerprint),
+        # so a part-downloaded package from before this change resumes into
+        # this same directory with <type>/<tile_id>.geojson files still
+        # sitting in it, and package.py's own _existing_output_files hands
+        # every file it finds under work_dir straight to merge() and to
+        # _record_tile_outcomes. merge() would then read each stale tile id
+        # as though it were a TYPE and write a <stem>_r00_c00.geojson into
+        # the package root beside the real layers, and _record_tile_outcomes
+        # would see a tile-stamped directory again and mark every tile the
+        # old run never reached FAILED, leaving a package that is in fact
+        # complete permanently reporting complete: false and painting a red
+        # tile the owner has no way to clear. Both were reproduced before
+        # this sweep was written. The closed list is the safety property, as
+        # it is for package.py's own stale-output sweep: only a directory
+        # named exactly after a type this source fetches, inside this
+        # source's own fingerprinted scratch tree, is ever removed.
+        self._remove_superseded_tile_layout(work_dir)
+
         paths: list[Path] = []
-        for tile in tiles:
-            for overture_type in self.types:
-                # Checked before each (tile, type) request, the finest
-                # unit of paid-for work this source has: a tile is never
-                # interrupted mid-type, and since Overture fetches every
-                # type for a tile before moving to the next tile, this
-                # still guarantees a stop lands within the tile it was
-                # asked to stop within, never spilling into a later one.
-                if cancel is not None:
-                    cancel.raise_if_cancelled()
-                output_path = work_dir / overture_type / f"{tile.tile_id}.geojson"
-                if output_path.exists() and output_path.stat().st_size > 0:
-                    progress.emit(
-                        "tile_skipped",
-                        source=self.id,
-                        tile_id=tile.tile_id,
-                        overture_type=overture_type,
-                    )
-                    paths.append(output_path)
-                    continue
-                self._download(tile, overture_type, output_path)
+        for overture_type in self.types:
+            # Checked before each type's download, which is now the finest
+            # unit of paid-for work this source has. Coarser than the old
+            # (tile, type) checkpoint in name only: a stop now lands within
+            # one download instead of within one of sixteen downloads of
+            # the same data, so it arrives sooner in wall-clock terms, not
+            # later. An in-flight download is still always allowed to
+            # finish and be kept, per the LayerSource cancel convention.
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            output_path = work_dir / f"{overture_type}.geojson"
+            if output_path.exists() and output_path.stat().st_size > 0:
+                event = "tile_skipped"
+            else:
+                self._download(bbox, overture_type, output_path)
+                event = "tile_done"
+            for tile in tiles:
                 progress.emit(
-                    "tile_done",
+                    event,
                     source=self.id,
                     tile_id=tile.tile_id,
                     overture_type=overture_type,
                 )
-                paths.append(output_path)
+            paths.append(output_path)
         return paths
 
-    def _download(self, tile: Tile, overture_type: str, output_path: Path) -> None:
+    def _remove_superseded_tile_layout(self, work_dir: Path) -> None:
+        """Remove any <work_dir>/<type>/ directory the per-tile layout left.
+
+        See the comment at the call site in fetch() for why this exists and
+        why it is a defect fix rather than a migration.
+        """
+        for overture_type in self.types:
+            legacy_dir = work_dir / overture_type
+            if legacy_dir.is_dir():
+                best_effort_rmtree(legacy_dir)
+
+    def _download(self, bbox: BBox, overture_type: str, output_path: Path) -> None:
         executable = self._find("overturemaps")
         if not executable:
             raise OvertureError(
@@ -163,14 +270,17 @@ class OvertureSource:
 
         ensure_dir(output_path.parent)
         # The CLI writes wherever we point it, and a killed process leaves a
-        # truncated file that resume would later mistake for a finished tile.
-        # Point it at a .part path and rename only once it exits cleanly.
+        # truncated file that resume would later mistake for a finished
+        # download. Point it at a .part path and rename only once it exits
+        # cleanly. Untouched by Task 23: one whole-extent file is a much
+        # bigger thing to half-write than one tile was, so the risk this
+        # guards against is if anything larger now, not smaller.
         temp_path = output_path.with_suffix(".geojson.part")
         temp_path.unlink(missing_ok=True)
         command = [
             executable,
             "download",
-            f"--bbox={tile.query_bbox.to_query_string()}",
+            f"--bbox={bbox.to_query_string()}",
             "-f",
             "geojson",
             "--type",
@@ -181,29 +291,41 @@ class OvertureSource:
         if self.release:
             command.extend(["--release", self.release])
 
-        # run_hidden, not a bare runner call: on Windows this is one console
-        # executable per tile per type, and without CREATE_NO_WINDOW each one
-        # opens a real window that the owner can close, killing the download
-        # inside it. See mapgen.procutil.
+        # run_hidden, not a bare runner call: on Windows this is a console
+        # executable, and without CREATE_NO_WINDOW it opens a real window
+        # that the owner can close, killing the download inside it. See
+        # mapgen.procutil. Far fewer windows than before Task 23 (one per
+        # type rather than one per tile per type), which is a reason the
+        # owner meets this less often, not a reason to stop hiding them.
         result = run_hidden(command, runner=self._runner)
         if result.returncode != 0:
             temp_path.unlink(missing_ok=True)
             detail = (result.stderr or result.stdout or "").strip()
             raise OvertureError(
-                f"overturemaps failed for tile {tile.tile_id}, type {overture_type}: {detail}"
+                f"overturemaps failed for type {overture_type}: {detail}"
             )
 
         if not temp_path.exists():
             raise OvertureError(
-                f"overturemaps exited cleanly but wrote nothing for tile "
-                f"{tile.tile_id}, type {overture_type}."
+                f"overturemaps exited cleanly but wrote nothing for type "
+                f"{overture_type}."
             )
         temp_path.replace(output_path)
 
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        # Grouped by the file's own stem, which IS the type now that fetch()
+        # writes one flat <type>.geojson per type (Task 23). It used to be
+        # part.parent.name, because the type was a directory holding one file
+        # per tile; that directory no longer exists, so that key would group
+        # every part under the single work directory's name and merge all
+        # eight types into one output. Still a grouping rather than a plain
+        # one-part-per-type walk, because merge() is handed whatever
+        # package.py's _existing_output_files found on disk, and a source
+        # that later regains a second file per type should not need this
+        # rewritten again.
         by_type: dict[str, list[Path]] = {}
         for part in parts:
-            by_type.setdefault(part.parent.name, []).append(part)
+            by_type.setdefault(part.stem, []).append(part)
 
         # Named after the package stem plus the type, not a bare
         # "<type>.geojson": Task 20 finding 2 found the same unidentified

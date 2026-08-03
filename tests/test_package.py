@@ -22,7 +22,7 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.osm import OsmSource
-from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES, OvertureSource
+from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES, OvertureError, OvertureSource
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
@@ -1445,6 +1445,84 @@ class _FakeOvertureRunner:
         return type("FakeCompleted", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
+# --- Task 23 item 5: with no tile-stamped files left, Overture now
+# contributes no tile-stamped directory to _record_tile_outcomes, so it
+# falls into the `elif files:` branch and the batch outcome applies
+# uniformly to every tile, exactly as ElevationSource's single whole-area
+# file already does. That needed no change to package.py, which is a claim
+# worth confirming by test rather than by reading, and against the REAL
+# OvertureSource rather than a stub that could easily be more permissive
+# than the real thing. -----------------------------------------------
+
+
+def test_an_overture_only_run_that_succeeds_marks_every_tile_ok(tmp_path):
+    runner = _FakeOvertureRunner()
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+    result = run_survey(
+        _request(tmp_path, source_ids=("overture",), overture_types=("water",))
+    )
+
+    assert result.complete is True
+    records = result.survey["tiles"]
+    assert len(records) == 4, "the plan's own four tiles should all be recorded"
+    assert all(record["overture"] == "ok" for record in records), records
+
+
+def test_an_overture_only_run_whose_fetch_raises_marks_every_tile_failed(tmp_path):
+    # The other half. A whole-extent download either lands or it does not,
+    # so there is no per-tile signal to be had and every tile is failed
+    # together, which is honest: none of them has data.
+    class ExplodingRunner:
+        def __init__(self):
+            self.commands = []
+
+        def __call__(self, command, **kwargs):
+            self.commands.append(command)
+            return type(
+                "FakeCompleted",
+                (),
+                {"returncode": 1, "stdout": "", "stderr": "the release is on fire"},
+            )()
+
+    register(
+        OvertureSource(runner=ExplodingRunner(), executable_finder=lambda _n: "overturemaps")
+    )
+    failures = []
+
+    class Sink:
+        def emit(self, event, **fields):
+            if event == "tile_failed":
+                failures.append(fields["tile_id"])
+
+    request = _request(tmp_path, source_ids=("overture",), overture_types=("water",))
+    with pytest.raises(OvertureError, match="the release is on fire"):
+        run_survey(request, progress=Sink())
+
+    tile_ids = ["r00_c00", "r00_c01", "r01_c00", "r01_c01"]
+    assert sorted(failures) == tile_ids, (
+        "every tile should be reported failed, since none of them got data"
+    )
+
+    # Recorded to state.json before the re-raise, so a resume knows nothing
+    # landed rather than trusting the batch call's own silence.
+    paths = build_package_paths(
+        tmp_path,
+        request.region,
+        request.site,
+        request.effective_date,
+        tiling_fingerprint(
+            *request.bbox.as_tuple(),
+            request.tile_size_m,
+            request.overlap_m,
+            request.effective_categories,
+            request.effective_overture_types,
+        ),
+    )
+    state = JobState.load_or_create(paths.work_dir, tile_ids, ["overture"])
+    for tile_id in tile_ids:
+        assert state.is_done(tile_id, "overture") is False
+
+
 def test_overture_type_selection_actually_reaches_the_fetch_not_just_the_registry(tmp_path):
     runner = _FakeOvertureRunner()
     register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
@@ -1960,10 +2038,14 @@ def test_resume_replicates_the_owners_real_interrupted_package_and_completes(tmp
     # which is the real behaviour this test exists to confirm.
     assert not (paths.work_dir / "state.json").exists()
 
-    # Overture: 6 of the 8 tile/type combinations already on disk; r01_c01
-    # is the one tile the crash caught mid-way, missing both types, the
-    # same "most tiles done, one caught mid-flight" shape as the real
-    # package's 34-out-of-however-many files.
+    # Overture: 6 of the 8 tile/type combinations already on disk, written
+    # in the PER-TILE layout that Task 23 superseded, because that is the
+    # layout the owner's one part-downloaded package on disk actually
+    # holds. r01_c01 is the one tile the crash caught mid-way, missing both
+    # types, the same "most tiles done, one caught mid-flight" shape as the
+    # real package's 34-out-of-however-many files. What happens to these
+    # files on a resume under the new layout is asserted on directly at the
+    # end of this test.
     preexisting = {
         (tile_id, overture_type)
         for tile_id in ("r00_c00", "r00_c01", "r01_c00")
@@ -2033,15 +2115,26 @@ def test_resume_replicates_the_owners_real_interrupted_package_and_completes(tmp
     assert result.paths.work_dir == paths.work_dir
     assert result.paths.survey_json.exists()
 
-    # Only the two genuinely missing tile/type combinations were fetched,
-    # not all 8: resume actually skips completed work rather than
-    # refetching it.
+    # Task 23: two calls, one per type, over the WHOLE request bbox.
+    #
+    # This assertion survived Task 23 unchanged in its number and would
+    # have been a test passing for the wrong reason if left at that: it
+    # used to mean "the 2 of 8 missing tile/type pairs were refetched and
+    # the other 6 were resumed", and it now means "each of the 2 types was
+    # fetched exactly once, and the per-tile files were not resumed at
+    # all". Same 2, completely different claim. The --bbox check below is
+    # what actually tells the two apart, so it is not optional decoration.
     assert len(overture_runner.commands) == 2, (
-        f"expected exactly the 2 missing tile/type combinations refetched, "
-        f"got {len(overture_runner.commands)}: {overture_runner.commands}"
+        f"expected exactly one call per type, got "
+        f"{len(overture_runner.commands)}: {overture_runner.commands}"
     )
     fetched_types = {cmd[cmd.index("--type") + 1] for cmd in overture_runner.commands}
     assert fetched_types == {"water", "building"}
+    for command in overture_runner.commands:
+        assert f"--bbox={request.bbox.to_query_string()}" in command, (
+            "Overture queried something other than the whole request bbox, "
+            "which is what a per-tile query would look like"
+        )
 
     # OSM never contacted a live endpoint: every tile was already done.
     osm_entry = next(s for s in result.survey["sources"] if s["id"] == "osm")
@@ -2050,15 +2143,44 @@ def test_resume_replicates_the_owners_real_interrupted_package_and_completes(tmp
         "successful file on disk"
     )
 
-    # The 6 pre-existing Overture files were reused untouched, not
-    # re-downloaded and silently overwritten.
-    for tile_id, overture_type in preexisting:
-        text = (
-            paths.work_dir / "raw" / "overture" / overture_type / f"{tile_id}.geojson"
-        ).read_text(encoding="utf-8")
-        assert f"preexisting-{tile_id}-{overture_type}" in text, (
-            f"the already-fetched {tile_id}/{overture_type} file was overwritten during resume"
+    # The 34-files-under-a-per-tile-layout question, answered on the real
+    # shape rather than in prose (Task 23).
+    #
+    # Those files are orphaned: the resume check looks for <type>.geojson
+    # and will never find <type>/<tile_id>.geojson, so Overture refetches
+    # from scratch. That is accepted, not worked around: refetching untiled
+    # is 2 calls here and 8 on the owner's real package, where resuming the
+    # old layout would have been 160. What is NOT accepted is leaving the
+    # orphans on disk, which was the defect this found. package.py hands
+    # every file under work_dir to merge() and to _record_tile_outcomes,
+    # and merge() now reads a file stem as a TYPE, so a surviving
+    # r00_c00.geojson becomes a <stem>_r00_c00.geojson sitting in the
+    # finished package beside the real layers, while _record_tile_outcomes
+    # sees a tile-stamped directory again and marks r01_c01, the tile the
+    # crash never reached, FAILED forever. Both were reproduced before
+    # OvertureSource's sweep was written; both are asserted against here.
+    for overture_type in ("water", "building"):
+        assert not (paths.work_dir / "raw" / "overture" / overture_type).exists(), (
+            f"the superseded per-tile directory for {overture_type} survived the resume"
         )
+    assert sorted(
+        p.name for p in (paths.work_dir / "raw" / "overture").iterdir()
+    ) == ["building.geojson", "water.geojson"]
+
+    root_outputs = sorted(p.name for p in paths.root.iterdir() if p.is_file())
+    assert root_outputs == [
+        f"{paths.stem}.osm",
+        f"{paths.stem}_building.geojson",
+        f"{paths.stem}_water.geojson",
+        "survey.json",
+    ], f"a stale tile id reached the package root as a merged output: {root_outputs}"
+
+    # r01_c01 is the tile the crash caught mid-flight, with neither type on
+    # disk. The whole-extent download covers it like every other tile, so
+    # it is ok, and no tile is failed.
+    tile_records = {record["tile_id"]: record for record in result.survey["tiles"]}
+    assert tile_records["r01_c01"]["overture"] == "ok"
+    assert all(record["overture"] == "ok" for record in result.survey["tiles"])
 
     # The second, stale fingerprint directory was never read: its poison
     # tile is untouched on disk and never reached the merged output.
