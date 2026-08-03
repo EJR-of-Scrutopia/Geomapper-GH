@@ -54,20 +54,37 @@ LAYER_FILENAMES = {
     "land_use": "landuse.geojson",
 }
 
-# Two real measurements on this machine against the live release, not a
-# model: 4.5s and about 6 MB for one type over a 2.0 km x 1.8 km extent,
-# 43.73s and 55 MB for one type over a 10 km x 14 km extent. A straight
-# line through exactly two points is all these four constants are, which
-# is why they are a fixed per-type cost plus a mild area term and nothing
-# more elaborate. No more precision than that is claimed, and none would
-# be honest: run-to-run variance on the SAME query has been seen at 4.66s
-# against 28.48s, an order of magnitude wider than any refinement two
-# samples could justify. Treat the output as "seconds, not minutes" or
-# "minutes, not hours", never as a countdown.
-BASE_SECONDS_PER_TYPE = 3.7
-SECONDS_PER_TYPE_PER_SQ_KM = 0.29
-BASE_BYTES_PER_TYPE = 5_000_000
-BYTES_PER_TYPE_PER_SQ_KM = 357_000
+# Real measurements on this machine against the live release, not a model.
+#
+# The per-type base comes from a full EIGHT-type run over a 2.08 x 2.00 km
+# extent (4.17 sq km), sampled twice back to back: 77.84s and 98.30s in
+# total, 23,587,730 bytes, which is 9.73s and 12.29s per type and about
+# 2.95 MB per type.
+#
+# Calibrating "per type" from ONE type is the easy mistake here and an
+# expensive one. `building` alone over that same extent takes 4.5s and
+# 5.96 MB, so it is roughly 2.4 times cheaper in time and 2 times larger
+# in bytes than the average of the eight. The first cut of these constants
+# was fitted to `building` measurements and understated a real 8-type run
+# by 2.2x, which the 8-type run above is what caught.
+#
+# The area slope is the weakest number here and is flagged as such. The
+# only large-extent measurement available is `building` alone over
+# 10 x 14 km (43.73s, 55 MB, 89,722 features), so the slope is derived
+# from that one type and scaled to an average type by the ratio measured
+# at the small extent. It is a line through two points, one of which had
+# to be adjusted to compare like with like.
+#
+# No more precision than that is claimed, and none would be honest:
+# run-to-run variance on the SAME query has been seen at 4.66s against
+# 28.48s, and the two 8-type samples above differ from each other by 26%.
+# That is wider than any refinement this data could justify. Treat the
+# output as "seconds, not minutes" or "minutes, not hours", never as a
+# countdown.
+BASE_SECONDS_PER_TYPE = 9.8
+SECONDS_PER_TYPE_PER_SQ_KM = 0.28
+BASE_BYTES_PER_TYPE = 2_230_000
+BYTES_PER_TYPE_PER_SQ_KM = 172_000
 
 
 class OvertureError(RuntimeError):

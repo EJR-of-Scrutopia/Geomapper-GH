@@ -634,25 +634,63 @@ def test_estimate_grows_with_the_extent_not_the_tiling():
     assert large.bytes_estimate > small.bytes_estimate
 
 
-def test_estimate_stays_close_to_the_two_measurements_it_was_fitted_to():
-    # The constants are a straight line through exactly two real
-    # measurements against the live release (see the module's own comment
-    # on them). This is not a claim of accuracy, it is a guard: a future
-    # edit that moves them far from the only evidence there is should
-    # fail here rather than quietly ship a wrong number to the estimate
-    # panel. Bounds are deliberately loose, because run-to-run variance on
-    # the same query has been seen at 4.66s against 28.48s.
-    measured_small = OvertureSource(types=["building"]).estimate(
+def test_estimate_stays_close_to_the_eight_type_run_it_was_fitted_to():
+    # The anchor: a full 8-type run over this exact extent, measured twice
+    # back to back against the live release, at 77.84s and 98.30s for
+    # 23,587,730 bytes. This is not a claim of accuracy, it is a guard, so
+    # a future edit that moves the constants away from the only real
+    # evidence there is fails here rather than quietly shipping a wrong
+    # number to the estimate panel.
+    #
+    # The bounds span both samples with room around them, deliberately:
+    # the two differ from each other by 26%, and run-to-run variance on a
+    # single query has been seen at 4.66s against 28.48s. Anything tighter
+    # would be pinning noise.
+    eight_types = OvertureSource().estimate(
         BBox.parse("-3.2830,51.4000,-3.2530,51.4180"), []
     )
-    assert 3.0 <= measured_small.seconds_estimate <= 8.0
-    assert 4_000_000 <= measured_small.bytes_estimate <= 9_000_000
-
-    measured_large = OvertureSource(types=["building"]).estimate(
-        BBox.parse("-3.35,51.35,-3.20,51.475"), []
+    assert len(OvertureSource().types) == 8
+    assert 60.0 <= eight_types.seconds_estimate <= 120.0, (
+        f"measured 77.84s and 98.30s for this run, estimate says "
+        f"{eight_types.seconds_estimate:.1f}s"
     )
-    assert 30.0 <= measured_large.seconds_estimate <= 60.0
-    assert 40_000_000 <= measured_large.bytes_estimate <= 75_000_000
+    assert 18_000_000 <= eight_types.bytes_estimate <= 30_000_000, (
+        f"measured 23,587,730 bytes for this run, estimate says "
+        f"{eight_types.bytes_estimate}"
+    )
+
+
+def test_estimate_is_not_calibrated_from_a_single_cheap_type():
+    # The specific mistake this guards, because it was made once already
+    # and cost a 2.2x underestimate: `building` alone over the anchor
+    # extent takes 4.5s, and treating that as the per-type cost makes a
+    # full 8-type run look like 36 seconds when it is nearer 90. A per-type
+    # cost fitted to the average of eight has to be well above any single
+    # cheap type's own measured time.
+    per_type = OvertureSource(types=["building"]).estimate(
+        BBox.parse("-3.2830,51.4000,-3.2530,51.4180"), []
+    )
+    assert per_type.seconds_estimate > 4.66, (
+        "the per-type cost is at or below `building`'s own measured time on "
+        "this extent, which means it was fitted to one cheap type rather "
+        "than to the average of the eight"
+    )
+
+
+def test_estimate_for_a_large_extent_stays_in_the_right_order_of_magnitude():
+    # Only one large-extent measurement exists (building alone over
+    # 10 x 14 km: 43.73s, 55 MB), so this checks the order of magnitude
+    # rather than a value. A full 8-type run over that extent should read
+    # as minutes, not seconds and not hours.
+    large = OvertureSource().estimate(BBox.parse("-3.35,51.35,-3.20,51.475"), [])
+    assert 120.0 <= large.seconds_estimate <= 1800.0, (
+        f"an 8-type run over 10 x 14 km should read as minutes, got "
+        f"{large.seconds_estimate:.0f}s"
+    )
+    assert large.bytes_estimate > 8 * 55_000_000 * 0.3, (
+        "building alone over this extent measured 55 MB, so eight types "
+        "cannot plausibly be far below that"
+    )
 
 
 def test_possible_outputs_declares_every_default_type_even_when_narrowed():
