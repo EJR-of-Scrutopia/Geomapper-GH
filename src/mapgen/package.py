@@ -15,7 +15,7 @@ from typing import Sequence
 
 from mapgen import __version__
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
-from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories
+from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
 from mapgen.fsutil import (
     atomic_write_text,
     best_effort_rmtree,
@@ -97,6 +97,17 @@ class SurveyRequest:
     force: bool = False
     survey_date: date | None = None
     run_bridge_step: bool = True
+
+    def __post_init__(self) -> None:
+        # A coordinator review's Critical 1: an unrecognised category id,
+        # most often a typo, used to reach osm_tag_clauses and
+        # overture_types_for_categories unvalidated, where it silently
+        # matched nothing rather than being rejected (see
+        # UnknownCategoryError's own docstring for the live reproduction).
+        # Checked here, once, at construction, so the CLI's --category and
+        # the browser's checklist both get the same rejection through the
+        # same code path: SurveyRequest is the one place both already meet.
+        validate_categories(self.categories)
 
     @property
     def effective_date(self) -> date:
@@ -184,6 +195,8 @@ def _plan(request: SurveyRequest):
         request.bbox.north,
         request.tile_size_m,
         request.overlap_m,
+        request.effective_categories,
+        request.effective_overture_types,
     )
     paths = build_package_paths(
         request.output_root,

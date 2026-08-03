@@ -64,6 +64,57 @@ ALL_CATEGORY_IDS: tuple[str, ...] = tuple(
 )
 
 
+class UnknownCategoryError(ValueError):
+    """Raised by validate_categories for an id outside ALL_CATEGORY_IDS.
+
+    A coordinator review's Critical 1: nothing validated a category
+    selection before it reached osm_tag_clauses and
+    overture_types_for_categories below, and both of those correctly
+    treat an unrecognised id exactly like a real one that just is not
+    present in their own lookup tables, because distinguishing "not
+    selected" from "does not exist" was never their job. The result,
+    reproduced live: --category building (missing its "s") matched
+    nothing in either function, which read back as a legitimate,
+    deliberate "match nothing" selection, the same shape
+    osm_tag_clauses' own docstring documents as a real, intended answer
+    for a genuinely empty selection. The run completed: 0 nodes, an
+    85-byte file, complete: true, and survey.json recording
+    categories: ["building"] as though that had been honoured.
+
+    A ValueError subclass, not a plain one, so it needs no special
+    handling anywhere already built to catch bad input by type: cli.py's
+    main() and server.py's _REQUEST_VALUE_ERRORS both already treat
+    ValueError (BBoxError and TilingError are also subclasses of it) as
+    "a request problem to report plainly, not a traceback."
+    """
+
+
+def validate_categories(categories: Sequence[str] | None) -> None:
+    """Raises UnknownCategoryError if categories contains any id this
+    vocabulary does not recognise.
+
+    Called once, from SurveyRequest.__post_init__ (see package.py), so
+    the CLI's --category and the browser's checklist share this one
+    check: this is validation of a person's own words becoming an id,
+    which belongs at the point that happens, not repeated inside (or
+    worse, half-inside) every function downstream that consumes a
+    category selection.
+
+    None passes silently: it means "not asked about at all", not "asked
+    for nothing", and is not something a caller can misspell.
+    """
+    if categories is None:
+        return
+    unknown = sorted(set(categories) - set(ALL_CATEGORY_IDS))
+    if not unknown:
+        return
+    noun = "category" if len(unknown) == 1 else "categories"
+    raise UnknownCategoryError(
+        f"Unknown {noun}: {', '.join(unknown)}. "
+        f"Valid categories are: {', '.join(ALL_CATEGORY_IDS)}."
+    )
+
+
 # --- OSM: Overpass tag filtering -------------------------------------------
 #
 # The UI's category ids do not always spell the real OSM tag value: OSM

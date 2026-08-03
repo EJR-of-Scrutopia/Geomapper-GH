@@ -1,9 +1,13 @@
+import pytest
+
 from mapgen.categories import (
     ALL_CATEGORY_IDS,
     CATEGORY_GROUPS,
     ROAD_SUBTYPES,
+    UnknownCategoryError,
     osm_tag_clauses,
     overture_types_for_categories,
+    validate_categories,
 )
 from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES
 
@@ -149,3 +153,69 @@ def test_overture_types_for_categories_returns_a_stable_deterministic_order():
     a = overture_types_for_categories(["water", "buildings", "points_of_interest"])
     b = overture_types_for_categories(["points_of_interest", "buildings", "water"])
     assert a == b
+
+
+# --- validate_categories -------------------------------------------------
+#
+# A coordinator review's Critical 1: before this, an unrecognised category
+# id reached osm_tag_clauses and overture_types_for_categories unvalidated,
+# where it silently matched nothing rather than being rejected. Reproduced
+# live: --category building (missing its "s") completed as a legitimate
+# "nothing selected" run (0 nodes, an 85-byte file, complete: true), with
+# survey.json recording categories: ["building"] as though that had been a
+# deliberate, honoured choice. These tests are about REJECTING that input,
+# not about the mapping functions above, which were already correct for
+# every id they were ever actually asked about.
+
+
+def test_validate_categories_accepts_none():
+    validate_categories(None)
+
+
+def test_validate_categories_accepts_every_known_id():
+    validate_categories(ALL_CATEGORY_IDS)
+
+
+def test_validate_categories_accepts_an_empty_list():
+    # A deliberate "nothing selected" is valid: whether an empty
+    # selection is a USEFUL thing to ask for is not this function's
+    # question, only whether every id in it, of which there are none, is
+    # recognised.
+    validate_categories([])
+
+
+def test_validate_categories_rejects_the_exact_typo_a_coordinator_review_reproduced():
+    with pytest.raises(UnknownCategoryError, match="building"):
+        validate_categories(["building"])
+
+
+def test_validate_categories_error_names_every_unknown_id():
+    with pytest.raises(UnknownCategoryError) as excinfo:
+        validate_categories(["rail_typo", "another_typo"])
+    assert "rail_typo" in str(excinfo.value)
+    assert "another_typo" in str(excinfo.value)
+
+
+def test_validate_categories_error_lists_every_valid_id():
+    with pytest.raises(UnknownCategoryError) as excinfo:
+        validate_categories(["not_a_real_category"])
+    for valid_id in ALL_CATEGORY_IDS:
+        assert valid_id in str(excinfo.value)
+
+
+def test_validate_categories_rejects_a_mix_of_known_and_unknown_rather_than_narrowing():
+    # A partially-valid selection is rejected outright, not silently
+    # narrowed to only the ids it recognises: narrowing would run a
+    # DIFFERENT selection than the one actually asked for, which is its
+    # own kind of silent wrong answer, just a smaller one.
+    with pytest.raises(UnknownCategoryError):
+        validate_categories(["buildings", "not_a_real_category"])
+
+
+def test_unknown_category_error_is_a_value_error():
+    # So it needs no special handling anywhere already built to catch bad
+    # request input by type: cli.py's main() and server.py's
+    # _REQUEST_VALUE_ERRORS both already treat ValueError (BBoxError and
+    # TilingError are also subclasses of it) as "a request problem to
+    # report plainly, not a traceback."
+    assert issubclass(UnknownCategoryError, ValueError)

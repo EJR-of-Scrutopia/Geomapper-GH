@@ -199,13 +199,32 @@ def test_build_package_paths_can_resume_a_suffixed_folder_too(tmp_path):
     assert third.root.name == "2026-08-01_Barry-Waterfront_02"
 
 
+# A coordinator review's Important 1: tiling_fingerprint used to take only
+# the six tiling numbers, so two requests over the same bbox and tiling but
+# a DIFFERENT category or Overture type selection landed in the SAME
+# _work/ fingerprint directory, resuming into a package that silently mixed
+# old, differently-filtered tiles with a survey.json describing only the
+# new selection. categories and overture_types are now required parameters
+# (see the function's own docstring for the full finding), always the
+# EFFECTIVE, already-resolved selection. ALL_CATEGORY_IDS/full defaults
+# below stand in for "no filtering, today's behaviour" the same way
+# SurveyRequest.effective_categories/effective_overture_types resolve an
+# unfiltered request; the tests that are not about categories or Overture
+# types themselves hold both fixed, so what they each claim to isolate
+# (tile size, overlap, bbox) is still the only thing that changed.
+_FULL_CATEGORIES = ("buildings", "water")
+_FULL_OVERTURE_TYPES = ("building", "water")
+
+
 def test_tiling_fingerprint_has_a_fixed_length():
-    fingerprint = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0)
+    fingerprint = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
     assert len(fingerprint) == FINGERPRINT_LENGTH
 
 
 def test_tiling_fingerprint_is_deterministic(tmp_path):
-    args = (-3.29, 51.38, -3.28, 51.39, 600.0, 50.0)
+    args = (-3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES)
     assert tiling_fingerprint(*args) == tiling_fingerprint(*args)
 
 
@@ -213,10 +232,11 @@ def test_tiling_fingerprint_is_stable_across_processes():
     # hashlib.sha256 over a fixed-format string has no dependency on
     # per-process state (unlike Python's built-in hash(), which is salted
     # per process by default), so two separate interpreter processes given
-    # the same six numbers must produce the same 8 characters.
+    # the same inputs must produce the same 8 characters.
     script = (
         "from mapgen.naming import tiling_fingerprint;"
-        "print(tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0))"
+        "print(tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0,"
+        " ['buildings', 'water'], ['building', 'water']))"
     )
     results = {
         subprocess.run(
@@ -229,29 +249,85 @@ def test_tiling_fingerprint_is_stable_across_processes():
 
 
 def test_tiling_fingerprint_differs_for_a_different_tile_size():
-    a = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0)
-    b = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 1200.0, 50.0)
+    a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
+    b = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 1200.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
     assert a != b
 
 
 def test_tiling_fingerprint_differs_for_a_different_overlap():
-    a = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0)
-    b = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 75.0)
+    a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
+    b = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 75.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
     assert a != b
 
 
 def test_tiling_fingerprint_differs_for_a_different_bbox():
-    a = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0)
-    b = tiling_fingerprint(-3.30, 51.38, -3.28, 51.39, 600.0, 50.0)
+    a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
+    b = tiling_fingerprint(
+        -3.30, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
     assert a != b
+
+
+def test_tiling_fingerprint_differs_for_a_different_category_selection():
+    # The heart of Important 1: this is what makes a resumed job land in a
+    # fresh _work/ directory, rather than mixing tiles fetched under the
+    # old selection with a survey.json that goes on to describe the new
+    # one, when only the categories change and the tiling itself does not.
+    a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, ("buildings",), _FULL_OVERTURE_TYPES
+    )
+    b = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, ("water",), _FULL_OVERTURE_TYPES
+    )
+    assert a != b
+
+
+def test_tiling_fingerprint_differs_for_a_different_overture_type_selection():
+    # The same property as above, for an explicit --overture-type selection
+    # that diverges from what the category selection alone would imply.
+    a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, ("building",)
+    )
+    b = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, ("water",)
+    )
+    assert a != b
+
+
+def test_tiling_fingerprint_is_independent_of_selection_order():
+    # A selection is a SET of ids, not a sequence with meaningful order:
+    # the CLI's repeated --category flags and the browser's checklist can
+    # each produce the same set in a different order without that being a
+    # different selection, so it must not fingerprint as one.
+    a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, ("buildings", "water"), ("building", "water")
+    )
+    b = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, ("water", "buildings"), ("water", "building")
+    )
+    assert a == b
 
 
 def test_work_dir_includes_the_fingerprint_segment(tmp_path):
     # The redesign's whole point: two different tilings must never resolve
     # to the same work_dir, and the guard below depends on this segment
     # actually being present, not merely intended.
-    fp_a = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 600.0, 50.0)
-    fp_b = tiling_fingerprint(-3.29, 51.38, -3.28, 51.39, 1200.0, 50.0)
+    fp_a = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 600.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
+    fp_b = tiling_fingerprint(
+        -3.29, 51.38, -3.28, 51.39, 1200.0, 50.0, _FULL_CATEGORIES, _FULL_OVERTURE_TYPES
+    )
     paths_a = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), fp_a)
     paths_b = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), fp_b)
     assert paths_a.work_dir != paths_b.work_dir

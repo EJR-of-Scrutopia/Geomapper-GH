@@ -58,8 +58,10 @@ def tiling_fingerprint(
     north: float,
     tile_size_m: float,
     overlap_m: float,
+    categories: Sequence[str],
+    overture_types: Sequence[str],
 ) -> str:
-    """Short, stable identifier for a specific tiling.
+    """Short, stable identifier for a specific tiling AND content selection.
 
     A tile id such as r00_c00 names a row and column of some grid, but the
     string carries no memory of which grid: that depends on the bbox,
@@ -68,6 +70,26 @@ def tiling_fingerprint(
     what tells them apart at the filesystem level, so they are never able
     to share a directory in the first place, rather than being detected and
     rejected after the fact.
+
+    A coordinator review's Important 1 finding: the six tiling numbers
+    were never the whole story once Task 19 added category and Overture
+    type filtering. Two requests over the same bbox at the same tiling
+    but a DIFFERENT category selection used to land in the SAME _work/
+    fingerprint directory, because nothing about the selection was ever
+    part of what got hashed. Resuming a job after narrowing the
+    selection (or widening it) then mixed old, differently-filtered
+    tiles into a package whose survey.json went on to describe only the
+    NEW selection, silently: a stale _water.geojson surviving a
+    buildings-only rerun, or an OSM tile fetched under one Overpass
+    filter reused under a since-changed one. categories and
+    overture_types are the two REQUIRED parameters that close this:
+    always the effective, already-resolved selection (see SurveyRequest.
+    effective_categories/effective_overture_types), never the possibly-
+    None raw request field, and always passed, with no default, so a
+    future call site cannot forget them the way every existing one
+    already had to be found and fixed once. Sorted before joining so the
+    same selection fingerprints identically regardless of the order its
+    caller happened to list it in.
 
     The canonical string is built with fixed-precision formatting rather
     than repr() or str(), which are not guaranteed stable across floats
@@ -78,7 +100,11 @@ def tiling_fingerprint(
     concern for this tool's scale.
     """
     canonical = "|".join(
-        f"{value:.7f}" for value in (west, south, east, north, tile_size_m, overlap_m)
+        [
+            *(f"{value:.7f}" for value in (west, south, east, north, tile_size_m, overlap_m)),
+            ",".join(sorted(categories)),
+            ",".join(sorted(overture_types)),
+        ]
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return digest[:FINGERPRINT_LENGTH]

@@ -80,6 +80,41 @@ def test_default_types_match_the_existing_script():
     ]
 
 
+def test_no_types_argument_at_all_uses_the_full_default():
+    assert OvertureSource().types == DEFAULT_OVERTURE_TYPES
+
+
+def test_types_none_explicitly_uses_the_full_default():
+    assert OvertureSource(types=None).types == DEFAULT_OVERTURE_TYPES
+
+
+def test_an_empty_type_list_is_taken_literally_not_treated_as_unspecified():
+    # A coordinator review's Critical 2: `types or DEFAULT_OVERTURE_TYPES`
+    # treated [] the same as no argument at all, since both are falsy.
+    # types=[] is what overture_types_for_categories returns for a
+    # category selection that maps to no Overture type at all, for
+    # example ["rail"] or ["boundaries"] alone (see that function's own
+    # docstring): a real, deliberate "fetch nothing", not "unspecified,
+    # use the default". Reproduced by the coordinator's own mutation:
+    # replacing this file's fix with the old `or` line left every test
+    # that existed at the time green, because none of them constructed
+    # an OvertureSource with types=[] and then checked self.types.
+    assert OvertureSource(types=[]).types == []
+
+
+def test_configure_with_an_empty_type_list_produces_a_source_that_fetches_nothing(tmp_path):
+    # The end of Critical 2's actual failure path: configure() (see
+    # package.py's _configured_sources) is what package.py calls with
+    # request.effective_overture_types, so this is the shape a
+    # --category rail or --category boundaries request actually sends.
+    configured = OvertureSource().configure([])
+    assert configured.types == []
+    paths = configured.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    assert paths == []
+
+
 def test_layer_filenames_map_the_three_phase_one_layers():
     assert LAYER_FILENAMES == {
         "water": "water.geojson",

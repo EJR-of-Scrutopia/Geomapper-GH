@@ -57,7 +57,21 @@ class OvertureSource:
         runner: Callable[..., object] = subprocess.run,
         executable_finder: Callable[[str], str | None] = shutil.which,
     ) -> None:
-        self.types = list(types or DEFAULT_OVERTURE_TYPES)
+        # A coordinator review's Critical 2: `types or DEFAULT_OVERTURE_TYPES`
+        # treats an EMPTY list the same as no list at all, because both are
+        # falsy. types=[] is not "unspecified", it is a genuine, deliberate
+        # "fetch nothing", the exact shape overture_types_for_categories
+        # returns for a category selection like ["rail"] or ["boundaries"]
+        # that maps to no Overture type at all (see that function's own
+        # docstring). Under the old line, every one of those selections
+        # silently fetched the full 8-type default instead, undetected by
+        # any test because the mutation this review proposed, replacing the
+        # line with the one below, left all 561 tests at the time green:
+        # nothing exercised configure() with an empty (as opposed to
+        # unspecified) type list and then checked what reached self.types.
+        # None is the only value this treats as "use the default"; anything
+        # else, including [], is taken exactly as given.
+        self.types = list(types) if types is not None else list(DEFAULT_OVERTURE_TYPES)
         self.release = release
         self._runner = runner
         self._find = executable_finder

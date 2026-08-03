@@ -444,7 +444,11 @@ def test_estimate_includes_the_exact_folder_naming_would_compose(tmp_path):
     request = _request(tmp_path)
     estimate = estimate_survey(request)
     fingerprint = tiling_fingerprint(
-        *request.bbox.as_tuple(), request.tile_size_m, request.overlap_m
+        *request.bbox.as_tuple(),
+        request.tile_size_m,
+        request.overlap_m,
+        request.effective_categories,
+        request.effective_overture_types,
     )
     expected = build_package_paths(
         tmp_path, request.region, request.site, request.effective_date, fingerprint
@@ -825,8 +829,18 @@ def test_force_run_excludes_leftover_part_files_from_a_hard_kill(tmp_path):
     # fsutil's atomic writer, and OvertureSource's own download-to-temp
     # convention, both leave a .part file behind if the process is killed
     # mid-write. A force-mode recovery sweep must not pick that debris up.
+    from mapgen.categories import ALL_CATEGORY_IDS
+    from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES
+
     register(StubSource(fail_on=("r01_c01",)))
-    fingerprint = tiling_fingerprint(*BBOX.as_tuple(), 600.0, 50.0)
+    # Must match what _request(tmp_path, force=True) below resolves to
+    # internally (categories=None, overture_types=None, both defaulted),
+    # since Important 1 folded the content selection into the fingerprint:
+    # planting debris under the wrong fingerprint would plant it somewhere
+    # run_survey's own _plan() never looks.
+    fingerprint = tiling_fingerprint(
+        *BBOX.as_tuple(), 600.0, 50.0, ALL_CATEGORY_IDS, DEFAULT_OVERTURE_TYPES
+    )
     paths = build_package_paths(
         tmp_path, "South Wales", "Barry Waterfront", date(2026, 8, 1), fingerprint
     )
@@ -1203,6 +1217,21 @@ def test_effective_categories_defaults_to_everything(tmp_path):
     assert sorted(request.effective_categories) == sorted(ALL_CATEGORY_IDS)
 
 
+def test_survey_request_rejects_an_unknown_category_at_construction(tmp_path):
+    # A coordinator review's Critical 1, reproduced upstream of this test
+    # in test_categories.py directly: --category building (missing its
+    # "s") used to construct a SurveyRequest that ran to completion,
+    # downloading nothing, while looking exactly like a legitimate,
+    # deliberate "nothing selected" request. SurveyRequest itself is where
+    # both the CLI and the web path already meet, so validating here, in
+    # __post_init__, is what makes the rejection reach both without
+    # either needing its own copy of the check.
+    from mapgen.categories import UnknownCategoryError
+
+    with pytest.raises(UnknownCategoryError, match="building"):
+        _request(tmp_path, categories=("building",))
+
+
 def test_effective_overture_types_prefers_an_explicit_overture_type_over_categories(tmp_path):
     # Two different ways of choosing the same thing must not both apply
     # at once: the CLI's own original, lower-level --overture-type wins
@@ -1402,6 +1431,150 @@ def test_survey_json_records_every_category_by_default(tmp_path):
     assert sorted(payload["categories"]) == sorted(ALL_CATEGORY_IDS)
 
 
+def test_a_category_selection_that_maps_to_no_overture_type_fetches_nothing_from_overture(
+    tmp_path,
+):
+    # A coordinator review's Critical 2, end to end: "rail" alone maps to
+    # no Overture type at all (overture_types_for_categories(["rail"])
+    # is [], see test_categories.py), which used to reach OvertureSource
+    # as `types or DEFAULT_OVERTURE_TYPES` and silently fetch the full
+    # 8-type default instead of the nothing the selection actually asked
+    # for. runner.commands staying empty is the real-run-shaped proof:
+    # not just that .types looks right in isolation (test_sources_
+    # overture.py covers that directly), but that the orchestration this
+    # request actually drives never once shells out to overturemaps.
+    runner = _FakeOvertureRunner()
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+    result = run_survey(_request(tmp_path, source_ids=("overture",), categories=("rail",)))
+    # complete is False here, correctly, for a reason this fix does not
+    # touch: _record_tile_outcomes' own pre-existing "vacuous is not
+    # done" rule (see its docstring) marks every tile FAILED when a
+    # source's work directory ends up with no files on disk at all,
+    # rather than assume zero files must mean zero was correct. Still
+    # finishes and writes survey.json rather than raising either way:
+    # assert_inputs_present never objects to an empty expected list, with
+    # or without force, since there is nothing in it to call a gap.
+    assert result.complete is False
+    assert runner.commands == [], f"expected no overturemaps calls at all, got {runner.commands}"
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    overture_entry = next(s for s in payload["sources"] if s["id"] == "overture")
+    assert overture_entry["types"] == []
+
+
+# --- A coordinator review's Important 1: resuming an incomplete package
+# after changing the category selection used to reuse the SAME _work/
+# fingerprint directory (nothing about the selection was part of the hash),
+# so a source's old output from the FIRST selection was still sitting
+# there, indistinguishable from real output for the SECOND, when merge()
+# went looking for "everything on disk for this source". Fixed by folding
+# effective_categories/effective_overture_types into tiling_fingerprint
+# (see naming.py and test_naming.py's own direct tests of that function);
+# this is the end-to-end proof, through run_survey twice, of the actual
+# failure mode the coordinator reproduced live: a stale _water.geojson
+# surviving a buildings-only rerun. -------------------------------------
+
+
+def test_run_survey_gives_a_resumed_request_a_different_work_dir_when_only_categories_changed(
+    tmp_path,
+):
+    # The most direct wiring proof: both work_dir's below come from two
+    # REAL run_survey calls, never from a value this test recomputed
+    # itself and compared against. That distinction matters: a mutation
+    # that has _plan() call tiling_fingerprint with the right SHAPE of
+    # arguments but the wrong, or a constant, VALUE (for example
+    # hardcoding () instead of passing request.effective_categories)
+    # would still coincidentally satisfy an assertion built by
+    # recomputing "the expected fingerprint" the same wrong way outside
+    # it; two independent real calls, compared only against each other,
+    # cannot pass by that accident.
+    stub = StubSource(fail_on=("r00_c00",))
+    register(stub)
+    first = run_survey(_request(tmp_path, categories=("water",), force=True, keep_work=True))
+    assert first.complete is False
+
+    stub._fail_on.clear()
+    second = run_survey(_request(tmp_path, categories=("buildings",), force=True, keep_work=True))
+    assert second.complete is True
+
+    # Same root: an incomplete package is always resumed at the same
+    # root (root is not fingerprinted, only work_dir is).
+    assert second.paths.root == first.paths.root
+    # A genuinely different work_dir all the same, because the category
+    # selection differed between the two calls.
+    assert second.paths.work_dir != first.paths.work_dir
+
+
+def test_a_resumed_run_with_a_different_category_selection_gets_a_fresh_work_dir(tmp_path):
+    # The mechanism itself, proven the same way
+    # test_force_run_excludes_leftover_part_files_from_a_hard_kill proves
+    # its converse: that one plants debris at the fingerprint a request
+    # WOULD use and shows it IS picked up; this plants debris at the
+    # fingerprint a DIFFERENT, water-only request would have used, and
+    # shows a buildings-only request, resuming the very same package root
+    # (root is not fingerprinted, only work_dir is; a root with no
+    # survey.json is always resumed, per build_package_paths), never
+    # even looks there. mkdir(parents=True) below also brings the shared
+    # root into existence, which is what makes the buildings-only
+    # request's own build_package_paths call resume it rather than mint
+    # a fresh _02: no survey.json exists yet, so _survey_reports_complete
+    # is False and the existing, still-empty-of-a-survey root is reused,
+    # exactly as an interrupted real first attempt would leave it.
+    water_only = _request(tmp_path, source_ids=("overture",), categories=("water",))
+    stale_fingerprint = tiling_fingerprint(
+        *water_only.bbox.as_tuple(),
+        water_only.tile_size_m,
+        water_only.overlap_m,
+        water_only.effective_categories,
+        water_only.effective_overture_types,
+    )
+    stale_paths = build_package_paths(
+        tmp_path, water_only.region, water_only.site, water_only.effective_date, stale_fingerprint
+    )
+    stale_water_file = stale_paths.work_dir / "raw" / "overture" / "water" / "r00_c00.geojson"
+    stale_water_file.parent.mkdir(parents=True, exist_ok=True)
+    stale_water_file.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
+
+    runner = _FakeOvertureRunner()
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+    # keep_work=True so a successful run's own cleanup (which deletes the
+    # WHOLE _work/ parent, sibling fingerprints included, once the job is
+    # complete: see run_survey's own comment on best_effort_rmtree) does
+    # not remove the planted file before this test gets to look for it.
+    buildings_only = _request(
+        tmp_path, source_ids=("overture",), categories=("buildings",), keep_work=True
+    )
+    result = run_survey(buildings_only)
+
+    assert result.complete is True
+    # The resume premise: the very same package root the water-only
+    # request's own paths would have used.
+    assert result.paths.root == stale_paths.root
+    # Important 1's actual fix: a DIFFERENT work_dir all the same, because
+    # the category selection is now part of the fingerprint. Before this
+    # fix these were equal, and the stale water file above would have sat
+    # inside THIS run's own work_dir, exactly where _existing_output_files
+    # looks, and been handed to merge() alongside the real building output.
+    assert result.paths.work_dir != stale_paths.work_dir
+    assert stale_water_file.exists(), "the planted file should still be exactly where it was left"
+
+    # The two consequences that matter: no water fetch happened at all
+    # (the buildings-only OvertureSource this run configured has no
+    # reason to ever look at a water/ directory, stale or otherwise)...
+    for command in runner.commands:
+        assert "water" not in command, f"a water fetch happened for a buildings-only run: {command}"
+    # ...and no water output landed in the finished package: the stale
+    # file sat in a work_dir this run's own merge() never scanned.
+    assert (result.paths.root / f"{result.paths.stem}_building.geojson").is_file()
+    assert not (result.paths.root / f"{result.paths.stem}_water.geojson").exists()
+
+    # What survey.json now says in the resume case: this run's own
+    # selection, matching what is actually on disk above.
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["categories"] == ["buildings"]
+    overture_entry = next(s for s in payload["sources"] if s["id"] == "overture")
+    assert overture_entry["types"] == ["building"]
+
+
 # --- Task 19 item 5: the whole-run retry at a smaller tile size on a node-
 # cap failure, restored by owner ruling after Task 17's audit found the
 # superseded script had it and mapgen initially dropped it. -----------------
@@ -1495,11 +1668,26 @@ def test_a_node_cap_retry_gets_its_own_fingerprinted_work_dir_not_the_failed_att
     source = NodeCapThenSucceedsSource()
     register(source)
     request_2000 = _request(tmp_path, tile_size_m=2000.0, overlap_m=100.0, source_ids=("osm",))
-    fp_2000 = tiling_fingerprint(*request_2000.bbox.as_tuple(), 2000.0, 100.0)
+    # The retry ladder only ever changes tile_size_m/overlap_m (see
+    # run_survey), never the category or Overture type selection, so both
+    # fingerprints below share request_2000's own effective selection.
+    fp_2000 = tiling_fingerprint(
+        *request_2000.bbox.as_tuple(),
+        2000.0,
+        100.0,
+        request_2000.effective_categories,
+        request_2000.effective_overture_types,
+    )
     # Overlap after the retry: min(original 100, max(50, 1500 / 10)) =
     # min(100, 150) = 100, unchanged, since the original overlap is
     # already below the new tile size's own 10% floor.
-    fp_1500 = tiling_fingerprint(*request_2000.bbox.as_tuple(), 1500.0, 100.0)
+    fp_1500 = tiling_fingerprint(
+        *request_2000.bbox.as_tuple(),
+        1500.0,
+        100.0,
+        request_2000.effective_categories,
+        request_2000.effective_overture_types,
+    )
     assert fp_2000 != fp_1500
 
     result = run_survey(request_2000)
