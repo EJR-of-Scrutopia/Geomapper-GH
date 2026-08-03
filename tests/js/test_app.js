@@ -43,8 +43,55 @@ const KNOWN_IDS = new Set(
 
 // --- minimal DOM -----------------------------------------------------
 
+// Parses <input .../> tags out of an HTML string into small, live
+// pseudo-elements: enough for app.js's own rendered-checklist pattern
+// (a container's innerHTML set to a template string of <label><input
+// type="checkbox" value="..." checked /><span>...</span></label>
+// entries, later read back with document.querySelectorAll) to be
+// genuinely exercised in this harness, rather than the container's
+// children being permanently invisible to any query. Deliberately not a
+// general HTML parser: only <input> tags are recognised, and only the
+// attributes app.js's own templates actually use (type, value, checked,
+// disabled, and any data-* attribute) are read. A checkbox's `checked`
+// is read ONLY from the markup at parse time, matching how app.js
+// renders it (server data decides which boxes start ticked); nothing
+// here needs to react to a later `.checked = ...` mutation on these
+// objects being written back into the source HTML, since app.js itself
+// never re-reads a container's innerHTML after rendering it, only
+// queries the live objects this returns.
+function _parseInputs(html) {
+  const inputs = [];
+  const tagRe = /<input\b([^>]*)>/gi;
+  let match;
+  while ((match = tagRe.exec(html))) {
+    const attrs = {};
+    const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*"([^"]*)")?/g;
+    let attrMatch;
+    while ((attrMatch = attrRe.exec(match[1]))) {
+      attrs[attrMatch[1]] = attrMatch[2] !== undefined ? attrMatch[2] : true;
+    }
+    inputs.push({
+      tagName: "input",
+      type: attrs.type === true || attrs.type === undefined ? "text" : attrs.type,
+      value: attrs.value !== undefined && attrs.value !== true ? attrs.value : "",
+      checked: attrs.checked === true || attrs.checked === "checked" || attrs.checked === "true",
+      disabled: attrs.disabled === true || attrs.disabled === "true",
+      _attrs: attrs,
+      getAttribute(name) {
+        if (!(name in this._attrs)) return null;
+        return this._attrs[name] === true ? "" : this._attrs[name];
+      },
+      hasAttribute(name) {
+        return name in this._attrs;
+      },
+    });
+  }
+  return inputs;
+}
+
 function makeElement(id) {
-  return {
+  let html = "";
+  const element = {
     id,
     value: "",
     checked: false,
@@ -52,11 +99,21 @@ function makeElement(id) {
     hidden: false,
     className: "",
     textContent: "",
-    innerHTML: "",
     style: {},
     scrollHeight: 0,
     scrollTop: 0,
     children: [],
+    // The live pseudo-inputs parsed from whatever was last assigned to
+    // innerHTML, consulted by document.querySelectorAll below. Present
+    // on every element, empty for one nothing was ever assigned to.
+    _inputs: [],
+    get innerHTML() {
+      return html;
+    },
+    set innerHTML(value) {
+      html = value;
+      this._inputs = _parseInputs(value);
+    },
     // A real element supports multiple listeners per event type; this
     // stored a single handler per type and let a later addEventListener
     // for the same type silently replace an earlier one, which is not
@@ -83,6 +140,39 @@ function makeElement(id) {
       this.children.push(node);
     },
   };
+  return element;
+}
+
+// Selectors app.js actually uses against a rendered checklist container:
+// "#id", "#id input", "#id input:checked", and an attribute clause
+// ("#id input[data-config-field]" or ...[data-config-field="x"]"),
+// against the live pseudo-inputs _parseInputs produced. Not a general
+// CSS engine: an unsupported selector shape throws rather than quietly
+// matching nothing, so a typo'd or unanticipated selector fails the
+// test loudly instead of passing 0 elements found.
+function _queryContainer(container, selector) {
+  const parts = selector.trim().split(/\s+/);
+  if (parts.length > 2 || !parts[0].startsWith("#")) {
+    throw new Error(`unsupported selector in this test harness: ${selector}`);
+  }
+  if (parts.length === 1) return [container];
+  const rest = parts[1];
+  const tagMatch = rest.match(/^[a-zA-Z]+/);
+  if (!tagMatch || tagMatch[0] !== "input") {
+    throw new Error(`unsupported selector in this test harness: ${selector}`);
+  }
+  let candidates = container._inputs.slice();
+  if (rest.includes(":checked")) {
+    candidates = candidates.filter((el) => el.checked === true);
+  }
+  const attrMatch = rest.match(/\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\]/);
+  if (attrMatch) {
+    const [, attrName, attrValue] = attrMatch;
+    candidates = candidates.filter((el) =>
+      attrValue !== undefined ? el.getAttribute(attrName) === attrValue : el.hasAttribute(attrName)
+    );
+  }
+  return candidates;
 }
 
 function makeDocument() {
@@ -106,8 +196,18 @@ function makeDocument() {
     createElement() {
       return makeElement("log-line");
     },
-    querySelectorAll() {
-      return [];
+    // Resolves against the SAME elements map getElementById uses, so a
+    // container queried before it has ever been fetched by id still
+    // finds the one live element rather than a second, disconnected one:
+    // querySelectorAll("#sources ...") must see whatever $("sources").
+    // innerHTML = ... actually wrote, not a fresh, empty stand-in.
+    querySelectorAll(selector) {
+      const containerId = selector.trim().split(/\s+/)[0].replace(/^#/, "");
+      if (!KNOWN_IDS.has(containerId)) return [];
+      return _queryContainer(this.getElementById(containerId), selector);
+    },
+    querySelector(selector) {
+      return this.querySelectorAll(selector)[0] || null;
     },
     // document itself needs addEventListener/fire too: the draw tool's
     // Escape handling is bound here rather than on the map container, so
@@ -974,6 +1074,40 @@ function ok(condition, message) {
         `elevation for lacking a key), got ${checkedCount} checked: ${html}`
     );
   });
+
+  await test(
+    "unticking a source checkbox excludes it from the job's payload (closes a long-standing harness gap)",
+    async () => {
+      // Task 16 documented this as an honest limit of the DOM mock at
+      // the time: querySelectorAll was stubbed to always return [], so
+      // payload().sources was always empty and source selection was
+      // "entirely unverified until someone clicks it" in a real browser.
+      // The mock now parses a rendered checklist's real <input> tags, so
+      // this is provable directly.
+      // Built directly rather than via bootedSandbox: bootRoutes() answers
+      // /api/sources with the fixed single-entry DEFAULT_SOURCES before an
+      // extra route ever gets a look in, which is exactly wrong for a test
+      // that needs two sources to tell apart.
+      const stub = makeFetchStub(async (url) => {
+        if (url.pathname === "/api/config") return jsonResponse(200, DEFAULT_CONFIG);
+        if (url.pathname === "/api/sources") {
+          return jsonResponse(200, [
+            { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false },
+            { id: "overture", display_name: "Overture Maps", licence: "ODbL", requires_api_key: false },
+          ]);
+        }
+        return null;
+      });
+      const sandbox = buildSandbox({ fetch: stub.fetch });
+      await flush(10);
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39"); // payload() needs a bbox to read
+      const checkboxes = sandbox.document.querySelectorAll("#sources input");
+      ok(checkboxes.length === 2, `expected 2 rendered source checkboxes, got ${checkboxes.length}`);
+      const overtureBox = checkboxes.find((c) => c.value === "overture");
+      overtureBox.checked = false;
+      ok(sandbox.payload().sources.sort().join(",") === "osm", `expected only osm, got ${sandbox.payload().sources}`);
+    }
+  );
 
   await test(
     "source metadata (id, display_name, licence) is HTML-escaped when rendered",
