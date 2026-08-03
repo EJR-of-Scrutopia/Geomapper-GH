@@ -487,22 +487,21 @@ def test_fetch_lets_cancelled_propagate_unwrapped(tmp_path):
     # today; this pins that it would still propagate correctly if
     # something ever did, by construction, not by the accident of what
     # is called there now.
+    #
+    # There is deliberately no KeyboardInterrupt counterpart to this
+    # test. Review round 3 called the previous one vacuous and it was
+    # right to: KeyboardInterrupt is a BaseException, not an Exception,
+    # so `except Exception` never catches it regardless of whether it is
+    # also named in the tuple above it, in this code or in any code.
+    # That test could not have failed for any change made to this
+    # method; Cancelled is the real case, because it IS an Exception
+    # subclass and so genuinely is at risk from the broad except below.
     class CancelsSession:
         def get(self, url, **kwargs):
             raise Cancelled("job was cancelled mid-request")
 
     source = ElevationSource(api_key="k", session=CancelsSession())
     with pytest.raises(Cancelled):
-        source.fetch(BBOX, [], tmp_path, NullProgress())
-
-
-def test_fetch_lets_keyboard_interrupt_propagate(tmp_path):
-    class InterruptsSession:
-        def get(self, url, **kwargs):
-            raise KeyboardInterrupt()
-
-    source = ElevationSource(api_key="k", session=InterruptsSession())
-    with pytest.raises(KeyboardInterrupt):
         source.fetch(BBOX, [], tmp_path, NullProgress())
 
 
