@@ -138,6 +138,35 @@ def _plan(request: SurveyRequest):
     return tiles, paths
 
 
+def _configured_sources(request: SurveyRequest) -> list:
+    """The sources this request actually uses, each configured for this
+    request's own selection rather than whatever a shared, registered
+    instance happened to be constructed with.
+
+    Task 20 found that --overture-type (and SurveyRequest.overture_types
+    generally) had no effect on what was actually fetched: register_
+    default_sources() builds one OvertureSource with the 8-type default
+    and registers it once, and every request fetched through that same
+    shared instance regardless of its own selection. The fix reads the
+    registered instance back via get_source (so listing routes like
+    GET /api/sources keep seeing the original, always-present instance),
+    then, only for sources that expose the optional `configure` extension
+    documented on LayerSource, asks for a fresh, request-scoped copy
+    rather than mutating the registered one. Only overture (types) and
+    osm (category tag filtering) have any such per-request selection
+    today; every other source id is used exactly as registered, with no
+    id-specific branch needed for it to keep working unchanged.
+    """
+    configured = []
+    for source_id in request.source_ids:
+        source = get_source(source_id)
+        configure = getattr(source, "configure", None)
+        if source_id == "overture" and callable(configure):
+            source = configure(request.effective_overture_types)
+        configured.append(source)
+    return configured
+
+
 def _geometry_summary(bbox: BBox, tiles: Sequence[Tile]) -> dict[str, object]:
     """Tile count, rows, cols and extent: the numbers that need nothing
     about naming or where output will land, shared verbatim by
@@ -176,8 +205,7 @@ def estimate_survey(request: SurveyRequest) -> dict[str, object]:
     total_seconds = 0.0
     source_summaries: list[dict[str, object]] = []
     warnings: list[str] = []
-    for source_id in request.source_ids:
-        source = get_source(source_id)
+    for source in _configured_sources(request):
         estimate = source.estimate(request.bbox, tiles)
         total_bytes += estimate.bytes_estimate
         total_seconds += estimate.seconds_estimate
@@ -234,7 +262,7 @@ def run_survey(
 
     sink.emit("job_started", tiles=len(tiles), root=str(paths.root))
 
-    sources = [get_source(source_id) for source_id in request.source_ids]
+    sources = _configured_sources(request)
     # work_dir is fingerprinted by tiling (see _plan), so the state.json
     # found here, if any, was written under this exact bbox, tile_size_m and
     # overlap_m. A different tiling gets an entirely separate work_dir and
@@ -464,6 +492,31 @@ def _write_layer_files(
                 break
 
 
+def _source_provenance(source) -> dict[str, object]:
+    """One survey.json `sources` entry: the LayerSource protocol's own
+    fields, plus endpoints_used, plus (Task 19) types if this source
+    exposes one, all read the same defensive way sources/base.py's own
+    docstring documents for optional, source-specific attributes.
+
+    types is Overture-specific today (the actual list of types this
+    package's Overture data was fetched with, which the fix in
+    _configured_sources means can genuinely differ from the 8-type
+    default): a package's audit trail should say what it actually
+    contains, not require cross-referencing category selection against a
+    mapping table kept somewhere else to work that out.
+    """
+    entry: dict[str, object] = {
+        "id": source.id,
+        "licence": source.licence,
+        "attribution": source.attribution,
+        "endpoints_used": list(getattr(source, "endpoints_used", [])),
+    }
+    types = getattr(source, "types", None)
+    if types is not None:
+        entry["types"] = list(types)
+    return entry
+
+
 def _build_survey_json(
     request,
     paths,
@@ -498,15 +551,7 @@ def _build_survey_json(
             "rows": max((t.row for t in tiles), default=0) + 1,
             "cols": max((t.col for t in tiles), default=0) + 1,
         },
-        "sources": [
-            {
-                "id": source.id,
-                "licence": source.licence,
-                "attribution": source.attribution,
-                "endpoints_used": list(getattr(source, "endpoints_used", [])),
-            }
-            for source in sources
-        ],
+        "sources": [_source_provenance(source) for source in sources],
         "tiles": state.as_tile_records(),
         # complete reports the survey DATA alone: every requested source's
         # every tile downloaded and merged successfully. It intentionally

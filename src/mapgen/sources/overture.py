@@ -69,6 +69,35 @@ class OvertureSource:
             seconds_estimate=SECONDS_PER_TILE_TYPE_ESTIMATE * units,
         )
 
+    def configure(self, types: Sequence[str]) -> "OvertureSource":
+        """Returns a fresh OvertureSource scoped to exactly these types,
+        sharing this instance's release/runner/executable_finder, and
+        never mutating self.
+
+        This is the fix for the bug Task 20 found and deliberately left
+        for this task: register_default_sources() builds ONE OvertureSource
+        with the 8-type default and registers it into the process-wide
+        registry once; every request, whatever its own --overture-type or
+        category selection, was fetching through that same shared
+        instance's fixed .types, so the owner downloaded all 8 datasets
+        every time regardless of what they asked for. The fix is not to
+        mutate the registered instance's .types in place: estimate_survey
+        can be polled from a browser while a job using a DIFFERENT
+        selection is already running (there is no busy-guard on
+        /api/estimate, only on /api/jobs), and mutating shared state that
+        an in-flight fetch() loop is actively reading from underneath it
+        is exactly the kind of race that would corrupt a running job's
+        output for a reason that would be very hard to reproduce. Handing
+        back a new, independently-configured instance instead means the
+        registered instance available_sources()/GET /api/sources lists
+        keeps behaving identically no matter what any single request
+        selects, while package.py uses the returned copy for the actual
+        estimate/fetch/merge work.
+        """
+        return OvertureSource(
+            types=types, release=self.release, runner=self._runner, executable_finder=self._find
+        )
+
     def fetch(
         self,
         bbox: BBox,

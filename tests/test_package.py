@@ -22,6 +22,7 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.osm import OsmSource
+from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES, OvertureSource
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
@@ -1103,3 +1104,84 @@ def test_register_default_sources_raises_when_a_foreign_object_squats_on_a_defau
     # raised before replacing anything, so a caller who ignores the exception
     # would not silently end up with a wrong source either.
     assert get_source("osm") is decoy
+
+
+# --- Task 20's out-of-scope finding, fixed here: --overture-type (and
+# SurveyRequest.overture_types generally) had no effect on what was
+# actually fetched. register_default_sources() builds one OvertureSource
+# with the 8-type default and registers it once; every request, whatever
+# its own selection, fetched through that same shared instance's fixed
+# .types. The fix is _configured_sources(), which asks a source exposing
+# the optional `configure` extension for a fresh, request-scoped copy
+# instead of ever mutating the registered one. -----------------------
+
+
+class _FakeOvertureRunner:
+    """Records every command run and writes a minimal valid GeoJSON at
+    the requested --output path: enough for OvertureSource.fetch's own
+    rename-from-.part-on-success step and run_survey's merge step to
+    both succeed, without ever shelling out to the real overturemaps CLI.
+    """
+
+    def __init__(self):
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        output = Path(command[command.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
+        return type("FakeCompleted", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+
+def test_overture_type_selection_actually_reaches_the_fetch_not_just_the_registry(tmp_path):
+    runner = _FakeOvertureRunner()
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+    result = run_survey(
+        _request(tmp_path, source_ids=("overture",), overture_types=("water", "building"))
+    )
+    assert result.complete is True
+    fetched_types = {cmd[cmd.index("--type") + 1] for cmd in runner.commands}
+    assert fetched_types == {"water", "building"}, (
+        f"expected only the requested types to be fetched, got {fetched_types}"
+    )
+
+
+def test_overture_type_selection_does_not_mutate_the_registered_instance(tmp_path):
+    # The property that makes this safe against a concurrent /api/estimate
+    # for a different selection while a job using this instance is
+    # running: the registered singleton must come out the other side of a
+    # narrowed-selection run exactly as it went in.
+    runner = _FakeOvertureRunner()
+    registered = OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps")
+    register(registered)
+    run_survey(_request(tmp_path, source_ids=("overture",), overture_types=("water",)))
+    assert registered.types == DEFAULT_OVERTURE_TYPES
+    assert get_source("overture") is registered
+
+
+def test_estimate_reflects_a_narrowed_overture_type_selection(tmp_path):
+    register(OvertureSource())
+    full = estimate_survey(_request(tmp_path, source_ids=("overture",)))
+    narrowed = estimate_survey(
+        _request(tmp_path, source_ids=("overture",), overture_types=("water",))
+    )
+    assert narrowed["bytes_estimate"] < full["bytes_estimate"]
+
+
+def test_survey_json_records_the_overture_types_actually_fetched(tmp_path):
+    runner = _FakeOvertureRunner()
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+    result = run_survey(
+        _request(tmp_path, source_ids=("overture",), overture_types=("water", "building"))
+    )
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    overture_entry = next(s for s in payload["sources"] if s["id"] == "overture")
+    assert sorted(overture_entry["types"]) == ["building", "water"]
+
+
+def test_survey_json_source_entry_omits_types_for_a_source_with_no_such_concept(tmp_path):
+    register(StubSource())
+    result = run_survey(_request(tmp_path))
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert "types" not in payload["sources"][0]
