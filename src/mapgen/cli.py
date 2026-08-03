@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from mapgen import __version__
-from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES, UnknownCategoryError
+from mapgen.categories import (
+    CATEGORY_GROUPS,
+    ROAD_SUBTYPES,
+    EmptyCategorySelectionError,
+    UnknownCategoryError,
+)
 from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
@@ -336,6 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         BBoxError,
         TilingError,
         UnknownCategoryError,
+        EmptyCategorySelectionError,
         OsmDownloadError,
         OvertureError,
         ElevationError,
@@ -353,7 +359,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # of these is already a deliberately plain, one-line message
         # written for exactly this purpose (see each class's own raise
         # sites); str(exc) here is not a fallback, it is what they were
-        # always for.
+        # always for. EmptyCategorySelectionError (Task 21) joins the
+        # tuple the same way UnknownCategoryError did: it is a ValueError
+        # already caught generically by server.py's _REQUEST_VALUE_ERRORS,
+        # but this CLI path names its exceptions explicitly rather than
+        # catching ValueError itself, so it needs the same one-line
+        # addition here that every new request-validation error has.
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

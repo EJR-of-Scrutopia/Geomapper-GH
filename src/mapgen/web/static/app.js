@@ -456,10 +456,33 @@ function payload() {
   };
 }
 
+// Task 21: unticking every category checkbox used to be accepted right
+// through to the server, which refused it (see mapgen.categories.
+// EmptyCategorySelectionError) but only after the owner had already
+// pressed Download and seen an error. Checked here instead, alongside
+// the extent and the region/site names, so the same missing-fields
+// message and disabled Download that already cover a blank site name
+// cover this too: the owner never reaches the state where pressing
+// Download does anything but disabled sit there.
+//
+// [...] first: a real browser's querySelectorAll returns a NodeList,
+// which has forEach but not every, the same reason payload() below
+// spreads #sources and #categories before calling .map on them. Empty
+// (boot() has not rendered the checklist yet, or index.html's markup is
+// momentarily bare) reads as "nothing to say yet", not "nothing
+// selected": the checklist is ticked by default the instant it renders,
+// so a genuinely empty list here only ever means boot() has not reached
+// GET /api/categories yet, never a deliberate empty selection.
+function noCategorySelected() {
+  const boxes = [...document.querySelectorAll("#categories input")];
+  return boxes.length > 0 && boxes.every((box) => !box.checked);
+}
+
 // Names the field or fields actually missing, rather than a fixed message
 // regardless of which ones are empty: a region already filled by the
 // reverse lookup must not be told to "enter a region" alongside a genuinely
-// empty site. Returns null once bbox, region and site are all present.
+// empty site. Returns null once bbox, region, site and at least one
+// category are all present.
 function missingFieldsMessage() {
   const clauses = [];
   if (!bbox) clauses.push("draw or paste an extent");
@@ -467,6 +490,7 @@ function missingFieldsMessage() {
   if (!$("region").value.trim()) namesMissing.push("region");
   if (!$("site").value.trim()) namesMissing.push("site");
   if (namesMissing.length) clauses.push(`enter a ${namesMissing.join(" and ")}`);
+  if (noCategorySelected()) clauses.push("select at least one category");
   if (!clauses.length) return null;
   const sentence = `${clauses.join(" and ")} to see an estimate.`;
   return sentence.charAt(0).toUpperCase() + sentence.slice(1);
@@ -630,6 +654,12 @@ $("settings-backdrop").addEventListener("click", closeSettingsPanel);
 // build from ever triggering that.
 
 let savedConfig = null;
+// Set once, in boot(), from GET /api/sources: the api-keys change handler
+// below needs the same list to re-render the saved/unsaved indicator
+// after a save, and it has no other way to get it, since the fields it is
+// re-rendering carry no memory of which source they belong to beyond
+// data-config-field.
+let currentSources = [];
 
 async function persistConfig(changes) {
   if (savedConfig === null) return; // boot() has not finished loading yet
@@ -703,10 +733,20 @@ function maybePersistFieldSettings() {
 // reported as "not configured" by the very estimate meant to reflect it,
 // if that estimate's request happened to reach the server before this
 // one's PUT did.
+//
+// renderApiKeys is called again after the save, not just refreshEstimate:
+// that is what makes the saved/unsaved indicator (Task 21, defect 2)
+// actually update the moment a key is saved or cleared, rather than only
+// reflecting whatever boot() saw once at load. It reads savedConfig, not
+// the field's own live value, so a save that genuinely failed (the catch
+// branch in persistConfig, savedConfig left unchanged) re-renders back to
+// the last confirmed truth instead of a field quietly claiming a state
+// that was never actually written to disk.
 $("api-keys").addEventListener("change", async (event) => {
   const field = event.target && event.target.getAttribute && event.target.getAttribute("data-config-field");
   if (!field) return;
   await persistConfig({ [field]: event.target.value });
+  renderApiKeys(currentSources, savedConfig);
   refreshEstimate();
 });
 
@@ -899,6 +939,20 @@ function renderCategories(groups) {
     .join("");
 }
 
+// Task 21, defect 2: a saved key and an unsaved one both render as the
+// same row of dots in a type="password" field, which is what convinced
+// the owner a save that had genuinely worked had not. The persistence
+// itself was never broken (see mapgen.config, unchanged by this fix); the
+// field just gave no honest signal either way. This never echoes the key
+// itself, only whether one is present in the saved config, matching the
+// redaction discipline mapgen.sources.elevation already applies to this
+// exact value everywhere else it could ever reach a log or a response.
+function apiKeyStatusMarkup(hasSavedKey) {
+  return hasSavedKey
+    ? '<span class="api-key-status saved">Key saved</span>'
+    : '<span class="api-key-status unsaved">No key saved</span>';
+}
+
 function renderApiKeys(sources, config) {
   // Driven from the source registry, not one hard-coded field per key:
   // a source that needs one names its own mapgen.config.Config field via
@@ -919,6 +973,7 @@ function renderApiKeys(sources, config) {
           <input type="password" data-config-field="${escapeHtml(s.api_key_config_field)}"
                  value="${value}" autocomplete="off"
                  placeholder="Only needed for this layer" />
+          ${apiKeyStatusMarkup(Boolean(config[s.api_key_config_field]))}
         </label>`;
     })
     .join("");
@@ -934,6 +989,7 @@ function renderApiKeys(sources, config) {
     savedConfig = config;
 
     const sources = await api("/api/sources");
+    currentSources = sources;
     renderSources(sources);
     renderApiKeys(sources, config);
     $("sources").addEventListener("change", refreshEstimate);

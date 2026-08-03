@@ -785,29 +785,63 @@ def test_a_jobs_category_selection_is_recorded_in_survey_json(server, tmp_path):
     assert sorted(recorded["categories"]) == ["buildings", "water"]
 
 
-def test_an_empty_category_selection_is_not_coalesced_into_the_default(server, tmp_path):
-    # payload.get(key) is used deliberately, not payload.get(key) or
-    # default: an explicit [] (every checkbox unticked) must survive as
-    # a genuine "nothing selected", not be treated the same as an absent
-    # key (which means "every category", today's behaviour).
-    status, payload = _post(
-        server,
-        "/api/jobs",
-        {
-            "bbox": "-3.29,51.38,-3.28,51.39",
-            "region": "South Wales",
-            "site": "Barry",
-            "output_root": str(tmp_path),
-            "sources": ["stub"],
-            "categories": [],
-            "run_bridge": False,
-        },
-    )
-    assert status == 202
-    final = _wait_for_state(server, payload["id"])
-    survey_json = Path(final["result_root"]) / "survey.json"
-    recorded = json.loads(survey_json.read_text(encoding="utf-8"))
-    assert recorded["categories"] == []
+def test_an_empty_category_selection_is_refused_with_a_plain_message(server, tmp_path):
+    # Task 21: this test used to assert the opposite (see its own prior
+    # form, still visible in git history) because at the time an explicit
+    # [] surviving as a genuine "nothing selected", distinct from an
+    # absent key defaulting to "every category", was itself the fix. That
+    # distinction still holds (payload.get(key) is still used deliberately,
+    # not payload.get(key) or default, see _survey_request), but "nothing
+    # selected" is not a real, useful survey to run: it matches nothing in
+    # either osm_tag_clauses or overture_types_for_categories, so the job
+    # used to complete with an empty package and no indication anything
+    # was wrong. SurveyRequest's own construction (via validate_categories)
+    # now refuses this synchronously, the same _REQUEST_VALUE_ERRORS path
+    # every other unbuildable request already goes through, before a job
+    # is ever started.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/jobs",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "South Wales",
+                "site": "Barry",
+                "output_root": str(tmp_path),
+                "sources": ["stub"],
+                "categories": [],
+                "run_bridge": False,
+            },
+        )
+    assert excinfo.value.code == 400
+    body = json.loads(excinfo.value.read().decode("utf-8"))
+    message = body["error"].lower()
+    assert "no categories are selected" in message or "nothing" in message
+    assert "at least one category" in message
+    # No job, and therefore no package, was ever created for a request
+    # that was refused before it started.
+    assert not any((tmp_path / "South-Wales").glob("**/survey.json"))
+
+
+def test_an_empty_category_selection_is_refused_by_estimate_too(server, tmp_path):
+    # The same construction-time check, reached through /api/estimate
+    # rather than /api/jobs: unticking every category must disable
+    # Download before a job can ever be started, which depends on the
+    # estimate call itself refusing the selection, not only job creation.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/estimate",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "South Wales",
+                "site": "Barry",
+                "output_root": str(tmp_path),
+                "sources": ["stub"],
+                "categories": [],
+            },
+        )
+    assert excinfo.value.code == 400
 
 
 def test_a_missing_category_selection_defaults_to_every_category(server, tmp_path):

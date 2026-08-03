@@ -4,6 +4,7 @@ from mapgen.categories import (
     ALL_CATEGORY_IDS,
     CATEGORY_GROUPS,
     ROAD_SUBTYPES,
+    EmptyCategorySelectionError,
     UnknownCategoryError,
     osm_tag_clauses,
     overture_types_for_categories,
@@ -176,12 +177,48 @@ def test_validate_categories_accepts_every_known_id():
     validate_categories(ALL_CATEGORY_IDS)
 
 
-def test_validate_categories_accepts_an_empty_list():
-    # A deliberate "nothing selected" is valid: whether an empty
-    # selection is a USEFUL thing to ask for is not this function's
-    # question, only whether every id in it, of which there are none, is
-    # recognised.
-    validate_categories([])
+def test_validate_categories_rejects_an_empty_list():
+    # Task 21: unticking every category in the browser, or otherwise
+    # passing categories=[], used to be accepted silently here (see this
+    # test's own prior form, which asserted the opposite). That let a
+    # selection that matches nothing in either osm_tag_clauses or
+    # overture_types_for_categories reach them unrefused, producing an
+    # empty package reported as complete: true with nothing to say why.
+    # None (untouched by this test, see test_validate_categories_accepts_
+    # none above) is still the real, different "every category" case;
+    # this is specifically the non-None, explicitly empty one.
+    with pytest.raises(EmptyCategorySelectionError):
+        validate_categories([])
+
+
+def test_validate_categories_empty_list_message_says_nothing_is_selected_and_one_is_needed():
+    with pytest.raises(EmptyCategorySelectionError) as excinfo:
+        validate_categories([])
+    message = str(excinfo.value).lower()
+    assert "no categories are selected" in message or "nothing" in message, (
+        f"expected the message to plainly say nothing is selected, got: {excinfo.value}"
+    )
+    assert "at least one category" in message, (
+        f"expected the message to plainly say at least one category is needed, got: {excinfo.value}"
+    )
+
+
+def test_empty_category_selection_error_is_a_value_error():
+    # Same reasoning as test_unknown_category_error_is_a_value_error
+    # below: server.py's _REQUEST_VALUE_ERRORS catches ValueError
+    # generically, so this needs no change there, only cli.py's own
+    # explicit exception tuple.
+    assert issubclass(EmptyCategorySelectionError, ValueError)
+
+
+def test_empty_category_selection_error_is_distinct_from_unknown_category_error():
+    # Deliberate: an empty selection is the vocabulary being consulted
+    # correctly and truthfully reporting nothing was asked for, not an id
+    # outside it. A caller that only catches UnknownCategoryError
+    # specifically (rather than ValueError generally) must not silently
+    # swallow this different condition.
+    assert not issubclass(EmptyCategorySelectionError, UnknownCategoryError)
+    assert not issubclass(UnknownCategoryError, EmptyCategorySelectionError)
 
 
 def test_validate_categories_rejects_the_exact_typo_a_coordinator_review_reproduced():

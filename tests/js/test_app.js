@@ -1458,6 +1458,105 @@ function ok(condition, message) {
   });
 
   // =======================================================================
+  // Task 21, defect 1: unticking every category used to be accepted right
+  // through to the server (which now refuses it, see
+  // mapgen.categories.EmptyCategorySelectionError), so the owner only found
+  // out after pressing Download and getting an error back. This is the
+  // browser-side half of that fix: reach the same disabled-Download state a
+  // missing site name already produces, before an estimate is ever
+  // attempted, never merely surface the server's rejection after the fact.
+  // =======================================================================
+
+  await test(
+    "unticking every category checkbox disables Download with a visible reason",
+    async () => {
+      let allowEstimate = true;
+      const { fetchCalls, sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/extent") {
+          return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
+        }
+        if (url.pathname === "/api/estimate") {
+          // Only ever answered for the initial, fully-ticked estimate
+          // below. Once every category is unticked, this test flips
+          // allowEstimate to false: if the page still reached this route
+          // with nothing selected, that is the client-side guard failing
+          // to do its one job, so the unhandled-fetch error is the right
+          // way for this test to fail, not a quiet 200 that would hide it.
+          if (!allowEstimate) return null;
+          return jsonResponse(200, {
+            tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 },
+            bytes_estimate: 1000, seconds_estimate: 60, warnings: [], folder: "C:\\out",
+          });
+        }
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      setField(sandbox, "region", "R");
+      setField(sandbox, "site", "S");
+      await flush(10);
+      ok(sandbox.document.getElementById("download").disabled === false, "expected a valid estimate first");
+
+      allowEstimate = false;
+      fetchCalls.length = 0;
+      const boxes = sandbox.document.querySelectorAll("#categories input");
+      boxes.forEach((box) => {
+        box.checked = false;
+      });
+      sandbox.document.getElementById("categories").fire("change");
+      await flush(10);
+
+      ok(
+        sandbox.document.getElementById("download").disabled === true,
+        "expected Download disabled once every category is unticked"
+      );
+      const message = sandbox.document.getElementById("estimate").textContent
+        || sandbox.document.getElementById("estimate").innerHTML;
+      ok(/categor/i.test(message), `expected the reason to mention categories, got: ${message}`);
+      ok(
+        !fetchCalls.some((c) => c.url.pathname === "/api/estimate"),
+        "expected no /api/estimate call while nothing is selected"
+      );
+    }
+  );
+
+  await test(
+    "re-ticking a category after unticking every one re-enables Download",
+    async () => {
+      const { sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/extent") {
+          return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
+        }
+        if (url.pathname === "/api/estimate") {
+          return jsonResponse(200, {
+            tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 },
+            bytes_estimate: 1000, seconds_estimate: 60, warnings: [], folder: "C:\\out",
+          });
+        }
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      setField(sandbox, "region", "R");
+      setField(sandbox, "site", "S");
+      await flush(10);
+      const boxes = sandbox.document.querySelectorAll("#categories input");
+      boxes.forEach((box) => {
+        box.checked = false;
+      });
+      sandbox.document.getElementById("categories").fire("change");
+      await flush(10);
+      ok(sandbox.document.getElementById("download").disabled === true);
+
+      boxes[0].checked = true;
+      sandbox.document.getElementById("categories").fire("change");
+      await flush(10);
+      ok(
+        sandbox.document.getElementById("download").disabled === false,
+        "expected Download re-enabled once a category is ticked again"
+      );
+    }
+  );
+
+  // =======================================================================
   // Task 19, item 2: the settings panel. API key fields are rendered from
   // the source registry (GET /api/sources' api_key_config_field), one per
   // keyed source, rather than a single hard-coded field, so a second or
@@ -1496,6 +1595,104 @@ function ok(condition, message) {
     ok(field, "expected a rendered field for opentopography_api_key");
     ok(field.value === "sk-saved-key", `expected the saved key prefilled, got: ${field.value}`);
     ok(field.type === "password", `expected type="password", got: ${field.type}`);
+  });
+
+  // =======================================================================
+  // Task 21, defect 2: a saved key and an unsaved one both render as the
+  // same row of dots in a type="password" field, which is what convinced
+  // the owner a save that had genuinely worked had not. mapgen.config's
+  // persistence is unchanged and correct (see the Python side of this
+  // fix); what was missing is an honest, visible "saved" signal that
+  // updates when a key is actually saved or cleared, without ever
+  // echoing the key itself.
+  //
+  // isSaved() below reads the api-key-status element's own class rather
+  // than matching "key saved"/"no key saved" as plain text: "no key
+  // saved" itself contains "key saved" as a substring, so a naive text
+  // match cannot tell the two states apart on its own.
+  // =======================================================================
+
+  function isSaved(sandbox) {
+    const html = sandbox.document.getElementById("api-keys").innerHTML;
+    const saved = html.includes('class="api-key-status saved"');
+    const unsaved = html.includes('class="api-key-status unsaved"');
+    ok(saved || unsaved, `expected a rendered saved/unsaved indicator, got: ${html}`);
+    ok(!(saved && unsaved), `expected exactly one indicator state, got both: ${html}`);
+    return saved;
+  }
+
+  await test("no saved key renders a 'no key saved' indicator, not a claim of saved", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
+      return null;
+    });
+    ok(isSaved(sandbox) === false, "expected the unsaved indicator with an empty config value");
+    ok(/no key saved/i.test(sandbox.document.getElementById("api-keys").innerHTML));
+  });
+
+  await test("a key already saved on disk renders a 'key saved' indicator", async () => {
+    const stub = makeFetchStub(async (url) => {
+      if (url.pathname === "/api/config") {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-saved-key" });
+      }
+      if (url.pathname === "/api/categories") return jsonResponse(200, DEFAULT_CATEGORIES);
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
+      return null;
+    });
+    const sandbox = buildSandbox({ fetch: stub.fetch });
+    await flush(10);
+    ok(isSaved(sandbox) === true, "expected the saved indicator when config already has a key");
+  });
+
+  await test("saving a new key updates the indicator from unsaved to saved", async () => {
+    const { sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
+      if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-new-key" });
+      }
+      return null;
+    });
+    ok(isSaved(sandbox) === false);
+    setApiKeyField(sandbox, "opentopography_api_key", "sk-new-key");
+    await flush(10);
+    ok(isSaved(sandbox) === true, "expected the indicator to flip to saved once the PUT resolves");
+  });
+
+  await test("clearing a saved key updates the indicator from saved back to unsaved", async () => {
+    const stub = makeFetchStub(async (url, options) => {
+      if (url.pathname === "/api/config" && (!options.method || options.method === "GET")) {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-saved-key" });
+      }
+      if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "" });
+      }
+      if (url.pathname === "/api/categories") return jsonResponse(200, DEFAULT_CATEGORIES);
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
+      return null;
+    });
+    const sandbox = buildSandbox({ fetch: stub.fetch });
+    await flush(10);
+    ok(isSaved(sandbox) === true);
+    setApiKeyField(sandbox, "opentopography_api_key", "");
+    await flush(10);
+    ok(isSaved(sandbox) === false, "expected the indicator to flip back to unsaved once cleared and saved");
+  });
+
+  await test("a failed save leaves the indicator reflecting the last confirmed state, not the unsaved attempt", async () => {
+    const { sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
+      if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
+        return jsonResponse(500, { error: "disk full" });
+      }
+      return null;
+    });
+    ok(isSaved(sandbox) === false);
+    setApiKeyField(sandbox, "opentopography_api_key", "sk-attempted-key");
+    await flush(10);
+    ok(
+      isSaved(sandbox) === false,
+      "expected the indicator to still say unsaved after a failed PUT, rather than claim the attempted value was saved"
+    );
   });
 
   await test("a keyed source's field persists immediately on change, with no estimate to validate it against", async () => {

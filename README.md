@@ -58,6 +58,12 @@ web interface, which saves it to `~/.mapgen/config.json`. The environment
 variable always wins if both are set. `OPENTOPO_API_KEY` is accepted as an
 older alias for the same variable.
 
+The field itself is `type="password"`, so a saved key and an unsaved one
+both show as the same row of dots; a small "Key saved" or "No key saved"
+label next to it says which is actually true, and updates the moment you
+save a new key or clear the field. It never shows the key itself, only
+whether one is on disk.
+
 ## Running it
 
 ### Browser
@@ -91,7 +97,10 @@ the URL, so nothing else on the machine can drive it. On the page:
   today's faster, well-tested path for a whole-area pull. The estimate
   panel and `survey.json` both say which of the two a run actually used
   and why, since Overpass is a separate, shared public service with its
-  own rate limits (see "Limits worth knowing about").
+  own rate limits (see "Limits worth knowing about"). At least one
+  category is required: unticking the last one disables Download with a
+  plain reason, the same way a missing site name already does, rather
+  than letting you press it and get an error back.
 - Output root, tile size and overlap live behind the Settings button:
   defaults you set once, not per-survey choices. An API key field appears
   there per data source that needs one (OpenTopography's, for the
@@ -175,6 +184,19 @@ an Overture type at all, `--category rail` alone for example, correctly
 fetches nothing from Overture rather than falling back to the full
 default set: an empty selection and an unspecified one are treated as
 two different things throughout.
+
+Passing no `--category` at all still means every category, exactly as
+above. An explicitly empty category selection, which the CLI's own
+`--category` flag cannot produce (it always takes a value when given)
+but the browser's checklist can, by unticking every box, is a different,
+refused case: it matches nothing in either OSM's tag filter or Overture's
+type mapping, and there is no real survey this tool serves where that is
+a useful, deliberate answer, unlike `--category rail` above, which still
+narrows to a real (if Overture-empty) filter. Refused with a plain
+message that nothing is selected and at least one category is needed,
+through the same `SurveyRequest` construction that an unknown id already
+goes through, so a Python caller building a request directly gets the
+same rejection the browser does.
 
 For OpenStreetMap, a genuine restriction switches the download to Overpass
 automatically, since the default OSM map API has no server-side filtering

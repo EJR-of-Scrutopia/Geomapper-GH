@@ -281,6 +281,13 @@ button.armed {
 .api-key-field input { margin-top: 2px; }
 #api-keys label { gap: 4px; padding: 4px 0; }
 
+/* Task 21, defect 2: a saved key and an unsaved one used to look
+   identical, a row of dots either way in a type="password" field. This
+   is the honest signal that was missing, never the key itself. */
+.api-key-status { font-size: 11px; }
+.api-key-status.saved { color: var(--accent); font-weight: 600; }
+.api-key-status.unsaved { opacity: 0.6; }
+
 footer { border-top: 1px solid var(--line); }
 
 .log {

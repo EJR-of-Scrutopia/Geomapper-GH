@@ -89,9 +89,51 @@ class UnknownCategoryError(ValueError):
     """
 
 
+class EmptyCategorySelectionError(ValueError):
+    """Raised by validate_categories for an explicitly empty selection.
+
+    A Task 21 owner-reported defect, the same family as Critical 1 above
+    and deliberately left open at the time: unticking every category in
+    the browser, or otherwise passing categories=[], used to be accepted
+    silently. osm_tag_clauses([]) and overture_types_for_categories([])
+    both correctly treat an empty selection as "match nothing" (that is
+    their own, correct job, see osm_tag_clauses' own docstring), which
+    means the request that reaches them is honoured exactly as asked: an
+    empty package, reported as complete: true, with nothing to say why.
+    The owner hit this by accident, not by deliberately wanting an empty
+    survey, and there is no real workflow this tool serves where "survey
+    nothing" is a useful, intentional answer, unlike an unfiltered
+    (categories=None) request, which is a real and common one.
+
+    Raised from the exact same place, and the same way, as
+    UnknownCategoryError: at SurveyRequest construction, via
+    validate_categories, so the CLI and the browser both get this
+    through the one code path they already share, and cli.py's main()
+    needs the same one-line addition to its existing exception tuple
+    that UnknownCategoryError itself already needed.
+
+    A ValueError subclass, not a plain one, for the same reason
+    UnknownCategoryError is: server.py's _REQUEST_VALUE_ERRORS already
+    catches ValueError generically, so this needs no change there at
+    all, only in cli.py's own explicit tuple.
+
+    Deliberately a DIFFERENT class from UnknownCategoryError rather than
+    reusing it: an empty selection is not "an id outside the vocabulary",
+    it is the vocabulary being consulted correctly and truthfully
+    reporting that nothing was asked for. Conflating the two would make
+    UnknownCategoryError's own docstring, and any caller matching on it
+    specifically, describe a condition it no longer only means.
+
+    None is not this: see effective_categories on SurveyRequest for why
+    "not asked about at all" and "asked for nothing" must never collapse
+    into each other.
+    """
+
+
 def validate_categories(categories: Sequence[str] | None) -> None:
     """Raises UnknownCategoryError if categories contains any id this
-    vocabulary does not recognise.
+    vocabulary does not recognise, or EmptyCategorySelectionError if
+    categories is present but empty.
 
     Called once, from SurveyRequest.__post_init__ (see package.py), so
     the CLI's --category and the browser's checklist share this one
@@ -101,10 +143,19 @@ def validate_categories(categories: Sequence[str] | None) -> None:
     category selection.
 
     None passes silently: it means "not asked about at all", not "asked
-    for nothing", and is not something a caller can misspell.
+    for nothing", and is not something a caller can misspell. An empty,
+    non-None sequence is the thing this function refuses: see
+    EmptyCategorySelectionError's own docstring for why that is a
+    different, later-added case from the unknown-id one above, and why
+    it is refused here rather than left to reach osm_tag_clauses and
+    overture_types_for_categories, which would honour it silently.
     """
     if categories is None:
         return
+    if len(categories) == 0:
+        raise EmptyCategorySelectionError(
+            "No categories are selected. At least one category is needed."
+        )
     unknown = sorted(set(categories) - set(ALL_CATEGORY_IDS))
     if not unknown:
         return

@@ -1232,6 +1232,27 @@ def test_survey_request_rejects_an_unknown_category_at_construction(tmp_path):
         _request(tmp_path, categories=("building",))
 
 
+def test_survey_request_rejects_an_empty_category_selection_at_construction(tmp_path):
+    # Task 21: unticking every category in the browser (or otherwise
+    # constructing a request with categories=()) used to construct a
+    # SurveyRequest that ran to completion, downloading nothing from
+    # either OSM or Overture, and reporting complete: true with no
+    # indication anything was wrong. Same construction-time code path as
+    # the unknown-id case directly above (both go through validate_
+    # categories inside SurveyRequest.__post_init__), so the CLI and the
+    # browser both get this without either needing its own copy of the
+    # check.
+    from mapgen.categories import EmptyCategorySelectionError
+
+    with pytest.raises(EmptyCategorySelectionError, match="category is needed"):
+        _request(tmp_path, categories=())
+
+    # categories=None (never asked about at all) must still mean every
+    # category, exactly as it always has: the two must never collapse
+    # into each other.
+    _request(tmp_path, categories=None)
+
+
 def test_effective_overture_types_prefers_an_explicit_overture_type_over_categories(tmp_path):
     # Two different ways of choosing the same thing must not both apply
     # at once: the CLI's own original, lower-level --overture-type wins
@@ -1573,6 +1594,182 @@ def test_a_resumed_run_with_a_different_category_selection_gets_a_fresh_work_dir
     assert payload["categories"] == ["buildings"]
     overture_entry = next(s for s in payload["sources"] if s["id"] == "overture")
     assert overture_entry["types"] == ["building"]
+
+
+# --- Task 21 defect 3: does resume actually work on the owner's real,
+# interrupted package? C:\Users\Param\Surveys\Vale-of-Glamorgan\
+# 2026-08-03_Barry holds 20 completed OSM tiles and 34 Overture files
+# under _work/1327f515/, a second, unrelated fingerprint directory
+# 43d56d4d/ left over from an earlier, different selection, one merged
+# .osm already sitting in the root, no .part files, and no survey.json:
+# the process died mid Overture fetch, after OSM had already finished and
+# been merged. This replicates that exact shape at a smaller scale (4
+# tiles rather than however many the real bbox produces) using the REAL
+# OsmSource and OvertureSource, not a stub shaped to be more permissive
+# than the real thing, and a hand-written state.json matching what
+# _record_tile_outcomes would genuinely have written by that point in the
+# crash. Nothing here touches the owner's actual folder. ------------------
+
+
+def test_resume_replicates_the_owners_real_interrupted_package_and_completes(tmp_path):
+    request = _request(
+        tmp_path,
+        source_ids=("osm", "overture"),
+        overture_types=("water", "building"),
+        run_bridge_step=False,
+        # Kept so the planted debris and raw tiles survive to inspect
+        # after the run: a normal complete run removes the whole _work/
+        # parent, which would otherwise erase the evidence this test
+        # exists to check.
+        keep_work=True,
+    )
+    fingerprint = tiling_fingerprint(
+        *request.bbox.as_tuple(),
+        request.tile_size_m,
+        request.overlap_m,
+        request.effective_categories,
+        request.effective_overture_types,
+    )
+    paths = build_package_paths(
+        tmp_path, request.region, request.site, request.effective_date, fingerprint
+    )
+    # BBOX at 600m tiles / 50m overlap (this file's own _request defaults)
+    # produces exactly these four tile ids; computed once, independently,
+    # in test_naming.py/test_geo.py's own tests, hardcoded here the same
+    # way test_a_resumed_run_only_refetches_tiles_that_previously_failed
+    # already hardcodes them above.
+    tile_ids = ["r00_c00", "r00_c01", "r01_c00", "r01_c01"]
+
+    # OSM: every tile already fetched and merged, exactly as it would be
+    # after a clean first stage that finished before the crash.
+    osm_raw = paths.work_dir / "raw" / "osm"
+    osm_raw.mkdir(parents=True)
+    for tile_id in tile_ids:
+        (osm_raw / f"{tile_id}.osm").write_text(_MINIMAL_OSM_XML, encoding="utf-8")
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / f"{paths.stem}.osm").write_text(_MINIMAL_OSM_XML, encoding="utf-8")
+
+    # Deliberately NO state.json planted here, even though a real crash
+    # this far in would very likely have left one recording osm as ok
+    # for every tile (_record_tile_outcomes calls state.save() after each
+    # tile is marked). Proving resume purely from the raw files on disk,
+    # with no bookkeeping to lean on, is the stronger and more honest
+    # claim: an early version of this test that pre-marked osm "ok" in a
+    # hand-written state.json passed even with OsmSource's own per-file
+    # skip check disabled, because pending came back empty before that
+    # check was ever reached. Leaving state.json out entirely means
+    # pending is every osm tile again, and the only thing that can still
+    # stop a redundant download is OsmSource.fetch's own existence check,
+    # which is the real behaviour this test exists to confirm.
+    assert not (paths.work_dir / "state.json").exists()
+
+    # Overture: 6 of the 8 tile/type combinations already on disk; r01_c01
+    # is the one tile the crash caught mid-way, missing both types, the
+    # same "most tiles done, one caught mid-flight" shape as the real
+    # package's 34-out-of-however-many files.
+    preexisting = {
+        (tile_id, overture_type)
+        for tile_id in ("r00_c00", "r00_c01", "r01_c00")
+        for overture_type in ("water", "building")
+    }
+    for tile_id, overture_type in preexisting:
+        part_dir = paths.work_dir / "raw" / "overture" / overture_type
+        part_dir.mkdir(parents=True, exist_ok=True)
+        (part_dir / f"{tile_id}.geojson").write_text(
+            json.dumps(
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "id": f"preexisting-{tile_id}-{overture_type}",
+                            "geometry": None,
+                            "properties": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # A second, unrelated fingerprint directory, exactly like the real
+    # package's 43d56d4d/: debris from a different tiling that a resume
+    # must never read from. Poisoned with a tile id that also exists in
+    # the CURRENT plan, so any future regression that scanned the wrong
+    # fingerprint's raw/osm/ (instead of paths.work_dir's own) would pick
+    # this up rather than being missed by coincidence.
+    stale_fingerprint = tiling_fingerprint(
+        *request.bbox.as_tuple(),
+        2000.0,
+        100.0,
+        request.effective_categories,
+        request.effective_overture_types,
+    )
+    assert stale_fingerprint != fingerprint
+    stale_osm_dir = paths.root / "_work" / stale_fingerprint / "raw" / "osm"
+    stale_osm_dir.mkdir(parents=True)
+    poison_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<osm version="0.6" generator="test">\n'
+        '  <node id="999999" version="1" lat="0.0" lon="0.0"/>\n'
+        "</osm>\n"
+    )
+    stale_osm_file = stale_osm_dir / "r00_c00.osm"
+    stale_osm_file.write_text(poison_xml, encoding="utf-8")
+
+    # No survey.json, no .part files: nothing else is written. This is the
+    # incomplete state resume exists for.
+    assert not paths.survey_json.exists()
+
+    # Any real call at all pops from an empty list and, after exhausting
+    # retries, raises OsmDownloadError: every OSM tile is already
+    # complete, so a correctly resumed run must never touch this session.
+    osm_session = _FakeOsmSession([])
+    register(OsmSource(session=osm_session, sleeper=lambda _s: None, min_interval_seconds=0.0))
+    overture_runner = _FakeOvertureRunner()
+    register(OvertureSource(runner=overture_runner, executable_finder=lambda _n: "overturemaps"))
+
+    result = run_survey(request)
+
+    assert result.complete is True
+    assert result.paths.root == paths.root
+    assert result.paths.work_dir == paths.work_dir
+    assert result.paths.survey_json.exists()
+
+    # Only the two genuinely missing tile/type combinations were fetched,
+    # not all 8: resume actually skips completed work rather than
+    # refetching it.
+    assert len(overture_runner.commands) == 2, (
+        f"expected exactly the 2 missing tile/type combinations refetched, "
+        f"got {len(overture_runner.commands)}: {overture_runner.commands}"
+    )
+    fetched_types = {cmd[cmd.index("--type") + 1] for cmd in overture_runner.commands}
+    assert fetched_types == {"water", "building"}
+
+    # OSM never contacted a live endpoint: every tile was already done.
+    osm_entry = next(s for s in result.survey["sources"] if s["id"] == "osm")
+    assert osm_entry["endpoints_used"] == [], (
+        "OSM re-contacted an endpoint even though every tile already had a "
+        "successful file on disk"
+    )
+
+    # The 6 pre-existing Overture files were reused untouched, not
+    # re-downloaded and silently overwritten.
+    for tile_id, overture_type in preexisting:
+        text = (
+            paths.work_dir / "raw" / "overture" / overture_type / f"{tile_id}.geojson"
+        ).read_text(encoding="utf-8")
+        assert f"preexisting-{tile_id}-{overture_type}" in text, (
+            f"the already-fetched {tile_id}/{overture_type} file was overwritten during resume"
+        )
+
+    # The second, stale fingerprint directory was never read: its poison
+    # tile is untouched on disk and never reached the merged output.
+    assert stale_osm_file.read_text(encoding="utf-8") == poison_xml
+    merged_osm_text = (paths.root / f"{paths.stem}.osm").read_text(encoding="utf-8")
+    assert "999999" not in merged_osm_text, (
+        "the stale second fingerprint directory leaked into the merged output"
+    )
 
 
 # --- Task 19 item 5: the whole-run retry at a smaller tile size on a node-
