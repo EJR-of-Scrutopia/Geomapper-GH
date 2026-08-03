@@ -292,21 +292,22 @@ def estimate_survey(request: SurveyRequest) -> dict[str, object]:
             problem = check_readiness()
             if problem:
                 warnings.append(problem)
-        # filtering_caveat is the same optional-extension convention,
-        # applied to a different kind of pre-flight problem: not "cannot
-        # run at all" (readiness_problem's job), but "will run, and will
-        # silently ignore part of what category selection asked for"
-        # (OsmSource's own case on the default, non-Overpass path, which
-        # has no server-side tag filtering to apply one with). Surfacing
-        # this as a warning is the "decide and state" the brief asked
-        # for: a control that appears to work and does not is worse than
-        # no control, and the estimate panel is where the owner would
-        # otherwise have no way to find out.
-        check_filtering_caveat = getattr(source, "filtering_caveat", None)
-        if callable(check_filtering_caveat):
-            caveat = check_filtering_caveat(request.effective_categories)
-            if caveat:
-                warnings.append(caveat)
+        # routing_note is the same optional-extension convention, for a
+        # different kind of thing worth telling the owner before they
+        # click Download: not "cannot run at all" (readiness_problem's
+        # job), but "which endpoint this run actually depends on, and
+        # why" (OsmSource's own case: a category filter routes it through
+        # Overpass instead of the default map API, see OsmSource.
+        # configure/routing_note). Zero arguments, not passed
+        # request.effective_categories: by the time a source reaches this
+        # loop it has already been through _configured_sources(), so its
+        # own state already reflects this request's actual routing
+        # decision, not a second, separately-computed guess at it.
+        check_routing_note = getattr(source, "routing_note", None)
+        if callable(check_routing_note):
+            note = check_routing_note()
+            if note:
+                warnings.append(note)
 
     result = dict(_geometry_summary(request.bbox, tiles))
     result["bytes_estimate"] = total_bytes
@@ -644,9 +645,10 @@ def _write_layer_files(
 
 def _source_provenance(source) -> dict[str, object]:
     """One survey.json `sources` entry: the LayerSource protocol's own
-    fields, plus endpoints_used, plus (Task 19) types if this source
-    exposes one, all read the same defensive way sources/base.py's own
-    docstring documents for optional, source-specific attributes.
+    fields, plus endpoints_used, plus (Task 19) types and routing_note if
+    this source exposes them, all read the same defensive way
+    sources/base.py's own docstring documents for optional,
+    source-specific attributes.
 
     types is Overture-specific today (the actual list of types this
     package's Overture data was fetched with, which the fix in
@@ -654,6 +656,12 @@ def _source_provenance(source) -> dict[str, object]:
     default): a package's audit trail should say what it actually
     contains, not require cross-referencing category selection against a
     mapping table kept somewhere else to work that out.
+
+    routing_note is OsmSource-specific today: endpoints_used already says
+    WHICH endpoint a run actually contacted, but not WHY it was that one
+    rather than the other, which matters here specifically because a
+    category filter now silently changes it (map API vs Overpass). A
+    coordinator review asked that survey.json say both.
     """
     entry: dict[str, object] = {
         "id": source.id,
@@ -664,6 +672,11 @@ def _source_provenance(source) -> dict[str, object]:
     types = getattr(source, "types", None)
     if types is not None:
         entry["types"] = list(types)
+    check_routing_note = getattr(source, "routing_note", None)
+    if callable(check_routing_note):
+        note = check_routing_note()
+        if note:
+            entry["routing_note"] = note
     return entry
 
 

@@ -1,14 +1,25 @@
 """OpenStreetMap as a LayerSource.
 
-Standard .osm XML comes from the OSM map API, which caps a request at 50000
-nodes. Overpass is available as an alternative (use_overpass=True), but
-only as a whole-run constructor choice, not an automatic per-tile
-fallback: a tile that exceeds the OSM API's limit fails outright (see
+Standard .osm XML comes from the OSM map API by default, which caps a
+single request at 50000 nodes and cannot filter by tag at all. Overpass
+(use_overpass=True) is the alternative: no node cap, and it can filter,
+at the cost of being a shared public service with its own rate limits and
+availability, distinct from the map API's.
+
+configure() (below) is what actually chooses between them for a given
+request, automatically: a genuine category restriction routes through
+Overpass, since the map API has no way to honour one; no restriction
+keeps the map API, today's default and the faster choice for a whole-area
+pull. This is a WHOLE-RUN choice made once per request, never a per-tile
+fallback: a tile that exceeds the map API's node cap fails outright (see
 _download_tile's "too many nodes" branch below, which raises
-NodeCapExceededError) rather than retrying against Overpass on its own.
-Task 18's interface help text was corrected to say this plainly after
-review found the same false "automatic fallback" claim here, in the one
-file that should have been the source of truth for it. Both are free
+NodeCapExceededError, and is scoped to the map API path specifically,
+since Overpass has no such cap to hit) rather than retrying against
+Overpass on its own mid-run. Task 18's interface help text was corrected
+to say this plainly after review found a false "automatic fallback" claim
+here, in the one file that should have been the source of truth for it;
+that correction still holds; it is a different claim from configure()'s
+own whole-request routing decision above it. Both endpoints are free
 public services, so requests are spaced out and back off on failure.
 
 Task 19 restored a different kind of retry the superseded script had and
@@ -18,7 +29,12 @@ ladder (2000, then 1500, then 1000 metres) before giving up. That is
 orchestration, not this module's concern: this module only ever raises
 the one exception type that makes the retry decision possible elsewhere,
 it does not loop or know about tile sizes other than the one it was
-asked to fetch.
+asked to fetch. Because NodeCapExceededError is never raised on the
+Overpass path (there is no cap there to except), a run that configure()
+routed to Overpass for its category filter is never a candidate for this
+retry either, which is the coherence a coordinator review asked to have
+confirmed rather than assumed: a limit that does not apply on a given
+path cannot trigger a response written for the path where it does.
 """
 
 from __future__ import annotations
@@ -29,7 +45,7 @@ from typing import Callable, Mapping, Sequence
 
 import requests
 
-from mapgen.categories import ALL_CATEGORY_IDS, osm_tag_clauses
+from mapgen.categories import osm_tag_clauses
 from mapgen.fsutil import atomic_write_text
 from mapgen.geo import BBox, Tile
 from mapgen.merge import merge_osm_xml
@@ -137,7 +153,9 @@ class RateLimiter:
 
 
 class OsmSource:
-    """OpenStreetMap LayerSource: the OSM map API by default, Overpass on request.
+    """OpenStreetMap LayerSource: the OSM map API by default, Overpass when
+    a category filter needs one (see configure()) or when a Python caller
+    asks for it directly (use_overpass=True).
 
     endpoints_used lists the distinct endpoints contacted DURING THIS RUN, in
     first-contacted order. A tile skipped because it was already downloaded in
@@ -193,7 +211,29 @@ class OsmSource:
         mutating self. See OvertureSource.configure's own docstring (the
         same optional LayerSource extension) for why request-scoped
         reconfiguration must never mutate a registered singleton.
+
+        Routes through Overpass automatically whenever categories is a
+        genuine restriction (osm_tag_clauses(categories) is not None: a
+        proper subset of every known id, including "nothing selected"),
+        because the OSM map API this source uses by default has no
+        server-side filtering at all, so a restricted selection can only
+        ever be honoured by asking Overpass instead. A coordinator review
+        caught this exact gap: earlier, configure() only ever set
+        .categories, leaving .use_overpass at whatever the REGISTERED
+        instance was built with, which register_default_sources() always
+        constructs as False. Every category clause the Overpass query
+        builder could produce was consequently unreachable through the
+        CLI or browser, precisely the "control that appears to work and
+        does not" failure this whole feature exists to avoid, one layer
+        further in than the Overture bug this task already fixed once.
+
+        self.use_overpass=True already set on THIS instance (a Python
+        caller's own whole-run choice, unrelated to category selection,
+        still available per the README) always wins and is never
+        downgraded back to the map API just because this particular
+        request did not restrict anything.
         """
+        use_overpass = self.use_overpass or (osm_tag_clauses(categories) is not None)
         return OsmSource(
             session=self.session,
             overpass_urls=self.overpass_urls,
@@ -202,36 +242,49 @@ class OsmSource:
             timeout_seconds=self.timeout_seconds,
             min_interval_seconds=self.min_interval_seconds,
             sleeper=self._sleeper,
-            use_overpass=self.use_overpass,
+            use_overpass=use_overpass,
             clock=self._clock,
             categories=categories,
         )
 
-    def filtering_caveat(self, categories: Sequence[str] | None) -> str | None:
-        """A plain-English caveat if the given category selection cannot
-        actually be applied to what this source will fetch, else None.
+    def routing_note(self) -> str | None:
+        """A plain-English statement of which OSM endpoint THIS
+        configured instance will use and why, for the estimate panel and
+        survey.json, or None when there is nothing notable to say (the
+        default map API, doing exactly what it always has).
 
-        The default OSM map API path (use_overpass=False) has no
-        server-side tag filtering at all: every node, way and relation in
-        the extent comes back regardless of category selection. Only the
-        Overpass path can filter by tag, and it is not wired to the CLI
-        or web interface as a whole-run choice (see the module
-        docstring). Read the same defensive way as readiness_problem:
-        this is the same optional LayerSource extension, documented in
-        sources/base.py, applied to a different kind of pre-flight
-        problem (not "cannot run at all", but "will run, and will ignore
-        part of what was asked for").
+        Was filtering_caveat, and said the opposite: "your category
+        selection does nothing here", because at the time nothing ever
+        routed a real request through Overpass regardless of what was
+        asked for. Once configure() (above) actually makes that routing
+        decision for real, the honest thing to tell the owner is not a
+        caveat about a broken control, it is a fact about which shared
+        public service this run depends on: Overpass has its own rate
+        limits and availability, distinct from the OSM map API's, and
+        that is exactly the kind of thing "decide and state" means
+        surfacing rather than leaving to be discovered as an unexplained
+        slowdown or a 429.
+
+        Read the same defensive, optional-extension way as
+        readiness_problem (documented in sources/base.py): called only if
+        present, zero arguments, since by the time this is checked (on an
+        instance configure() already produced) self.use_overpass and
+        self.categories already reflect this run's actual routing.
         """
-        if self.use_overpass:
+        if not self.use_overpass:
             return None
-        if categories is not None and set(categories) < set(ALL_CATEGORY_IDS):
+        if self.categories is not None and osm_tag_clauses(self.categories) is not None:
             return (
-                "Category selection has no effect on OpenStreetMap data: the "
-                "default OSM download has no server-side filtering and always "
-                "returns everything in the extent, regardless of which "
-                "categories are selected."
+                "OpenStreetMap is being fetched via Overpass instead of the "
+                "default map API, to apply the selected category filter (the "
+                "map API cannot filter by category). Overpass is a shared "
+                "public service with its own rate limits."
             )
-        return None
+        return (
+            "OpenStreetMap is being fetched via Overpass (set directly, not "
+            "through category selection), a shared public service with its "
+            "own rate limits."
+        )
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         return Estimate(
@@ -277,7 +330,22 @@ class OsmSource:
                 self._record_endpoint(endpoint)
                 return
 
-            if response.status_code == 400 and "too many nodes" in response.text.lower():
+            if (
+                not self.use_overpass
+                and response.status_code == 400
+                and "too many nodes" in response.text.lower()
+            ):
+                # not self.use_overpass matters: the 50000-node cap is the
+                # OSM map API's own limit, and Overpass is not subject to
+                # it at all. A coordinator review caught that this branch
+                # used to fire regardless of which endpoint was actually
+                # asked, which would have wrongly triggered mapgen.
+                # package's whole-run smaller-tile retry (below) for a
+                # limit a filtered, Overpass-routed run cannot hit in the
+                # first place. On Overpass, any 400 falls through to the
+                # generic branch beneath this one instead, an ordinary
+                # retried-then-reported failure, never a node-cap retry.
+                #
                 # mapgen.package's run_survey catches NodeCapExceededError
                 # specifically and retries the whole run at the next
                 # smaller size in its own fixed ladder before this message

@@ -1247,16 +1247,17 @@ class _RecordingOsmSession:
 def test_run_survey_configures_the_real_osm_source_with_the_requests_categories(tmp_path):
     # Proves the wiring reaches OsmSource specifically, using the real
     # class (not a stub) so a change to OsmSource.configure's own
-    # signature would be caught here too. use_overpass=True so the
-    # category selection is not immediately inert (see the module's own
-    # filtering_caveat on the default path).
+    # signature would be caught here too.
+    #
+    # Registered BARE, exactly as register_default_sources() actually
+    # constructs it (use_overpass defaults False): a coordinator review
+    # found that an earlier version of this test registered the source
+    # with use_overpass=True set MANUALLY, which sidestepped the exact
+    # gap being tested for and let the real bug (configure() never
+    # actually turning a category restriction into a working filter)
+    # pass unnoticed. This must now route to Overpass on its own.
     session = _RecordingOsmSession([_FakeOsmResponse() for _ in range(4)])
-    registered = OsmSource(
-        session=session,
-        sleeper=lambda _seconds: None,
-        min_interval_seconds=0.0,
-        use_overpass=True,
-    )
+    registered = OsmSource(session=session, sleeper=lambda _seconds: None, min_interval_seconds=0.0)
     register(registered)
     result = run_survey(
         _request(tmp_path, source_ids=("osm",), categories=("buildings",), run_bridge_step=False)
@@ -1271,18 +1272,115 @@ def test_run_survey_configures_the_real_osm_source_with_the_requests_categories(
     # The registered singleton itself must come out unchanged, the same
     # property already pinned for Overture.
     assert registered.categories is None
+    assert registered.use_overpass is False, "must not mutate the registered instance's routing either"
     assert get_source("osm") is registered
 
 
-def test_estimate_surfaces_the_osm_filtering_caveat_for_a_narrowed_selection_on_the_default_path(
-    tmp_path,
-):
-    register(OsmSource())  # use_overpass defaults False: the caveat path
+def test_survey_json_records_the_overpass_endpoint_and_why_for_a_filtered_osm_run(tmp_path):
+    # Coordinator finding: endpoints_used must show the endpoint a
+    # filtered run ACTUALLY hit (an Overpass URL), not the map API's, and
+    # survey.json must also say why, since a category filter silently
+    # changing which shared service a run depends on is exactly the kind
+    # of thing an audit trail should not require cross-referencing code
+    # to work out.
+    session = _RecordingOsmSession([_FakeOsmResponse() for _ in range(4)])
+    registered = OsmSource(session=session, sleeper=lambda _seconds: None, min_interval_seconds=0.0)
+    register(registered)
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm",), categories=("buildings",), run_bridge_step=False)
+    )
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    osm_entry = next(s for s in payload["sources"] if s["id"] == "osm")
+    assert osm_entry["endpoints_used"] == [registered.overpass_urls[0]]
+    assert "map API" not in " ".join(osm_entry["endpoints_used"])
+    assert "Overpass" in osm_entry["routing_note"]
+    assert "category filter" in osm_entry["routing_note"]
+
+
+def test_survey_json_records_the_map_api_endpoint_with_no_routing_note_when_unfiltered(tmp_path):
+    responses = [_FakeOsmResponse() for _ in range(4)]
+    registered = OsmSource(
+        session=_FakeOsmSession(responses), sleeper=lambda _seconds: None, min_interval_seconds=0.0
+    )
+    register(registered)
+    result = run_survey(_request(tmp_path, source_ids=("osm",), run_bridge_step=False))
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    osm_entry = next(s for s in payload["sources"] if s["id"] == "osm")
+    assert osm_entry["endpoints_used"] == [registered.osm_api_url]
+    assert "routing_note" not in osm_entry
+
+
+# --- Coordinator finding: the node-cap retry ladder must not fire for a
+# run that configure() has already routed to Overpass, since the 50000-
+# node cap is the map API's own limit and Overpass is not subject to it.
+# Confirmed through the full orchestration, not only at OsmSource's own
+# unit level. ---------------------------------------------------------
+
+
+class _NodeCapShapedOverpassSession:
+    """An Overpass session that answers every POST with a 400 body
+    SHAPED like the map API's own node-cap error text, to prove
+    orchestration-level coherence: even if such a response somehow came
+    back from Overpass, OsmSource's own use_overpass-scoped check (unit-
+    tested directly in test_sources_osm.py) means this must never be
+    classified as a NodeCapExceededError, so run_survey's retry ladder
+    must never engage for it either.
+    """
+
+    def __init__(self):
+        self.post_calls = 0
+
+    def get(self, url, **kwargs):
+        raise AssertionError("expected the Overpass (POST) path, not the map API (GET) one")
+
+    def post(self, url, **kwargs):
+        self.post_calls += 1
+        return type(
+            "R", (), {"status_code": 400, "text": "You requested too many nodes", "headers": {}}
+        )()
+
+
+def test_a_node_cap_shaped_failure_on_overpass_does_not_trigger_the_tile_size_retry(tmp_path):
+    session = _NodeCapShapedOverpassSession()
+    registered = OsmSource(session=session, sleeper=lambda _seconds: None, min_interval_seconds=0.0)
+    register(registered)
+    log = EventLog()
+    with pytest.raises(Exception) as excinfo:
+        run_survey(
+            _request(
+                tmp_path,
+                tile_size_m=2000.0,
+                overlap_m=100.0,
+                source_ids=("osm",),
+                categories=("buildings",),  # routes to Overpass
+                run_bridge_step=False,
+            ),
+            progress=log,
+        )
+    from mapgen.sources.osm import NodeCapExceededError
+
+    assert not isinstance(excinfo.value, NodeCapExceededError)
+    # No retry ladder event at all: this failure was never eligible for
+    # one in the first place, not merely "retried until exhausted".
+    assert not any(e["event"] == "tile_size_retry" for e in log.events)
+    # Confirms the request never even reached a second, smaller-tile
+    # attempt: max_retries (4, the default) POSTs for the one and only
+    # tile_size_m this ran at, not 4 attempts repeated across a ladder of
+    # sizes it should never have entered.
+    assert session.post_calls == 4
+
+
+def test_estimate_states_the_overpass_routing_for_a_narrowed_osm_category_selection(tmp_path):
+    # Coordinator finding: a narrowed selection now genuinely routes OSM
+    # through Overpass (see OsmSource.configure), so the estimate's
+    # message changed from a caveat about a broken control ("no effect")
+    # to a statement of fact about which endpoint this run depends on.
+    register(OsmSource())  # use_overpass=False; configure() upgrades it
     estimate = estimate_survey(_request(tmp_path, source_ids=("osm",), categories=("buildings",)))
-    assert any("no effect" in w for w in estimate["warnings"])
+    assert any("Overpass" in w and "category filter" in w for w in estimate["warnings"])
 
 
-def test_estimate_has_no_osm_filtering_caveat_when_every_category_is_selected(tmp_path):
+def test_estimate_has_no_osm_routing_note_when_every_category_is_selected(tmp_path):
     register(OsmSource())
     estimate = estimate_survey(_request(tmp_path, source_ids=("osm",)))
     assert estimate["warnings"] == []

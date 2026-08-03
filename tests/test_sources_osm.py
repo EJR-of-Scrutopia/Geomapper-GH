@@ -30,7 +30,16 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Replays a queued list of responses and records every call."""
+    """Replays a queued list of responses and records every call.
+
+    A queued item that is an exception instance is RAISED, not returned:
+    without this, a queued TimeoutError would come back as if it were a
+    response object, and fail later on response.status_code with an
+    unrelated AttributeError outside of _download_tile's own except
+    Exception block, instead of exercising the retry path it exists to
+    simulate. Matches test_geocode.py's FakeGeocodeSession, which already
+    needed the same thing for the same reason.
+    """
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -38,11 +47,17 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        return self._responses.pop(0)
+        item = self._responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
-        return self._responses.pop(0)
+        item = self._responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 def _tile(tile_id="r00_c00"):
@@ -207,6 +222,26 @@ def test_a_different_400_is_not_a_node_cap_exceeded_error(tmp_path):
     assert not isinstance(excinfo.value, NodeCapExceededError)
 
 
+def test_a_too_many_nodes_400_on_the_overpass_path_is_not_a_node_cap_exceeded_error(tmp_path):
+    # Coordinator finding: the 50000-node cap belongs to the OSM map API.
+    # Overpass is not subject to it, so even a response SHAPED like the
+    # map API's own "too many nodes" body must not be classified as a
+    # node-cap failure when this instance is actually configured for
+    # Overpass, or mapgen.package's whole-run smaller-tile retry would
+    # fire for a limit that run is not subject to. Node cap detection is
+    # scoped to `not self.use_overpass`; on Overpass this falls through
+    # to the generic, retried-then-reported branch instead.
+    source = _source(
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 4,
+        use_overpass=True,
+    )
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert not isinstance(excinfo.value, NodeCapExceededError)
+
+
 def test_overpass_fetch_issues_a_post_with_the_query_body_and_content_type(tmp_path):
     source = _source([FakeResponse()], use_overpass=True)
     tile = _tile()
@@ -236,6 +271,85 @@ def test_overpass_fetch_records_the_overpass_endpoint(tmp_path):
     source = _source([FakeResponse()], use_overpass=True)
     source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
     assert source.endpoints_used == [source.overpass_urls[0]]
+
+
+# --- Coordinator finding: confirm Overpass etiquette (rate limiting,
+# endpoint rotation) is genuinely applied on this path now that category
+# selection can route real requests through it, rather than assumed
+# because the code happens to be shared with the map API path. A 429 or
+# a timeout from a busy Overpass instance must retry and, if it still
+# cannot succeed, fail with a plain message naming the endpoint and
+# status, never a stack trace. ------------------------------------------
+
+
+def test_overpass_fetch_honours_retry_after_on_a_429(tmp_path):
+    source = _source(
+        [FakeResponse(status_code=429, text="rate limited", headers={"Retry-After": "5"}), FakeResponse()],
+        use_overpass=True,
+    )
+    slept = []
+    source._sleeper = slept.append
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
+    assert slept == [pytest.approx(5.0)]
+    assert len(source.session.calls) == 2
+
+
+def test_overpass_fetch_raises_a_plain_message_after_repeated_429s(tmp_path):
+    source = _source(
+        [FakeResponse(status_code=429, text="rate limited")] * 4,
+        use_overpass=True,
+    )
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    # A plain sentence naming the tile and attempt count, not a stack
+    # trace; the 429 and endpoint are chained as the cause, matching how
+    # the map API's own exhausted-retry message already behaves.
+    assert "Traceback" not in str(excinfo.value)
+    assert "r00_c00" in str(excinfo.value)
+    assert "429" in str(excinfo.value.__cause__)
+    assert source.overpass_urls[1] in str(excinfo.value.__cause__)
+
+
+def test_overpass_fetch_retries_after_a_transport_level_timeout(tmp_path):
+    # A raised exception (a real timeout, a connection reset), not just a
+    # bad status code: _download_tile's broad except already handles this
+    # for the map API path; confirmed here for Overpass specifically.
+    source = _source([TimeoutError("timed out"), FakeResponse()], use_overpass=True)
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress())
+    assert len(source.session.calls) == 2
+
+
+def test_overpass_fetch_raises_a_plain_message_after_repeated_timeouts(tmp_path):
+    source = _source([TimeoutError("timed out")] * 4, use_overpass=True)
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert "Traceback" not in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, TimeoutError)
+
+
+def test_overpass_fetch_waits_between_consecutive_tiles(tmp_path):
+    # test_fetch_waits_between_consecutive_tiles (below) already pins this
+    # for the default map API path; confirmed here specifically for
+    # Overpass, since that is the path a category filter now genuinely
+    # uses, and rate limiting silently only applying to the other path
+    # would be exactly the kind of thing worth catching directly rather
+    # than assuming shared code stayed shared.
+    slept = []
+    clock_values = iter([0.0, 0.0, 0.5, 0.5])
+    source = _source(
+        [FakeResponse(), FakeResponse()],
+        use_overpass=True,
+        min_interval_seconds=2.0,
+        sleeper=slept.append,
+        clock=lambda: next(clock_values),
+    )
+    tiles = [_tile("r00_c00"), _tile("r00_c01")]
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), tiles, tmp_path, NullProgress())
+    assert slept == [pytest.approx(1.5)]
 
 
 # --- Task 19: category selection, Overpass path only -----------------------
@@ -289,26 +403,69 @@ def test_configure_preserves_transport_settings():
     assert configured.use_overpass is True
 
 
-def test_filtering_caveat_is_none_on_the_overpass_path_regardless_of_selection():
-    source = OsmSource(use_overpass=True)
-    assert source.filtering_caveat(["buildings"]) is None
+# --- Coordinator finding: configure() used to leave use_overpass exactly
+# as constructed (always False on the registered instance, since
+# register_default_sources() never sets it), so every category clause the
+# Overpass query builder could produce was unreachable through the CLI or
+# browser. A real category restriction must now route through Overpass
+# automatically, since the map API has no way to honour one at all. -----
 
 
-def test_filtering_caveat_is_none_on_the_default_path_when_everything_is_selected():
-    source = OsmSource(use_overpass=False)
+def test_configure_routes_through_overpass_for_a_genuine_category_restriction():
+    original = OsmSource(use_overpass=False)
+    configured = original.configure(["buildings"])
+    assert configured.use_overpass is True
+    assert original.use_overpass is False, "must not mutate the registered instance"
+
+
+def test_configure_routes_through_overpass_for_an_empty_selection_too():
+    # An empty (nothing ticked) selection is still a genuine restriction,
+    # distinct from None: it must route to Overpass the same as any other
+    # narrowed selection, not silently fall back to the unfiltered map API.
+    original = OsmSource(use_overpass=False)
+    configured = original.configure([])
+    assert configured.use_overpass is True
+
+
+def test_configure_keeps_the_map_api_when_nothing_is_restricted():
+    original = OsmSource(use_overpass=False)
+    assert original.configure(None).use_overpass is False
     from mapgen.categories import ALL_CATEGORY_IDS
 
-    assert source.filtering_caveat(list(ALL_CATEGORY_IDS)) is None
-    assert source.filtering_caveat(None) is None
+    assert original.configure(list(ALL_CATEGORY_IDS)).use_overpass is False
 
 
-def test_filtering_caveat_warns_on_the_default_path_for_a_narrowed_selection():
-    # The default OSM map API has no server-side filtering at all: a
-    # narrowed selection is silently ignored unless this is surfaced.
+def test_configure_never_downgrades_an_explicit_use_overpass_choice():
+    # A Python caller's own whole-run use_overpass=True (documented in the
+    # README as still available directly) must survive configure() being
+    # called with no restriction at all: it is a standing choice, not
+    # something category selection gets to take away.
+    original = OsmSource(use_overpass=True)
+    assert original.configure(None).use_overpass is True
+
+
+def test_routing_note_is_none_on_the_default_map_api_path():
     source = OsmSource(use_overpass=False)
-    caveat = source.filtering_caveat(["buildings"])
-    assert caveat is not None
-    assert "no effect" in caveat
+    assert source.routing_note() is None
+
+
+def test_routing_note_states_the_overpass_routing_when_configured_for_a_category_filter():
+    source = OsmSource(use_overpass=False).configure(["buildings"])
+    note = source.routing_note()
+    assert note is not None
+    assert "Overpass" in note
+    assert "category filter" in note
+
+
+def test_routing_note_still_states_overpass_when_use_overpass_was_set_directly():
+    # A Python caller who set use_overpass=True themselves (not via a
+    # category filter) still gets told they are on a shared service, just
+    # without claiming a category filter caused it.
+    source = OsmSource(use_overpass=True)
+    note = source.routing_note()
+    assert note is not None
+    assert "Overpass" in note
+    assert "category filter" not in note
 
 
 def test_retry_delay_honours_retry_after_in_seconds():

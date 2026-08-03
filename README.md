@@ -85,10 +85,13 @@ the URL, so nothing else on the machine can drive it. On the page:
   water, vegetation and landuse, rail, boundaries, points of interest).
   Categories are ticked by default, matching the everything-selected
   behaviour before this control existed. Category selection reaches
-  Overture directly; it only reaches OpenStreetMap on the Overpass path,
-  which the browser and CLI do not use today (see "Limits worth knowing
-  about"), and the estimate panel says so plainly rather than pretending a
-  narrowed selection changed anything about the OSM data.
+  Overture directly. It reaches OpenStreetMap by switching that download
+  to Overpass automatically, since the default OSM map API cannot filter
+  by tag at all; ticking everything (the default) keeps the map API,
+  today's faster, well-tested path for a whole-area pull. The estimate
+  panel and `survey.json` both say which of the two a run actually used
+  and why, since Overpass is a separate, shared public service with its
+  own rate limits (see "Limits worth knowing about").
 - Output root, tile size and overlap live behind the Settings button:
   defaults you set once, not per-survey choices. An API key field appears
   there per data source that needs one (OpenTopography's, for the
@@ -163,12 +166,18 @@ land_cover, water) if omitted. `--region` and `--site` are always required.
 subtypes. It reaches Overture's own type selection (mapped from category to
 type; `--overture-type`, if also given, wins outright over `--category` for
 Overture specifically, since they are two ways of choosing the same thing).
-It reaches OpenStreetMap only on the Overpass path (`use_overpass=True`,
-a Python-only constructor choice today, not exposed as a flag): the OSM map
-API this tool uses by default has no server-side filtering at all, and a
-narrowed `--category` selection combined with it is silently ignored for
-OSM specifically. `mapgen estimate` reports this as a warning when it
-applies, rather than a control that appears to work and does not.
+
+For OpenStreetMap, a genuine restriction switches the download to Overpass
+automatically, since the default OSM map API has no server-side filtering
+at all and cannot honour one. Ticking or passing every category (the
+default) keeps the map API, today's behaviour and the faster path for a
+whole-area pull. This switch is automatic, not a separate flag: `mapgen
+estimate` and `survey.json`'s per-source `routing_note` both say which
+endpoint a run actually used and why, since Overpass is a distinct, shared
+public service with its own rate limits, separate from the map API's.
+`use_overpass=True` is also still available directly to Python callers as
+a standing, whole-run choice independent of category selection; see
+`OsmSource.configure` if calling this from Python rather than the CLI.
 
 Other commands:
 
@@ -260,7 +269,7 @@ Fields, as actually written:
 | `extent_km` | Width and height of that bbox in kilometres. |
 | `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. On a node-cap retry (see "Limits worth knowing about") this is the size the retry settled on, which can be smaller than what was requested. |
 | `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
-| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), and, for Overture specifically, `types` (the actual Overture types this package's data was fetched with). |
+| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), and, for Overture, `types` (the actual Overture types fetched). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
 | `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"` status per source. |
 | `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
 | `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely. |
@@ -305,13 +314,16 @@ not a substitute for reading either.
 ## Limits worth knowing about
 
 **The OSM node cap.** The OSM map API refuses any single request over 50000
-nodes. A tile that dense automatically retries the *whole run* at the next
-smaller size in a fixed ladder, 2000, then 1500, then 1000 m, matching the
-old superseded script's own behaviour, restored by owner ruling: dense city
-centres are exactly where surveys happen, and a run that stops to wait for a
-manual `--tile-size-m` retry has to be babysat. The whole run retries, not
-just the failing tile, because the fingerprinted work folder makes that safe
-by construction: a different tile size hashes to a different `_work/`
+nodes. This is the map API's own limit; Overpass has no equivalent, so it
+only applies to a run that is actually using the map API, which is the
+default whenever every category is selected. A tile that dense
+automatically retries the *whole run* at the next smaller size in a fixed
+ladder, 2000, then 1500, then 1000 m, matching the old superseded script's
+own behaviour, restored by owner ruling: dense city centres are exactly
+where surveys happen, and a run that stops to wait for a manual
+`--tile-size-m` retry has to be babysat. The whole run retries, not just
+the failing tile, because the fingerprinted work folder makes that safe by
+construction: a different tile size hashes to a different `_work/`
 subfolder, so a retry cannot mix its tiles with the failed attempt's. Each
 retry is announced through the progress log (`[tile_size_retry]
 previous_tile_size_m=... next_tile_size_m=...`), and `survey.json`'s
@@ -319,11 +331,20 @@ previous_tile_size_m=... next_tile_size_m=...`), and `survey.json`'s
 smaller than what you asked for. If the smallest size in the ladder still
 fails, or you were already at or below 1000 m, mapgen fails once, clearly,
 with the same message as before, and leaves a further manual retry to you.
-`use_overpass=True` remains available as a whole-run constructor choice for
-Python callers, querying Overpass instead of the OSM map API from the start,
-but it is not wired to the CLI or web interface, and it is a different,
-separately-configured run, not a per-tile fallback triggered by this
-failure.
+A run already on Overpass, whether because a category filter put it there
+or because `use_overpass=True` was set directly, never enters this retry
+at all: there is no node cap on that path for a smaller tile to fix.
+
+**Overpass is a second, separate shared public service.** Once any category
+is deselected, OpenStreetMap downloads switch from the map API to Overpass
+to actually honour the filter (see "Category filtering" above). Overpass
+has its own rate limits, its own availability, and no relation to the map
+API's quota; `mapgen estimate` and `survey.json`'s per-source `routing_note`
+both name which one a run depends on, so a busy Overpass instance is a known
+possibility, not a mystery, when a filtered run is slower or a 429 turns up.
+Endpoint rotation and rate limiting already applied to the map API apply
+identically here. `use_overpass=True` remains available directly to Python
+callers as a standing, whole-run choice independent of category selection.
 
 **Windows path length.** Windows resolves a path at 260 characters by
 default, and this repository's own OneDrive-synced location is already
