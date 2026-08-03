@@ -1,3 +1,5 @@
+import pytest
+
 from mapgen.config import Config, load_config, save_config
 
 
@@ -109,3 +111,58 @@ def test_a_numeric_api_key_falls_back_to_the_default(tmp_path):
     target = tmp_path / "config.json"
     target.write_text('{"opentopography_api_key": 12345}', encoding="utf-8")
     assert load_config(target).opentopography_api_key == ""
+
+
+# --- A coordinator review's free fix: a rejected field now says so -----
+#
+# Before this, a wrong-typed or null field value fell back to that field's
+# own default with nothing anywhere to say it had happened. The tests
+# above this comment (a null field, a bool for a float field, a null or
+# numeric API key) all cover that fallback ITSELF, which this fix leaves
+# completely unchanged; none of them noticed the silence. These do,
+# without touching any of those, so both properties, "still falls back"
+# and "now says so", stay pinned by tests of their own.
+
+
+def test_a_wrong_typed_field_value_warns_and_names_the_field(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"output_root": 123}', encoding="utf-8")
+    with pytest.warns(UserWarning, match="output_root"):
+        config = load_config(target)
+    assert config.output_root == Config().output_root
+
+
+def test_a_null_field_value_warns_too(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"last_region": null}', encoding="utf-8")
+    with pytest.warns(UserWarning, match="last_region"):
+        load_config(target)
+
+
+def test_a_bool_value_for_a_float_field_warns_specifically(tmp_path):
+    # bool is a subclass of int, so this exercises the branch that
+    # excludes it on purpose (see the isinstance checks above) rather
+    # than the more general wrong-type branch the other two tests here
+    # exercise.
+    target = tmp_path / "config.json"
+    target.write_text('{"tile_size_m": true}', encoding="utf-8")
+    with pytest.warns(UserWarning, match="tile_size_m"):
+        load_config(target)
+
+
+def test_a_correctly_typed_field_value_does_not_warn(recwarn, tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"output_root": "D:/S"}', encoding="utf-8")
+    load_config(target)
+    assert len(recwarn) == 0
+
+
+def test_an_unknown_key_does_not_warn(recwarn, tmp_path):
+    # An unrecognised key (see test_unknown_keys_are_ignored above) is a
+    # different, pre-existing case: there is no expected type to compare
+    # it against for a field this Config does not have at all, so the
+    # loop never reaches either branch that warns for a known one.
+    target = tmp_path / "config.json"
+    target.write_text('{"from_the_future": 1}', encoding="utf-8")
+    load_config(target)
+    assert len(recwarn) == 0

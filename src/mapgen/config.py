@@ -10,6 +10,7 @@ store.
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -67,14 +68,45 @@ def load_config(path: Path | None = None) -> Config:
         # that field alone rather than poisoning the whole Config with a
         # value no caller declared it could hold, such as a None that later
         # crashes Path(None) far away from here.
+        #
+        # A coordinator review pointed out that the else this if/elif used
+        # to fall through to had no body at all: a rejected field just
+        # never entered known, silently, with nothing anywhere to say
+        # which field it was or why. warnings.warn below does not change
+        # what value the field takes, only whether the rejection is
+        # visible: still the default, now with a reason.
+        #
+        # This is also, deliberately, the ONLY place that validates: PUT
+        # /api/config (see server.py) writes whatever a client sends
+        # straight through setattr and save_config with no type check of
+        # its own, on purpose, so a bad value and a good one are stored
+        # the same way and there is exactly one place, here, that decides
+        # what counts as valid. That single choke point is what makes
+        # this warning cover both routes to a bad config.json at once: a
+        # malformed PUT body, and a person hand-editing the file directly
+        # on disk. Either way, the bad value only ever surfaces as this
+        # warning the next time the file is loaded, never as a crash.
         if isinstance(default_value, float):
             # An int is a reasonable spelling of a float in hand-edited
             # JSON (2000 rather than 2000.0), but bool is a subclass of
             # int in Python and true/false must not silently become 1.0/0.0.
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 known[field] = float(value)
+            else:
+                warnings.warn(
+                    f"{target}: {field!r} is {value!r}, not a number; "
+                    f"keeping the default ({default_value!r}) for this field.",
+                    stacklevel=2,
+                )
         elif isinstance(value, type(default_value)):
             known[field] = value
+        else:
+            warnings.warn(
+                f"{target}: {field!r} is {value!r}, not a "
+                f"{type(default_value).__name__}; keeping the default "
+                f"({default_value!r}) for this field.",
+                stacklevel=2,
+            )
     return Config(**known)
 
 

@@ -443,17 +443,27 @@ class ElevationSource:
         # Review round 4's finding: it used to be, and the
         # except (ElevationError, ...): raise clause immediately below
         # re-raised it with api_key and params still bound in this frame,
-        # because a bare `raise` re-raises the exception unchanged and
-        # must not run cleanup code of its own, that being exactly what
-        # "re-raise unchanged" means. Three rounds of work fixed the
-        # other two raise sites in this method and missed this one
-        # precisely because it did not look like a third site: it was
-        # hiding inside a try/except that reads, at a glance, as already
-        # handled. Only status_code, a plain int with nothing in it to
-        # redact, is captured here; the actual raise happens below, after
-        # the try, in the same straight-line shape as the non-TIFF check
-        # beneath it, so every raise site in this method now looks the
-        # same and none of them hide inside a catch-and-reraise clause.
+        # uncleared. Three rounds of work fixed the other two raise sites
+        # in this method and missed this one precisely because it did
+        # not look like a third site: it was hiding inside a try/except
+        # that reads, at a glance, as already handled. Only status_code,
+        # a plain int with nothing in it to redact, is captured here; the
+        # actual raise happens below, after the try, in the same
+        # straight-line shape as the non-TIFF check beneath it, so every
+        # raise site in this method now looks the same and none of them
+        # hide inside a catch-and-reraise clause.
+        #
+        # Review round 5 corrected a false claim round 4 left behind
+        # here: that a bare `raise` "re-raises the exception unchanged
+        # and must not run cleanup code of its own, that being exactly
+        # what re-raise unchanged means." That conflated two different
+        # things. A bare `raise` re-raises the same exception OBJECT:
+        # unchanged type, unchanged message, unchanged __traceback__.
+        # `del` only removes a name from this frame's OWN local
+        # bindings; it never touches the exception object in flight, so
+        # it cannot be what changes "unchanged" here. The except clause
+        # immediately below now clears api_key and params before its own
+        # `raise`, same as every other raise site in this method.
         try:
             with self.session.get(
                 self.url,
@@ -469,17 +479,25 @@ class ElevationSource:
                     else b""
                 )
         except (ElevationError, Cancelled, KeyboardInterrupt):
-            # Left exactly as raised. Nothing inside the block above
-            # raises any of these three today: the one thing that used to
-            # raise ElevationError from in here, the status check, has
-            # moved below, out of this try entirely, precisely so it
-            # stops needing this clause's protection, which cannot clean
-            # up a frame on its way through. Kept anyway, for
+            # Left exactly as raised: type, message and __traceback__ all
+            # unchanged. Nothing inside the block above raises any of
+            # these three today: the one thing that used to raise
+            # ElevationError from in here, the status check, has moved
+            # below, out of this try entirely. Kept anyway, for
             # ElevationError alongside Cancelled (this project's own
             # cooperative-cancellation signal) and KeyboardInterrupt
             # (Python's), so a future change to what this block calls
             # cannot silently start swallowing any of the three into a
             # new, differently-worded ElevationError.
+            #
+            # api_key and params cleared before the raise anyway, same as
+            # every other raise site in this method: del only drops
+            # these two names from this frame's own locals, which is all
+            # pytest --showlocals, Sentry's local-variable capture, and a
+            # debugger's postmortem ever read directly, and none of that
+            # is the exception object being re-raised, so "left exactly
+            # as raised" above still holds byte for byte.
+            del api_key, params
             raise
         except Exception as exc:
             # Deliberately broad, and deliberately not a list of specific

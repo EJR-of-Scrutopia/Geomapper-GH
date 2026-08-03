@@ -962,14 +962,13 @@ def test_urllib3_debug_logging_never_reveals_the_key(local_http_server, caplog):
 # test file should already have caught. fetch() has three raise sites, not
 # two: the status check used to raise from INSIDE the try block, where the
 # bare `raise` in except (ElevationError, Cancelled, KeyboardInterrupt):
-# re-raised it with api_key and params both still bound in this frame, since
-# a bare `raise` must re-raise unchanged and so cannot run cleanup of its
-# own. Round 3 added a frame-locals test for the broad-except path and one
-# for the non-TIFF path, and none for this one, so the gap between "two
-# raise sites are fixed" and "there are three" walked straight past three
-# rounds of otherwise-thorough work. str(exc) was never affected (this
-# path never builds a message from anything containing the key), so CLI
-# stdout, CLI stderr and the browser's polled job record were never at
+# re-raised it with api_key and params both still bound in this frame,
+# uncleared. Round 3 added a frame-locals test for the broad-except path
+# and one for the non-TIFF path, and none for this one, so the gap between
+# "two raise sites are fixed" and "there are three" walked straight past
+# three rounds of otherwise-thorough work. str(exc) was never affected
+# (this path never builds a message from anything containing the key), so
+# CLI stdout, CLI stderr and the browser's polled job record were never at
 # risk; the exposure was always limited to pytest --showlocals, Sentry-style
 # local capture and a postmortem debugger, which is exactly why three
 # rounds of mutation-testing str(exc)/traceback text never surfaced it.
@@ -977,14 +976,25 @@ def test_urllib3_debug_logging_never_reveals_the_key(local_http_server, caplog):
 # Fixed by restructuring rather than by adding a fourth `del`: the status
 # check now happens AFTER the try, in the same straight-line
 # compute-then-delete-then-raise shape as the non-TIFF check beneath it,
-# so it no longer hides inside a catch-and-reraise clause that cannot clean
-# up on its way through. See _redact_response_urls and the status_code
-# handling in fetch() for the actual fix; the two tests below are its
-# frame-locals proof, mirroring round 3's own two tests for the other
-# raise sites exactly, so this class of gap cannot recur silently: any
-# future raise site added to fetch() without a matching frame-locals test
-# is now the odd one out against a pattern of three, not one exception
-# alongside two.
+# so it no longer hides inside a catch-and-reraise clause. See
+# _redact_response_urls and the status_code handling in fetch() for the
+# actual fix; the two tests below are its frame-locals proof, mirroring
+# round 3's own two tests for the other raise sites exactly, so this class
+# of gap cannot recur silently: any future raise site added to fetch()
+# without a matching frame-locals test is now the odd one out against a
+# pattern of three, not one exception alongside two.
+#
+# Round 4 also left behind a claim of its own, corrected in round 5: that
+# the bare `raise` in except (ElevationError, Cancelled, KeyboardInterrupt)
+# "cannot clean up on its way through", offered here as the reason that
+# clause was left as the one raise site in fetch() with no del. That was
+# never true. `del` removes a name from this frame's own locals; it does
+# not touch the exception object a bare `raise` sends on its way, so nothing
+# stops it running immediately before that `raise` the same as at the other
+# three sites. Fixed there directly, and proven by the fourth frame-locals
+# test below, completing the set: all four of fetch()'s raise sites now
+# clear api_key and params first, and all four have a test that fails if
+# one stops.
 
 
 def test_fetch_redacts_the_response_url_on_a_bad_status_before_it_can_survive_as_a_frame_local(
@@ -1018,6 +1028,39 @@ def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_bad_status_p
     session = FakeSession(FakeStreamResponse([], status_code=401))
     source = ElevationSource(api_key=SECRET, session=session)
     with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+
+    tb = excinfo.tb
+    checked_fetch_frame = False
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_name == "fetch":
+            checked_fetch_frame = True
+            for name, value in frame.f_locals.items():
+                if isinstance(value, str):
+                    assert SECRET not in value, f"local {name!r} in fetch() still holds the key"
+                elif isinstance(value, dict):
+                    assert not any(
+                        isinstance(v, str) and SECRET in v for v in value.values()
+                    ), f"local {name!r} in fetch() still holds the key in a dict value"
+        tb = tb.tb_next
+    assert checked_fetch_frame, "the traceback did not include elevation.py's fetch() frame"
+
+
+def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_cancelled_path(tmp_path):
+    # The fourth and last raise site: the bare `raise` in
+    # except (ElevationError, Cancelled, KeyboardInterrupt): below,
+    # mirroring the three tests above exactly. Cancelled is the member of
+    # that tuple this test can actually reach; see
+    # test_fetch_lets_cancelled_propagate_unwrapped for why there is no
+    # KeyboardInterrupt counterpart, and this file's own round-3 note for
+    # why that omission does not weaken this test.
+    class CancelsSession:
+        def get(self, url, **kwargs):
+            raise Cancelled("job was cancelled mid-request")
+
+    source = ElevationSource(api_key=SECRET, session=CancelsSession())
+    with pytest.raises(Cancelled) as excinfo:
         source.fetch(BBOX, [], tmp_path, NullProgress())
 
     tb = excinfo.tb
