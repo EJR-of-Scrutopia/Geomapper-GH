@@ -275,6 +275,19 @@ function showPlaceMessage(message) {
 function choosePlaceMatch(match) {
   $("place").value = match.display_name;
   closePlaceResults();
+  // Fill region/site from the chosen result's own address breakdown
+  // before setBBox ever runs. This is better evidence than a reverse
+  // lookup on the centroid of the rectangle that follows: the owner
+  // picked this specific place by name, so its own address is what the
+  // site should be named after, not a second, separately-derived guess
+  // at the middle of whatever box it turns into. Guarded the same way
+  // suggestNames guards itself: never overwrites something already
+  // typed. setBBox's own debounced suggestNames() still runs afterward
+  // and fills whichever of the two, if either, this result's address did
+  // not have: not a redundant lookup, since it only acts on a field this
+  // block left blank.
+  if (!$("site").value) $("site").value = match.site || "";
+  if (!$("region").value) $("region").value = match.region || "";
   setBBox({ west: match.west, south: match.south, east: match.east, north: match.north });
 }
 

@@ -1321,9 +1321,35 @@ def test_geocode_returns_a_bbox_for_a_match(geocode_server):
             "south": 51.38,
             "east": -3.25,
             "north": 51.43,
+            "region": "",
+            "site": "",
         }
     ]
     assert stub.search_calls == ["Barry, Wales"]
+
+
+def test_geocode_returns_the_hits_own_region_and_site_when_present(geocode_server):
+    # Task 19: the typeahead is the client's evidence for deriving region
+    # and site directly from a chosen result, without a second reverse
+    # lookup. The route must pass these through, not drop them.
+    base, stub = geocode_server
+    stub.search_results = [
+        GeocodeResult(
+            display_name="Barry Island, Barry, Vale of Glamorgan, Wales, United Kingdom",
+            west=-3.29,
+            south=51.37,
+            east=-3.25,
+            north=51.41,
+            region="Vale of Glamorgan",
+            site="Barry Island",
+        )
+    ]
+    with urllib.request.urlopen(
+        f"{base}/api/geocode?q=Barry+Island&token={TOKEN}", timeout=10
+    ) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    assert payload[0]["region"] == "Vale of Glamorgan"
+    assert payload[0]["site"] == "Barry Island"
 
 
 def test_geocode_returns_several_matches_for_disambiguation(geocode_server):

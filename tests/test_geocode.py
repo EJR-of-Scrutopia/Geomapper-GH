@@ -71,6 +71,35 @@ SEARCH_HIT_SECOND = {
 
 SEARCH_HITS_MULTIPLE = [SEARCH_HIT[0], SEARCH_HIT_SECOND]
 
+# A /search hit carrying an address breakdown (addressdetails=1), shaped
+# after a real Nominatim response for a coastal/dockland point (Barry
+# Island) checked directly against the live service while diagnosing
+# Task 19's derived-site-name bug: this is the exact shape that used to
+# come back empty for "site" at the old zoom=12 and now resolves cleanly.
+SEARCH_HIT_WITH_ADDRESS = {
+    "place_id": 282058602,
+    "licence": "Data © OpenStreetMap contributors, ODbL 1.0. https://osm.org/copyright",
+    "osm_type": "node",
+    "osm_id": 728376036,
+    "boundingbox": ["51.3718420", "51.4118420", "-3.2912029", "-3.2512029"],
+    "lat": "51.3918420",
+    "lon": "-3.2712029",
+    "display_name": "Barry Island, Barry, Vale of Glamorgan, Cymru / Wales, CF62 5AH, United Kingdom",
+    "address": {
+        "suburb": "Barry Island",
+        "town": "Barry",
+        "county": "Vale of Glamorgan",
+        "ISO3166-2-lvl6": "GB-VGL",
+        "state": "Cymru / Wales",
+        "postcode": "CF62 5AH",
+        "country": "United Kingdom",
+        "country_code": "gb",
+    },
+    "class": "place",
+    "type": "suburb",
+    "importance": 0.15,
+}
+
 REVERSE_HIT = {
     "place_id": 98765432,
     "licence": "Data © OpenStreetMap contributors, ODbL 1.0. https://osm.org/copyright",
@@ -199,6 +228,47 @@ def test_search_passes_the_configured_timeout():
     assert kwargs["timeout"] == 3.5
 
 
+def test_search_requests_address_details():
+    # Nominatim's default for /search is addressdetails=0, unlike
+    # /reverse (defaulted on). Without this explicitly set, every hit's
+    # "address" key is simply absent and region/site can never be
+    # anything but empty, regardless of what the fix below does with it.
+    client = _client([FakeGeocodeResponse(payload=SEARCH_HIT)])
+    client.search("Barry")
+    _url, kwargs = client.session.calls[0]
+    assert kwargs["params"]["addressdetails"] == 1
+
+
+def test_search_derives_region_and_site_from_the_hits_own_address():
+    # Task 19: the typeahead pick's own address is read directly, rather
+    # than depending on a second, separate reverse-geocode call on the
+    # centroid of whatever bbox the pick produces.
+    client = _client([FakeGeocodeResponse(payload=[SEARCH_HIT_WITH_ADDRESS])])
+    results = client.search("Barry Island")
+    assert results == [
+        GeocodeResult(
+            display_name="Barry Island, Barry, Vale of Glamorgan, Cymru / Wales, CF62 5AH, United Kingdom",
+            west=-3.2912029,
+            south=51.3718420,
+            east=-3.2512029,
+            north=51.4118420,
+            region="Vale of Glamorgan",
+            site="Barry Island",
+        )
+    ]
+
+
+def test_search_leaves_region_and_site_empty_when_the_hit_has_no_address():
+    # SEARCH_HIT carries no "address" key at all (a plain, unenriched
+    # hit): region/site must default to empty rather than raising or
+    # inventing something, the same "say nothing rather than guess"
+    # contract reverse() already holds for a point with no address data.
+    client = _client([FakeGeocodeResponse(payload=SEARCH_HIT)])
+    result = client.search("Barry")[0]
+    assert result.region == ""
+    assert result.site == ""
+
+
 def test_search_returns_an_empty_list_for_no_hit():
     client = _client([FakeGeocodeResponse(payload=SEARCH_NO_HIT)])
     assert client.search("nowhere at all") == []
@@ -303,6 +373,20 @@ def test_reverse_sends_lat_lon_and_a_real_user_agent():
     assert kwargs["params"]["lat"] == 51.405
     assert kwargs["params"]["lon"] == -3.283
     assert kwargs["headers"]["User-Agent"].startswith("mapgen/")
+
+
+def test_reverse_requests_zoom_14_not_the_old_zoom_12():
+    # Task 19's reported bug: zoom=12 ("town/borough" in Nominatim's own
+    # zoom-to-address-rank table) resolved a real dockland point to
+    # {"county": "Vale of Glamorgan"} alone, no suburb, town or village,
+    # confirmed directly against the live service across a city centre, a
+    # village, open countryside and the reported coastal point before
+    # picking zoom=14 ("neighbourhood"), which resolved all four. See
+    # reverse()'s own docstring for the specific responses checked.
+    client = _client([FakeGeocodeResponse(payload=REVERSE_HIT)])
+    client.reverse(51.405, -3.283)
+    _url, kwargs = client.session.calls[0]
+    assert kwargs["params"]["zoom"] == 14
 
 
 def test_reverse_raises_for_a_non_200_status():

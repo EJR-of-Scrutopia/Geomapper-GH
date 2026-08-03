@@ -1318,6 +1318,93 @@ function ok(condition, message) {
     ok(sandbox.document.getElementById("place").value === "Barry, Wales", "expected the field to show the chosen name");
   });
 
+  // =======================================================================
+  // Task 19, item 1: choosing a typeahead result fills region/site from
+  // that result's own address, without waiting on a second reverse lookup
+  // at the bbox centroid.
+  // =======================================================================
+
+  await test("choosing a typeahead result fills region and site from that result directly", async () => {
+    const { fetchCalls, sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/geocode") {
+        return jsonResponse(200, [
+          {
+            display_name: "Barry Island, Barry, Vale of Glamorgan, Wales, United Kingdom",
+            west: -3.29,
+            south: 51.37,
+            east: -3.25,
+            north: 51.41,
+            region: "Vale of Glamorgan",
+            site: "Barry Island",
+          },
+        ]);
+      }
+      // suggestNames' own fallback reverse lookup must never be reached
+      // here: both fields are already filled by the chosen result before
+      // setBBox's debounce would otherwise fire it.
+      if (url.pathname === "/api/reverse") {
+        throw new Error("reverse should not be called when the pick already supplied region and site");
+      }
+      return null;
+    });
+    typeIntoPlace(sandbox, "Barry Island");
+    await flush(500);
+    sandbox.document.getElementById("place").fire("keydown", { key: "Enter" });
+    ok(sandbox.document.getElementById("region").value === "Vale of Glamorgan");
+    ok(sandbox.document.getElementById("site").value === "Barry Island");
+    await flush(500); // past the suggest debounce, to prove it never fires the reverse call
+    ok(!fetchCalls.some((c) => c.url.pathname === "/api/reverse"), "expected no reverse lookup");
+  });
+
+  await test("choosing a typeahead result does not overwrite region or site already typed", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/geocode") {
+        return jsonResponse(200, [
+          {
+            display_name: "Barry Island, Barry, Vale of Glamorgan, Wales, United Kingdom",
+            west: -3.29,
+            south: 51.37,
+            east: -3.25,
+            north: 51.41,
+            region: "Vale of Glamorgan",
+            site: "Barry Island",
+          },
+        ]);
+      }
+      return null;
+    });
+    setField(sandbox, "site", "My Own Site Name");
+    typeIntoPlace(sandbox, "Barry Island");
+    await flush(500);
+    sandbox.document.getElementById("place").fire("keydown", { key: "Enter" });
+    ok(sandbox.document.getElementById("site").value === "My Own Site Name", "expected typed site preserved");
+    ok(sandbox.document.getElementById("region").value === "Vale of Glamorgan", "expected the still-empty region filled");
+  });
+
+  await test(
+    "choosing a typeahead result with no address falls back to the debounced reverse lookup",
+    async () => {
+      const { sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/geocode") {
+          return jsonResponse(200, [
+            { display_name: "Somewhere Unnamed", west: -3.29, south: 51.37, east: -3.25, north: 51.41 },
+          ]);
+        }
+        if (url.pathname === "/api/reverse") {
+          return jsonResponse(200, { region: "Fallback Region", site: "Fallback Site" });
+        }
+        return null;
+      });
+      typeIntoPlace(sandbox, "Somewhere Unnamed");
+      await flush(500);
+      sandbox.document.getElementById("place").fire("keydown", { key: "Enter" });
+      ok(sandbox.document.getElementById("region").value === "", "expected region still blank right after the pick");
+      await flush(500); // past the suggest debounce
+      ok(sandbox.document.getElementById("region").value === "Fallback Region");
+      ok(sandbox.document.getElementById("site").value === "Fallback Site");
+    }
+  );
+
   await test("ArrowDown twice then Enter selects the second result", async () => {
     const { sandbox } = await bootedSandbox((url) => {
       if (url.pathname === "/api/geocode") {

@@ -282,6 +282,8 @@ def make_handler(
                             "south": result.south,
                             "east": result.east,
                             "north": result.north,
+                            "region": result.region,
+                            "site": result.site,
                         }
                         for result in results
                     ],

@@ -157,6 +157,17 @@ class GeocodeResult:
     """One place-search hit: a bounding box (field names match BBox's) plus
     Nominatim's own display_name, which is what lets a person tell two
     hits called the same thing apart in a typeahead list.
+
+    region and site (Task 19): the same best-effort names reverse() derives
+    for a bbox centroid, read directly from THIS hit's own address
+    breakdown instead. Picking a result from the typeahead is better
+    evidence of the site name than a reverse lookup on the centroid of
+    whatever rectangle the pick produces, so the caller should prefer
+    these over a second, separate reverse() call whenever they are
+    present. Default to empty strings, matching ReverseResult's own
+    convention, so a hit whose address Nominatim did not break down (rare,
+    but the same "cannot be derived" case reverse() already handles) is
+    simply absent rather than raising.
     """
 
     display_name: str
@@ -164,6 +175,8 @@ class GeocodeResult:
     south: float
     east: float
     north: float
+    region: str = ""
+    site: str = ""
 
 
 @dataclass(frozen=True)
@@ -175,6 +188,31 @@ class ReverseResult:
 
     region: str
     site: str
+
+
+def _region_and_site(address: object) -> tuple[str, str]:
+    """Best-effort (region, site) from a Nominatim address breakdown dict.
+
+    Shared by search() and reverse() so the two never drift apart: a
+    typeahead pick and a bbox-centroid reverse lookup are two different
+    ways of arriving at the same address dict shape, and both should read
+    it the same way. address is typed as object rather than dict because
+    both call sites already have to guard against Nominatim returning
+    something other than a dict (a missing "address" key entirely, or a
+    non-dict value under it); doing that check once here rather than
+    twice at each call site is the point.
+    """
+    if not isinstance(address, dict):
+        address = {}
+    site = (
+        address.get("suburb")
+        or address.get("town")
+        or address.get("village")
+        or address.get("city")
+        or ""
+    )
+    region = address.get("county") or address.get("state_district") or address.get("state") or ""
+    return str(region), str(site)
 
 
 class NominatimClient:
@@ -236,8 +274,15 @@ class NominatimClient:
         whole call rather than silently dropping just that one entry,
         matching how a single-hit shape mismatch has always been treated.
         """
+        # addressdetails=1: Nominatim's default for /search is 0 (unlike
+        # /reverse, which already defaults it on). Without this, hit.get
+        # ("address") below is always absent, and region/site come back
+        # empty for every hit regardless of what Nominatim actually knows
+        # about it, which defeats the whole point of reading them from the
+        # search hit directly (see GeocodeResult's own docstring).
         payload = self._get(
-            NOMINATIM_SEARCH_URL, {"format": "json", "limit": limit, "q": query}
+            NOMINATIM_SEARCH_URL,
+            {"format": "json", "addressdetails": 1, "limit": limit, "q": query},
         )
         if not isinstance(payload, list):
             raise GeocodeError("Nominatim's search response was not in the expected shape.")
@@ -253,15 +298,48 @@ class NominatimClient:
                 raise GeocodeError(
                     "Nominatim's search response was not in the expected shape."
                 ) from exc
+            region, site = _region_and_site(hit.get("address"))
             results.append(
                 GeocodeResult(
-                    display_name=display_name, west=west, south=south, east=east, north=north
+                    display_name=display_name,
+                    west=west,
+                    south=south,
+                    east=east,
+                    north=north,
+                    region=region,
+                    site=site,
                 )
             )
         return results
 
     def reverse(self, lat: float, lon: float) -> ReverseResult:
         """Best-effort region and site names for a point.
+
+        zoom=14 ("neighbourhood" in Nominatim's own documented zoom-to-
+        address-rank table), not the zoom=12 ("town/borough") this used
+        to send. Task 19's reported bug: a real reverse lookup near Barry
+        Waterfront's dock at zoom=12 came back with only
+        {"county": "Vale of Glamorgan"}, no suburb, town or village at
+        all, because zoom=12 asks Nominatim for the enclosing polygon at
+        town/borough rank, and a dockland or coastal point is often not
+        inside any polygon that coarse. Checked directly against Nominatim
+        (not merely reasoned about) across four representative cases
+        before picking this value: a city centre (Cardiff, zoom=12
+        already resolved "Cardiff" as a city; zoom=14 resolves the finer
+        "Castle" suburb instead, an improvement not a regression), a
+        village (zoom=12 gave county only; zoom=14 gave suburb "St
+        Nicholas and Bonvilston" and village "St Nicholas"), open
+        countryside (zoom=12 gave county only; zoom=14 still resolved the
+        containing civil parish, "Llanwrthwl", which is the correct UK
+        administrative answer for a rural point with no settlement
+        directly on it, not a fabrication), and the reported coastal/dock
+        case itself (zoom=12 jumped to a same-named neighbouring city;
+        zoom=14 correctly resolved suburb "Barry Island", town "Barry").
+        zoom=14 is a genuinely finer request than zoom=12, not merely a
+        bigger number tried until one case passed: Nominatim's own address
+        breakdown grows monotonically finer as zoom increases, so a field
+        present at zoom=12 stays present at zoom=14, and this never
+        regresses a case that already worked.
 
         Nominatim answers a point with no address data (open water, deep
         countryside) with HTTP 200 and a JSON object containing an
@@ -272,15 +350,11 @@ class NominatimClient:
         to fill in, not something to report.
         """
         payload = self._get(
-            NOMINATIM_REVERSE_URL, {"format": "json", "zoom": 12, "lat": lat, "lon": lon}
+            NOMINATIM_REVERSE_URL, {"format": "json", "zoom": 14, "lat": lat, "lon": lon}
         )
         if not isinstance(payload, dict):
             raise GeocodeError("Nominatim's reverse response was not in the expected shape.")
         if "error" in payload:
             return ReverseResult(region="", site="")
-        address = payload.get("address")
-        if not isinstance(address, dict):
-            address = {}
-        site = address.get("suburb") or address.get("town") or address.get("village") or address.get("city") or ""
-        region = address.get("county") or address.get("state_district") or address.get("state") or ""
+        region, site = _region_and_site(payload.get("address"))
         return ReverseResult(region=region, site=site)
