@@ -10,9 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+import traceback
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from mapgen import __version__
 from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES
@@ -25,6 +26,12 @@ from mapgen.package import (
     run_survey,
 )
 from mapgen.sources.base import UnknownSourceError, available_sources
+
+# Task 19 item 4: where a windowless launch's own errors go when there is
+# no console to print them to. Alongside ~/.mapgen/config.json, the same
+# home-directory convention mapgen.config already established, so both
+# live in one place the owner can find.
+WINDOWLESS_LOG_PATH = Path.home() / ".mapgen" / "ui.log"
 
 
 class ConsoleProgress:
@@ -136,11 +143,100 @@ def command_survey(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_ui(args: argparse.Namespace) -> int:
-    from mapgen.web.server import serve
+def _install_windowless_safety() -> bool:
+    """Redirects sys.stdout/sys.stderr to WINDOWLESS_LOG_PATH when there
+    is no console attached, returning True if it actually did so.
 
-    serve(open_browser=not args.no_browser, port=args.port)
-    return 0
+    pythonw.exe, and the assets/make_shortcut.ps1 shortcut this backs, run
+    as a GUI-subsystem process: Python itself sets sys.stdout and
+    sys.stderr to None in that case, since there is no console for them to
+    write to. Left alone, the very first ordinary print() anywhere in
+    serve() (there are several, today) crashes immediately with
+    AttributeError: 'NoneType' object has no attribute 'write', which is a
+    WORSE failure than the one being reported, since the crash happens
+    inside the code that would have written the original error down. A
+    tool that fails invisibly is worse than one that fails loudly, and an
+    AttributeError two frames from the real problem is its own kind of
+    invisible: redirecting first means every existing print() keeps
+    working completely unchanged, writing to a file instead of a console
+    that was never going to exist either way.
+
+    A real console (sys.stdout is not None) needs none of this: `mapgen
+    ui` from a terminal must keep working exactly as it does today, so
+    this is a no-op whenever a console is actually attached, windowless
+    flag or not.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return False
+    WINDOWLESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(WINDOWLESS_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    handle.write(
+        f"\n--- mapgen ui --windowless started "
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} ---\n"
+    )
+    sys.stdout = handle
+    sys.stderr = handle
+    return True
+
+
+def _default_message_box(message: str) -> None:
+    import ctypes
+
+    MB_ICONERROR = 0x10
+    ctypes.windll.user32.MessageBoxW(None, message, "mapgen", MB_ICONERROR)
+
+
+def _report_windowless_failure(
+    exc: BaseException, message_box: Callable[[str], None] = _default_message_box
+) -> None:
+    """The one thing a windowless launch can do that a silent crash under
+    pythonw cannot: put an unmissable, native signal in front of the owner
+    that something went wrong, since there is no console for a traceback
+    to ever appear in. traceback.print_exc() below writes the full detail
+    to sys.stderr, which _install_windowless_safety has already pointed at
+    WINDOWLESS_LOG_PATH by the time this can ever be reached, so the
+    message box itself only needs to be loud, not detailed.
+
+    message_box is injectable so a test can prove this function is called
+    on failure without a real MessageBoxW popping up and waiting on
+    someone to click it. A failing message_box (no user32, running under
+    something unexpected) must never mask the original exception or raise
+    a second, different one out of a failure-reporting path, so it is
+    swallowed, after the log write above has already happened regardless.
+    """
+    traceback.print_exc()
+    message = (
+        f"mapgen ui failed to start:\n{exc}\n\n"
+        f"Full details were written to:\n{WINDOWLESS_LOG_PATH}"
+    )
+    try:
+        message_box(message)
+    except Exception:
+        pass
+
+
+def command_ui(args: argparse.Namespace) -> int:
+    from mapgen.web.server import DEFAULT_HEARTBEAT_TIMEOUT_SECONDS, serve
+
+    windowless = args.windowless
+    if windowless:
+        _install_windowless_safety()
+    try:
+        serve(
+            open_browser=not args.no_browser,
+            port=args.port,
+            heartbeat_timeout_seconds=DEFAULT_HEARTBEAT_TIMEOUT_SECONDS if windowless else None,
+        )
+        return 0
+    except Exception as exc:
+        if not windowless:
+            raise
+        # Under a real console this re-raises and behaves exactly as
+        # before (a traceback on stderr, a non-zero exit): only a
+        # windowless launch, which has no console for that traceback to
+        # ever reach, gets the extra, louder reporting.
+        _report_windowless_failure(exc)
+        return 1
 
 
 def command_sources(args: argparse.Namespace) -> int:
@@ -188,6 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
     ui = subparsers.add_parser("ui", help="Open the map picker in a browser.")
     ui.add_argument("--port", type=int, default=0, help="0 picks a free port.")
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument(
+        "--windowless", action="store_true",
+        help="For the desktop shortcut, not everyday terminal use: stops the server "
+             "when the page is closed, and redirects output to "
+             f"{WINDOWLESS_LOG_PATH} since a windowless launch has no console to print "
+             "to. Plain `mapgen ui` is unaffected either way.",
+    )
     ui.set_defaults(func=command_ui)
 
     sources = subparsers.add_parser("sources", help="List available data sources.")

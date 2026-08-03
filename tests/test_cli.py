@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+import mapgen.cli as cli
 from mapgen.cli import build_parser, main
 from mapgen.sources.base import Estimate, clear_registry, register
 
@@ -457,3 +458,117 @@ sys.exit(main([
     # not merely short by coincidence.
     assert "direct cause" not in result.stderr
     assert "another exception occurred" not in result.stderr
+
+
+# --- Task 19 item 4: the windowless launch --------------------------------
+
+
+def test_ui_windowless_flag_defaults_to_false():
+    parser = build_parser()
+    args = parser.parse_args(["ui"])
+    assert args.windowless is False
+
+
+def test_ui_windowless_flag_is_accepted():
+    parser = build_parser()
+    args = parser.parse_args(["ui", "--windowless"])
+    assert args.windowless is True
+
+
+def test_command_ui_passes_no_heartbeat_timeout_without_the_flag(monkeypatch):
+    # mapgen ui from a terminal must keep behaving exactly as it does
+    # today: no heartbeat wiring at all unless --windowless was given.
+    captured = {}
+    monkeypatch.setattr("mapgen.web.server.serve", lambda **kwargs: captured.update(kwargs))
+    parser = build_parser()
+    args = parser.parse_args(["ui", "--no-browser"])
+    exit_code = cli.command_ui(args)
+    assert exit_code == 0
+    assert captured["heartbeat_timeout_seconds"] is None
+
+
+def test_command_ui_passes_the_default_heartbeat_timeout_with_the_flag(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("mapgen.web.server.serve", lambda **kwargs: captured.update(kwargs))
+    parser = build_parser()
+    args = parser.parse_args(["ui", "--no-browser", "--windowless"])
+    exit_code = cli.command_ui(args)
+    assert exit_code == 0
+    from mapgen.web.server import DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+
+    assert captured["heartbeat_timeout_seconds"] == DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+
+
+def test_command_ui_reraises_on_failure_without_windowless(monkeypatch):
+    def boom(**kwargs):
+        raise OSError("port already in use")
+
+    monkeypatch.setattr("mapgen.web.server.serve", boom)
+    parser = build_parser()
+    args = parser.parse_args(["ui", "--no-browser"])
+    with pytest.raises(OSError, match="port already in use"):
+        cli.command_ui(args)
+
+
+def test_command_ui_reports_windowless_failure_instead_of_raising(monkeypatch, capsys):
+    def boom(**kwargs):
+        raise OSError("port already in use")
+
+    monkeypatch.setattr("mapgen.web.server.serve", boom)
+    reported = []
+    monkeypatch.setattr(cli, "_report_windowless_failure", lambda exc: reported.append(exc))
+    parser = build_parser()
+    args = parser.parse_args(["ui", "--no-browser", "--windowless"])
+    exit_code = cli.command_ui(args)
+    assert exit_code == 1
+    assert len(reported) == 1
+    assert "port already in use" in str(reported[0])
+
+
+def test_install_windowless_safety_is_a_noop_with_a_real_console(monkeypatch):
+    monkeypatch.setattr(sys, "stdout", sys.__stdout__, raising=False)
+    monkeypatch.setattr(sys, "stderr", sys.__stderr__, raising=False)
+    assert cli._install_windowless_safety() is False
+    # Must not have touched either, having decided there was nothing to do.
+    assert sys.stdout is sys.__stdout__
+    assert sys.stderr is sys.__stderr__
+
+
+def test_install_windowless_safety_redirects_stdio_when_there_is_no_console(monkeypatch, tmp_path):
+    log_path = tmp_path / "ui.log"
+    monkeypatch.setattr(cli, "WINDOWLESS_LOG_PATH", log_path)
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    try:
+        assert cli._install_windowless_safety() is True
+        assert sys.stdout is not None, "expected stdout redirected rather than left None"
+        assert sys.stderr is not None, "expected stderr redirected rather than left None"
+        # The specific failure this whole function exists to prevent: an
+        # ordinary print() must not crash with AttributeError on a None
+        # stream once this has run.
+        print("hello from a windowless session", flush=True)
+    finally:
+        if sys.stdout is not None:
+            sys.stdout.close()
+    assert log_path.exists()
+    content = log_path.read_text(encoding="utf-8")
+    assert "started" in content
+    assert "hello from a windowless session" in content
+
+
+def test_report_windowless_failure_calls_the_injected_message_box(capsys):
+    calls = []
+    cli._report_windowless_failure(RuntimeError("boom"), message_box=calls.append)
+    assert len(calls) == 1
+    assert "boom" in calls[0]
+    assert "mapgen ui failed to start" in calls[0]
+    assert str(cli.WINDOWLESS_LOG_PATH) in calls[0]
+
+
+def test_report_windowless_failure_swallows_a_failing_message_box(capsys):
+    def failing_message_box(message):
+        raise RuntimeError("no display available")
+
+    # Must not raise: a message box failing must never mask the original
+    # error or blow up a failure-reporting path with a second exception.
+    cli._report_windowless_failure(RuntimeError("original problem"), message_box=failing_message_box)

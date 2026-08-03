@@ -24,8 +24,10 @@ from mapgen.web.server import (
     JobBusyError,
     JobManager,
     JobRecord,
+    _watch_heartbeat,
     build_server,
     make_handler,
+    serve,
 )
 
 TOKEN = "test-token"
@@ -1770,3 +1772,185 @@ def test_every_vendor_file_is_listed_in_the_readme_and_hashes_match():
                 f"{filename}: README says {expected_hash}, actual file hashes to {actual_hash}"
             )
     assert not mismatches, "\n".join(mismatches)
+
+
+# --- Task 19 item 4: the windowless launch stops when the page closes -----
+#
+# Two layers, tested separately: _watch_heartbeat's own timing logic
+# (fast, deterministic, using a short real timeout and a short real poll
+# interval rather than the 20s/1s production values), and the real HTTP
+# routes (/api/heartbeat, /api/shutdown) plus serve()'s own wiring of the
+# heartbeat_timeout_seconds parameter end to end.
+
+
+def test_heartbeat_endpoint_requires_a_token(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            urllib.request.Request(f"{server}/api/heartbeat", method="POST"), timeout=10
+        )
+    assert excinfo.value.code == 403
+
+
+def test_heartbeat_endpoint_updates_last_heartbeat_at():
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        before = httpd.last_heartbeat_at
+        time.sleep(0.05)
+        status, payload = _post(base, "/api/heartbeat", {})
+        assert status == 200
+        assert payload == {"ok": True}
+        assert httpd.last_heartbeat_at > before
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_shutdown_endpoint_requires_a_token(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            urllib.request.Request(f"{server}/api/shutdown", method="POST"), timeout=10
+        )
+    assert excinfo.value.code == 403
+
+
+def test_shutdown_endpoint_without_a_token_has_no_side_effects(server):
+    with pytest.raises(urllib.error.HTTPError):
+        urllib.request.urlopen(
+            urllib.request.Request(f"{server}/api/shutdown", method="POST"), timeout=10
+        )
+    # If the unauthorised attempt had actually triggered a shutdown, this
+    # legitimate, authorised follow-up would fail to connect at all,
+    # the same technique already used to prove the same property for
+    # /api/jobs.
+    status, _payload = _get(server, "/api/config")
+    assert status == 200
+
+
+def test_shutdown_endpoint_stops_the_server():
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        status, payload = _post(base, "/api/shutdown", {})
+        assert status == 200
+        assert payload == {"stopping": True}
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "expected serve_forever() to return after /api/shutdown"
+    finally:
+        httpd.server_close()
+
+
+def test_build_server_initialises_last_heartbeat_at_before_any_ping():
+    httpd = build_server(port=0, token=TOKEN)
+    try:
+        assert httpd.last_heartbeat_at is not None
+        assert time.monotonic() - httpd.last_heartbeat_at < 5.0
+    finally:
+        httpd.server_close()
+
+
+def test_watch_heartbeat_shuts_down_the_server_once_the_timeout_elapses_with_no_pings():
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    stop_event = threading.Event()
+    watchdog = threading.Thread(
+        target=_watch_heartbeat, args=(httpd, 0.05, stop_event, 0.01), daemon=True
+    )
+    watchdog.start()
+    try:
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "expected the heartbeat timeout to shut the server down"
+    finally:
+        stop_event.set()
+        httpd.server_close()
+
+
+def test_watch_heartbeat_does_not_shut_down_while_pings_keep_arriving():
+    # The "survives a reload" property: as long as SOMETHING keeps
+    # last_heartbeat_at recent, the watchdog must never fire, no matter
+    # how long the server has been up in total.
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    stop_event = threading.Event()
+    watchdog = threading.Thread(
+        target=_watch_heartbeat, args=(httpd, 0.1, stop_event, 0.02), daemon=True
+    )
+    watchdog.start()
+    try:
+        deadline = time.time() + 0.4  # several multiples of the 0.1s timeout
+        while time.time() < deadline:
+            httpd.last_heartbeat_at = time.monotonic()
+            time.sleep(0.02)
+        assert thread.is_alive(), "expected the server to still be running while pings kept arriving"
+    finally:
+        stop_event.set()
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_watch_heartbeat_stops_promptly_once_told_to_via_stop_event():
+    # Proves the interruptible-sleep property directly: a stop_event set
+    # immediately must not leave this thread polling a server that
+    # something else is already closing down.
+    httpd = build_server(port=0, token=TOKEN)
+    stop_event = threading.Event()
+    watchdog = threading.Thread(
+        target=_watch_heartbeat, args=(httpd, 100.0, stop_event, 0.01), daemon=True
+    )
+    watchdog.start()
+    stop_event.set()
+    watchdog.join(timeout=2)
+    assert not watchdog.is_alive(), "expected the watchdog thread to exit promptly once stopped"
+    httpd.server_close()
+
+
+def test_serve_never_auto_shuts_down_when_heartbeat_timeout_is_not_given(monkeypatch):
+    # The default: a plain `mapgen ui` must keep behaving exactly as it
+    # does today, console and all, closed tab or not.
+    import mapgen.web.server as server_module
+
+    captured = {}
+    real_build_server = server_module.build_server
+
+    def capturing_build_server(*args, **kwargs):
+        httpd = real_build_server(*args, **kwargs)
+        captured["httpd"] = httpd
+        return httpd
+
+    monkeypatch.setattr(server_module, "build_server", capturing_build_server)
+
+    thread = threading.Thread(
+        target=server_module.serve,
+        kwargs={"open_browser": False, "port": 0, "heartbeat_timeout_seconds": None},
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.time() + 5
+    while "httpd" not in captured and time.time() < deadline:
+        time.sleep(0.01)
+    assert "httpd" in captured, "expected serve() to have built a server by now"
+    time.sleep(0.2)
+    assert thread.is_alive(), "expected no auto-shutdown with heartbeat_timeout_seconds=None"
+    captured["httpd"].shutdown()
+    thread.join(timeout=5)
+
+
+def test_serve_auto_shuts_down_end_to_end_when_the_heartbeat_times_out():
+    # The real, public entry point the CLI's --windowless flag calls,
+    # proving the parameter is actually wired through to the watchdog,
+    # not just that _watch_heartbeat works in isolation.
+    thread = threading.Thread(
+        target=serve,
+        kwargs={"open_browser": False, "port": 0, "heartbeat_timeout_seconds": 0.05},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "expected serve() to return once the heartbeat timed out"

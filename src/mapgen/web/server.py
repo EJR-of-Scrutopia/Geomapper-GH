@@ -11,6 +11,7 @@ import json
 import re
 import secrets
 import threading
+import time
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
@@ -54,6 +55,51 @@ _ROAD_SUBTYPE_LABELS = dict(ROAD_SUBTYPES)
 # malformed path such as /api/cancel.
 _JOB_STATUS_RE = re.compile(r"^/api/jobs/([^/]+)$")
 _JOB_CANCEL_RE = re.compile(r"^/api/jobs/([^/]+)/cancel$")
+
+# Task 19 item 4: the windowless desktop shortcut needs the server to stop
+# once nobody is watching the page any more, rather than leaving a process
+# behind that only Task Manager can end. The page pings /api/heartbeat
+# every HEARTBEAT_INTERVAL_MS (app.js); this is how long the SERVER waits
+# with no ping at all before deciding the page is genuinely gone rather
+# than mid-reload. Picked deliberately, not guessed: app.js starts pinging
+# at script load, before boot()'s own network round-trips, so a reload's
+# real gap between the old page's last ping and the new page's first is on
+# the order of tens to a couple of hundred milliseconds on localhost, not
+# seconds. 20 seconds is roughly 100x that realistic gap and 4x the ping
+# interval itself, which comfortably survives a slow machine's reload
+# without leaving a genuinely closed browser's process running for minutes
+# after the fact. None of this applies to a plain `mapgen ui`: it is only
+# ever wired in when the caller explicitly asks for it (see serve()'s own
+# heartbeat_timeout_seconds parameter, None by default), so a terminal
+# launch keeps running exactly as it always has if the tab is closed
+# without Ctrl+C.
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 20.0
+_HEARTBEAT_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _watch_heartbeat(
+    httpd: ThreadingHTTPServer,
+    timeout_seconds: float,
+    stop_event: threading.Event,
+    poll_interval: float = _HEARTBEAT_POLL_INTERVAL_SECONDS,
+) -> None:
+    """Runs in its own daemon thread for the lifetime of a heartbeat-
+    enabled server. Shuts httpd down (causing its serve_forever() to
+    return, in build_server/serve) once more than timeout_seconds have
+    passed since the last /api/heartbeat ping, checked every poll_interval.
+
+    stop_event.wait(poll_interval) is an interruptible sleep: serve()'s own
+    cleanup sets it when the server is stopping for any OTHER reason
+    (Ctrl+C, /api/shutdown), so this thread notices and exits promptly
+    instead of polling a server that no longer exists until the process
+    itself ends. httpd.shutdown() is documented as safe to call from a
+    thread other than the one running serve_forever(), which this always
+    is by construction.
+    """
+    while not stop_event.wait(poll_interval):
+        if time.monotonic() - httpd.last_heartbeat_at > timeout_seconds:
+            httpd.shutdown()
+            return
 
 
 class JobBusyError(RuntimeError):
@@ -423,6 +469,32 @@ def make_handler(
                     return self._send_json(404, {"error": "Unknown job."})
                 return self._send_json(200, {"cancelled": True})
 
+            if parsed.path == "/api/heartbeat":
+                # Recorded unconditionally, whether or not a heartbeat
+                # watchdog is even running (self.server.last_heartbeat_at
+                # always exists, set at build_server time): a plain
+                # `mapgen ui` session gets pinged the same as a windowless
+                # one, harmlessly, since nothing reads this attribute at
+                # all unless serve() was given a heartbeat_timeout_seconds.
+                # One code path in app.js regardless of launch mode, rather
+                # than the page needing to know which kind of session it is.
+                self.server.last_heartbeat_at = time.monotonic()
+                return self._send_json(200, {"ok": True})
+
+            if parsed.path == "/api/shutdown":
+                # The response is sent BEFORE shutdown() runs, from a
+                # separate thread: shutdown() blocks until serve_forever()'s
+                # poll loop has actually exited, and this handler thread
+                # must not block on that just to answer its own caller.
+                # Available regardless of launch mode: a visible way to end
+                # the session from the page is useful even with a terminal
+                # open, not only under the windowless shortcut, and a
+                # browser that crashes should not leave a process behind
+                # either way.
+                self._send_json(200, {"stopping": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+
             return self._send_json(404, {"error": "Unknown endpoint."})
 
         def do_PUT(self) -> None:
@@ -497,10 +569,28 @@ def build_server(
     httpd.token = resolved_token
     httpd.manager = manager
     httpd.geocode_client = geocode_client
+    # Initialised at build time, not on the first ping: /api/heartbeat
+    # sets this the same way regardless, but a heartbeat-enabled server
+    # started with no page open yet (the ordinary case: serve() opens the
+    # browser AFTER this returns) must not already look overdue before the
+    # page has had any chance to load and start pinging at all.
+    httpd.last_heartbeat_at = time.monotonic()
     return httpd
 
 
-def serve(open_browser: bool = True, port: int = 0, host: str = "127.0.0.1") -> None:
+def serve(
+    open_browser: bool = True,
+    port: int = 0,
+    host: str = "127.0.0.1",
+    heartbeat_timeout_seconds: float | None = None,
+) -> None:
+    """heartbeat_timeout_seconds is None by default: a plain `mapgen ui`
+    keeps running until Ctrl+C regardless of whether the page is closed,
+    exactly as it always has. Only a caller that explicitly asks (the
+    --windowless CLI flag) gets the page-closed-stops-the-server
+    behaviour, via a background watchdog thread that shuts the server
+    down once /api/heartbeat has not been pinged for that long.
+    """
     httpd = build_server(host=host, port=port)
     actual_port = httpd.server_address[1]
     url = f"http://{host}:{actual_port}/?token={httpd.token}"
@@ -508,9 +598,25 @@ def serve(open_browser: bool = True, port: int = 0, host: str = "127.0.0.1") -> 
     print("Press Ctrl+C to stop.")
     if open_browser:
         webbrowser.open(url)
+
+    watchdog_stop = threading.Event()
+    if heartbeat_timeout_seconds is not None:
+        threading.Thread(
+            target=_watch_heartbeat,
+            args=(httpd, heartbeat_timeout_seconds, watchdog_stop),
+            daemon=True,
+        ).start()
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        # Set before server_close(), not after: the watchdog thread reads
+        # httpd.last_heartbeat_at, not the socket itself, so it would
+        # otherwise keep polling a closed server (harmlessly, since
+        # shutdown() on an already-stopped server is a no-op, but there is
+        # no reason to leave a daemon thread spinning for the rest of the
+        # process's life when a plain event flag stops it promptly).
+        watchdog_stop.set()
         httpd.server_close()
