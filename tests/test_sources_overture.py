@@ -394,3 +394,37 @@ def test_possible_outputs_also_covers_an_exotic_requested_type():
     assert "Stem_address.geojson" in [
         n for n in exotic.possible_outputs("Stem")
     ]
+
+
+def test_the_cli_is_invoked_with_no_console_window(tmp_path):
+    # Not a cosmetic preference. Under the windowless desktop shortcut this
+    # is one console executable per tile per type, and each window is real
+    # enough for the owner to close, which kills the download inside it.
+    # That is exactly what happened to them mid-survey, and the child died
+    # before writing anything, so the failure reached the log as
+    # "overturemaps failed for tile r00_c04, type segment:" with nothing
+    # after the colon.
+    import subprocess
+    import sys
+
+    calls = []
+    inner = FakeRunner()
+
+    def recording_runner(command, **kwargs):
+        calls.append(kwargs)
+        return inner(command, **kwargs)
+
+    source = OvertureSource(
+        types=["building"],
+        runner=recording_runner,
+        executable_finder=lambda name: "overturemaps",
+    )
+    source.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+
+    assert calls, "the CLI was never invoked"
+    if sys.platform == "win32":
+        assert calls[0]["creationflags"] == subprocess.CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in calls[0]

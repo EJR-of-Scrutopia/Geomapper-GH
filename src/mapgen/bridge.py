@@ -12,6 +12,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from mapgen.procutil import run_hidden
 from typing import Callable
 
 from mapgen.geo import BBox
@@ -111,11 +112,13 @@ def run_bridge(
     # it can be inspected for the one failure UrbanoBridge already names
     # precisely (see _missing_urbano_directory) before deciding whether the
     # owner needs to see it at all.
-    result = runner(
+    # run_hidden for the same reason overture.py uses it: dotnet is a console
+    # executable, and under the windowless desktop shortcut every invocation
+    # would otherwise open a console window the owner can close. See
+    # mapgen.procutil.
+    result = run_hidden(
         build_command(request, project),
-        check=False,
-        capture_output=True,
-        text=True,
+        runner=runner,
         errors="replace",
     )
     if result.returncode != 0:

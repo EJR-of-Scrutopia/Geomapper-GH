@@ -15,6 +15,7 @@ from typing import Callable, Sequence
 from mapgen.fsutil import ensure_dir
 from mapgen.geo import BBox, Tile
 from mapgen.merge import merge_geojson
+from mapgen.procutil import run_hidden
 from mapgen.sources.base import Estimate, ProgressSink
 
 DEFAULT_OVERTURE_TYPES = [
@@ -170,7 +171,11 @@ class OvertureSource:
         if self.release:
             command.extend(["--release", self.release])
 
-        result = self._runner(command, capture_output=True, text=True, check=False)
+        # run_hidden, not a bare runner call: on Windows this is one console
+        # executable per tile per type, and without CREATE_NO_WINDOW each one
+        # opens a real window that the owner can close, killing the download
+        # inside it. See mapgen.procutil.
+        result = run_hidden(command, runner=self._runner)
         if result.returncode != 0:
             temp_path.unlink(missing_ok=True)
             detail = (result.stderr or result.stdout or "").strip()
