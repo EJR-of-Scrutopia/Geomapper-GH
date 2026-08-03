@@ -1302,3 +1302,199 @@ def test_survey_json_records_every_category_by_default(tmp_path):
     result = run_survey(_request(tmp_path))
     payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
     assert sorted(payload["categories"]) == sorted(ALL_CATEGORY_IDS)
+
+
+# --- Task 19 item 5: the whole-run retry at a smaller tile size on a node-
+# cap failure, restored by owner ruling after Task 17's audit found the
+# superseded script had it and mapgen initially dropped it. -----------------
+
+
+class NodeCapThenSucceedsSource:
+    """Raises NodeCapExceededError on its first fetch() call (as if the
+    tile at the ORIGINALLY requested size were too dense), then succeeds
+    on every call after that (as if a smaller size cleared it). Does not
+    model real node-counting: the orchestration under test (does run_survey
+    retry at all, does it stop, does it record the right size) does not
+    depend on the stub actually knowing anything about tile density.
+    """
+
+    id = "osm"
+    display_name = "Stub OSM"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self):
+        self.attempt = 0
+        self.fetch_calls: list[list[str]] = []
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100 * len(tiles), seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.attempt += 1
+        self.fetch_calls.append([t.tile_id for t in tiles])
+        if self.attempt == 1:
+            from mapgen.sources.osm import NodeCapExceededError
+
+            raise NodeCapExceededError("Tile r00_c00 exceeded the OSM API 50000-node limit.")
+        paths = []
+        for tile in tiles:
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def merge(self, parts, out_dir, stem):
+        out = out_dir / f"{self.id}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n".join(p.read_text(encoding="utf-8") for p in parts), encoding="utf-8")
+        return [out]
+
+
+class AlwaysNodeCapSource(NodeCapThenSucceedsSource):
+    """Raises NodeCapExceededError on every single attempt, to test the
+    end of the retry ladder rather than a successful step down it.
+    """
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.attempt += 1
+        self.fetch_calls.append([t.tile_id for t in tiles])
+        from mapgen.sources.osm import NodeCapExceededError
+
+        raise NodeCapExceededError(f"Tile exceeded the OSM API 50000-node limit (attempt {self.attempt}).")
+
+
+def test_a_node_cap_failure_automatically_retries_at_the_next_smaller_tile_size(tmp_path):
+    source = NodeCapThenSucceedsSource()
+    register(source)
+    log = EventLog()
+    result = run_survey(
+        _request(tmp_path, tile_size_m=2000.0, overlap_m=100.0, source_ids=("osm",)),
+        progress=log,
+    )
+    assert result.complete is True
+    assert source.attempt == 2, "expected exactly one retry: fail once, then succeed"
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    # The tile size ACTUALLY used, one rung down from what was requested,
+    # not the originally requested 2000m: a package must describe itself
+    # accurately.
+    assert payload["tiling"]["tile_size_m"] == 1500.0
+    retry_events = [e for e in log.events if e["event"] == "tile_size_retry"]
+    assert len(retry_events) == 1
+    assert retry_events[0]["previous_tile_size_m"] == 2000.0
+    assert retry_events[0]["next_tile_size_m"] == 1500.0
+
+
+def test_a_node_cap_retry_gets_its_own_fingerprinted_work_dir_not_the_failed_attempts(tmp_path):
+    # "Safe by construction", confirmed directly rather than assumed: the
+    # retry must land in a DIFFERENT work_dir, and the original, larger-
+    # tile-size attempt's own work_dir must not still exist afterwards
+    # (cleaned up by the later success, the same property already proven
+    # for a sibling scenario by
+    # test_a_later_success_at_a_different_tiling_cleans_up_a_failed_siblings_scratch).
+    source = NodeCapThenSucceedsSource()
+    register(source)
+    request_2000 = _request(tmp_path, tile_size_m=2000.0, overlap_m=100.0, source_ids=("osm",))
+    fp_2000 = tiling_fingerprint(*request_2000.bbox.as_tuple(), 2000.0, 100.0)
+    # Overlap after the retry: min(original 100, max(50, 1500 / 10)) =
+    # min(100, 150) = 100, unchanged, since the original overlap is
+    # already below the new tile size's own 10% floor.
+    fp_1500 = tiling_fingerprint(*request_2000.bbox.as_tuple(), 1500.0, 100.0)
+    assert fp_2000 != fp_1500
+
+    result = run_survey(request_2000)
+
+    assert result.complete is True
+    assert result.paths.work_dir.name == fp_1500
+    assert not result.paths.work_dir.exists(), "expected the successful run's own work_dir cleaned up too"
+    assert not result.paths.work_dir.parent.exists(), (
+        "expected the shared _work/ parent gone entirely, including the abandoned 2000m attempt"
+    )
+
+
+def test_a_node_cap_failure_stops_at_the_smallest_size_and_fails_with_the_existing_message(tmp_path):
+    source = AlwaysNodeCapSource()
+    register(source)
+    log = EventLog()
+    with pytest.raises(Exception) as excinfo:
+        run_survey(
+            _request(tmp_path, tile_size_m=1500.0, overlap_m=75.0, source_ids=("osm",)),
+            progress=log,
+        )
+    # The internal retry signal must never leak to a caller: only the
+    # ORIGINAL, existing exception the brief calls "the existing clear
+    # message" should ever be visible outside run_survey.
+    from mapgen.package import _RetryAtSmallerTileSize
+    from mapgen.sources.osm import NodeCapExceededError
+
+    assert not isinstance(excinfo.value, _RetryAtSmallerTileSize)
+    assert isinstance(excinfo.value, NodeCapExceededError)
+    assert "50000-node limit" in str(excinfo.value)
+    # Exactly one retry (1500 -> 1000, the only rung left below 1500), then
+    # the second failure at 1000 has nowhere smaller to go and is fatal.
+    assert source.attempt == 2
+    retry_events = [e for e in log.events if e["event"] == "tile_size_retry"]
+    assert len(retry_events) == 1
+    assert retry_events[0]["next_tile_size_m"] == 1000.0
+
+
+def test_a_node_cap_failure_at_the_smallest_size_with_force_completes_incomplete_rather_than_raising(
+    tmp_path,
+):
+    # force's existing promise, "continue past a failure and mark the
+    # package incomplete rather than stop", must still hold once the
+    # retry ladder itself is exhausted: the ladder deciding there is
+    # nothing smaller left to try is not a reason to ignore force at that
+    # final attempt.
+    source = AlwaysNodeCapSource()
+    register(source)
+    result = run_survey(
+        _request(tmp_path, tile_size_m=1000.0, overlap_m=50.0, source_ids=("osm",), force=True)
+    )
+    assert result.complete is False
+    # tile_size_m=1000 has no smaller rung at all, so this must be the
+    # very first and only attempt: force never gets a chance to matter
+    # unless the ladder was correctly recognised as already exhausted.
+    assert source.attempt == 1
+
+
+def test_a_non_node_cap_failure_is_never_retried_even_with_room_in_the_ladder(tmp_path):
+    # The retry is specifically for NodeCapExceededError. Any other
+    # failure, even at a tile size with room left in the ladder, must
+    # behave exactly as it always has: request.force decides, this
+    # mechanism does not get involved at all.
+    register(StubSource(fail_on=("r00_c00", "r00_c01", "r01_c00", "r01_c01")))
+    with pytest.raises(RuntimeError, match="stub failure"):
+        run_survey(_request(tmp_path, tile_size_m=2000.0, overlap_m=100.0, source_ids=("stub",)))
+
+
+def test_a_node_cap_retry_scales_overlap_down_when_it_would_dwarf_the_smaller_tile(tmp_path):
+    # A 900m overlap on a 1000m tile would be nearly the whole tile; the
+    # retry scales overlap down to at most 10% of the new tile size (with
+    # a 50m floor), matching the superseded script's own formula, rather
+    # than carrying a now-disproportionate overlap through unchanged.
+    source = NodeCapThenSucceedsSource()
+    register(source)
+    result = run_survey(
+        _request(tmp_path, tile_size_m=2000.0, overlap_m=900.0, source_ids=("osm",))
+    )
+    assert result.complete is True
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["tiling"]["tile_size_m"] == 1500.0
+    # max(50, 1500 / 10) = 150; min(900, 150) = 150.
+    assert payload["tiling"]["overlap_m"] == 150.0
+
+
+def test_next_smaller_node_cap_tile_size_steps_down_the_fixed_ladder():
+    from mapgen.package import _next_smaller_node_cap_tile_size
+
+    assert _next_smaller_node_cap_tile_size(2000.0) == 1500.0
+    assert _next_smaller_node_cap_tile_size(1500.0) == 1000.0
+    assert _next_smaller_node_cap_tile_size(1000.0) is None
+    # A request already below every ladder rung has nowhere to go either.
+    assert _next_smaller_node_cap_tile_size(800.0) is None
+    # A size between two rungs steps to the largest rung still smaller
+    # than it, not the smallest overall.
+    assert _next_smaller_node_cap_tile_size(1800.0) == 1500.0

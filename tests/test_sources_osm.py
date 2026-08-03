@@ -3,6 +3,7 @@ import pytest
 from mapgen.geo import BBox, Tile
 from mapgen.sources.base import NullProgress
 from mapgen.sources.osm import (
+    NodeCapExceededError,
     OsmDownloadError,
     OsmSource,
     RateLimiter,
@@ -178,6 +179,32 @@ def test_node_limit_failure_is_reported_immediately_without_retrying(tmp_path):
             BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
         )
     assert len(source.session.calls) == 1
+
+
+def test_node_limit_failure_is_specifically_a_node_cap_exceeded_error(tmp_path):
+    # Task 19: mapgen.package's whole-run retry needs to tell this failure
+    # apart from any other kind of download failure by TYPE, not by
+    # matching on message text (the same structural-over-textual lesson
+    # the elevation API key redaction work had to learn the hard way).
+    source = _source(
+        [FakeResponse(status_code=400, text="You requested too many nodes")], max_retries=4
+    )
+    with pytest.raises(NodeCapExceededError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+
+
+def test_a_different_400_is_not_a_node_cap_exceeded_error(tmp_path):
+    # The narrow type must not fire on every 400: only the specific,
+    # recognised "too many nodes" body counts as a retryable node-cap
+    # failure.
+    source = _source([FakeResponse(status_code=400, text="Bad request: malformed bbox")] * 4)
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert not isinstance(excinfo.value, NodeCapExceededError)
 
 
 def test_overpass_fetch_issues_a_post_with_the_query_body_and_content_type(tmp_path):

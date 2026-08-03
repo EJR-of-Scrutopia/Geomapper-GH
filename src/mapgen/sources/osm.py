@@ -4,12 +4,21 @@ Standard .osm XML comes from the OSM map API, which caps a request at 50000
 nodes. Overpass is available as an alternative (use_overpass=True), but
 only as a whole-run constructor choice, not an automatic per-tile
 fallback: a tile that exceeds the OSM API's limit fails outright (see
-_download_tile's "too many nodes" branch below) rather than retrying
-against Overpass on its own. Task 18's interface help text was corrected
-to say this plainly after review found the same false "automatic
-fallback" claim here, in the one file that should have been the source
-of truth for it. Both are free public services, so requests are spaced
-out and back off on failure.
+_download_tile's "too many nodes" branch below, which raises
+NodeCapExceededError) rather than retrying against Overpass on its own.
+Task 18's interface help text was corrected to say this plainly after
+review found the same false "automatic fallback" claim here, in the one
+file that should have been the source of truth for it. Both are free
+public services, so requests are spaced out and back off on failure.
+
+Task 19 restored a different kind of retry the superseded script had and
+mapgen initially dropped: on a NodeCapExceededError, mapgen.package's
+run_survey retries the WHOLE run at the next smaller size in a fixed
+ladder (2000, then 1500, then 1000 metres) before giving up. That is
+orchestration, not this module's concern: this module only ever raises
+the one exception type that makes the retry decision possible elsewhere,
+it does not loop or know about tile sizes other than the one it was
+asked to fetch.
 """
 
 from __future__ import annotations
@@ -40,6 +49,23 @@ SECONDS_PER_TILE_ESTIMATE = 14.0
 
 class OsmDownloadError(RuntimeError):
     """Raised when a tile could not be downloaded."""
+
+
+class NodeCapExceededError(OsmDownloadError):
+    """Raised specifically when a tile exceeded the OSM API's 50000-node
+    limit, as distinct from any other download failure.
+
+    A subclass, not a message-text convention: mapgen.package's whole-run
+    retry-at-a-smaller-tile-size logic (Task 19) needs to tell "this tile
+    was too dense, a smaller tile size might clear it" apart from "this
+    tile failed for some other reason a smaller tile size would not fix"
+    (a timeout, a 500, an exhausted retry budget), and matching on
+    isinstance() here is exactly the structural-over-textual discipline
+    the API key redaction work in mapgen.sources.elevation had to learn
+    the hard way: a string match on "50000" or "too many nodes" in some
+    later, differently-worded message is a future regression waiting to
+    happen, in a way a type check is not.
+    """
 
 
 def build_overpass_query(
@@ -252,7 +278,14 @@ class OsmSource:
                 return
 
             if response.status_code == 400 and "too many nodes" in response.text.lower():
-                raise OsmDownloadError(
+                # mapgen.package's run_survey catches NodeCapExceededError
+                # specifically and retries the whole run at the next
+                # smaller size in its own fixed ladder before this message
+                # ever reaches a human; it is the message actually shown
+                # only once that ladder is exhausted, so it still needs to
+                # read correctly on its own at that point, not assume the
+                # reader already knows a retry was attempted.
+                raise NodeCapExceededError(
                     f"Tile {tile.tile_id} exceeded the OSM API 50000-node limit. "
                     f"Reduce the tile size, for example to 1500 or 2000 metres in "
                     f"dense urban areas."

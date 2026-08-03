@@ -240,21 +240,25 @@ not a substitute for reading either.
 ## Limits worth knowing about
 
 **The OSM node cap.** The OSM map API refuses any single request over 50000
-nodes. A tile that dense fails outright, with a message telling you to
-reduce `--tile-size-m` (1500 or 2000 m usually clears it in a dense urban
-core). There is no automatic fallback to Overpass, and no automatic retry at
-a smaller tile size: mapgen fails once, clearly, and leaves the retry to you.
-The old script's `urbano-package` command did retry automatically, silently
-stepping down through 2000, 1500 and 1000 m tiles on this exact failure; that
-behaviour was not carried over. Given mapgen's default tile size is already
-2000 m (down from the old script's 5000 m default, chosen because of this
-same failure mode), it should be rarer to hit in practice, but it can still
-happen in dense areas and now needs a manual `--tile-size-m` on the next
-attempt. `use_overpass=True` remains available as a whole-run constructor
-choice for Python callers, querying Overpass instead of the OSM map API from
-the start, but it is not wired to the CLI or web interface, and it is a
-different, separately-configured run, not a per-tile fallback triggered by
-this failure.
+nodes. A tile that dense automatically retries the *whole run* at the next
+smaller size in a fixed ladder, 2000, then 1500, then 1000 m, matching the
+old superseded script's own behaviour, restored by owner ruling: dense city
+centres are exactly where surveys happen, and a run that stops to wait for a
+manual `--tile-size-m` retry has to be babysat. The whole run retries, not
+just the failing tile, because the fingerprinted work folder makes that safe
+by construction: a different tile size hashes to a different `_work/`
+subfolder, so a retry cannot mix its tiles with the failed attempt's. Each
+retry is announced through the progress log (`[tile_size_retry]
+previous_tile_size_m=... next_tile_size_m=...`), and `survey.json`'s
+`tiling.tile_size_m` records whichever size was actually used, which may be
+smaller than what you asked for. If the smallest size in the ladder still
+fails, or you were already at or below 1000 m, mapgen fails once, clearly,
+with the same message as before, and leaves a further manual retry to you.
+`use_overpass=True` remains available as a whole-run constructor choice for
+Python callers, querying Overpass instead of the OSM map API from the start,
+but it is not wired to the CLI or web interface, and it is a different,
+separately-configured run, not a per-tile fallback triggered by this
+failure.
 
 **Windows path length.** Windows resolves a path at 260 characters by
 default, and this repository's own OneDrive-synced location is already
