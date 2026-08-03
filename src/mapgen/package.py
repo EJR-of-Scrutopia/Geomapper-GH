@@ -6,6 +6,7 @@ individual data source, which is what makes phase 2 additive.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from dataclasses import dataclass, replace
@@ -23,7 +24,7 @@ from mapgen.fsutil import (
     work_dir_scope,
 )
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
-from mapgen.jobs import FAILED, OK, CancelToken, JobState
+from mapgen.jobs import FAILED, OK, CancelToken, Cancelled, JobState
 from mapgen.merge import assert_inputs_present
 from mapgen.naming import (
     PackagePaths,
@@ -79,6 +80,30 @@ class _RetryAtSmallerTileSize(RuntimeError):
     def __init__(self, original: BaseException) -> None:
         super().__init__(str(original))
         self.original = original
+
+
+def _fetch_accepts_cancel(source) -> bool:
+    """Whether source.fetch() accepts the optional `cancel` keyword Task
+    22 adds to the LayerSource protocol.
+
+    fetch() is not an optional extension the way readiness_problem or
+    possible_outputs are (every source has one), only its willingness to
+    be interrupted mid-loop varies, so this cannot be read defensively
+    with a plain getattr the way this module reads those. The three real
+    sources (osm, overture, elevation) all accept `cancel` now; every
+    stub LayerSource this project's own tests define, and any future
+    source that has not been updated yet, does not, and calling
+    fetch(..., cancel=token) against one of those would raise TypeError
+    before a single tile is fetched. Checked once per source per run via
+    inspect.signature, not a try/except TypeError around the real call,
+    so a source that fails on its very first tile for some unrelated
+    reason is never misdiagnosed as "does not accept cancel".
+    """
+    try:
+        params = inspect.signature(source.fetch).parameters
+    except (TypeError, ValueError):
+        return False
+    return "cancel" in params
 
 
 @dataclass(frozen=True)
@@ -149,6 +174,12 @@ class SurveyResult:
     paths: PackagePaths
     complete: bool
     survey: dict[str, object]
+    # Task 22: True only if a Stop request is why this run ends short of
+    # complete, never for an ordinary failure. False (the default) covers
+    # both a genuinely complete run and a force-tolerated failure, exactly
+    # as `complete` alone always did before this field existed; every
+    # existing caller that only reads `.complete` is unaffected.
+    stopped: bool = False
 
 
 def register_default_sources() -> None:
@@ -243,10 +274,21 @@ def _configured_sources(request: SurveyRequest) -> list:
 
 
 def _geometry_summary(bbox: BBox, tiles: Sequence[Tile]) -> dict[str, object]:
-    """Tile count, rows, cols and extent: the numbers that need nothing
-    about naming or where output will land, shared verbatim by
-    estimate_survey and estimate_geometry so this tiling arithmetic is
-    written exactly once.
+    """Tile count, rows, cols, extent and the tile grid itself: the
+    numbers that need nothing about naming or where output will land,
+    shared verbatim by estimate_survey and estimate_geometry so this
+    tiling arithmetic is written exactly once.
+
+    tile_grid (Task 22) is the actual rectangle build_tiles computed for
+    each tile, keyed by the same tile_id progress events already carry,
+    so the browser can draw the real tiling on the map instead of a
+    number and shade a rectangle from a tile_id it never had to
+    recompute itself. core_bbox, not query_bbox: core_bbox is the
+    non-overlapping grid that actually tiles the extent edge to edge,
+    which is what "the same grid the pipeline is using" reads as on a
+    map; query_bbox tiles deliberately overlap their neighbours (see
+    geo.build_tiles), and drawing those instead would show overlapping
+    rectangles that do not visually tile anything.
     """
     width_m, height_m = extent_metres(bbox)
     return {
@@ -254,6 +296,9 @@ def _geometry_summary(bbox: BBox, tiles: Sequence[Tile]) -> dict[str, object]:
         "rows": max((t.row for t in tiles), default=0) + 1,
         "cols": max((t.col for t in tiles), default=0) + 1,
         "extent_km": {"width": width_m / 1000.0, "height": height_m / 1000.0},
+        "tile_grid": [
+            {"tile_id": t.tile_id, **t.core_bbox.to_dict()} for t in tiles
+        ],
     }
 
 
@@ -417,19 +462,49 @@ def _run_survey_once(
     ensure_dir(paths.work_dir)
 
     outputs_by_source: dict[str, list[Path]] = {}
+    # Task 22: true once a Stop request has been noticed, at any of three
+    # checkpoints (between sources, mid-fetch inside a source that accepts
+    # `cancel`, or between the last source and the bridge). A stop is a
+    # deliberate, honest partial, never treated like a failure from here
+    # on: whatever was already fetched is still merged below (see the
+    # Cancelled branch), no further source is attempted, the bridge is
+    # skipped, and the stale-output sweep never runs against a package
+    # this incomplete on purpose. See _build_survey_json for how this is
+    # told apart from an ordinary failure in survey.json.
+    stopped = False
 
     # The scope always keeps the directory. Removal is decided after the job,
     # by completeness, so a partial run can always be resumed.
     with work_dir_scope(paths.work_dir, keep=True):
         for source in sources:
-            token.raise_if_cancelled()
+            if token.is_cancelled():
+                # Noticed before this source ever started: nothing of
+                # its own to merge, and every source after it is skipped
+                # too. Earlier sources in this same run already merged
+                # in their own iteration below and are untouched.
+                stopped = True
+                break
             source_work = paths.work_dir / "raw" / source.id
             ensure_dir(source_work)
             pending = [t for t in tiles if not state.is_done(t.tile_id, source.id)]
             fetch_succeeded = False
+            fetch_kwargs = {"cancel": token} if _fetch_accepts_cancel(source) else {}
             try:
-                source.fetch(request.bbox, pending, source_work, sink)
+                source.fetch(request.bbox, pending, source_work, sink, **fetch_kwargs)
                 fetch_succeeded = True
+            except Cancelled:
+                # The same shape as the Urbano bridge fix (Task 20): real
+                # work completed, and it must not be discarded because
+                # one step was interrupted. Unlike the generic failure
+                # branch below, this is never a reason to re-raise
+                # regardless of request.force: whatever this source's own
+                # fetch() already wrote to disk before noticing the stop
+                # (every tile whose in-flight request was allowed to
+                # finish; see the LayerSource protocol's own cancel
+                # convention) is merged below exactly like a force-
+                # tolerated partial fetch, and the loop stops after it,
+                # never attempting a further source.
+                stopped = True
             except Exception as exc:
                 sink.emit("source_failed", source=source.id, error=str(exc))
                 # A node-cap failure with a smaller size still to try is
@@ -449,7 +524,7 @@ def _run_survey_once(
                     and _next_smaller_node_cap_tile_size(request.tile_size_m) is not None
                 ):
                     _record_tile_outcomes(
-                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids
+                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids, sink
                     )
                     raise _RetryAtSmallerTileSize(exc) from exc
                 if not request.force:
@@ -458,7 +533,7 @@ def _run_survey_once(
                     # that already succeeded, or the next resume would redo
                     # work that was already done.
                     _record_tile_outcomes(
-                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids
+                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids, sink
                     )
                     raise
 
@@ -471,22 +546,41 @@ def _run_survey_once(
             parts = _existing_output_files(source_work, current_tile_ids)
 
             # Refuse to merge a tile set with holes unless the caller forced
-            # it. Per-tile status is recorded only once this has run, or been
-            # attempted, so a file fetch() claimed but never materialised is
-            # never marked ok on the strength of fetch() alone.
+            # it, or the run was stopped: a stop tolerates a partial tile
+            # set for the same reason force does (whatever is missing is
+            # missing on purpose, not because anything is broken), so it
+            # is treated the same way here rather than needing its own
+            # separate leniency check.
             try:
-                parts = assert_inputs_present(parts, force=request.force)
+                parts = assert_inputs_present(parts, force=request.force or stopped)
             finally:
                 _record_tile_outcomes(
-                    state, source.id, pending, source_work, fetch_succeeded, current_tile_ids
+                    state, source.id, pending, source_work, fetch_succeeded, current_tile_ids, sink
                 )
             merged = source.merge(parts, paths.root, paths.stem)
             outputs_by_source[source.id] = merged
             sink.emit("source_done", source=source.id, outputs=[p.name for p in merged])
 
+            if stopped:
+                # This source's own partial output is merged above; no
+                # further source is attempted once a stop has landed.
+                break
+
+        if not stopped and token.is_cancelled():
+            # Cancelled between the last source finishing and this check:
+            # the same checkpoint this always had before the bridge step,
+            # resolved the same way as every other stop rather than
+            # raising past this point.
+            stopped = True
+
         layer_files = _write_layer_files(outputs_by_source, paths)
 
-        if state.complete:
+        # Never on a stopped run, whatever state.complete happens to say:
+        # a stop is a deliberate, honest partial (see _sweep_stale_
+        # outputs's own docstring on why an incomplete run is never swept),
+        # and sweeping it risks removing a merged file a resume would
+        # still want to find sitting in the root next time.
+        if state.complete and not stopped:
             produced = {
                 merged.resolve()
                 for outputs in outputs_by_source.values()
@@ -502,11 +596,18 @@ def _run_survey_once(
         # package is still finished. See Task 20 finding 1: on the owner's
         # machine, with no Urbano installed, this branch fails on every
         # single run, and it used to take the whole survey down with it.
-        bridge_attempted = request.run_bridge_step
+        #
+        # Never attempted on a stopped run (Task 22): the owner asked this
+        # run to stop, and starting another external process, on data that
+        # may itself be partial, works against "stop must actually stop,
+        # promptly" for no benefit a subsequent resume does not already
+        # provide once the survey data itself is complete. Recorded the
+        # same honest way a --skip-bridge run already is: attempted=False,
+        # ok=None, not a fabricated failure.
+        bridge_attempted = request.run_bridge_step and not stopped
         bridge_ok: bool | None = None
         bridge_error: str | None = None
-        if request.run_bridge_step:
-            token.raise_if_cancelled()
+        if bridge_attempted:
             sink.emit("bridge_started")
             osm_outputs = outputs_by_source.get("osm", [])
             elevation_outputs = outputs_by_source.get("elevation", [])
@@ -538,10 +639,19 @@ def _run_survey_once(
                 sink.emit("bridge_done")
 
     survey = _build_survey_json(
-        request, paths, tiles, sources, state, started_at, bridge_attempted, bridge_ok, bridge_error
+        request,
+        paths,
+        tiles,
+        sources,
+        state,
+        started_at,
+        bridge_attempted,
+        bridge_ok,
+        bridge_error,
+        stopped,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
-    sink.emit("job_finished", complete=state.complete, root=str(paths.root))
+    sink.emit("job_finished", complete=state.complete, stopped=stopped, root=str(paths.root))
 
     # Removed only on a clean, complete run. A failed or partial job keeps its
     # tiles, because that is what makes the next run resume rather than restart.
@@ -549,10 +659,16 @@ def _run_survey_once(
     # subdirectory: a complete root is never reused (a later request lands on
     # a fresh _02), so a sibling tiling's abandoned scratch tree left inside
     # _work/ would otherwise survive forever with nothing left to remove it.
+    #
+    # Gated on state.complete alone, not also on stopped: if every tile
+    # genuinely did finish (state.complete is True) despite a stop landing
+    # right at the end (only the bridge step was actually skipped), there
+    # is nothing left to resume, and _work/ is dead weight exactly as it
+    # would be on any other complete run.
     if state.complete and not request.keep_work:
         best_effort_rmtree(paths.work_dir.parent)
 
-    return SurveyResult(paths=paths, complete=state.complete, survey=survey)
+    return SurveyResult(paths=paths, complete=state.complete, survey=survey, stopped=stopped)
 
 
 _TILE_ID_SHAPE = re.compile(r"^r\d+_c\d+$")
@@ -596,9 +712,23 @@ def _record_tile_outcomes(
     source_work: Path,
     fetch_succeeded: bool,
     current_tile_ids: Sequence[str],
+    sink: ProgressSink,
 ) -> None:
     """Mark each pending tile from what is actually on disk, not from
     whether the batch fetch() call raised.
+
+    Also emits a tile_failed progress event for every tile this call
+    resolves to FAILED (Task 22), whatever the reason: an ordinary
+    per-tile error, a source that never got its turn because the run was
+    stopped first, or a stop that landed mid-source and left some of its
+    tiles untouched. This is deliberately the ONE place that decides a
+    tile has failed, since it is the one place that already has to reason
+    about what is genuinely on disk rather than trust a batch call's own
+    return value; the browser's tile grid reads this event to show a
+    failed tile as visibly distinct from one that is merely still
+    pending, which matters more here than for the other three grid
+    states, since it is the one the owner would want to know about before
+    deciding they have enough.
 
     fetch() is one Python call for potentially many tiles: it either returns
     once for all of them or raises once for all of them, which says nothing
@@ -644,6 +774,8 @@ def _record_tile_outcomes(
         else:
             status = FAILED
         state.mark(tile.tile_id, source_id, status)
+        if status == FAILED:
+            sink.emit("tile_failed", source=source_id, tile_id=tile.tile_id)
 
 
 def _write_layer_files(
@@ -755,6 +887,7 @@ def _build_survey_json(
     bridge_attempted,
     bridge_ok,
     bridge_error,
+    stopped,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     return {
@@ -803,6 +936,22 @@ def _build_survey_json(
         # different questions and an owner reading this file deserves a
         # straight answer to each.
         "complete": state.complete,
+        # stopped (Task 22) is what tells "short because the owner said
+        # so" apart from "short because something broke", the distinction
+        # complete alone cannot make: it was always a bool covering both
+        # "finished" and "something failed", and a deliberate stop is
+        # neither. True only when a Stop request is the reason this run
+        # ends with complete: false; never true for an ordinary tile
+        # failure (with or without --force), and never true once complete
+        # is true (a stop noticed only after every tile had already
+        # genuinely finished has nothing left to be honest about here,
+        # see run_survey's own handling of that exact race). Read this
+        # alongside `tiles`, which already carries the true per-tile
+        # picture this field is a one-word summary of: complete=false,
+        # stopped=true, some tiles "failed" is not a contradiction, it is
+        # this file correctly saying which tiles the stop caught before
+        # they were reached.
+        "stopped": stopped,
         "bridge": {
             "attempted": bridge_attempted,
             "ok": bridge_ok,

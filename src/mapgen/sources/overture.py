@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 
 from mapgen.fsutil import ensure_dir
 from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken
 from mapgen.merge import merge_geojson
 from mapgen.procutil import run_hidden
 from mapgen.sources.base import Estimate, ProgressSink
@@ -119,10 +120,19 @@ class OvertureSource:
         tiles: Sequence[Tile],
         work_dir: Path,
         progress: ProgressSink,
+        cancel: CancelToken | None = None,
     ) -> list[Path]:
         paths: list[Path] = []
         for tile in tiles:
             for overture_type in self.types:
+                # Checked before each (tile, type) request, the finest
+                # unit of paid-for work this source has: a tile is never
+                # interrupted mid-type, and since Overture fetches every
+                # type for a tile before moving to the next tile, this
+                # still guarantees a stop lands within the tile it was
+                # asked to stop within, never spilling into a later one.
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
                 output_path = work_dir / overture_type / f"{tile.tile_id}.geojson"
                 if output_path.exists() and output_path.stat().st_size > 0:
                     progress.emit(

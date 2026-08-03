@@ -184,11 +184,34 @@ class JobManager:
                     request, progress=record.log, cancel=record.cancel
                 )
                 record.result_root = str(result.paths.root)
-                record.state = "done" if result.complete else "failed"
-                if not result.complete:
+                # Task 22: a stopped run is neither "done" (it may be
+                # missing tiles) nor "failed" (nothing broke; the owner
+                # asked for this). run_survey() itself now merges whatever
+                # it has and writes a truthful survey.json before ever
+                # returning, so by the time this reads result.stopped the
+                # package on disk already matches whichever state this
+                # sets. Checked before result.complete, not after: a run
+                # that happened to finish every tile right as the stop
+                # landed (result.complete True and result.stopped True at
+                # once, see run_survey's own handling of that race) is
+                # still reported as done, since there is nothing short
+                # about the data in that case, only the bridge step was
+                # skipped.
+                if result.complete:
+                    record.state = "done"
+                elif result.stopped:
+                    record.state = "stopped"
+                else:
+                    record.state = "failed"
                     record.error = "Some tiles failed. See survey.json."
             except Cancelled:
-                record.state = "cancelled"
+                # Defensive only: run_survey() now catches Cancelled
+                # itself at every checkpoint and returns a normal
+                # SurveyResult with stopped=True instead of raising it, so
+                # this should never actually fire. Kept, and reported the
+                # same way as the ordinary path above, in case a future
+                # change to run_survey ever reopens a gap where it does.
+                record.state = "stopped"
             except Exception as exc:
                 record.state = "failed"
                 record.error = str(exc)

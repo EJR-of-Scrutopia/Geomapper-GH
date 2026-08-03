@@ -157,6 +157,32 @@ def test_fetch_reuses_an_existing_tiff(tmp_path):
     assert session.calls == []
 
 
+# --- Task 22: fetch()'s optional `cancel` parameter -------------------
+#
+# Elevation has no per-tile loop (one whole-area request, see the module
+# docstring), so the only meaningful checkpoint is before that single
+# request starts.
+
+
+def test_fetch_with_no_cancel_argument_behaves_exactly_as_before(tmp_path):
+    session = FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    paths = ElevationSource(api_key="k", session=session).fetch(BBOX, [], tmp_path, NullProgress())
+    assert paths[0].read_bytes() == TIFF_LITTLE_ENDIAN
+
+
+def test_fetch_stops_before_the_request_when_already_cancelled(tmp_path):
+    from mapgen.jobs import CancelToken
+
+    token = CancelToken()
+    token.cancel()
+    session = FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    with pytest.raises(Cancelled):
+        ElevationSource(api_key="k", session=session).fetch(
+            BBOX, [], tmp_path, NullProgress(), cancel=token
+        )
+    assert session.calls == []
+
+
 def test_fetch_handles_http_errors(tmp_path):
     session = FakeSession(FakeStreamResponse([b"Server error"], status_code=500))
     source = ElevationSource(api_key="k", session=session)

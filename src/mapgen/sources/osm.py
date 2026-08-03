@@ -48,6 +48,7 @@ import requests
 from mapgen.categories import osm_tag_clauses
 from mapgen.fsutil import atomic_write_text
 from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken
 from mapgen.merge import merge_osm_xml
 from mapgen.sources.base import Estimate, ProgressSink
 
@@ -298,9 +299,18 @@ class OsmSource:
         tiles: Sequence[Tile],
         work_dir: Path,
         progress: ProgressSink,
+        cancel: CancelToken | None = None,
     ) -> list[Path]:
         paths: list[Path] = []
         for tile in tiles:
+            # Checked at the top of the loop, before this tile's own
+            # request starts, not after: a tile already in flight is paid
+            # for and always allowed to finish (see the LayerSource
+            # protocol's own docstring on this). Cancelled propagates
+            # straight out of fetch(); package.py's own per-source loop is
+            # what catches it and merges whatever tiles already landed.
+            if cancel is not None:
+                cancel.raise_if_cancelled()
             output_path = work_dir / f"{tile.tile_id}.osm"
             if output_path.exists() and output_path.stat().st_size > 0:
                 progress.emit("tile_skipped", source=self.id, tile_id=tile.tile_id)

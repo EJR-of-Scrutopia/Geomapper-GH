@@ -1,6 +1,7 @@
 import pytest
 
 from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken, Cancelled
 from mapgen.sources.base import NullProgress
 from mapgen.sources.osm import (
     NodeCapExceededError,
@@ -129,6 +130,56 @@ def test_fetch_emits_progress_per_tile(tmp_path):
     source = _source([FakeResponse()])
     source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, Recorder())
     assert "tile_done" in events
+
+
+# --- Task 22: fetch()'s optional `cancel` parameter ------------------
+
+
+def test_fetch_with_no_cancel_argument_behaves_exactly_as_before(tmp_path):
+    # The optional-extension convention only works if omitting the
+    # argument entirely is indistinguishable from the pre-Task-22 shape.
+    source = _source([FakeResponse()])
+    paths = source.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    assert paths[0].read_text(encoding="utf-8") == OSM_XML
+
+
+def test_fetch_stops_before_the_first_tile_when_already_cancelled(tmp_path):
+    token = CancelToken()
+    token.cancel()
+    source = _source([FakeResponse()])  # a request would raise IndexError
+    with pytest.raises(Cancelled):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress(), cancel=token
+        )
+    assert source.session.calls == []
+
+
+def test_fetch_stops_within_one_tile_once_cancelled_mid_loop(tmp_path):
+    # Models a Stop click landing on the server the instant tile 0's own
+    # request finishes, before tile 1 starts: the in-flight tile (r00_c00)
+    # is paid for and kept, the next one (r00_c01) never starts.
+    token = CancelToken()
+
+    class CancellingSession(FakeSession):
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            token.cancel()
+            return response
+
+    source = OsmSource(
+        session=CancellingSession([FakeResponse(), FakeResponse()]),
+        sleeper=lambda _seconds: None,
+        min_interval_seconds=0.0,
+    )
+    tiles = [_tile("r00_c00"), _tile("r00_c01")]
+    with pytest.raises(Cancelled):
+        source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), tiles, tmp_path, NullProgress(), cancel=token)
+
+    assert (tmp_path / "r00_c00.osm").read_text(encoding="utf-8") == OSM_XML
+    assert not (tmp_path / "r00_c01.osm").exists()
+    assert len(source.session.calls) == 1, "expected only the in-flight tile's own request"
 
 
 def test_fetch_skips_a_tile_that_is_already_downloaded(tmp_path):

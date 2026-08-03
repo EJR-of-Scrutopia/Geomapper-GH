@@ -546,7 +546,7 @@ def test_extent_endpoint_returns_tile_geometry_with_no_region_site_or_output_roo
         {"bbox": "-3.29,51.38,-3.28,51.39", "tile_size_m": 600, "overlap_m": 50},
     )
     assert status == 200
-    assert set(payload) == {"tiles", "rows", "cols", "extent_km"}
+    assert set(payload) == {"tiles", "rows", "cols", "extent_km", "tile_grid"}
     # Review round 1: "tiles >= 1" alone survives _geometry_summary
     # returning len(tiles) + 1, or rows/cols swapped, or any other
     # off-by-something. This exact bbox/tile_size/overlap combination is
@@ -556,6 +556,17 @@ def test_extent_endpoint_returns_tile_geometry_with_no_region_site_or_output_roo
     assert payload["tiles"] == 4
     assert payload["rows"] == 2
     assert payload["cols"] == 2
+    # Task 22: the tile grid the browser draws on the map, keyed by the
+    # same tile_id progress events carry, so it never has to recompute
+    # the geometry itself and cannot disagree with the server about it.
+    assert {entry["tile_id"] for entry in payload["tile_grid"]} == {
+        "r00_c00",
+        "r00_c01",
+        "r01_c00",
+        "r01_c01",
+    }
+    for entry in payload["tile_grid"]:
+        assert {"tile_id", "west", "south", "east", "north"} == set(entry)
 
 
 def test_extent_endpoint_defaults_tile_size_and_overlap_like_estimate_does(server):
@@ -952,10 +963,16 @@ def test_cancelling_an_unknown_job_returns_404(server):
 
 
 def test_cancel_endpoint_stops_a_running_job(server, tmp_path):
-    # run_survey only checks for cancellation between sources (and once more
-    # before the bridge step), never mid-fetch. Two sources make this
-    # deterministic: cancel while "blocking" is stuck in fetch(), release it,
-    # and the cancellation is guaranteed to be observed before "stub" starts.
+    # run_survey only checks for cancellation between sources (BlockingSource
+    # itself has no `cancel` parameter, so it cannot be interrupted mid-
+    # fetch; see CancelAwareStubSource in test_package.py for that case).
+    # Two sources make this deterministic: cancel while "blocking" is stuck
+    # in fetch(), release it, and the cancellation is guaranteed to be
+    # observed before "stub" starts.
+    #
+    # Task 22: a stop must leave a usable, truthful package, not just end
+    # the job. "blocking"'s own tile really did finish and is really
+    # merged; "stub" never started and survey.json says so honestly.
     blocking = BlockingSource()
     register(blocking)
 
@@ -981,7 +998,19 @@ def test_cancel_endpoint_stops_a_running_job(server, tmp_path):
 
     blocking.release.set()
     final = _wait_for_state(server, job_id)
-    assert final["state"] == "cancelled"
+    assert final["state"] == "stopped"
+    assert final["error"] is None
+
+    result_root = Path(final["result_root"])
+    assert (result_root / "blocking.txt").is_file(), (
+        "expected the source that finished before the stop to be merged into the package"
+    )
+    assert not (result_root / "stub.txt").exists(), (
+        "expected the source that never got a turn to have produced nothing"
+    )
+    survey_json = json.loads((result_root / "survey.json").read_text(encoding="utf-8"))
+    assert survey_json["complete"] is False
+    assert survey_json["stopped"] is True
 
 
 def test_a_malformed_job_path_returns_404_rather_than_crashing(server):

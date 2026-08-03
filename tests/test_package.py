@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from mapgen.geo import BBox
-from mapgen.jobs import CancelToken, Cancelled, EventLog, JobState
+from mapgen.geo import BBox, build_tiles
+from mapgen.jobs import CancelToken, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
     SurveyRequest,
@@ -504,6 +504,7 @@ def test_estimate_geometry_matches_estimate_survey_for_the_same_inputs(tmp_path)
         "rows": survey_estimate["rows"],
         "cols": survey_estimate["cols"],
         "extent_km": survey_estimate["extent_km"],
+        "tile_grid": survey_estimate["tile_grid"],
     }
 
 
@@ -520,6 +521,33 @@ def test_estimate_geometry_reports_the_exact_known_tile_count_and_grid():
     assert geometry["tiles"] == 4
     assert geometry["rows"] == 2
     assert geometry["cols"] == 2
+
+
+# --- Task 22: /api/extent's tile_grid, so the browser can draw the actual
+# tiling as rectangles instead of a number ---------------------------------
+
+
+def test_tile_grid_has_one_entry_per_tile_keyed_by_the_same_tile_id_progress_events_use():
+    geometry = estimate_geometry(BBOX, 600.0, 50.0)
+    tile_ids = {entry["tile_id"] for entry in geometry["tile_grid"]}
+    assert tile_ids == {"r00_c00", "r00_c01", "r01_c00", "r01_c01"}
+    assert len(geometry["tile_grid"]) == geometry["tiles"]
+
+
+def test_tile_grid_entries_carry_the_core_non_overlapping_bounds():
+    # core_bbox, not query_bbox: the grid on the map is meant to tile the
+    # extent edge to edge, which is core_bbox's job (see build_tiles).
+    # query_bbox tiles deliberately overlap their neighbours, and drawing
+    # those instead would show rectangles that overlap rather than tile.
+    tiles = build_tiles(BBOX, 600.0, 50.0)
+    geometry = estimate_geometry(BBOX, 600.0, 50.0)
+    by_id = {entry["tile_id"]: entry for entry in geometry["tile_grid"]}
+    for tile in tiles:
+        entry = by_id[tile.tile_id]
+        assert entry["west"] == tile.core_bbox.to_dict()["west"]
+        assert entry["south"] == tile.core_bbox.to_dict()["south"]
+        assert entry["east"] == tile.core_bbox.to_dict()["east"]
+        assert entry["north"] == tile.core_bbox.to_dict()["north"]
 
 
 def test_estimate_geometry_needs_no_region_site_or_output_root():
@@ -902,12 +930,265 @@ def test_progress_events_reach_the_sink(tmp_path):
     assert any(e["event"] == "job_finished" for e in log.events)
 
 
-def test_cancellation_stops_the_job(tmp_path):
+def test_cancellation_before_any_source_starts_stops_the_job_without_raising(tmp_path):
+    # Task 22: this used to raise Cancelled straight out of run_survey,
+    # which JobManager's worker caught and turned into a bare "cancelled"
+    # state with no survey.json and no merged output at all (see the
+    # brief). A stop must instead behave like the Urbano bridge fix
+    # (Task 20): return a normal SurveyResult, with the honest, resumable
+    # package that implies.
     register(StubSource())
     token = CancelToken()
     token.cancel()
-    with pytest.raises(Cancelled):
-        run_survey(_request(tmp_path), cancel=token)
+    result = run_survey(_request(tmp_path), cancel=token)
+    assert result.stopped is True
+    assert result.complete is False
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["stopped"] is True
+    assert payload["complete"] is False
+    # Nothing was ever fetched: the token was already cancelled before
+    # the source's own turn even began, so _record_tile_outcomes never
+    # ran for it and every tile is honestly still "pending", never
+    # silently "ok" and never "failed" either (which would claim an
+    # attempt was made when none was).
+    assert all(record["stub"] == "pending" for record in payload["tiles"])
+
+
+# --- Task 22: a source whose fetch() accepts the optional `cancel`
+# keyword and checks it between tiles, exactly the convention
+# sources/base.py documents for the three real sources. Cancels the
+# token itself right after its first tile finishes, which is enough to
+# prove run_survey's own handling of a Cancelled raised mid-fetch without
+# needing a second thread: this is a synchronous, single-threaded test,
+# so nothing else could cancel the token WHILE fetch() is running except
+# fetch() itself choosing to, which is exactly what a real Stop click
+# racing a real network call looks like from this function's point of
+# view. ----------------------------------------------------------------
+
+
+class CancelAwareStubSource:
+    id = "stub"
+    display_name = "Stub Cancel Aware"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self):
+        self.fetched_tile_ids: list[str] = []
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100 * len(tiles), seconds_estimate=1.0 * len(tiles))
+
+    def fetch(self, bbox, tiles, work_dir, progress, cancel=None):
+        for index, tile in enumerate(tiles):
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
+            self.fetched_tile_ids.append(tile.tile_id)
+            if index == 0 and cancel is not None:
+                # Models a Stop click landing the instant tile 0's own
+                # "request" finishes: tile 0 is paid for and kept, tile 1
+                # never starts.
+                cancel.cancel()
+        return [work_dir / f"{tile.tile_id}.txt" for tile in tiles]
+
+    def merge(self, parts, out_dir, stem):
+        out = out_dir / f"{self.id}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            "\n".join(p.read_text(encoding="utf-8") for p in parts), encoding="utf-8"
+        )
+        return [out]
+
+
+def test_cancellation_reaches_the_per_tile_loop_and_stops_within_one_tile(tmp_path):
+    source = CancelAwareStubSource()
+    register(source)
+    log = EventLog()
+    result = run_survey(_request(tmp_path), progress=log)
+
+    # Only the tile in flight when the stop landed was fetched: the loop
+    # never even started a second tile, let alone all four.
+    assert source.fetched_tile_ids == ["r00_c00"]
+    assert result.stopped is True
+    assert result.complete is False
+
+
+def test_a_stopped_run_merges_the_tile_it_has_and_writes_a_truthful_survey_json(tmp_path):
+    source = CancelAwareStubSource()
+    register(source)
+    result = run_survey(_request(tmp_path))
+
+    # The merged output on disk is real and usable, not empty and not
+    # discarded: exactly the "Grasshopper can read it" bar the brief sets.
+    merged_text = (result.paths.root / "stub.txt").read_text(encoding="utf-8")
+    assert merged_text == "r00_c00"
+
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["complete"] is False
+    assert payload["stopped"] is True
+    records = {record["tile_id"]: record["stub"] for record in payload["tiles"]}
+    # The tile actually fetched says so; the three the stop caught before
+    # they were reached say so too, truthfully, not "ok".
+    assert records["r00_c00"] == "ok"
+    assert records["r00_c01"] == "failed"
+    assert records["r01_c00"] == "failed"
+    assert records["r01_c01"] == "failed"
+
+
+def test_a_stopped_run_emits_tile_failed_for_every_tile_it_never_reached(tmp_path):
+    source = CancelAwareStubSource()
+    register(source)
+    log = EventLog()
+    run_survey(_request(tmp_path), progress=log)
+    failed_tile_ids = {e["tile_id"] for e in log.events if e["event"] == "tile_failed"}
+    assert failed_tile_ids == {"r00_c01", "r01_c00", "r01_c01"}
+
+
+def test_a_stopped_run_does_not_sweep_stale_outputs(tmp_path):
+    # Mirrors test_an_incomplete_run_keeps_every_leftover: a stop is
+    # exactly the same kind of incomplete-on-purpose run that must never
+    # trigger the sweep, whatever state.complete happens to say.
+    class CancelAwareSweepingStubSource(CancelAwareStubSource):
+        def possible_outputs(self, stem):
+            return [f"{self.id}.txt", f"{stem}_water.geojson", "layers/water.geojson"]
+
+    register(CancelAwareSweepingStubSource())
+    root, stem = _root_with_leftovers(tmp_path)
+    result = run_survey(_request(tmp_path))
+    assert result.stopped is True
+    assert (root / f"{stem}_water.geojson").exists()
+    assert (root / "layers" / "water.geojson").exists()
+
+
+def test_a_stopped_run_skips_the_bridge_and_records_it_honestly(tmp_path):
+    source = CancelAwareStubSource()
+    register(source)
+    log = EventLog()
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        progress=log,
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+    assert result.stopped is True
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["bridge"] == {"attempted": False, "ok": None, "error": None}
+    assert not any(e["event"] in ("bridge_started", "bridge_done", "bridge_failed") for e in log.events)
+
+
+def test_a_stopped_run_keeps_work_dir_and_a_resume_completes_it(tmp_path):
+    source = CancelAwareStubSource()
+    register(source)
+    first = run_survey(_request(tmp_path))
+    assert first.stopped is True
+    assert first.paths.work_dir.is_dir(), "expected _work/ kept so the job can resume"
+
+    # A fresh, uncancelled request over the exact same extent resumes
+    # rather than restarts: the one tile already fetched is never asked
+    # for again, and the package finishes. A plain StubSource here, not
+    # another CancelAwareStubSource: that class cancels itself after
+    # whatever tile it sees first, which on a resume is r00_c01 (the
+    # first tile still PENDING), not r00_c00, and would cut this second
+    # run short again for a reason that has nothing to do with what this
+    # test is actually proving.
+    second_source = StubSource()
+    clear_registry()
+    register(second_source)
+    second = run_survey(_request(tmp_path))
+
+    assert second.paths.root == first.paths.root
+    assert second.complete is True
+    assert second.stopped is False
+    merged_text = (second.paths.root / "stub.txt").read_text(encoding="utf-8")
+    for tile_id in ("r00_c00", "r00_c01", "r01_c00", "r01_c01"):
+        assert tile_id in merged_text
+    payload = json.loads(second.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["complete"] is True
+    assert payload["stopped"] is False
+
+
+class LegacyNoCancelStubSource(StubSource):
+    """Predates Task 22: fetch(bbox, tiles, work_dir, progress), no
+    `cancel` parameter at all. Cancels the very token package.py is using
+    itself, via a reference handed to the constructor directly (never
+    through fetch()'s own signature, which is the whole point), to model
+    "the owner pressed Stop while this old, unmodified source was already
+    running". Finishes fetching every one of its own tiles regardless,
+    since a source shaped like this has no way to notice mid-loop: the
+    between-sources checkpoint in package.py is the only one available to
+    it, and this proves that checkpoint alone is enough to stop the run
+    (never attempting the source after it) without needing every source
+    to have been updated.
+    """
+
+    def __init__(self, token, source_id="stub"):
+        super().__init__(source_id=source_id)
+        self._token = token
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        result = super().fetch(bbox, tiles, work_dir, progress)
+        self._token.cancel()
+        return result
+
+
+def test_a_source_with_no_cancel_parameter_still_stops_the_run_between_sources(tmp_path):
+    token = CancelToken()
+    first_source = LegacyNoCancelStubSource(token, source_id="first")
+    second_source = StubSource(source_id="second")
+    register(first_source)
+    register(second_source)
+    result = run_survey(
+        _request(tmp_path, source_ids=("first", "second")), cancel=token
+    )
+
+    assert result.stopped is True
+    assert result.complete is False
+    # The legacy source finished every one of its own tiles (it had no
+    # way to stop mid-loop) and its output is genuinely merged.
+    assert (result.paths.root / "first.txt").is_file()
+    merged_first = (result.paths.root / "first.txt").read_text(encoding="utf-8")
+    for tile_id in ("r00_c00", "r00_c01", "r01_c00", "r01_c01"):
+        assert tile_id in merged_first
+    # The second source never started at all: the between-sources check
+    # caught the cancellation the legacy source itself triggered. Its
+    # tiles are honestly "pending" (never attempted), not "failed" (which
+    # would claim an attempt was made and came up short).
+    assert not (result.paths.root / "second.txt").exists()
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    second_records = {r["tile_id"]: r["second"] for r in payload["tiles"]}
+    assert all(status == "pending" for status in second_records.values())
+
+
+def test_a_stop_noticed_only_after_every_tile_genuinely_finished_still_skips_the_sweep(
+    tmp_path,
+):
+    # The one edge case where state.complete and stopped are BOTH true at
+    # once: a single source that finishes every tile normally (no
+    # exception anywhere, so state.complete is genuinely True), but flips
+    # the token to cancelled right as its own fetch() returns, landing
+    # exactly in the gap between the last source finishing and
+    # run_survey's own post-loop cancellation check. This is the case the
+    # brief's "do not sweep on a stopped run" is explicit about even
+    # though the data is not actually short: the sweep is skipped
+    # regardless of what state.complete says, deferred to a later,
+    # ordinary run rather than risking removing something a resume might
+    # still want (see _run_survey_once's own comment on this).
+    class SweepingLegacyNoCancelStubSource(LegacyNoCancelStubSource):
+        def possible_outputs(self, stem):
+            return [f"{self.id}.txt", f"{stem}_water.geojson", "layers/water.geojson"]
+
+    token = CancelToken()
+    register(SweepingLegacyNoCancelStubSource(token))
+    root, stem = _root_with_leftovers(tmp_path)
+    result = run_survey(_request(tmp_path), cancel=token)
+
+    assert result.complete is True, "expected every tile to have genuinely finished"
+    assert result.stopped is True, "expected the post-loop checkpoint to catch the cancellation"
+    assert (root / f"{stem}_water.geojson").exists(), "the sweep must not have run"
+    assert (root / "layers" / "water.geojson").exists()
 
 
 def test_coordinate_stem_option_uses_the_coordinate_form(tmp_path):

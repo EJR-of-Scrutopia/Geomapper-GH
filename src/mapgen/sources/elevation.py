@@ -21,7 +21,7 @@ import requests
 from mapgen.config import load_config
 from mapgen.fsutil import atomic_write_bytes
 from mapgen.geo import BBox, Tile, extent_metres
-from mapgen.jobs import Cancelled
+from mapgen.jobs import CancelToken, Cancelled
 from mapgen.sources.base import Estimate, ProgressSink
 
 DEFAULT_OPENTOPOGRAPHY_URL = "https://portal.opentopography.org/API/globaldem"
@@ -411,7 +411,17 @@ class ElevationSource:
         tiles: Sequence[Tile],
         work_dir: Path,
         progress: ProgressSink,
+        cancel: CancelToken | None = None,
     ) -> list[Path]:
+        # Elevation has no per-tile loop to check between iterations of
+        # (see the module docstring: one whole-area request, not one per
+        # tile), so the only meaningful checkpoint is before that single
+        # request starts. Checked before the already-downloaded skip
+        # branch too: a resumed, already-satisfied elevation fetch costs
+        # nothing either way, but a stop requested while this source is
+        # merely next in line should not start a slow DEM download at all.
+        if cancel is not None:
+            cancel.raise_if_cancelled()
         output_path = work_dir / OUTPUT_NAME
         if output_path.exists() and output_path.stat().st_size > 0:
             progress.emit("tile_skipped", source=self.id, tile_id="whole-area")

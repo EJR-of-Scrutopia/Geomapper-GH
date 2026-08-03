@@ -3,6 +3,7 @@ import json
 import pytest
 
 from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken, Cancelled
 from mapgen.sources.base import NullProgress
 from mapgen.sources.overture import (
     DEFAULT_OVERTURE_TYPES,
@@ -134,6 +135,54 @@ def test_fetch_calls_the_cli_once_per_tile_and_type(tmp_path):
     )
     assert len(runner.commands) == 4
     assert len(paths) == 4
+
+
+# --- Task 22: fetch()'s optional `cancel` parameter ------------------
+
+
+def test_fetch_with_no_cancel_argument_behaves_exactly_as_before(tmp_path):
+    source = _source(FakeRunner())
+    paths = source.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    assert paths[0] == tmp_path / "water" / "r00_c00.geojson"
+
+
+def test_fetch_stops_before_the_first_request_when_already_cancelled(tmp_path):
+    token = CancelToken()
+    token.cancel()
+    runner = FakeRunner()
+    source = _source(runner, types=("water", "building"))
+    with pytest.raises(Cancelled):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress(), cancel=token
+        )
+    assert runner.commands == []
+
+
+def test_fetch_stops_within_one_tile_once_cancelled_mid_loop(tmp_path):
+    # Overture fetches every type for a tile before moving to the next
+    # tile, so the finest available checkpoint is between (tile, type)
+    # requests. This proves a stop landing right after the first type's
+    # request never even starts the second type for the SAME tile, let
+    # alone spills into a second tile.
+    token = CancelToken()
+    inner = FakeRunner()
+
+    def cancelling_runner(command, **kwargs):
+        result = inner(command, **kwargs)
+        token.cancel()
+        return result
+
+    source = _source(cancelling_runner, types=("water", "building"))
+    tiles = [_tile("r00_c00"), _tile("r00_c01")]
+    with pytest.raises(Cancelled):
+        source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), tiles, tmp_path, NullProgress(), cancel=token)
+
+    assert len(inner.commands) == 1, "expected only the in-flight (tile, type) request"
+    assert (tmp_path / "water" / "r00_c00.geojson").exists()
+    assert not (tmp_path / "building" / "r00_c00.geojson").exists()
+    assert not (tmp_path / "water" / "r00_c01.geojson").exists()
 
 
 def test_fetch_writes_into_a_per_type_subfolder(tmp_path):

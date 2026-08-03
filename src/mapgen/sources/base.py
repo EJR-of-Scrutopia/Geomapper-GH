@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol, Sequence, runtime_checkable
 
 from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,29 @@ class LayerSource(Protocol):
     survey.json that never mentions it. The closed list is the safety
     property: a file the user dropped into the package folder can never
     match it, so the sweep cannot touch anything mapgen did not write.
+
+    fetch()'s own `cancel` parameter (Task 22) is different in kind from
+    everything above: those are all optional EXTENSIONS, read defensively
+    with getattr because a source that has no opinion on them can simply
+    not define them at all. fetch() is not optional, every source has one,
+    only its willingness to be interrupted mid-loop varies. Adding a
+    required parameter to it would break every source, real or a test
+    double, that predates this task in one stroke, which is exactly the
+    "control that appears to work and does not" failure this codebase
+    keeps naming as the thing to avoid. So `cancel` is optional in the
+    other sense instead: a keyword argument, default None, threaded
+    through package.py's own call site only when
+    inspect.signature(source.fetch) actually names it (see package.py's
+    _fetch_accepts_cancel). A source that accepts it should call
+    cancel.raise_if_cancelled() between whole units of paid-for work, the
+    tile loop for OsmSource, the (tile, type) loop for OvertureSource,
+    so a tile already in flight is always allowed to finish and be kept,
+    never interrupted mid-request. A source that omits the parameter
+    entirely, including every stub in this project's own test suite, is
+    still called exactly as before and still works: it is simply not
+    interruptible mid-fetch, and the next checkpoint (between sources, or
+    before the bridge step, both in package.py) is what actually stops
+    the run for it.
     """
 
     id: str
@@ -95,6 +119,7 @@ class LayerSource(Protocol):
         tiles: Sequence[Tile],
         work_dir: Path,
         progress: ProgressSink,
+        cancel: CancelToken | None = None,
     ) -> list[Path]: ...
 
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
