@@ -1895,6 +1895,67 @@ def test_watch_heartbeat_does_not_shut_down_while_pings_keep_arriving():
         httpd.server_close()
 
 
+def test_a_reload_sized_heartbeat_gap_does_not_kill_a_job_genuinely_still_running(tmp_path):
+    # The brief's own named requirement, tested literally rather than only
+    # inferred from the timing tests above: a real job, started through the
+    # real HTTP route and JobManager exactly as a browser would, must run
+    # to completion even though the heartbeat watchdog is live and several
+    # reload-sized gaps pass while it is still blocked in fetch(). The
+    # watchdog's own timeout (0.15s) is deliberately much shorter than the
+    # blocking source's own hold time, so a broken implementation that
+    # shut the server down mid-job would fail this well before the source
+    # is ever released.
+    blocking = BlockingSource()
+    clear_registry()
+    register(blocking)
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    stop_event = threading.Event()
+    watchdog = threading.Thread(
+        target=_watch_heartbeat, args=(httpd, 0.15, stop_event, 0.02), daemon=True
+    )
+    watchdog.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        status, payload = _post(
+            base,
+            "/api/jobs",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "South Wales",
+                "site": "Barry",
+                "output_root": str(tmp_path),
+                "sources": ["blocking"],
+                "run_bridge": False,
+            },
+        )
+        assert status == 202
+        job_id = payload["id"]
+        assert blocking.started.wait(timeout=5)
+
+        # Several reload-sized gaps, each shorter than the 0.15s timeout,
+        # spanning a total well past it: exactly the "page reloads a few
+        # times while a big download keeps running in the background"
+        # scenario, not one lucky ping.
+        for _ in range(6):
+            status, _ = _post(base, "/api/heartbeat", {})
+            assert status == 200
+            time.sleep(0.08)
+        assert thread.is_alive(), "expected the server to survive reload-sized gaps"
+        assert httpd.server_address, "server must still be bound, not shut down"
+
+        blocking.release.set()
+        final = _wait_for_state(base, job_id)
+        assert final["state"] == "done", f"expected the job to finish cleanly, got {final}"
+    finally:
+        stop_event.set()
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+        clear_registry()
+
+
 def test_watch_heartbeat_stops_promptly_once_told_to_via_stop_event():
     # Proves the interruptible-sleep property directly: a stop_event set
     # immediately must not leave this thread polling a server that
