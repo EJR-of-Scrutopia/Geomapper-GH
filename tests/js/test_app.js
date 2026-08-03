@@ -219,6 +219,38 @@ function makeDocument() {
       const event = { preventDefault() {}, ...eventLike };
       for (const handler of listeners[type] || []) handler(event);
     },
+    // Real documents have this, and app.js's keep-alive reads it to tell
+    // "came back to the foreground" from "went away". A stub without it
+    // would make the returning-page ping untestable.
+    visibilityState: "visible",
+  };
+}
+
+function makeWindow() {
+  const listeners = {};
+  return {
+    addEventListener(type, handler) {
+      (listeners[type] = listeners[type] || []).push(handler);
+    },
+    fire(type, eventLike = {}) {
+      const event = { preventDefault() {}, ...eventLike };
+      for (const handler of listeners[type] || []) handler(event);
+    },
+  };
+}
+
+function makeNavigator() {
+  // sendBeacon rather than fetch is the entire point of the pagehide path:
+  // a closing page is not guaranteed to live long enough to finish a normal
+  // request. Recording the URLs is what lets a test prove the token really
+  // made it onto the beacon, which a bare "was it called" check would miss.
+  const beacons = [];
+  return {
+    beacons,
+    sendBeacon(url) {
+      beacons.push(String(url));
+      return true;
+    },
   };
 }
 
@@ -393,9 +425,13 @@ function bootRoutes(extra) {
 
 function buildSandbox({ fetch, token = DEFAULT_TOKEN }) {
   const document = makeDocument();
+  const windowObject = makeWindow();
+  const navigator = makeNavigator();
   const sandbox = {
     location: { search: `?token=${token}`, origin: FETCH_ORIGIN },
     document,
+    window: windowObject,
+    navigator,
     L: makeLeaflet(),
     fetch,
     console,
@@ -786,6 +822,76 @@ function ok(condition, message) {
       ok((heartbeats[0].options.method || "").toUpperCase() === "POST");
     }
   );
+
+  // The owner lost a working session to exactly this: they switched tabs
+  // to register for an API key, the browser throttled the hidden page's
+  // timers below the ping interval, and the server treated the silence as
+  // a closed page and shut down. Silence alone cannot tell a backgrounded
+  // tab from a closed one, so these three pin the two signals that can.
+
+  await test("returning to the foreground pings immediately, without waiting for the interval", async () => {
+    const { fetchCalls, sandbox } = await bootedSandbox();
+    fetchCalls.length = 0;
+    sandbox.document.visibilityState = "visible";
+    sandbox.document.fire("visibilitychange");
+    await flush(10);
+    const pings = fetchCalls.filter((c) => c.url.pathname === "/api/heartbeat");
+    ok(
+      pings.length >= 1,
+      "a page coming back to the foreground must ping at once, not wait up to a full interval"
+    );
+  });
+
+  await test("going to the background does not ping", async () => {
+    // The mirror of the above: visibilitychange fires in both directions,
+    // and only the returning edge should ping. A handler that pinged on
+    // every change would pass the test above while being wrong.
+    const { fetchCalls, sandbox } = await bootedSandbox();
+    fetchCalls.length = 0;
+    sandbox.document.visibilityState = "hidden";
+    sandbox.document.fire("visibilitychange");
+    await flush(10);
+    const pings = fetchCalls.filter((c) => c.url.pathname === "/api/heartbeat");
+    ok(pings.length === 0, `expected no ping when hidden, got ${pings.length}`);
+  });
+
+  await test("a genuine close reports itself by beacon, with the token attached", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.window.fire("pagehide");
+    const beacons = sandbox.navigator.beacons;
+    ok(beacons.length === 1, `expected exactly one beacon, got ${beacons.length}`);
+    const sent = new URL(beacons[0]);
+    ok(sent.pathname === "/api/closing", `beacon went to ${sent.pathname}`);
+    ok(
+      sent.searchParams.get("token") === DEFAULT_TOKEN,
+      "the beacon must carry the token or the server will reject it as unauthorised"
+    );
+  });
+
+  await test("an unreachable server is reported as stopped, not as a raw browser error", async () => {
+    // fetch() rejects with a bare "Failed to fetch" when it cannot reach
+    // the server, which the owner saw as a red box that looked like the
+    // tool was broken rather than like the server had stopped.
+    const { sandbox } = await bootedSandbox(() => {
+      throw new TypeError("Failed to fetch");
+    });
+    let caught = null;
+    try {
+      await sandbox.api("/api/config");
+    } catch (error) {
+      caught = error;
+    }
+    ok(caught !== null, "expected the unreachable server to surface as an error");
+    ok(caught.serverGone === true, "expected the error to be flagged as the server being gone");
+    ok(
+      !/failed to fetch/i.test(caught.message),
+      `the browser's own wording must not reach the owner: ${caught.message}`
+    );
+    ok(
+      /start mapgen again/i.test(caught.message),
+      `the message must say what actually helps: ${caught.message}`
+    );
+  });
 
   await test("a single failed heartbeat ping is swallowed quietly, not thrown as unhandled", async () => {
     const { sandbox } = await bootedSandbox((url) => {

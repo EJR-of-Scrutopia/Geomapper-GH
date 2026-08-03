@@ -2,6 +2,7 @@ import hashlib
 import http.client
 import json
 import re
+import tempfile
 import threading
 import time
 import urllib.error
@@ -20,6 +21,7 @@ from mapgen.package import SurveyRequest
 from mapgen.sources.base import Estimate, clear_registry, register
 from mapgen.sources.elevation import ElevationSource
 from mapgen.web.server import (
+    DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
     STATIC_DIR,
     JobBusyError,
     JobManager,
@@ -2021,3 +2023,147 @@ def test_serve_auto_shuts_down_end_to_end_when_the_heartbeat_times_out(capsys):
     # from a silent crash short of noticing the process itself was gone.
     out = capsys.readouterr().out
     assert "Stopped" in out, f"expected an explanatory line on a watchdog-triggered exit, got: {out!r}"
+
+
+# --- the watchdog must not kill a running download -------------------------
+#
+# The owner hit the idle half of this within a day of the feature landing:
+# they switched tabs to register for an API key, the browser throttled the
+# backgrounded page's timers below the ping interval, and the 20 second
+# timeout read that as a closed page and shut the server down. The running
+# half was worse and had not been hit yet: a survey takes minutes, watching
+# a progress log for minutes is exactly when someone goes and does
+# something else, and the watchdog would have taken the daemon worker
+# thread down mid-download with nothing to connect the empty folder to.
+
+
+def test_watch_heartbeat_never_shuts_down_while_a_job_is_running():
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    blocking = BlockingSource()
+    clear_registry()
+    register(blocking)
+    stop_event = threading.Event()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with tempfile.TemporaryDirectory() as output_root:
+            status, payload = _post(
+                base,
+                "/api/jobs",
+                {
+                    "bbox": "-3.29,51.38,-3.28,51.39",
+                    "region": "South Wales",
+                    "site": "Barry",
+                    "output_root": output_root,
+                    "sources": ["blocking"],
+                },
+            )
+            assert status == 202
+            assert blocking.started.wait(timeout=5), "the job never actually started"
+
+            # No ping will EVER arrive from here on, exactly as from a
+            # throttled background tab, and the timeout is far shorter than
+            # the job. Only the running-job check can keep this alive.
+            watchdog = threading.Thread(
+                target=_watch_heartbeat, args=(httpd, 0.05, stop_event, 0.01), daemon=True
+            )
+            watchdog.start()
+            time.sleep(0.4)  # many multiples of the timeout
+            assert thread.is_alive(), (
+                "the watchdog shut the server down mid-download, killing the job"
+            )
+
+            # Disarm the watchdog BEFORE letting the job finish. The moment
+            # it does, is_busy() goes false and this deliberately tiny
+            # timeout fires at once, correctly, which would leave the poll
+            # below talking to a server already shutting down. That
+            # idle-shutdown behaviour is the sibling test's job to pin.
+            stop_event.set()
+            blocking.release.set()
+            _wait_for_state(base, payload["id"], timeout=10)
+    finally:
+        stop_event.set()
+        blocking.release.set()
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_watch_heartbeat_still_shuts_down_once_the_job_finishes():
+    # The exemption is "a job is running", not "a job was ever started":
+    # an idle server after a completed download must still stop, or the
+    # watchdog would be permanently disarmed by one survey.
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    clear_registry()
+    register(StubSource())
+    stop_event = threading.Event()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        with tempfile.TemporaryDirectory() as output_root:
+            _, payload = _post(
+                base,
+                "/api/jobs",
+                {
+                    "bbox": "-3.29,51.38,-3.28,51.39",
+                    "region": "South Wales",
+                    "site": "Barry",
+                    "output_root": output_root,
+                    "sources": ["stub"],
+                },
+            )
+            _wait_for_state(base, payload["id"], timeout=10)
+
+        watchdog = threading.Thread(
+            target=_watch_heartbeat, args=(httpd, 0.05, stop_event, 0.01), daemon=True
+        )
+        watchdog.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), (
+            "an idle server after a finished job should still time out"
+        )
+    finally:
+        stop_event.set()
+        httpd.server_close()
+
+
+def test_closing_endpoint_requires_a_token(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            urllib.request.Request(f"{server}/api/closing", method="POST"), timeout=10
+        )
+    assert excinfo.value.code == 403
+
+
+def test_closing_endpoint_backdates_the_heartbeat_rather_than_shutting_down():
+    # A genuine close is reported here so the timeout can be generous
+    # enough to survive background throttling without leaving a process
+    # for 90 seconds after a real close. It hands the decision to the
+    # watchdog rather than stopping the server itself, so that the
+    # running-job exemption still applies to a closed tab.
+    httpd = build_server(host="127.0.0.1", port=0, token=TOKEN)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        status, _payload = _post(base, "/api/closing", {})
+        assert status == 200
+        # Still serving: this route reports, it does not stop anything.
+        assert thread.is_alive()
+        # And it has aged the heartbeat past any sane timeout.
+        assert time.monotonic() - httpd.last_heartbeat_at >= 60
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
+def test_the_heartbeat_timeout_clears_browser_background_throttling():
+    # Not a style preference: browsers throttle timers in hidden tabs to
+    # about once a minute, so any timeout at or under 60 seconds means
+    # "the owner looked at another window", not "the page is gone". This
+    # pins the property, not the number, so a future tweak that drops it
+    # back under a minute fails here with the reason attached.
+    assert DEFAULT_HEARTBEAT_TIMEOUT_SECONDS > 60.0

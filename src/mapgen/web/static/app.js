@@ -41,10 +41,29 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
 async function api(path, options = {}) {
   const url = new URL(path, location.origin);
   url.searchParams.set("token", token);
-  const response = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+  } catch (networkError) {
+    // fetch() rejects with a bare "Failed to fetch" when it cannot reach
+    // the server at all, which reads to the owner as though the tool is
+    // broken. It usually means the server has stopped: this page holds a
+    // token and a port belonging to one specific run, so a stopped server
+    // makes every request here fail permanently, and no amount of
+    // retrying or re-ticking anything will help. Say that, and say the
+    // one thing that does help, rather than passing the browser's own
+    // wording through to a red box.
+    const error = new Error(
+      "Cannot reach the mapgen server. It has stopped, so this page is now " +
+        "out of date. Start mapgen again from the desktop shortcut; your " +
+        "settings and API key are saved."
+    );
+    error.serverGone = true;
+    throw error;
+  }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(payload.error || `HTTP ${response.status}`);
@@ -756,29 +775,58 @@ $("cancel").addEventListener("click", async () => {
 
 // --- keep-alive and shutdown -------------------------------------------
 //
-// A ping every HEARTBEAT_INTERVAL_MS while this page is open. This is the
-// whole client-side half of "closing the interface stops the server":
-// there is nothing to do on unload, since a closed or crashed tab simply
-// stops sending these, and the server's own watchdog (see mapgen.web.
-// server, only wired in for a --windowless launch) treats a long enough
-// silence as the page being gone. Sent unconditionally, launch mode
-// unknown to this page: harmless against a plain `mapgen ui` session,
-// which records the ping but has no watchdog thread reading it.
+// A ping every HEARTBEAT_INTERVAL_MS while this page is open, telling the
+// server's watchdog (see mapgen.web.server, only wired in for a
+// --windowless launch) that someone is still here. Sent unconditionally,
+// launch mode unknown to this page: harmless against a plain `mapgen ui`
+// session, which records the ping but has no watchdog reading it.
 //
-// Started at script load, not inside boot(): boot() awaits /api/config
-// and /api/sources before it can do anything else, and the first ping
-// should not wait on those, particularly since a slow or failed boot() is
-// exactly when the owner is most likely to be looking at a blank page
-// and takes longest to reach the point a human would call "the page is
-// up", the moment that actually matters for not being mistaken for "gone".
+// An earlier version of this comment claimed "there is nothing to do on
+// unload, since a closed or crashed tab simply stops sending these". That
+// was wrong in a way that cost the owner a working session. A BACKGROUNDED
+// tab also stops sending these, because browsers throttle timers in hidden
+// tabs to around once a minute; the two states are indistinguishable from
+// silence alone. The owner switched away to register for an API key, came
+// back, and every request failed against a server that had shut itself
+// down. Silence is now the weakest of three signals, not the only one:
+//
+//   pagehide           a genuine close or navigation, reported immediately
+//                      via sendBeacon, which is the one thing browsers
+//                      guarantee will still be delivered as a page dies.
+//   visibilitychange   coming back to the foreground pings AT ONCE rather
+//                      than waiting up to a full interval, so a returning
+//                      page cannot be killed in the gap.
+//   the interval       the idle-session backstop it always was, now read
+//                      against a timeout well clear of throttling.
+//
+// Started at script load, not inside boot(): boot() awaits /api/config and
+// /api/sources before it can do anything else, and the first ping should
+// not wait on those, particularly since a slow or failed boot() is exactly
+// when the owner is most likely to be looking at a blank page.
 const HEARTBEAT_INTERVAL_MS = 5000;
-setInterval(() => {
+
+function ping() {
   api("/api/heartbeat", { method: "POST" }).catch(() => {
-    // A single missed ping is well within the server's own grace period
-    // (see DEFAULT_HEARTBEAT_TIMEOUT_SECONDS); nothing useful to do here
-    // beyond letting the next interval try again.
+    // A missed ping is well within the server's grace period; the next
+    // interval, or the next return to the foreground, tries again.
   });
-}, HEARTBEAT_INTERVAL_MS);
+}
+
+setInterval(ping, HEARTBEAT_INTERVAL_MS);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") ping();
+});
+
+// sendBeacon rather than fetch: a page being closed is not guaranteed to
+// live long enough to finish a normal request, and a beacon is queued by
+// the browser and delivered regardless. The token goes on the query string
+// exactly as api() would put it, because this bypasses api() entirely.
+window.addEventListener("pagehide", () => {
+  const url = new URL("/api/closing", location.origin);
+  url.searchParams.set("token", token);
+  navigator.sendBeacon(url.toString());
+});
 
 $("stop-server").addEventListener("click", async () => {
   try {

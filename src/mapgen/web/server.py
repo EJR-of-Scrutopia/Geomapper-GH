@@ -61,19 +61,29 @@ _JOB_CANCEL_RE = re.compile(r"^/api/jobs/([^/]+)/cancel$")
 # behind that only Task Manager can end. The page pings /api/heartbeat
 # every HEARTBEAT_INTERVAL_MS (app.js); this is how long the SERVER waits
 # with no ping at all before deciding the page is genuinely gone rather
-# than mid-reload. Picked deliberately, not guessed: app.js starts pinging
-# at script load, before boot()'s own network round-trips, so a reload's
-# real gap between the old page's last ping and the new page's first is on
-# the order of tens to a couple of hundred milliseconds on localhost, not
-# seconds. 20 seconds is roughly 100x that realistic gap and 4x the ping
-# interval itself, which comfortably survives a slow machine's reload
-# without leaving a genuinely closed browser's process running for minutes
-# after the fact. None of this applies to a plain `mapgen ui`: it is only
-# ever wired in when the caller explicitly asks for it (see serve()'s own
+# than merely not in front.
+#
+# This was 20 seconds, reasoned entirely from how long a RELOAD takes, and
+# the owner hit the case that reasoning missed within a day: they switched
+# tabs to register for an OpenTopography key and came back to a dead server
+# and a page where every request failed. Browsers deliberately throttle
+# timers in background tabs, down to roughly once a minute in Chrome and
+# Edge once a tab has been hidden a while, so a 5 second ping interval is
+# simply not honoured by a backgrounded page. Any timeout under a minute
+# therefore means "the owner looked at another window for half a minute",
+# not "the page is gone".
+#
+# 90 seconds clears that throttled once-a-minute floor with room for a
+# missed ping. It no longer has to be short to avoid stray processes,
+# because pagehide's beacon (app.js) now reports a genuinely closed tab
+# immediately rather than leaving it to be inferred from silence.
+#
+# None of this applies to a plain `mapgen ui`: it is only ever wired in
+# when the caller explicitly asks for it (see serve()'s own
 # heartbeat_timeout_seconds parameter, None by default), so a terminal
 # launch keeps running exactly as it always has if the tab is closed
 # without Ctrl+C.
-DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 20.0
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 90.0
 _HEARTBEAT_POLL_INTERVAL_SECONDS = 1.0
 
 
@@ -86,7 +96,22 @@ def _watch_heartbeat(
     """Runs in its own daemon thread for the lifetime of a heartbeat-
     enabled server. Shuts httpd down (causing its serve_forever() to
     return, in build_server/serve) once more than timeout_seconds have
-    passed since the last /api/heartbeat ping, checked every poll_interval.
+    passed since the last /api/heartbeat ping, checked every poll_interval,
+    UNLESS a download is currently running.
+
+    The running-job exemption is not a refinement, it is the difference
+    between this watchdog being safe and being destructive. A survey takes
+    minutes, watching a progress log for minutes is exactly when someone
+    goes and does something else, and a backgrounded tab has its timers
+    throttled by the browser. Without this check, alt-tabbing during a
+    download killed the server, and with it the daemon worker thread doing
+    the downloading, midway through the job. Nobody would have connected
+    the empty folder to having looked at their email.
+
+    A running job is its own proof that the session is alive and wanted,
+    better proof than any ping, so it holds the server open on its own.
+    The heartbeat still governs the idle case, which is the one the
+    watchdog exists for.
 
     stop_event.wait(poll_interval) is an interruptible sleep: serve()'s own
     cleanup sets it when the server is stopping for any OTHER reason
@@ -97,9 +122,13 @@ def _watch_heartbeat(
     is by construction.
     """
     while not stop_event.wait(poll_interval):
-        if time.monotonic() - httpd.last_heartbeat_at > timeout_seconds:
-            httpd.shutdown()
-            return
+        if time.monotonic() - httpd.last_heartbeat_at <= timeout_seconds:
+            continue
+        manager = getattr(httpd, "manager", None)
+        if manager is not None and manager.is_busy():
+            continue
+        httpd.shutdown()
+        return
 
 
 class JobBusyError(RuntimeError):
@@ -479,6 +508,27 @@ def make_handler(
                 # One code path in app.js regardless of launch mode, rather
                 # than the page needing to know which kind of session it is.
                 self.server.last_heartbeat_at = time.monotonic()
+                return self._send_json(200, {"ok": True})
+
+            if parsed.path == "/api/closing":
+                # The page reports its own genuine close here, via
+                # sendBeacon on pagehide, because silence alone cannot
+                # distinguish a closed tab from a backgrounded one whose
+                # timers the browser has throttled. Answering this is what
+                # lets the heartbeat timeout be generous enough to survive
+                # throttling without leaving a process behind for a minute
+                # and a half after a real close.
+                #
+                # Deliberately NOT a shutdown of its own: a job still
+                # running is the session that matters most, and losing it
+                # because a tab closed would be worse than an idle process
+                # lingering. Backdating the heartbeat rather than shutting
+                # down hands the decision to the watchdog, which already
+                # knows to wait for a running job and is the single place
+                # that owns "should this server stop".
+                self.server.last_heartbeat_at = (
+                    time.monotonic() - DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+                )
                 return self._send_json(200, {"ok": True})
 
             if parsed.path == "/api/shutdown":
