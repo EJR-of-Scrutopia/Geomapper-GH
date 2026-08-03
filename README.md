@@ -7,12 +7,20 @@ that Grasshopper and Urbano 2 can read directly.
 ## What it does
 
 You give it a bounding box, a region name and a site name. It splits the
-extent into overlapping tiles, downloads OpenStreetMap and Overture Maps data
-(and, if you have an OpenTopography key, a Copernicus elevation model) for
-every tile, deduplicates the overlap, merges everything into single per-source
-files, and writes it all into a dated, named package folder alongside a
-`survey.json` audit trail and an Urbano 2 project setting file. A failed or
-interrupted job resumes rather than restarting.
+extent into overlapping tiles and downloads OpenStreetMap tile by tile,
+deduplicating the overlap. Overture Maps, and the elevation model if you
+have an OpenTopography key, are each fetched in one request over the whole
+extent instead. Everything is merged into single per-source files and
+written into a dated, named package folder alongside a `survey.json` audit
+trail and an Urbano 2 project setting file. A failed or interrupted job
+resumes rather than restarting.
+
+Only OpenStreetMap is tiled, and only because the OSM map API has a hard
+50,000-node cap per request that tiling exists to stay under. Overture is a
+bbox-filtered read of cloud-hosted parquet with no equivalent cap, so
+tiling it cost one process launch per tile per type and bought nothing: on
+one measured extent, 16 tiled calls took 69 to 93 seconds against 4.5
+seconds for the single call that returned the identical 9,910 features.
 
 It replaces an earlier script, `osm_overture_tiles.py`, that did the same job
 by hand-composed command line. Everything that script did is either here
@@ -288,8 +296,10 @@ Each file:
 - **`<stem>.osm`**: every OSM node, way and relation in the extent, tiles
   merged and deduplicated by id, highest version wins at a seam. This is the
   file the Urbano bridge reads for OSM geometry.
-- **`<stem>_<type>.geojson`**: one deduplicated GeoJSON FeatureCollection per
-  Overture type the completed request asked for. A complete run also sweeps
+- **`<stem>_<type>.geojson`**: one GeoJSON FeatureCollection per Overture
+  type the completed request asked for, each fetched in a single request
+  over the whole extent, so there are no tile seams in it to deduplicate.
+  A complete run also sweeps
   away any merged file an earlier, differently-scoped attempt left in the
   root, so the folder matches `survey.json` rather than accumulating types
   the current request never asked for. The sweep only ever touches names
