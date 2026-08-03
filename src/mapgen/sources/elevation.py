@@ -10,6 +10,7 @@ source than COP30 for anywhere in Wales.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import quote
@@ -19,6 +20,7 @@ import requests
 from mapgen.config import load_config
 from mapgen.fsutil import atomic_write_bytes
 from mapgen.geo import BBox, Tile, extent_metres
+from mapgen.jobs import Cancelled
 from mapgen.sources.base import Estimate, ProgressSink
 
 DEFAULT_OPENTOPOGRAPHY_URL = "https://portal.opentopography.org/API/globaldem"
@@ -38,9 +40,19 @@ def is_tiff(header: bytes) -> bool:
     return header.startswith(b"II*\x00") or header.startswith(b"MM\x00*")
 
 
+REDACTION_PLACEHOLDER = "[REDACTED]"
+# Used only when redaction itself cannot be trusted: the secret was found
+# in the text in some form _redact's own substitutions did not already
+# catch (today: hiding behind interspersed NUL bytes). Withholding the
+# whole text is the honest answer there, not a best-effort scrub of a
+# shape nothing here anticipated.
+WITHHELD_PLACEHOLDER = "[response withheld: contained the API key in an unexpected form]"
+
+
 def _redact(text: str, secret: str | None) -> str:
-    """Removes every occurrence of secret from text, by content rather than
-    by exception type.
+    """Removes every occurrence of secret from text, by content rather
+    than by exception type, and case-insensitively, and defensively
+    against an encoding that would otherwise defeat the match outright.
 
     This is the boundary fix for a real leak: API_Key travels as a plain
     query parameter to OpenTopography, so requests' own exception text
@@ -54,14 +66,73 @@ def _redact(text: str, secret: str | None) -> str:
     Both the raw key and its URL-percent-encoded form are stripped, since
     a key containing characters that need encoding would otherwise survive
     inside a URL-shaped message unredacted.
+
+    Two more properties, past a plain str.replace:
+
+    - Case: str.replace is case-sensitive, and nothing guarantees a key
+      always reaches this function in the exact case it was issued in (a
+      proxy or gateway can title-case a header, for instance). Matched
+      with re.IGNORECASE instead.
+    - Encoding: a UTF-16 error page decoded with the UTF-8 codec
+      (errors="replace") does not raise, since every byte of ASCII-range
+      UTF-16LE text is independently valid UTF-8 on its own; it produces
+      the original characters each followed by a stray NUL
+      ("s\\x00k\\x00-\\x00..."), which reads as the key to a human, since
+      a terminal or a browser renders NUL as invisible, while containing
+      no contiguous match for a plain substring search. Checked for
+      directly, by stripping NULs from the already-redacted text and
+      searching again, rather than by guessing or enumerating source
+      encodings. If that second check still finds the secret, the honest
+      answer is to withhold the text entirely rather than publish a
+      "redacted" string that may still be hiding it in a shape this
+      function did not anticipate.
     """
     if not secret:
         return text
-    redacted = text.replace(secret, "[REDACTED]")
+    candidates = [secret]
     encoded = quote(secret, safe="")
     if encoded != secret:
-        redacted = redacted.replace(encoded, "[REDACTED]")
+        candidates.append(encoded)
+
+    redacted = text
+    for candidate in candidates:
+        redacted = re.sub(re.escape(candidate), REDACTION_PLACEHOLDER, redacted, flags=re.IGNORECASE)
+
+    stripped = redacted.replace("\x00", "")
+    for candidate in candidates:
+        if re.search(re.escape(candidate), stripped, flags=re.IGNORECASE):
+            return WITHHELD_PLACEHOLDER
     return redacted
+
+
+def _scrub_exception_chain(exc: BaseException, secret: str | None) -> None:
+    """Redacts secret from exc's own args, and from every exception
+    chained to it via __cause__ or __context__, in place.
+
+    `raise ... from None` at the call site is what actually stops a
+    standard traceback from printing the chain at all, by telling
+    Python's own formatting machinery to suppress it regardless of what
+    it contains: that is what closes this for every ordinary rendering
+    path (an uncaught exception reaching the interpreter's own top level,
+    logging.exception, traceback.format_exc). This is the second,
+    independent layer underneath it: if anything ever reads __cause__ or
+    __context__ directly instead of going through that machinery, or a
+    future call site on this path forgets the `from None`, the chained
+    exceptions' own text is already clean rather than depending on that
+    not happening. Bounded against a cyclical chain (which should not be
+    possible in practice) with a seen-set, since this walks the chain in
+    a plain loop rather than recursion.
+    """
+    if not secret:
+        return
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        current.args = tuple(
+            _redact(arg, secret) if isinstance(arg, str) else arg for arg in current.args
+        )
+        current = current.__cause__ or current.__context__
 
 
 def resolve_api_key(
@@ -194,16 +265,6 @@ class ElevationSource:
         # own message the way a genuine requests exception does, all
         # reached run_survey's source_failed event and JobManager's
         # record.error unredacted under the previous, HTTPError-only fix.
-        # The whole request/response cycle is inside one try, including
-        # session.get() itself: a connection refused or DNS failure raises
-        # before any response object exists at all, so a boundary that
-        # only wrapped the body-reading step (as an earlier version of
-        # this method did) never saw that failure to redact it. Review
-        # round 1 proved this end to end: a fake connection failure, read
-        # timeout and mid-stream drop, each carrying the real key in its
-        # own message the way a genuine requests exception does, all
-        # reached run_survey's source_failed event and JobManager's
-        # record.error unredacted under the previous, HTTPError-only fix.
         try:
             with self.session.get(
                 self.url,
@@ -215,22 +276,53 @@ class ElevationSource:
                 if response.status_code >= 400:
                     raise ElevationError(f"Failed to download DEM: HTTP {response.status_code}")
                 payload = b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
-        except ElevationError:
+        except (ElevationError, Cancelled, KeyboardInterrupt):
+            # Left exactly as raised. Cancelled is this project's own
+            # cooperative-cancellation signal and KeyboardInterrupt is
+            # Python's; neither is raised anywhere inside the block above
+            # today, but that must stay true because nothing in this
+            # method calls anything that raises them, not because the
+            # broad except below happens not to catch them. Named here
+            # explicitly, so a future change to what this block calls
+            # cannot silently start swallowing either one into an
+            # ElevationError.
             raise
         except Exception as exc:
             # Deliberately broad, and deliberately not a list of specific
             # requests exception classes: see _redact's docstring for why
-            # enumerating types is the trap this replaces. Whatever exc
-            # is, whatever it says, the key is stripped from its text
-            # before any of it is allowed into this source's own
-            # exception, which is the only thing run_survey and
-            # JobManager ever see.
+            # enumerating types is the trap this replaces.
+            #
+            # Round 1 redacted only the NEW message this raises. That
+            # left exc itself, attached unredacted as __cause__ via
+            # `from exc`, one uncaught exception away from a full
+            # traceback showing the real key: main() does not catch
+            # ElevationError, so Python's own default exception printer
+            # renders the whole chain, and the browser's own safety here
+            # was never a fix, only the accident that JobManager stops at
+            # str(exc) and never renders a cause. Closed at the boundary,
+            # not at either throw site: exc (and anything already chained
+            # to IT) is scrubbed in place first, and the new exception is
+            # cut loose from it with `from None`, so a standard traceback
+            # does not show the chain at all regardless of what it
+            # contains, and even a reader that walks __cause__/__context__
+            # directly, bypassing that suppression, finds it already clean.
+            _scrub_exception_chain(exc, api_key)
             raise ElevationError(
                 f"Failed to download DEM: {_redact(str(exc), api_key)}"
-            ) from exc
+            ) from None
 
         if not is_tiff(payload[:16]):
-            preview = _redact(payload[:300].decode("utf-8", errors="replace"), api_key)
+            # Redacted before truncating, not after: truncating to a
+            # fixed byte window first can cut a real key in half (enough
+            # padding ahead of "API_Key=" pushes the back part of the key
+            # past the window), and that surviving fragment matches
+            # nothing a whole-string redaction looks for, so it reaches
+            # the browser log exactly as readable as the full key would
+            # have been. Decoding and redacting the complete body first,
+            # then cutting the ALREADY-SAFE result down to a preview
+            # length, leaves no window for a partial key to survive in.
+            decoded = payload.decode("utf-8", errors="replace")
+            preview = _redact(decoded, api_key)[:300]
             raise ElevationError(
                 f"OpenTopography did not return a TIFF. Response began: {preview}"
             )

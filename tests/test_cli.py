@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -265,3 +267,65 @@ def test_estimate_with_no_output_root_survives_a_corrupt_config(tmp_path, capsys
     )
     assert exit_code == 0
     assert "Tiles:" in capsys.readouterr().out
+
+
+# --- Review round 2: the CLI path had no coverage at all, and it is the
+# one place a leak-around-the-message actually reached a human. Captured
+# from a real run, per the review: the [source_failed] line correctly
+# showed the redacted key, and three lines below it, in the chained
+# traceback Python's own default exception printer renders for an
+# exception main() does not catch, the real key. main() is not expected
+# to catch ElevationError specifically (a genuinely unanticipated source
+# failure printing a traceback is reasonable CLI behaviour); what must be
+# true regardless is that the traceback, however it gets printed, never
+# contains the key. This runs the real CLI entry point as a real
+# subprocess, so what is asserted against is exactly what a terminal
+# would show, not a simulation of it.
+
+
+def test_a_leaking_elevation_failure_never_reaches_cli_stdout_or_stderr(tmp_path):
+    secret = "sk-real-secret-should-never-leak-anywhere"
+    output_root = tmp_path / "out"
+    script = tmp_path / "leak_repro.py"
+    script.write_text(
+        f'''
+import sys
+import requests
+from mapgen.sources.base import register, clear_registry
+from mapgen.sources.elevation import ElevationSource
+from mapgen.cli import main
+
+SECRET = {secret!r}
+
+class LeakySession:
+    def get(self, url, **kwargs):
+        leaky_url = url + "?API_Key=" + SECRET + "&demtype=COP30"
+        raise requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: " + leaky_url
+        )
+
+clear_registry()
+register(ElevationSource(api_key=SECRET, session=LeakySession()))
+sys.exit(main([
+    "survey", "--bbox=-3.29,51.38,-3.28,51.39", "--region=R", "--site=S",
+    "--output-root", {str(output_root)!r}, "--source", "elevation", "--skip-bridge",
+]))
+''',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert secret not in result.stdout, f"leaked into stdout:\n{result.stdout}"
+    assert secret not in result.stderr, f"leaked into stderr:\n{result.stderr}"
+    # Not a test that the command quietly did nothing: a genuinely
+    # unhandled failure exits non-zero and says something recognisable.
+    assert result.returncode != 0
+    assert "ElevationError" in result.stderr or "Failed to download DEM" in result.stderr
+    # And the chain really is suppressed in the real, rendered traceback,
+    # not merely short by coincidence.
+    assert "direct cause" not in result.stderr
+    assert "another exception occurred" not in result.stderr

@@ -1,12 +1,17 @@
+import traceback
+
 import pytest
 import requests
 
 from mapgen.geo import BBox
+from mapgen.jobs import Cancelled
 from mapgen.sources.base import NullProgress
 from mapgen.sources.elevation import (
     ElevationError,
     ElevationSource,
     MissingApiKeyError,
+    _redact,
+    _scrub_exception_chain,
     is_tiff,
     resolve_api_key,
 )
@@ -341,6 +346,157 @@ def test_fetch_redaction_also_catches_the_url_encoded_form_of_the_key(tmp_path):
     message = str(excinfo.value)
     assert secret_with_special_chars not in message
     assert encoded_secret not in message
+
+
+# --- Review round 2: the redacted MESSAGE was not the whole leak surface.
+# `raise ... from exc` kept the ORIGINAL, unredacted exception attached as
+# __cause__, one uncaught exception away from a full traceback showing the
+# real key (confirmed against a real CLI run, see test_cli.py's own round 2
+# test). Fixed by scrubbing exc's own args (and anything already chained to
+# it) in place, then cutting the new exception loose with `from None`, so
+# a standard traceback does not show the chain at all, and even code that
+# reads __cause__/__context__ directly finds it already clean either way.
+
+
+def test_fetch_cuts_the_new_exception_loose_from_its_cause(tmp_path):
+    session = ConnectFailureSession(requests.exceptions.ConnectionError)
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+
+def test_fetch_scrubs_the_original_exception_even_if_suppression_is_bypassed(tmp_path):
+    # `from None` is what stops a STANDARD traceback from showing the
+    # chain at all, via __suppress_context__. This proves the second,
+    # independent layer: __context__ is still set internally (that is how
+    # Python's runtime records "raised while handling another exception",
+    # regardless of any `from` clause), so code that reads it directly,
+    # bypassing the suppression flag entirely, must still find an
+    # already-scrubbed exception there, not the raw one.
+    session = ConnectFailureSession(requests.exceptions.ConnectionError)
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    chained = excinfo.value.__context__
+    assert chained is not None, "expected the original exception still present as __context__"
+    assert SECRET not in str(chained)
+    assert all(SECRET not in arg for arg in chained.args if isinstance(arg, str))
+
+
+def test_fetch_rendered_traceback_never_contains_the_key(tmp_path):
+    # The exact check the review applied: not just str(exception), but
+    # what traceback.format_exception actually produces, since that is
+    # what an uncaught exception, logging.exception, or
+    # traceback.format_exc() would show a human.
+    session = ConnectFailureSession(requests.exceptions.ConnectionError)
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    rendered = "".join(traceback.format_exception(excinfo.type, excinfo.value, excinfo.tb))
+    assert SECRET not in rendered, f"the key appeared in a rendered traceback: {rendered}"
+    # Proves the chain is genuinely suppressed, not merely short: a
+    # suppressed chain and a chain that never existed both satisfy "the
+    # secret is absent" equally well by that assertion alone.
+    assert "direct cause" not in rendered
+    assert "another exception occurred" not in rendered
+
+
+def test_fetch_preview_redacts_the_full_body_before_truncating_for_display(tmp_path):
+    # Review round 2's own example: enough padding ahead of "API_Key="
+    # pushes part of the key past a fixed-size truncation window, so
+    # truncating BEFORE redacting leaves a partial, unredacted fragment
+    # that still reads as most of the key. 280 bytes of filler plus
+    # "API_Key=" (8 bytes) starts the key at byte 288; redacting only
+    # payload[:300] would see just the first 12 characters of this
+    # 33-character key, which is not a match for a whole-string
+    # substitution and so is never touched.
+    assert len(SECRET) > 20, "the test needs a key long enough to be split by the padding"
+    padding = b"x" * 280
+    leaky_body = padding + f"API_Key={SECRET}".encode("utf-8")
+    session = FakeSession(FakeStreamResponse([leaky_body], status_code=200))
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    message = str(excinfo.value)
+    assert SECRET not in message
+    # The real property: no fragment of the key survives either. A bug
+    # that truncated to exactly the first N bytes before redacting would
+    # otherwise pass a bare "SECRET not in message" check by accident,
+    # since the FULL secret genuinely never appears, only part of it.
+    assert SECRET[:12] not in message, f"a partial key fragment survived: {message}"
+
+
+def test_redact_strips_a_case_shifted_key():
+    # str.replace is case-sensitive; nothing guarantees a key survives in
+    # its original case by the time it reaches this function (a proxy or
+    # gateway can title-case a header, for instance).
+    text = f"failed: API_Key={SECRET.upper()} was rejected"
+    redacted = _redact(text, SECRET)
+    assert SECRET.upper() not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_redact_withholds_text_when_the_key_survives_only_nul_interspersed():
+    # A UTF-16 error page decoded with the UTF-8 codec (errors="replace")
+    # does not raise: every byte of ASCII-range UTF-16LE text is
+    # independently valid UTF-8 on its own, so it decodes to the original
+    # characters each followed by a stray NUL. A human reading this (a
+    # browser or a terminal renders NUL as invisible) sees the key in
+    # plain sight; a plain substring search does not, since there is no
+    # contiguous match.
+    nul_interspersed = "".join(ch + "\x00" for ch in SECRET)
+    text = f"error page: {nul_interspersed} appeared in the response"
+    redacted = _redact(text, SECRET)
+    assert SECRET not in redacted
+    # The real property: nothing readable survives, not merely that the
+    # exact original substring is no longer contiguous.
+    assert SECRET not in redacted.replace("\x00", "")
+    assert "withheld" in redacted.lower()
+
+
+def test_redact_leaves_ordinary_text_alone_when_the_key_is_absent():
+    text = "a perfectly ordinary error message with no secret in it"
+    assert _redact(text, SECRET) == text
+
+
+def test_scrub_exception_chain_redacts_every_link_in_a_real_chain():
+    try:
+        try:
+            raise ValueError(f"root cause with {SECRET} embedded")
+        except ValueError as root:
+            raise RuntimeError(f"middle layer also has {SECRET}") from root
+    except RuntimeError as top:
+        _scrub_exception_chain(top, SECRET)
+        assert SECRET not in str(top)
+        assert SECRET not in str(top.__cause__)
+
+
+def test_fetch_lets_cancelled_propagate_unwrapped(tmp_path):
+    # The broad except Exception in fetch() would otherwise convert this
+    # project's own cooperative-cancellation signal into an ElevationError.
+    # Nothing calls anything that raises Cancelled inside that block
+    # today; this pins that it would still propagate correctly if
+    # something ever did, by construction, not by the accident of what
+    # is called there now.
+    class CancelsSession:
+        def get(self, url, **kwargs):
+            raise Cancelled("job was cancelled mid-request")
+
+    source = ElevationSource(api_key="k", session=CancelsSession())
+    with pytest.raises(Cancelled):
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+
+
+def test_fetch_lets_keyboard_interrupt_propagate(tmp_path):
+    class InterruptsSession:
+        def get(self, url, **kwargs):
+            raise KeyboardInterrupt()
+
+    source = ElevationSource(api_key="k", session=InterruptsSession())
+    with pytest.raises(KeyboardInterrupt):
+        source.fetch(BBOX, [], tmp_path, NullProgress())
 
 
 def test_readiness_problem_is_none_when_a_key_is_available():
