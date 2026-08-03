@@ -26,6 +26,14 @@ class Config:
     tile_size_m: float = 2000.0
     overlap_m: float = 100.0
     last_region: str = ""
+    # Task 22: "auto" follows the OS/browser preference (prefers-color-
+    # scheme), "light" and "dark" override it. Validated the same
+    # structural way as every other field here (must be a str; an
+    # unrecognised value is not rejected by load_config itself, which has
+    # no notion of an enum, only a type, the same as every other field),
+    # so app.js's own applyTheme is what actually falls back to "auto"
+    # for anything it does not recognise.
+    theme: str = "auto"
     # The one exception to this module's own docstring: Task 18 gave the
     # elevation layer's OpenTopography key an interface field, and the
     # owner chose to save it here rather than nowhere. An environment

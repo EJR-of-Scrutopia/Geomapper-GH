@@ -175,10 +175,37 @@ function _queryContainer(container, selector) {
   return candidates;
 }
 
+// A real <html> element, minimal but genuine: app.js's applyTheme
+// (Task 22) sets/removes a data-theme attribute on it rather than on any
+// id-addressable element (there is no id="theme-root" in the markup, the
+// same as a real page, which addresses <html> structurally, not by id).
+// Added because applyTheme needed it, the same reason every other
+// primitive in this file exists: without it, choosing a theme in
+// Settings would be untestable rather than merely inert.
+function makeDocumentElement() {
+  const attrs = {};
+  return {
+    setAttribute(name, value) {
+      attrs[name] = String(value);
+    },
+    removeAttribute(name) {
+      delete attrs[name];
+    },
+    getAttribute(name) {
+      return name in attrs ? attrs[name] : null;
+    },
+    hasAttribute(name) {
+      return name in attrs;
+    },
+  };
+}
+
 function makeDocument() {
   const elements = new Map();
   const listeners = {};
+  const documentElement = makeDocumentElement();
   return {
+    documentElement,
     getElementById(id) {
       // A real getElementById returns null, not a fresh element, for an
       // id nothing in the document defines. Checking against KNOWN_IDS
@@ -228,6 +255,14 @@ function makeDocument() {
 
 function makeWindow() {
   const listeners = {};
+  // Task 22: app.js's effectiveTheme() reads window.matchMedia to resolve
+  // "auto" for whatever it draws itself (the tile grid's colours; the
+  // page's own light/dark switching is plain CSS and needs no JS at
+  // all). Added because effectiveTheme() needed it, not speculatively:
+  // a system dark-mode preference is exactly the kind of thing this
+  // harness cannot observe from the real OS, so a test controls it
+  // through prefersDark below instead.
+  let prefersDark = false;
   return {
     addEventListener(type, handler) {
       (listeners[type] = listeners[type] || []).push(handler);
@@ -235,6 +270,18 @@ function makeWindow() {
     fire(type, eventLike = {}) {
       const event = { preventDefault() {}, ...eventLike };
       for (const handler of listeners[type] || []) handler(event);
+    },
+    matchMedia(query) {
+      return {
+        matches: query.includes("dark") ? prefersDark : false,
+        addEventListener() {},
+        removeEventListener() {},
+      };
+    },
+    // Test-only hook: sets what matchMedia("(prefers-color-scheme: dark)")
+    // reports from here on, standing in for the OS/browser's own signal.
+    _setPrefersDark(value) {
+      prefersDark = value;
     },
   };
 }
@@ -2374,6 +2421,305 @@ function ok(condition, message) {
     ok(
       sandbox.L._rectangles.length === rectanglesAfterFirstPaste + 1,
       "expected a valid paste after a rejected one to still commit normally"
+    );
+  });
+
+  // =======================================================================
+  // Task 22: dark/light theme, applied to the page and resolved for
+  // whatever the tile grid draws itself with.
+  // =======================================================================
+
+  await test("boot() applies a saved theme to the page immediately", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/config") return jsonResponse(200, { ...DEFAULT_CONFIG, theme: "dark" });
+      return null;
+    });
+    ok(sandbox.document.getElementById("theme").value === "dark");
+    ok(sandbox.document.documentElement.getAttribute("data-theme") === "dark");
+  });
+
+  await test("choosing a theme in Settings applies it at once and persists it", async () => {
+    const { fetchCalls, sandbox } = await bootedSandbox();
+    fetchCalls.length = 0;
+    setField(sandbox, "theme", "dark");
+    await flush(10);
+    ok(sandbox.document.documentElement.getAttribute("data-theme") === "dark");
+    const putCall = fetchCalls.find((c) => (c.options.method || "").toUpperCase() === "PUT");
+    ok(putCall, "expected the theme change to be persisted");
+    ok(JSON.parse(putCall.options.body).theme === "dark");
+  });
+
+  await test("choosing 'match system' clears any explicit theme override", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/config") return jsonResponse(200, { ...DEFAULT_CONFIG, theme: "dark" });
+      return null;
+    });
+    ok(sandbox.document.documentElement.getAttribute("data-theme") === "dark");
+    setField(sandbox, "theme", "auto");
+    await flush(10);
+    ok(
+      sandbox.document.documentElement.getAttribute("data-theme") === null,
+      "expected no explicit override left once 'auto' is chosen, so the CSS media query alone governs"
+    );
+  });
+
+  await test("effectiveTheme falls back to the system preference when the setting is auto", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("theme").value = "auto";
+    ok(sandbox.effectiveTheme() === "light", "expected light with no system dark preference set");
+    sandbox.window._setPrefersDark(true);
+    ok(sandbox.effectiveTheme() === "dark", "expected dark once the system preference says so");
+  });
+
+  await test("an explicit theme choice overrides the system preference", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.window._setPrefersDark(true);
+    sandbox.document.getElementById("theme").value = "light";
+    ok(
+      sandbox.effectiveTheme() === "light",
+      "expected the explicit choice to win over a dark system preference"
+    );
+  });
+
+  // =======================================================================
+  // Task 22: the tile grid drawn on the map from /api/extent's and
+  // /api/estimate's own tile_grid, never recomputed client-side.
+  // =======================================================================
+
+  await test(
+    "drawing an extent renders one tile-grid rectangle per tile_grid entry, and shows the legend",
+    async () => {
+      const { sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/extent") {
+          return jsonResponse(200, {
+            tiles: 2,
+            rows: 1,
+            cols: 2,
+            extent_km: { width: 1, height: 1 },
+            tile_grid: [
+              { tile_id: "r00_c00", west: -3.3, south: 51.4, east: -3.29, north: 51.41 },
+              { tile_id: "r00_c01", west: -3.29, south: 51.4, east: -3.28, north: 51.41 },
+            ],
+          });
+        }
+        return null;
+      });
+      ok(
+        sandbox.document.getElementById("tile-legend").hidden === true,
+        "expected no legend before any extent exists"
+      );
+      setField(sandbox, "bbox", "-3.30,51.40,-3.28,51.41");
+      await flush(10);
+      // One rectangle for the committed extent itself (setBBox's own),
+      // plus one per tile_grid entry: the grid is drawn from the
+      // server's own geometry, never recomputed from the bbox here.
+      ok(
+        sandbox.L._rectangles.length === 3,
+        `expected 3 rectangles total, got ${sandbox.L._rectangles.length}`
+      );
+      ok(
+        sandbox.document.getElementById("tile-legend").hidden === false,
+        "expected the legend visible once a grid is drawn"
+      );
+      ok(/Not started/.test(sandbox.document.getElementById("tile-legend").innerHTML));
+    }
+  );
+
+  await test("a changed extent redraws the tile grid instead of accumulating rectangles", async () => {
+    let call = 0;
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/extent") {
+        call += 1;
+        const grid =
+          call === 1
+            ? [{ tile_id: "r00_c00", west: -3.3, south: 51.4, east: -3.29, north: 51.41 }]
+            : [
+                { tile_id: "r00_c00", west: -3.3, south: 51.4, east: -3.29, north: 51.41 },
+                { tile_id: "r00_c01", west: -3.29, south: 51.4, east: -3.28, north: 51.41 },
+              ];
+        return jsonResponse(200, {
+          tiles: grid.length,
+          rows: 1,
+          cols: grid.length,
+          extent_km: { width: 1, height: 1 },
+          tile_grid: grid,
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.30,51.40,-3.28,51.41");
+    await flush(10);
+    setField(sandbox, "bbox", "-3.35,51.40,-3.25,51.42");
+    await flush(10);
+    const unremoved = sandbox.L._rectangles.filter((r) => !r.removed);
+    // 2 committed-extent rectangles were created (setBBox removes its
+    // own previous one each time), plus the second grid's own 2 tiles;
+    // only the second extent and the second grid's 2 tiles should
+    // remain: the first grid's single tile must not still be sitting
+    // underneath the new one.
+    ok(
+      sandbox.L._rectangles.length === 5,
+      `expected 5 rectangles created in total, got ${sandbox.L._rectangles.length}`
+    );
+    ok(
+      unremoved.length === 3,
+      `expected 3 unremoved rectangles (1 extent + 2 grid tiles), got ${unremoved.length}`
+    );
+  });
+
+  // --- classifyTiles: pure event-to-state classification, the logic that
+  // decides what colour each rectangle above actually gets painted. -------
+
+  await test("classifyTiles: an untouched tile stays pending while the job runs", async () => {
+    const { sandbox } = await bootedSandbox();
+    const result = sandbox.classifyTiles(["r00_c00"], ["osm"], [], true);
+    ok(result.get("r00_c00") === "pending");
+  });
+
+  await test(
+    "classifyTiles: a tile_done event marks a tile active, not yet done, while the job runs",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      const result = sandbox.classifyTiles(
+        ["r00_c00"],
+        ["osm", "overture"],
+        [{ event: "tile_done", tile_id: "r00_c00" }],
+        true
+      );
+      ok(result.get("r00_c00") === "active", `expected active, got ${result.get("r00_c00")}`);
+    }
+  );
+
+  await test("classifyTiles: Overture's first per-type event alone does not mark a tile done", async () => {
+    // The brief's own caution: Overture emits per tile AND per type, so a
+    // tile is not done when the first event for it arrives.
+    const { sandbox } = await bootedSandbox();
+    const result = sandbox.classifyTiles(
+      ["r00_c00"],
+      ["overture"],
+      [{ event: "tile_done", tile_id: "r00_c00", overture_type: "water" }],
+      true
+    );
+    ok(result.get("r00_c00") === "active", `expected active (not yet done), got ${result.get("r00_c00")}`);
+  });
+
+  await test("classifyTiles: a tile is done once every selected source reports source_done", async () => {
+    const { sandbox } = await bootedSandbox();
+    const events = [
+      { event: "tile_done", tile_id: "r00_c00" },
+      { event: "source_done", source: "osm" },
+      { event: "tile_done", tile_id: "r00_c00", overture_type: "water" },
+      { event: "source_done", source: "overture" },
+    ];
+    const result = sandbox.classifyTiles(["r00_c00"], ["osm", "overture"], events, true);
+    ok(result.get("r00_c00") === "done", `expected done, got ${result.get("r00_c00")}`);
+  });
+
+  await test(
+    "classifyTiles: a failed tile is visibly distinct from one that is merely unfinished",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      const events = [
+        { event: "tile_done", tile_id: "r00_c00" },
+        { event: "tile_failed", tile_id: "r00_c01" },
+      ];
+      const result = sandbox.classifyTiles(["r00_c00", "r00_c01", "r00_c02"], ["osm"], events, true);
+      ok(result.get("r00_c00") === "active", "expected the in-progress tile to read active");
+      ok(result.get("r00_c01") === "failed", "expected the failed tile to read failed");
+      ok(result.get("r00_c02") === "pending", "expected the untouched tile to read pending");
+      ok(
+        new Set(result.values()).size === 3,
+        "expected three genuinely distinct values, not two states doing duty for four"
+      );
+    }
+  );
+
+  await test("classifyTiles: a failed tile stays failed even if a later event for it arrives", async () => {
+    const { sandbox } = await bootedSandbox();
+    const events = [
+      { event: "tile_failed", tile_id: "r00_c00" },
+      { event: "tile_done", tile_id: "r00_c00" }, // stale/late, must not un-fail it
+      { event: "source_done", source: "osm" },
+    ];
+    const result = sandbox.classifyTiles(["r00_c00"], ["osm"], events, false);
+    ok(result.get("r00_c00") === "failed", `expected failed to stick, got ${result.get("r00_c00")}`);
+  });
+
+  await test(
+    "classifyTiles: once the job stops running, a touched tile settles even without every source reporting done",
+    async () => {
+      // Models a stopped run: "osm" finished (source_done), "overture"
+      // never got a turn at all, and the job has left "running".
+      const { sandbox } = await bootedSandbox();
+      const events = [
+        { event: "tile_done", tile_id: "r00_c00" },
+        { event: "source_done", source: "osm" },
+      ];
+      const result = sandbox.classifyTiles(["r00_c00"], ["osm", "overture"], events, false);
+      ok(
+        result.get("r00_c00") === "done",
+        `expected done once the job has stopped running, got ${result.get("r00_c00")}`
+      );
+    }
+  );
+
+  // =======================================================================
+  // Task 22: Stop keeps the data, so a stopped job is a normal, successful
+  // outcome in the interface, never styled or worded like a failure.
+  // =======================================================================
+
+  await test("a stopped job is logged plainly, not styled as a failure", async () => {
+    const { sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: 1,
+          rows: 1,
+          cols: 1,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 60,
+          warnings: [],
+          folder: "C:\\Surveys\\R\\2026-08-02_S",
+        });
+      }
+      if (url.pathname === "/api/jobs" && (options.method || "").toUpperCase() === "POST") {
+        return jsonResponse(202, { id: "job1" });
+      }
+      if (url.pathname === "/api/jobs/job1") {
+        return jsonResponse(200, {
+          id: "job1",
+          state: "stopped",
+          events: [],
+          error: null,
+          result_root: "C:\\out",
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    await flush(10);
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("cancel").hidden === true,
+      "expected the Stop button hidden once the job has stopped"
+    );
+    ok(
+      sandbox.document.getElementById("download").disabled === false,
+      "expected Download re-enabled once the job has stopped"
+    );
+    const logLines = sandbox.document.getElementById("log").children;
+    const stoppedLine = logLines.find((l) => /stopped/i.test(l.textContent));
+    ok(
+      stoppedLine,
+      `expected a stopped log line, got: ${logLines.map((l) => l.textContent).join(" | ")}`
+    );
+    ok(
+      stoppedLine.className !== "fail",
+      "expected a stopped job logged as a normal outcome, not styled like a failure"
     );
   });
 

@@ -33,6 +33,7 @@
     <main>
       <section class="map-pane">
         <div id="map"></div>
+        <div id="tile-legend" class="tile-legend" hidden></div>
         <div class="map-tools">
           <button id="draw" type="button">Draw extent</button>
           <div class="place-search">
@@ -74,7 +75,7 @@
         </div>
 
         <button id="download" type="button" class="primary" disabled>Download package</button>
-        <button id="cancel" type="button" class="danger" hidden>Cancel</button>
+        <button id="cancel" type="button" class="danger" hidden>Stop</button>
       </section>
     </main>
 
@@ -86,6 +87,15 @@
           <button id="settings-close" type="button">Close</button>
         </div>
         <p class="settings-panel-intro">Defaults the owner sets once, not per-survey choices. These apply to the next estimate or download, and are remembered from here on.</p>
+
+        <label>Appearance
+          <select id="theme">
+            <option value="auto">Match system</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+          <span class="hint">Applies to the whole page, including the tile grid drawn on the map while a download runs.</span>
+        </label>
 
         <label>Output root
           <input id="output-root" type="text" />

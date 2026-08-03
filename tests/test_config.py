@@ -29,6 +29,19 @@ def test_unknown_keys_are_ignored(tmp_path):
     assert load_config(target).output_root == "D:/S"
 
 
+# --- Task 22: the theme setting -----------------------------------------
+
+
+def test_theme_defaults_to_auto():
+    assert Config().theme == "auto"
+
+
+def test_theme_round_trips_through_save_and_load(tmp_path):
+    target = tmp_path / "config.json"
+    save_config(Config(theme="dark"), target)
+    assert load_config(target).theme == "dark"
+
+
 def test_an_empty_object_falls_back_to_defaults(tmp_path):
     target = tmp_path / "config.json"
     target.write_text("{}", encoding="utf-8")

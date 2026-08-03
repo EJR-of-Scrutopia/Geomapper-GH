@@ -23,6 +23,211 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: "&copy; OpenStreetMap contributors",
 }).addTo(map);
 
+// --- theme -------------------------------------------------------------
+//
+// Task 22: dark and light mode, interface-wide, requested alongside the
+// tile grid and answered with the one setting rather than two: "auto"
+// (the default) follows the OS/browser preference, an explicit choice
+// overrides it. The PAGE itself needs no JS to do this at all: styles.css
+// carries both palettes as CSS variables, switched by a plain
+// prefers-color-scheme media query for "auto" and by a data-theme
+// attribute this function sets for an explicit choice. JS only has to
+// resolve "auto" for itself where CSS variables cannot reach: the tile
+// grid below is drawn as Leaflet SVG shapes with colours set directly in
+// JS, not through a stylesheet, so effectiveTheme() is what lets it pick
+// the right palette without duplicating a media query in script.
+function applyTheme(theme) {
+  const root = document.documentElement;
+  if (!root) return;
+  if (theme === "light" || theme === "dark") {
+    root.setAttribute("data-theme", theme);
+  } else {
+    root.removeAttribute("data-theme");
+  }
+}
+
+function effectiveTheme() {
+  const setting = $("theme") ? $("theme").value : "auto";
+  if (setting === "light" || setting === "dark") return setting;
+  const prefersDark =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-color-scheme: dark)").matches;
+  return prefersDark ? "dark" : "light";
+}
+
+// --- tile grid -----------------------------------------------------------
+//
+// Task 22: draws the actual tiling build_tiles computed as rectangles over
+// the extent, from /api/extent's or /api/estimate's own tile_grid (see
+// package.py's _geometry_summary), never recomputed here: the same
+// tile_id progress events already carry is what keys each rectangle, so
+// this can never disagree with the server about the geometry.
+//
+// Four states, not three: pending (not started), active (touched by at
+// least one event but not yet settled), done, and failed. Failed is
+// checked first everywhere below and is sticky (nothing ever downgrades
+// it), because it is the one state the owner would want to notice before
+// deciding they have enough, per the brief.
+const TILE_COLOURS = {
+  light: {
+    pending: { color: "#9c9686", fillColor: "#9c9686", fillOpacity: 0.05, weight: 1 },
+    active: { color: "#c98a2e", fillColor: "#c98a2e", fillOpacity: 0.25, weight: 1 },
+    done: { color: "#2f5d4f", fillColor: "#2f5d4f", fillOpacity: 0.25, weight: 1 },
+    failed: { color: "#8c3b2e", fillColor: "#8c3b2e", fillOpacity: 0.45, weight: 2 },
+  },
+  dark: {
+    pending: { color: "#6b6656", fillColor: "#6b6656", fillOpacity: 0.1, weight: 1 },
+    active: { color: "#e0a840", fillColor: "#e0a840", fillOpacity: 0.3, weight: 1 },
+    done: { color: "#6fc3a3", fillColor: "#6fc3a3", fillOpacity: 0.3, weight: 1 },
+    failed: { color: "#e0685a", fillColor: "#e0685a", fillOpacity: 0.5, weight: 2 },
+  },
+};
+const TILE_STATE_LABELS = {
+  pending: "Not started",
+  active: "In progress",
+  done: "Done",
+  failed: "Failed",
+};
+
+let tileRectangles = new Map(); // tile_id -> Leaflet rectangle
+let tileState = new Map(); // tile_id -> "pending" | "active" | "done" | "failed"
+
+function tileStyleFor(state) {
+  return TILE_COLOURS[effectiveTheme()][state] || TILE_COLOURS[effectiveTheme()].pending;
+}
+
+function clearTileGrid() {
+  for (const rect of tileRectangles.values()) map.removeLayer(rect);
+  tileRectangles = new Map();
+  tileState = new Map();
+  renderTileLegend();
+}
+
+// Drawn every time the extent, tile size or overlap changes (see
+// refreshEstimate): a fresh tile_grid always means a fresh set of
+// rectangles, never a resize of the previous ones, since a changed
+// tiling can add, remove or move tiles rather than just reshape them.
+function renderTileGrid(tileGrid) {
+  clearTileGrid();
+  for (const tile of tileGrid || []) {
+    tileState.set(tile.tile_id, "pending");
+    const bounds = [
+      [tile.south, tile.west],
+      [tile.north, tile.east],
+    ];
+    const rect = L.rectangle(bounds, tileStyleFor("pending"));
+    rect.addTo(map);
+    tileRectangles.set(tile.tile_id, rect);
+  }
+  renderTileLegend();
+}
+
+function paintTileStates(states) {
+  for (const [tileId, state] of states) {
+    if (tileState.get(tileId) === state) continue;
+    tileState.set(tileId, state);
+    const rect = tileRectangles.get(tileId);
+    if (rect) rect.setStyle(tileStyleFor(state));
+  }
+}
+
+// Repaints every rectangle already on the map in its current state, using
+// whichever palette effectiveTheme() now resolves to: called when the
+// theme setting changes, since the tile-by-tile state itself has not
+// changed, only which colours represent it.
+function repaintTileGridTheme() {
+  for (const [tileId, rect] of tileRectangles) {
+    rect.setStyle(tileStyleFor(tileState.get(tileId) || "pending"));
+  }
+  renderTileLegend();
+}
+
+function renderTileLegend() {
+  const legend = $("tile-legend");
+  if (tileRectangles.size === 0) {
+    legend.hidden = true;
+    legend.innerHTML = "";
+    return;
+  }
+  legend.hidden = false;
+  legend.innerHTML = Object.keys(TILE_STATE_LABELS)
+    .map((state) => {
+      const style = tileStyleFor(state);
+      return (
+        `<span class="tile-legend-item">` +
+        `<span class="tile-legend-swatch" style="background:${style.fillColor}"></span>` +
+        `${escapeHtml(TILE_STATE_LABELS[state])}</span>`
+      );
+    })
+    .join("");
+}
+
+// Classifies every tile from the job's progress events alone: a pure
+// function of (tile ids, selected source ids, events so far, whether the
+// job is still running), recomputed fresh on every poll tick rather than
+// updated incrementally, which is cheap even for the "hundreds of tiles"
+// the brief warns this has to scale to and is simpler than reasoning
+// about incremental state transitions across a poll that can, in
+// principle, miss no events (the server holds the full history) but is
+// still worth not depending on.
+//
+// tile_done/tile_skipped alone only ever reaches "active", never "done":
+// Overture emits one such event per (tile, type), so a tile is not
+// finished when the first one arrives (see the brief). "done" is reached
+// two ways instead: every SELECTED source has reported its own
+// source_done (package.py emits this once a source's whole fetch+merge
+// pass, complete or a tolerated partial, is over), which is the strong,
+// mid-run signal; or the job has stopped running at all (job.state left
+// "running"), which is the closing signal for a run that ended before
+// every source got a source_done of its own, a stopped or a hard-failed
+// run in particular.
+//
+// "failed" is sticky: nothing here ever moves a tile OFF "failed" once a
+// tile_failed event (see package.py's _record_tile_outcomes) has set it,
+// which matters more than the other states per the brief. This falls out
+// of the tile_done/tile_skipped branch's own guard rather than needing a
+// separate check: it only ever promotes a tile FROM "pending", so once a
+// tile has moved to "failed" (or "active"), a later tile_done/tile_skipped
+// for it (Overture's own multiple per-tile events, most often) has
+// nothing to do. tile_failed itself stays unconditional, deliberately: a
+// genuine failure discovered after a tile was already marked done ought
+// to still register as failed, not be masked by having arrived "too late".
+function classifyTiles(tileIds, sourceIds, events, jobRunning) {
+  const state = new Map(tileIds.map((id) => [id, "pending"]));
+  const finishedSources = new Set();
+  for (const event of events || []) {
+    if (event.tile_id && state.has(event.tile_id)) {
+      if (event.event === "tile_failed") {
+        state.set(event.tile_id, "failed");
+      } else if (
+        (event.event === "tile_done" || event.event === "tile_skipped") &&
+        state.get(event.tile_id) === "pending"
+      ) {
+        state.set(event.tile_id, "active");
+      }
+    }
+    if (event.event === "source_done" && event.source) {
+      finishedSources.add(event.source);
+    }
+  }
+  const everySourceFinished =
+    sourceIds.length > 0 && sourceIds.every((id) => finishedSources.has(id));
+  if (everySourceFinished || !jobRunning) {
+    for (const [tileId, value] of state) {
+      if (value === "active") state.set(tileId, "done");
+    }
+  }
+  return state;
+}
+
+// Starts with no grid and the legend hidden. Set explicitly here rather
+// than left to index.html's own `hidden` attribute, the same reasoning
+// closeSettingsPanel documents below for the settings panel: a real
+// browser honours the markup's own attribute before any script runs, but
+// the Node test harness's synthetic elements have no knowledge of the
+// real markup's attributes at all, only of whatever a script sets.
+clearTileGrid();
+
 // --- API -------------------------------------------------------------
 
 // Every /api/ route needs ?token= on its query string. Building that by
@@ -513,6 +718,10 @@ function showEstimateError(message) {
   box.textContent = message;
   $("download").disabled = true;
   hideFolderPreview();
+  // A tiling or extent problem invalidates whatever grid was last drawn:
+  // showing rectangles for a configuration that just failed would
+  // mislead rather than help.
+  clearTileGrid();
 }
 
 async function refreshEstimate() {
@@ -523,6 +732,7 @@ async function refreshEstimate() {
     $("estimate").textContent = missing;
     $("download").disabled = true;
     hideFolderPreview();
+    clearTileGrid();
     return;
   }
 
@@ -545,6 +755,7 @@ async function refreshEstimate() {
         }),
       });
       $("estimate").innerHTML = `${formatGeometryLine(geometry)}<br />${escapeHtml(missing)}`;
+      renderTileGrid(geometry.tile_grid);
     } catch (error) {
       // A genuine problem with the extent or tiling itself (an absurd
       // tiling, a zero-area box that slipped through some other path, a
@@ -575,6 +786,7 @@ async function refreshEstimate() {
     }
     $("estimate").innerHTML = html;
     $("download").disabled = false;
+    renderTileGrid(data.tile_grid);
     // The exact path naming.build_package_paths composed for this request,
     // not a guess assembled here: this is read straight into Grasshopper,
     // so it has to be the same path the download itself will create, from
@@ -711,6 +923,19 @@ function maybePersistFieldSettings() {
   $(id).addEventListener("change", maybePersistFieldSettings)
 );
 
+// The theme setting persists immediately, unconditionally, like an API
+// key field: there is nothing here an estimate could reject, so there is
+// no "value the estimate just rejected" case to defer past the way
+// output-root/tile-size/overlap do. Applied to the page and repainted on
+// the tile grid at once, not only on the next reload: a setting the
+// owner just changed should look changed immediately.
+$("theme").addEventListener("change", () => {
+  const value = $("theme").value;
+  applyTheme(value);
+  repaintTileGridTheme();
+  persistConfig({ theme: value });
+});
+
 // API keys have no equivalent to check_path_length: estimate_survey never
 // rejects the estimate over one, only adds a warning alongside a still-
 // successful estimate (see readiness_problem in mapgen.sources.elevation),
@@ -760,14 +985,32 @@ function log(message, failed = false) {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
+// The sources this specific job was started with, for classifyTiles: read
+// from the same payload() the job start request itself sent, never
+// re-read from the checklist afterwards, since the owner is free to
+// change ticks while a job runs and this must describe the job actually
+// in flight, not whatever the form currently shows.
+let activeJobSourceIds = [];
+
 $("download").addEventListener("click", async () => {
   $("log").innerHTML = "";
   try {
+    const requestPayload = payload();
     const started = await api("/api/jobs", {
       method: "POST",
-      body: JSON.stringify(payload()),
+      body: JSON.stringify(requestPayload),
     });
     jobId = started.id;
+    activeJobSourceIds = requestPayload.sources;
+    // A fresh job restarts the grid's own bookkeeping (every rectangle
+    // back to "pending") without redrawing the rectangles themselves:
+    // the extent has not changed since the estimate that enabled
+    // Download, so the geometry is still correct, only the progress is
+    // new.
+    for (const [tileId, rect] of tileRectangles) {
+      tileState.set(tileId, "pending");
+      rect.setStyle(tileStyleFor("pending"));
+    }
     persistConfig({ last_region: $("region").value.trim() });
     $("download").disabled = true;
     $("cancel").hidden = false;
@@ -796,11 +1039,25 @@ $("download").addEventListener("click", async () => {
         log(`${e.event} ${detail}`.trim());
       });
       seen = job.events.length;
+      paintTileStates(
+        classifyTiles(
+          [...tileRectangles.keys()],
+          activeJobSourceIds,
+          job.events,
+          job.state === "running"
+        )
+      );
       if (job.state !== "running") {
         clearInterval(poller);
         $("cancel").hidden = true;
         $("download").disabled = false;
         if (job.state === "done") log(`Finished: ${job.result_root}`);
+        // Stopped is a deliberate, successful outcome, not a failure: the
+        // owner asked for this, and the package at result_root is real
+        // and usable (see survey.json's own stopped field). Logged plainly,
+        // never in the red "fail" styling the line below uses for an
+        // actual failure.
+        else if (job.state === "stopped") log(`Stopped: ${job.result_root}`);
         else log(`${job.state}: ${job.error || ""}`, true);
       }
     }, 700);
@@ -986,6 +1243,8 @@ function renderApiKeys(sources, config) {
     $("tile-size").value = config.tile_size_m;
     $("overlap").value = config.overlap_m;
     if (config.last_region) $("region").value = config.last_region;
+    $("theme").value = config.theme || "auto";
+    applyTheme(config.theme || "auto");
     savedConfig = config;
 
     const sources = await api("/api/sources");

@@ -1,9 +1,61 @@
+/* Task 22: dark and light mode, interface-wide, per the owner's own
+   request. Auto (no data-theme attribute at all) follows the OS/browser
+   preference via prefers-color-scheme; an explicit choice in Settings
+   sets data-theme on <html> (see app.js's applyTheme), which the two
+   attribute selectors below override the media query with. --surface is
+   the one addition beyond what the light palette already had: every
+   "background: #fff" the light theme wrote as a literal is now
+   var(--surface), because a literal white never had an opinion to
+   override once a dark palette exists beside it.
+
+   The tile grid drawn on the map (app.js's TILE_COLOURS) is a second,
+   separate palette, not CSS: Leaflet draws it as SVG shapes styled
+   directly through JS, which is also what lets app.js resolve "auto"
+   itself via matchMedia rather than needing a DOM readback of a computed
+   CSS variable. Both palettes change together, from the same one
+   setting, which is the point: the owner asked for light/dark, not two
+   independent switches that happen to share a name. */
 :root {
   --ink: #1c1c1a;
   --paper: #f6f4ef;
+  --surface: #ffffff;
   --line: #cfcabd;
   --accent: #2f5d4f;
   --warn: #8c3b2e;
+  /* The colour to put ON a solid --accent/--warn background (button
+     text): white reads on the light theme's dark accent/warn swatches.
+     A theme cannot simply reuse --accent as both a foreground colour
+     (needs contrast against --paper) and a button-fill colour (needs
+     contrast against whatever text sits on it): the dark theme below
+     lightens --accent/--warn so they read as text on a near-black page,
+     which means the text ON them has to flip to dark instead of staying
+     white, or the buttons below would render light text on a light fill. */
+  --accent-ink: #ffffff;
+  --warn-ink: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: #ece8dd;
+    --paper: #1b1c19;
+    --surface: #26271f;
+    --line: #4a4a3f;
+    --accent: #6fc3a3;
+    --warn: #e0685a;
+    --accent-ink: #0e1512;
+    --warn-ink: #1c0d0a;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ink: #ece8dd;
+  --paper: #1b1c19;
+  --surface: #26271f;
+  --line: #4a4a3f;
+  --accent: #6fc3a3;
+  --warn: #e0685a;
+  --accent-ink: #0e1512;
+  --warn-ink: #1c0d0a;
 }
 
 * { box-sizing: border-box; }
@@ -51,6 +103,33 @@ main {
   background: var(--paper);
 }
 
+/* Task 22: the tile grid legend, keyed to whatever palette app.js's
+   TILE_COLOURS actually drew the rectangles with for the current theme,
+   read back from data attributes app.js sets on each swatch rather than
+   duplicated here as a second, separately-maintained set of colours. */
+.tile-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 6px 10px;
+  font-size: 11px;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+}
+
+.tile-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tile-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
 .map-tools > input { flex: 1; }
 
 /* The place search box and its typeahead dropdown. A wrapper is needed so
@@ -70,7 +149,7 @@ main {
   list-style: none;
   max-height: 220px;
   overflow-y: auto;
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 3px;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
@@ -118,11 +197,12 @@ label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
   opacity: 0.65;
 }
 
-input[type="text"], input[type="number"], input[type="search"], input[type="password"] {
+input[type="text"], input[type="number"], input[type="search"], input[type="password"], select {
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 3px;
-  background: #fff;
+  background: var(--surface);
+  color: var(--ink);
   font: inherit;
   width: 100%;
   min-width: 0;
@@ -161,7 +241,7 @@ legend { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; opa
   border-left: 3px solid var(--accent);
   padding: 10px;
   font-size: 13px;
-  background: #fff;
+  background: var(--surface);
 }
 
 .estimate.error { border-left-color: var(--warn); color: var(--warn); }
@@ -178,7 +258,7 @@ legend { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; opa
   border-left: 3px solid var(--accent);
   padding: 8px 10px;
   font-size: 12px;
-  background: #fff;
+  background: var(--surface);
 }
 
 .folder-preview-label {
@@ -202,21 +282,22 @@ button {
   padding: 9px 12px;
   border: 1px solid var(--line);
   border-radius: 3px;
-  background: #fff;
+  background: var(--surface);
+  color: var(--ink);
   font: inherit;
   cursor: pointer;
 }
 
-button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
-button.danger { background: var(--warn); color: #fff; border-color: var(--warn); }
+button.danger { background: var(--warn); color: var(--warn-ink); border-color: var(--warn); }
 
 /* The draw tool's armed state: visible on its own, without relying on the
    button's text alone, so it is obvious the map is waiting for a first
    click. Uses the same green as the drawn/previewed rectangle itself. */
 button.armed {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-ink);
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(47, 93, 79, 0.35);
 }
@@ -295,7 +376,7 @@ footer { border-top: 1px solid var(--line); }
   overflow-y: auto;
   padding: 8px 20px;
   font: 12px/1.5 Consolas, monospace;
-  background: #fff;
+  background: var(--surface);
 }
 
 .log .fail { color: var(--warn); }
