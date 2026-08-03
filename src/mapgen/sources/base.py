@@ -59,7 +59,7 @@ class LayerSource(Protocol):
     "elevation" by name. Any future source with its own pre-flight
     prerequisite gets the same treatment for free by defining the same
     method; a source with nothing to check simply omits it. OsmSource's
-    configure() and filtering_caveat() (Task 19: request-scoped category
+    configure() and routing_note() (Task 19: request-scoped category
     selection) are the same convention again, for a different purpose.
 
     api_key_config_field is the same convention for a different job (Task

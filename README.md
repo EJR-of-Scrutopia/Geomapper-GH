@@ -163,9 +163,18 @@ land_cover, water) if omitted. `--region` and `--site` are always required.
 
 `--category` is repeatable and defaults to every category if omitted; run
 `mapgen categories` for the full list of ids, including the nine road
-subtypes. It reaches Overture's own type selection (mapped from category to
-type; `--overture-type`, if also given, wins outright over `--category` for
-Overture specifically, since they are two ways of choosing the same thing).
+subtypes. An id outside that list, `building` for the real id `buildings`
+being the typo actually seen in practice, is rejected outright with the
+list of valid ids, not silently treated as an empty or partial selection:
+a category selection that reaches neither a real filter nor an error is
+worse than either. It reaches Overture's own type selection (mapped from
+category to type; `--overture-type`, if also given, wins outright over
+`--category` for Overture specifically, since they are two ways of
+choosing the same thing). Deselecting every category that would map to
+an Overture type at all, `--category rail` alone for example, correctly
+fetches nothing from Overture rather than falling back to the full
+default set: an empty selection and an unspecified one are treated as
+two different things throughout.
 
 For OpenStreetMap, a genuine restriction switches the download to Overpass
 automatically, since the default OSM map API has no server-side filtering
@@ -208,8 +217,8 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
 ```text
 <output root>/South-Wales/2026-08-03_Barry-Waterfront/
   Barry-Waterfront_2026-08-03.osm                    merged OpenStreetMap XML
-  Barry-Waterfront_2026-08-03_building.geojson        one file per requested Overture type
-  Barry-Waterfront_2026-08-03_water.geojson
+  Barry-Waterfront_2026-08-03_building.geojson        one file per Overture type
+  Barry-Waterfront_2026-08-03_water.geojson           ever fetched into this package
   Barry-Waterfront_2026-08-03.tif                     elevation, only if selected
   Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here
   survey.json                                         audit trail, read this first
@@ -232,8 +241,14 @@ Each file:
   merged and deduplicated by id, highest version wins at a seam. This is the
   file the Urbano bridge reads for OSM geometry.
 - **`<stem>_<type>.geojson`**: one deduplicated GeoJSON FeatureCollection per
-  requested Overture type, sitting in the package root regardless of which
-  types you asked for.
+  Overture type this package has ever fetched, sitting in the package root
+  regardless of which types the current request asked for. A resumed
+  package whose category or `--overture-type` selection changed between
+  attempts keeps whatever an earlier, differently-scoped attempt already
+  wrote here: nothing removes a type's file just because the current
+  request no longer asks for it. `survey.json`'s own `types` list always
+  names the current request's selection; treat it, not the file list, as
+  the record of what this run actually asked for.
 - **`layers/water.geojson`, `layers/vegetation.geojson`, `layers/landuse.geojson`**:
   copies of the Overture `water`, `land_cover` and `land_use` types
   specifically, under names meant to be read straight into Grasshopper
@@ -246,10 +261,14 @@ Each file:
   the bridge succeeds. This is the single file to point Urbano 2 at.
 - **`survey.json`**: see below.
 - **`_work/`**: the in-progress scratch folder, keyed by a fingerprint of the
-  exact bbox, tile size and overlap. It is only present while a job is
-  incomplete, or if `--keep-work` was passed. A clean, complete run removes
-  it automatically. Re-running the same survey with the same tiling resumes
-  from whatever is already in here rather than restarting.
+  exact bbox, tile size, overlap, category selection and Overture type
+  selection. It is only present while a job is incomplete, or if
+  `--keep-work` was passed. A clean, complete run removes it automatically.
+  Re-running the same survey with the same tiling AND the same content
+  selection resumes from whatever is already in here rather than
+  restarting; changing either gets a fresh, separate scratch folder of its
+  own, so raw tiles fetched under an old selection are never mistaken for
+  the new one's.
 
 ### survey.json
 

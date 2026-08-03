@@ -196,6 +196,30 @@ def test_node_limit_failure_is_reported_immediately_without_retrying(tmp_path):
     assert len(source.session.calls) == 1
 
 
+def test_node_limit_message_does_not_suggest_a_specific_tile_size(tmp_path):
+    # A coordinator review's Honesty finding 1: this used to say "reduce
+    # to 1500 or 2000 metres", which is wrong exactly when the message
+    # actually reaches a person, since run_survey's own retry ladder
+    # (package.py's NODE_CAP_RETRY_TILE_SIZES_M) already tries both of
+    # those, among others, before ever letting this propagate that far,
+    # and is also wrong for a run that started at or below the ladder's
+    # smallest rung, which the ladder never touches. osm.py cannot import
+    # that ladder to check against without a circular import (package.py
+    # imports this module already), so the fix is a message with no
+    # specific size claim to be wrong about, checked here by name so a
+    # future edit cannot casually reintroduce one.
+    source = _source(
+        [FakeResponse(status_code=400, text="You requested too many nodes")], max_retries=4
+    )
+    with pytest.raises(NodeCapExceededError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    message = str(excinfo.value)
+    assert "1500" not in message
+    assert "2000" not in message
+
+
 def test_node_limit_failure_is_specifically_a_node_cap_exceeded_error(tmp_path):
     # Task 19: mapgen.package's whole-run retry needs to tell this failure
     # apart from any other kind of download failure by TYPE, not by

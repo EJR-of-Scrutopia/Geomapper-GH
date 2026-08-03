@@ -199,7 +199,7 @@ class OsmSource:
         # the original unfiltered query when nothing has been narrowed.
         # Read only by the Overpass path (self.use_overpass); the OSM map
         # API path has no equivalent filtering ability at all, see
-        # filtering_caveat below.
+        # routing_note below.
         self.categories = list(categories) if categories is not None else None
         # Endpoints actually contacted this run, deduplicated, first-seen
         # order. See the class docstring: a skipped tile records nothing.
@@ -353,10 +353,28 @@ class OsmSource:
                 # only once that ladder is exhausted, so it still needs to
                 # read correctly on its own at that point, not assume the
                 # reader already knows a retry was attempted.
+                #
+                # A coordinator review's Honesty finding 1: this used to
+                # suggest "1500 or 2000 metres" unconditionally, which is
+                # wrong exactly when it matters most: those are two of the
+                # three sizes the automatic retry ladder above already
+                # tried before giving up and reaching this message at all,
+                # and it is also wrong for a run that started at or below
+                # the ladder's own smallest rung, which the ladder never
+                # touches (see package.py's _next_smaller_node_cap_tile_
+                # size). osm.py has no import on package.py's ladder
+                # constant to check against (package.py imports THIS
+                # module, not the other way round) and no tile_size_m
+                # scalar of its own to compare either, a Tile only ever
+                # carries its bbox; naming any specific size here would be
+                # a guess this function cannot actually verify. Relative
+                # instead, and true regardless of what was already tried.
                 raise NodeCapExceededError(
                     f"Tile {tile.tile_id} exceeded the OSM API 50000-node limit. "
-                    f"Reduce the tile size, for example to 1500 or 2000 metres in "
-                    f"dense urban areas."
+                    f"mapgen already retries automatically at smaller tile sizes "
+                    f"where a smaller size is available; seeing this means none "
+                    f"was, or none helped. Draw a smaller extent, or split this "
+                    f"area into smaller pieces and survey them separately."
                 )
 
             last_error = OsmDownloadError(
