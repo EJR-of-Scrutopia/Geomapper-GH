@@ -343,8 +343,14 @@ def test_check_path_length_accounts_for_the_fingerprint_segment(tmp_path):
     # This matters specifically because the guard exists to keep paths well
     # inside the Windows limit: silently under-measuring by the fingerprint
     # segment's length is exactly the failure it was built to prevent.
+    #
+    # Overture's raw path is "raw/overture/<type>.geojson" since Task 23
+    # stopped tiling it; it was "raw/overture/<type>/rNN_cNN.geojson". Every
+    # probe in this file that composes that path by hand had to follow, or
+    # it would go on measuring a path the tool can no longer produce and
+    # claim eight characters of slack that are not really there.
     paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
-    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure" / "r00_c00.geojson"
+    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure.geojson"
     actual_length = len(str(overture_path))
     unfingerprinted_length = actual_length - (len(FINGERPRINT) + 1)
 
@@ -369,7 +375,7 @@ def test_check_path_length_rejects_long_site_name_pushing_project_setting_over_l
     long_site = "A" * 40
     paths = build_package_paths(deep, "R", long_site, date(2026, 8, 1), FINGERPRINT)
 
-    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure" / "r00_c00.geojson"
+    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure.geojson"
     overture_length = len(str(overture_path.resolve() if not overture_path.is_absolute() else overture_path))
     project_setting_length = len(str(paths.project_setting.resolve() if not paths.project_setting.is_absolute() else paths.project_setting))
 
@@ -383,7 +389,7 @@ def test_check_path_length_rejects_long_site_name_pushing_project_setting_over_l
 
 def test_check_path_length_boundary_is_inclusive(tmp_path):
     paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
-    probe = len(str(paths.work_dir / "raw" / "overture" / "infrastructure" / "r00_c00.geojson"))
+    probe = len(str(paths.work_dir / "raw" / "overture" / "infrastructure.geojson"))
     check_path_length(paths, ["infrastructure"], limit=probe)
     with pytest.raises(PathTooLongError):
         check_path_length(paths, ["infrastructure"], limit=probe - 1)
@@ -397,7 +403,7 @@ def test_check_path_length_boundary_is_inclusive(tmp_path):
 
 def test_check_path_length_ignores_overture_when_it_is_not_among_the_selected_sources(tmp_path):
     paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
-    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure" / "r00_c00.geojson"
+    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure.geojson"
     osm_path = paths.work_dir / "raw" / "osm" / "r00_c00.osm"
     overture_length = len(str(overture_path))
     osm_length = len(str(osm_path))

@@ -422,7 +422,37 @@ def test_estimate_does_not_reject_an_osm_only_job_over_an_unselected_overture_pa
     # _request's defaults are already region="South Wales", site="Barry
     # Waterfront", matching the real reported run; only output_root and
     # source_ids vary here.
-    deep = Path("C:/") / ("x" * 140)
+    #
+    # 148, not the 140 this used before Task 23: Overture's raw path lost
+    # its "/rNN_cNN" segment when it stopped being tiled, so it is eight
+    # characters shorter and 140 no longer trips the guard at all. The
+    # window that isolates Overture is only a few characters wide (osm's
+    # own path and project_setting both have to still fit), so the setup
+    # asserts its own preconditions below rather than trusting the number
+    # to stay right through the next change to any of the three shapes.
+    deep = Path("C:/") / ("x" * 148)
+    probe = build_package_paths(
+        deep,
+        "South Wales",
+        "Barry Waterfront",
+        date.today(),
+        "abcdef01",
+    )
+    longest_type = max(DEFAULT_OVERTURE_TYPES, key=len)
+    lengths = {
+        "overture": len(str(probe.work_dir / "raw" / "overture" / f"{longest_type}.geojson")),
+        "osm": len(str(probe.work_dir / "raw" / "osm" / "r00_c00.osm")),
+        "project_setting": len(str(probe.project_setting)),
+    }
+    assert lengths["overture"] > 240, (
+        f"test setup: this depth no longer trips the guard on Overture's own "
+        f"path, so the test below would prove nothing: {lengths}"
+    )
+    assert lengths["osm"] <= 240 and lengths["project_setting"] <= 240, (
+        f"test setup: at this depth something other than Overture is already "
+        f"over the limit, so an osm-only run would be refused for a reason "
+        f"this test is not about: {lengths}"
+    )
 
     # Guard: at this depth the OLD (fixed) behaviour, and today's behaviour
     # whenever Overture genuinely is selected, must still raise. Otherwise

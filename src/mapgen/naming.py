@@ -191,15 +191,23 @@ def check_path_length(
     """Raises PathTooLongError if this job's worst-case path would be too long.
 
     source_ids is the sources the job actually requested. Each source's raw
-    tile path has a different, fixed shape (Overture nests an extra
-    "<type>/" segment beneath "raw/overture/", which is why it is normally
-    the longest of the three), and only a selected source's shape is a path
-    this job can ever produce. source_ids=None, the default, means "unknown,
-    assume every source": every caller inside this codebase always knows the
-    job's real source_ids and passes it, so None only arises from a caller
-    (or a test) that has not been told, and the safe, conservative answer
-    for an unknown job is to check all three rather than silently under
-    counting one of them.
+    path has a different, fixed shape, and only a selected source's shape is
+    a path this job can ever produce. source_ids=None, the default, means
+    "unknown, assume every source": every caller inside this codebase always
+    knows the job's real source_ids and passes it, so None only arises from
+    a caller (or a test) that has not been told, and the safe, conservative
+    answer for an unknown job is to check all three rather than silently
+    under counting one of them.
+
+    Overture's shape is "raw/overture/<longest type>.geojson" (Task 23). It
+    used to nest an extra "<type>/" segment above a per-tile
+    "rNN_cNN.geojson", which made it reliably the longest of the three;
+    untiled it is 8 characters shorter, and still the longest, since a type
+    name plus ".geojson" beats "r00_c00.osm". Measured from the real shape
+    rather than left at the old one deliberately: a guard that is merely
+    conservative still names a path in its error message, and naming a path
+    the tool can no longer produce sends the owner looking for a file that
+    will never exist.
 
     project_setting is always a candidate: it exists for a package
     regardless of which sources it contains, since naming.py builds it
@@ -217,7 +225,7 @@ def check_path_length(
 
     if selected is None or "overture" in selected:
         longest_type = max(overture_types, key=len) if overture_types else "overture"
-        overture_path = paths.work_dir / "raw" / "overture" / longest_type / "r00_c00.geojson"
+        overture_path = paths.work_dir / "raw" / "overture" / f"{longest_type}.geojson"
         candidates.append((_length(overture_path), overture_path))
 
     candidates.append((_length(paths.project_setting), paths.project_setting))
