@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mapgen import __version__
+from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES
 from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
@@ -55,6 +56,13 @@ def _add_survey_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source", action="append", dest="sources",
                         help="Repeatable. Defaults to osm and overture.")
     parser.add_argument("--overture-type", action="append", dest="overture_types")
+    parser.add_argument(
+        "--category", action="append", dest="categories",
+        help="Repeatable. One of the ids `mapgen categories` lists. Filters OSM "
+             "(Overpass path only, see that command's own notes) and Overture "
+             "(unless --overture-type is also given, which wins outright). "
+             "Defaults to every category, today's behaviour.",
+    )
     parser.add_argument("--date", type=_parse_date, default=None,
                         help="Survey date, ISO format. Defaults to today.")
     parser.add_argument("--keep-work", action="store_true",
@@ -80,6 +88,7 @@ def _request_from_args(args: argparse.Namespace) -> SurveyRequest:
         overlap_m=args.overlap_m,
         source_ids=tuple(args.sources or ("osm", "overture")),
         overture_types=tuple(args.overture_types) if args.overture_types else None,
+        categories=tuple(args.categories) if args.categories else None,
         keep_work=args.keep_work,
         coordinate_stem=args.coordinate_stem,
         force=args.force,
@@ -142,6 +151,23 @@ def command_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_categories(args: argparse.Namespace) -> int:
+    """Lists every --category id, so the flag is discoverable without
+    reading source. Road subtypes are indented under "roads": that
+    grouping is a label only, "roads" itself is never a valid --category
+    value, only its nine children are (see mapgen.categories).
+    """
+    road_labels = dict(ROAD_SUBTYPES)
+    for group in CATEGORY_GROUPS:
+        if not group.children:
+            print(f"{group.id}: {group.label}")
+            continue
+        print(f"{group.label} (grouping label, not itself a --category value):")
+        for subtype_id in group.children:
+            print(f"  {subtype_id}: {road_labels[subtype_id]}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mapgen",
@@ -166,6 +192,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sources = subparsers.add_parser("sources", help="List available data sources.")
     sources.set_defaults(func=command_sources)
+
+    categories = subparsers.add_parser("categories", help="List available --category ids.")
+    categories.set_defaults(func=command_categories)
 
     # Legacy names, same machinery.
     for legacy in ("plan", "download", "merge", "urbano-package"):

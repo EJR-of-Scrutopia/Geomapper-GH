@@ -708,6 +708,75 @@ def test_starting_a_job_reaches_done_with_events_and_result_root(server, tmp_pat
     assert Path(final["result_root"]).is_dir()
 
 
+def test_a_jobs_category_selection_is_recorded_in_survey_json(server, tmp_path):
+    status, payload = _post(
+        server,
+        "/api/jobs",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+            "categories": ["buildings", "water"],
+            "run_bridge": False,
+        },
+    )
+    assert status == 202
+    final = _wait_for_state(server, payload["id"])
+    assert final["state"] == "done"
+    survey_json = Path(final["result_root"]) / "survey.json"
+    recorded = json.loads(survey_json.read_text(encoding="utf-8"))
+    assert sorted(recorded["categories"]) == ["buildings", "water"]
+
+
+def test_an_empty_category_selection_is_not_coalesced_into_the_default(server, tmp_path):
+    # payload.get(key) is used deliberately, not payload.get(key) or
+    # default: an explicit [] (every checkbox unticked) must survive as
+    # a genuine "nothing selected", not be treated the same as an absent
+    # key (which means "every category", today's behaviour).
+    status, payload = _post(
+        server,
+        "/api/jobs",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+            "categories": [],
+            "run_bridge": False,
+        },
+    )
+    assert status == 202
+    final = _wait_for_state(server, payload["id"])
+    survey_json = Path(final["result_root"]) / "survey.json"
+    recorded = json.loads(survey_json.read_text(encoding="utf-8"))
+    assert recorded["categories"] == []
+
+
+def test_a_missing_category_selection_defaults_to_every_category(server, tmp_path):
+    status, payload = _post(
+        server,
+        "/api/jobs",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+            "run_bridge": False,
+        },
+    )
+    assert status == 202
+    final = _wait_for_state(server, payload["id"])
+    survey_json = Path(final["result_root"]) / "survey.json"
+    recorded = json.loads(survey_json.read_text(encoding="utf-8"))
+    from mapgen.categories import ALL_CATEGORY_IDS
+
+    assert sorted(recorded["categories"]) == sorted(ALL_CATEGORY_IDS)
+
+
 def test_events_can_be_read_while_the_job_is_still_running(server, tmp_path):
     blocking = BlockingSource()
     register(blocking)

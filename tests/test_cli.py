@@ -205,6 +205,47 @@ def test_estimate_reports_a_zero_tile_size_without_a_traceback(tmp_path, capsys)
     assert "greater than zero" in capsys.readouterr().err
 
 
+def test_categories_command_lists_every_leaf_id(capsys):
+    from mapgen.categories import ALL_CATEGORY_IDS
+
+    exit_code = main(["categories"])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    for category_id in ALL_CATEGORY_IDS:
+        assert category_id in out, f"expected {category_id!r} to be listed"
+
+
+def test_category_flag_reaches_the_survey_request(tmp_path):
+    exit_code = main(
+        [
+            "survey",
+            "--bbox=-3.29,51.38,-3.28,51.39",
+            "--region=South Wales",
+            "--site=Barry",
+            "--output-root",
+            str(tmp_path),
+            "--tile-size-m",
+            "600",
+            "--source",
+            "stub",
+            "--skip-bridge",
+            "--date",
+            "2026-08-01",
+            "--category",
+            "buildings",
+            "--category",
+            "water",
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(
+        (tmp_path / "South-Wales" / "2026-08-01_Barry" / "survey.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sorted(payload["categories"]) == ["buildings", "water"]
+
+
 def test_coordinate_stem_flag_is_accepted():
     parser = build_parser()
     args = parser.parse_args(

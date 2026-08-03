@@ -15,6 +15,7 @@ from typing import Sequence
 
 from mapgen import __version__
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
+from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories
 from mapgen.fsutil import (
     atomic_write_text,
     best_effort_rmtree,
@@ -59,6 +60,7 @@ class SurveyRequest:
     overlap_m: float = 100.0
     source_ids: Sequence[str] = ("osm", "overture")
     overture_types: Sequence[str] | None = None
+    categories: Sequence[str] | None = None
     keep_work: bool = False
     coordinate_stem: bool = False
     force: bool = False
@@ -70,8 +72,34 @@ class SurveyRequest:
         return self.survey_date or date.today()
 
     @property
+    def effective_categories(self) -> list[str]:
+        """None (nothing selected, or not asked about at all) means every
+        category: today's behaviour, so an existing workflow that has
+        never heard of categories does not silently start returning less.
+        """
+        return list(self.categories) if self.categories is not None else list(ALL_CATEGORY_IDS)
+
+    @property
     def effective_overture_types(self) -> list[str]:
-        return list(self.overture_types or DEFAULT_OVERTURE_TYPES)
+        """Precedence: an explicit --overture-type wins outright (the
+        CLI's own original, lower-level knob, unchanged since before
+        categories existed), then a category selection maps to the
+        types it implies, then the full 8-type default.
+
+        overture_types is checked first, not merged with categories: the
+        two are different ways of choosing the same thing, and letting
+        both apply at once (say, --category water plus --overture-type
+        building) would mean guessing whether the two are additive,
+        exclusive, or something else, with no obvious right answer.
+        Explicit and specific beats derived and general, matching how
+        resolve_api_key's own precedence chain in mapgen.sources.elevation
+        already favours a more specific, more direct source of truth.
+        """
+        if self.overture_types is not None:
+            return list(self.overture_types)
+        if self.categories is not None:
+            return overture_types_for_categories(self.effective_categories)
+        return list(DEFAULT_OVERTURE_TYPES)
 
 
 @dataclass(frozen=True)
@@ -161,8 +189,11 @@ def _configured_sources(request: SurveyRequest) -> list:
     for source_id in request.source_ids:
         source = get_source(source_id)
         configure = getattr(source, "configure", None)
-        if source_id == "overture" and callable(configure):
-            source = configure(request.effective_overture_types)
+        if callable(configure):
+            if source_id == "overture":
+                source = configure(request.effective_overture_types)
+            elif source_id == "osm":
+                source = configure(request.effective_categories)
         configured.append(source)
     return configured
 
@@ -230,6 +261,21 @@ def estimate_survey(request: SurveyRequest) -> dict[str, object]:
             problem = check_readiness()
             if problem:
                 warnings.append(problem)
+        # filtering_caveat is the same optional-extension convention,
+        # applied to a different kind of pre-flight problem: not "cannot
+        # run at all" (readiness_problem's job), but "will run, and will
+        # silently ignore part of what category selection asked for"
+        # (OsmSource's own case on the default, non-Overpass path, which
+        # has no server-side tag filtering to apply one with). Surfacing
+        # this as a warning is the "decide and state" the brief asked
+        # for: a control that appears to work and does not is worse than
+        # no control, and the estimate panel is where the owner would
+        # otherwise have no way to find out.
+        check_filtering_caveat = getattr(source, "filtering_caveat", None)
+        if callable(check_filtering_caveat):
+            caveat = check_filtering_caveat(request.effective_categories)
+            if caveat:
+                warnings.append(caveat)
 
     result = dict(_geometry_summary(request.bbox, tiles))
     result["bytes_estimate"] = total_bytes
@@ -552,6 +598,12 @@ def _build_survey_json(
             "cols": max((t.col for t in tiles), default=0) + 1,
         },
         "sources": [_source_provenance(source) for source in sources],
+        # The resolved selection (never the possibly-None raw field:
+        # every other audit-trail value here is a concrete, resolved
+        # fact, not "whatever was asked for or a default"), so a package
+        # says what it contains without the reader having to separately
+        # know that None means everything.
+        "categories": request.effective_categories,
         "tiles": state.as_tile_records(),
         # complete reports the survey DATA alone: every requested source's
         # every tile downloaded and merged successfully. It intentionally

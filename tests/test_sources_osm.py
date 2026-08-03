@@ -211,6 +211,79 @@ def test_overpass_fetch_records_the_overpass_endpoint(tmp_path):
     assert source.endpoints_used == [source.overpass_urls[0]]
 
 
+# --- Task 19: category selection, Overpass path only -----------------------
+
+
+def test_overpass_fetch_sends_a_tag_filtered_query_for_a_narrowed_category_selection(tmp_path):
+    source = _source([FakeResponse()], use_overpass=True, categories=["buildings"])
+    tile = _tile()
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [tile], tmp_path, NullProgress())
+    _method, _url, kwargs = source.session.calls[0]
+    assert b'["building"]' in kwargs["data"]
+    assert b"node(" not in kwargs["data"], "expected the filtered form, not the unfiltered query"
+
+
+def test_overpass_fetch_sends_the_original_unfiltered_query_when_categories_is_none(tmp_path):
+    source = _source([FakeResponse()], use_overpass=True)
+    tile = _tile()
+    source.fetch(BBox.parse("-3.29,51.38,-3.28,51.39"), [tile], tmp_path, NullProgress())
+    _method, _url, kwargs = source.session.calls[0]
+    assert kwargs["data"] == build_overpass_query(tile.query_bbox, source.timeout_seconds).encode(
+        "utf-8"
+    )
+
+
+def test_configure_returns_a_fresh_instance_with_the_given_categories(tmp_path):
+    original = OsmSource(use_overpass=True)
+    configured = original.configure(["buildings"])
+    assert configured is not original
+    assert configured.categories == ["buildings"]
+    assert original.categories is None, "configure() must not mutate the original instance"
+
+
+def test_configure_preserves_transport_settings():
+    session = object()
+    original = OsmSource(
+        session=session,
+        overpass_urls=["https://example.invalid/api"],
+        osm_api_url="https://example.invalid/map",
+        max_retries=7,
+        timeout_seconds=99,
+        min_interval_seconds=3.5,
+        use_overpass=True,
+    )
+    configured = original.configure(["water"])
+    assert configured.session is session
+    assert configured.overpass_urls == ["https://example.invalid/api"]
+    assert configured.osm_api_url == "https://example.invalid/map"
+    assert configured.max_retries == 7
+    assert configured.timeout_seconds == 99
+    assert configured.min_interval_seconds == 3.5
+    assert configured.use_overpass is True
+
+
+def test_filtering_caveat_is_none_on_the_overpass_path_regardless_of_selection():
+    source = OsmSource(use_overpass=True)
+    assert source.filtering_caveat(["buildings"]) is None
+
+
+def test_filtering_caveat_is_none_on_the_default_path_when_everything_is_selected():
+    source = OsmSource(use_overpass=False)
+    from mapgen.categories import ALL_CATEGORY_IDS
+
+    assert source.filtering_caveat(list(ALL_CATEGORY_IDS)) is None
+    assert source.filtering_caveat(None) is None
+
+
+def test_filtering_caveat_warns_on_the_default_path_for_a_narrowed_selection():
+    # The default OSM map API has no server-side filtering at all: a
+    # narrowed selection is silently ignored unless this is surfaced.
+    source = OsmSource(use_overpass=False)
+    caveat = source.filtering_caveat(["buildings"])
+    assert caveat is not None
+    assert "no effect" in caveat
+
+
 def test_retry_delay_honours_retry_after_in_seconds():
     assert retry_delay_seconds({"Retry-After": "42"}, attempt=1) == pytest.approx(42.0)
 

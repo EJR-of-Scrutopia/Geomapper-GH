@@ -1185,3 +1185,120 @@ def test_survey_json_source_entry_omits_types_for_a_source_with_no_such_concept(
     result = run_survey(_request(tmp_path))
     payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
     assert "types" not in payload["sources"][0]
+
+
+# --- Task 19: category selection, end to end through SurveyRequest/
+# _configured_sources/survey.json. The category vocabulary's own mapping
+# logic (osm_tag_clauses, overture_types_for_categories) is covered
+# directly in tests/test_categories.py; these tests are about the
+# ORCHESTRATION: does a request's category selection actually reach the
+# sources it should, and get recorded truthfully. ---------------------
+
+
+def test_effective_categories_defaults_to_everything(tmp_path):
+    from mapgen.categories import ALL_CATEGORY_IDS
+
+    request = _request(tmp_path)
+    assert request.categories is None
+    assert sorted(request.effective_categories) == sorted(ALL_CATEGORY_IDS)
+
+
+def test_effective_overture_types_prefers_an_explicit_overture_type_over_categories(tmp_path):
+    # Two different ways of choosing the same thing must not both apply
+    # at once: the CLI's own original, lower-level --overture-type wins
+    # outright over a category selection, rather than the two being
+    # merged in some guessed-at way.
+    request = _request(
+        tmp_path, overture_types=("building",), categories=("water",)
+    )
+    assert request.effective_overture_types == ["building"]
+
+
+def test_effective_overture_types_derives_from_categories_when_no_explicit_overture_type(tmp_path):
+    request = _request(tmp_path, categories=("buildings",))
+    assert request.effective_overture_types == ["building"]
+
+
+def test_effective_overture_types_defaults_to_the_full_set_with_neither(tmp_path):
+    request = _request(tmp_path)
+    assert request.effective_overture_types == list(DEFAULT_OVERTURE_TYPES)
+
+
+class _RecordingOsmSession:
+    """Like _FakeOsmSession, but records every POST body: what actually
+    proves configure() was reached is the QUERY SENT, not merely that
+    the run completed (a fake session returns canned XML regardless of
+    what query it was asked for, so completion alone cannot tell a
+    configured, tag-filtered fetch apart from an unconfigured one).
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.post_calls: list[bytes] = []
+
+    def get(self, url, **kwargs):
+        return self._responses.pop(0)
+
+    def post(self, url, **kwargs):
+        self.post_calls.append(kwargs["data"])
+        return self._responses.pop(0)
+
+
+def test_run_survey_configures_the_real_osm_source_with_the_requests_categories(tmp_path):
+    # Proves the wiring reaches OsmSource specifically, using the real
+    # class (not a stub) so a change to OsmSource.configure's own
+    # signature would be caught here too. use_overpass=True so the
+    # category selection is not immediately inert (see the module's own
+    # filtering_caveat on the default path).
+    session = _RecordingOsmSession([_FakeOsmResponse() for _ in range(4)])
+    registered = OsmSource(
+        session=session,
+        sleeper=lambda _seconds: None,
+        min_interval_seconds=0.0,
+        use_overpass=True,
+    )
+    register(registered)
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm",), categories=("buildings",), run_bridge_step=False)
+    )
+    assert result.complete is True
+    # The query actually sent must be the tag-filtered form: this is what
+    # a mutation that skips calling configure() for "osm" cannot fake,
+    # since an unconfigured registered instance (categories=None) sends
+    # the original unfiltered query instead.
+    assert all(b'["building"]' in body for body in session.post_calls)
+    assert all(b"node(" not in body for body in session.post_calls)
+    # The registered singleton itself must come out unchanged, the same
+    # property already pinned for Overture.
+    assert registered.categories is None
+    assert get_source("osm") is registered
+
+
+def test_estimate_surfaces_the_osm_filtering_caveat_for_a_narrowed_selection_on_the_default_path(
+    tmp_path,
+):
+    register(OsmSource())  # use_overpass defaults False: the caveat path
+    estimate = estimate_survey(_request(tmp_path, source_ids=("osm",), categories=("buildings",)))
+    assert any("no effect" in w for w in estimate["warnings"])
+
+
+def test_estimate_has_no_osm_filtering_caveat_when_every_category_is_selected(tmp_path):
+    register(OsmSource())
+    estimate = estimate_survey(_request(tmp_path, source_ids=("osm",)))
+    assert estimate["warnings"] == []
+
+
+def test_survey_json_records_the_resolved_category_selection(tmp_path):
+    register(StubSource())
+    result = run_survey(_request(tmp_path, categories=("buildings", "water")))
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert sorted(payload["categories"]) == ["buildings", "water"]
+
+
+def test_survey_json_records_every_category_by_default(tmp_path):
+    from mapgen.categories import ALL_CATEGORY_IDS
+
+    register(StubSource())
+    result = run_survey(_request(tmp_path))
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert sorted(payload["categories"]) == sorted(ALL_CATEGORY_IDS)

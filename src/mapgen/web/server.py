@@ -148,6 +148,15 @@ def _survey_request(payload: dict) -> SurveyRequest:
         tile_size_m=float(payload.get("tile_size_m", 2000.0)),
         overlap_m=float(payload.get("overlap_m", 100.0)),
         source_ids=tuple(payload.get("sources") or ("osm", "overture")),
+        # Absent entirely (an older client, or the CLI without --category)
+        # means None, "every category". A present-but-empty list is a
+        # genuine, deliberate "nothing selected" and must not be coalesced
+        # into the default the way `or` would: payload.get(key) is used
+        # here rather than payload.get(key) or default, precisely so an
+        # explicit [] survives as [] rather than becoming None.
+        categories=(
+            tuple(payload["categories"]) if payload.get("categories") is not None else None
+        ),
         keep_work=bool(payload.get("keep_work", False)),
         coordinate_stem=bool(payload.get("coordinate_stem", False)),
         run_bridge_step=bool(payload.get("run_bridge", True)),
