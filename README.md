@@ -241,14 +241,14 @@ Each file:
   merged and deduplicated by id, highest version wins at a seam. This is the
   file the Urbano bridge reads for OSM geometry.
 - **`<stem>_<type>.geojson`**: one deduplicated GeoJSON FeatureCollection per
-  Overture type this package has ever fetched, sitting in the package root
-  regardless of which types the current request asked for. A resumed
-  package whose category or `--overture-type` selection changed between
-  attempts keeps whatever an earlier, differently-scoped attempt already
-  wrote here: nothing removes a type's file just because the current
-  request no longer asks for it. `survey.json`'s own `types` list always
-  names the current request's selection; treat it, not the file list, as
-  the record of what this run actually asked for.
+  Overture type the completed request asked for. A complete run also sweeps
+  away any merged file an earlier, differently-scoped attempt left in the
+  root, so the folder matches `survey.json` rather than accumulating types
+  the current request never asked for. The sweep only ever touches names
+  mapgen itself could have written for this exact survey stem: your own
+  files in the folder are never candidates, whatever they are called. An
+  incomplete run (`complete: false`) keeps everything it finds until a
+  resume finishes the job.
 - **`layers/water.geojson`, `layers/vegetation.geojson`, `layers/landuse.geojson`**:
   copies of the Overture `water`, `land_cover` and `land_use` types
   specifically, under names meant to be read straight into Grasshopper

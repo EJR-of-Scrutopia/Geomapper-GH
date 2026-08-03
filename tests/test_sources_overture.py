@@ -372,3 +372,25 @@ def test_estimate_scales_with_tiles_and_types():
 
     assert one_tile_two_types.bytes_estimate == 2 * one_tile_one_type.bytes_estimate
     assert two_tiles_one_type.bytes_estimate == 2 * one_tile_one_type.bytes_estimate
+
+
+def test_possible_outputs_declares_every_default_type_even_when_narrowed():
+    # The sweep's whole job is removing what a WIDER earlier attempt left
+    # behind, so a narrowed instance must still declare the full namespace
+    # it could ever have written, not just what this run asked for.
+    narrowed = OvertureSource(types=["building"])
+    names = narrowed.possible_outputs("Stem_2026-08-01")
+    for overture_type in DEFAULT_OVERTURE_TYPES:
+        assert f"Stem_2026-08-01_{overture_type}.geojson" in names
+    assert "layers/water.geojson" in names
+    assert "layers/vegetation.geojson" in names
+    assert "layers/landuse.geojson" in names
+
+
+def test_possible_outputs_also_covers_an_exotic_requested_type():
+    # --overture-type accepts strings outside the default eight; a run that
+    # fetched one must be sweepable by a later run that did not.
+    exotic = OvertureSource(types=["building", "address"])
+    assert "Stem_address.geojson" in [
+        n for n in exotic.possible_outputs("Stem")
+    ]

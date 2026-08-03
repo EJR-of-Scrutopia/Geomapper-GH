@@ -577,3 +577,7 @@ def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
     part.write_text(OSM_XML, encoding="utf-8")
     outputs = OsmSource().merge([part], tmp_path / "out", "Cardiff-Bay_2026-09-01")
     assert outputs[0].name == "Cardiff-Bay_2026-09-01.osm"
+
+
+def test_possible_outputs_names_exactly_the_stem_osm_file():
+    assert OsmSource().possible_outputs("Stem_2026-08-01") == ["Stem_2026-08-01.osm"]

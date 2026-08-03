@@ -1784,3 +1784,101 @@ def test_next_smaller_node_cap_tile_size_steps_down_the_fixed_ladder():
     # A size between two rungs steps to the largest rung still smaller
     # than it, not the smallest overall.
     assert _next_smaller_node_cap_tile_size(1800.0) == 1500.0
+
+
+# --- the stale-output sweep (final review residual, HANDOFF item 4) ---------
+#
+# The fingerprinted work directory isolates each selection's RAW tiles, but
+# merged outputs land in the shared package root, so a failed wide attempt
+# followed by a completed narrow one left the wide attempt's merged file
+# beside a survey.json that never mentioned it. These pin the sweep that
+# closes that: only names a source declares in possible_outputs(stem) are
+# candidates, only a COMPLETE run sweeps, and files the user put in the
+# folder are untouchable because they can never match the closed list.
+
+
+class SweepingStubSource(StubSource):
+    """StubSource plus the possible_outputs declaration the sweep reads.
+
+    Declares more names than merge() ever writes, the way OvertureSource
+    declares all eight types while a narrowed run merges two: the extra
+    names are exactly the ones a previous, wider attempt could have left
+    behind.
+    """
+
+    def possible_outputs(self, stem):
+        return [
+            f"{self.id}.txt",
+            f"{stem}_water.geojson",
+            "layers/water.geojson",
+        ]
+
+
+def _root_with_leftovers(tmp_path):
+    """The exact root _request()'s defaults compose, pre-seeded with one
+    stale pair a wider attempt could have merged plus two files only a
+    user would have put there."""
+    root = tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront"
+    stem = "Barry-Waterfront_2026-08-01"
+    (root / "layers").mkdir(parents=True)
+    (root / f"{stem}_water.geojson").write_text("stale wide merge", encoding="utf-8")
+    (root / "layers" / "water.geojson").write_text("stale layer copy", encoding="utf-8")
+    (root / f"{stem}_notes.txt").write_text("the owner's own note", encoding="utf-8")
+    (root / "random.txt").write_text("also the owner's", encoding="utf-8")
+    return root, stem
+
+
+def test_a_complete_run_sweeps_stale_merged_outputs_and_nothing_else(tmp_path):
+    register(SweepingStubSource())
+    root, stem = _root_with_leftovers(tmp_path)
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    # Reused the seeded root rather than suffixing to _02: no survey.json
+    # meant an unfinished earlier attempt, which is the reuse rule.
+    assert result.paths.root == root
+    # The stale pair is gone, root and layers/ both.
+    assert not (root / f"{stem}_water.geojson").exists()
+    assert not (root / "layers" / "water.geojson").exists()
+    # This run's own merge survived the sweep.
+    assert (root / "stub.txt").read_text(encoding="utf-8") != ""
+    # The user's files were never candidates.
+    assert (root / f"{stem}_notes.txt").read_text(encoding="utf-8") == "the owner's own note"
+    assert (root / "random.txt").read_text(encoding="utf-8") == "also the owner's"
+    # And the run said what it removed, so the log is a complete account.
+    removed = sorted(
+        e["name"] for e in log.events if e["event"] == "stale_output_removed"
+    )
+    assert removed == [f"{stem}_water.geojson", "layers/water.geojson"]
+
+
+def test_an_incomplete_run_keeps_every_leftover(tmp_path):
+    # Deleting the only merged copy of anything mid-failure helps nobody:
+    # survey.json already says complete false, and the resume that finishes
+    # the job sweeps then. force=True is what lets a source failure mark
+    # the package incomplete instead of raising, same as the other
+    # incomplete-package tests above.
+    register(SweepingStubSource(fail_on=("r01_c01",)))
+    root, stem = _root_with_leftovers(tmp_path)
+
+    result = run_survey(_request(tmp_path, force=True))
+
+    assert result.complete is False
+    assert (root / f"{stem}_water.geojson").exists()
+    assert (root / "layers" / "water.geojson").exists()
+
+
+def test_a_source_without_the_declaration_is_skipped_not_crashed(tmp_path):
+    # possible_outputs is an optional extension like readiness_problem and
+    # routing_note; a plain StubSource has no such method and the sweep
+    # must read it defensively rather than assume the protocol grew.
+    register(StubSource())
+    root, stem = _root_with_leftovers(tmp_path)
+
+    result = run_survey(_request(tmp_path))
+
+    assert result.complete is True
+    # Nothing declared, so nothing swept, and nothing raised.
+    assert (root / f"{stem}_water.geojson").exists()

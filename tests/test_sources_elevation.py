@@ -1078,3 +1078,8 @@ def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_cancelled_pa
                     ), f"local {name!r} in fetch() still holds the key in a dict value"
         tb = tb.tb_next
     assert checked_fetch_frame, "the traceback did not include elevation.py's fetch() frame"
+
+
+def test_possible_outputs_names_exactly_the_stem_tif_file():
+    source = ElevationSource(api_key="k")
+    assert source.possible_outputs("Stem_2026-08-01") == ["Stem_2026-08-01.tif"]

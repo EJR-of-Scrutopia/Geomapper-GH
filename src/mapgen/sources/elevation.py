@@ -615,3 +615,8 @@ class ElevationSource:
         output = out_dir / f"{stem}.tif"
         atomic_write_bytes(output, parts[0].read_bytes())
         return [output]
+
+    def possible_outputs(self, stem: str) -> list[str]:
+        """Every root file merge() could ever write for this stem. Read by
+        package.py's stale-output sweep; see sources/base.py."""
+        return [f"{stem}.tif"]

@@ -201,3 +201,19 @@ class OvertureSource:
             merge_geojson(type_parts, output)
             outputs.append(output)
         return outputs
+
+    def possible_outputs(self, stem: str) -> list[str]:
+        """Every root-relative file this source could ever produce for this
+        stem, across ALL selections, which is why this unions the full
+        default type list with the instance's own (possibly narrowed, or
+        exotically widened via --overture-type) selection rather than
+        reading either alone. Includes the layers/ copies package.py's
+        _write_layer_files derives from the merged output, so a stale
+        layers/water.geojson is swept together with the stale
+        <stem>_water.geojson it was copied from. Read by package.py's
+        stale-output sweep; see sources/base.py.
+        """
+        every_type = sorted(set(DEFAULT_OVERTURE_TYPES) | set(self.types))
+        names = [f"{stem}_{overture_type}.geojson" for overture_type in every_type]
+        names += [f"layers/{filename}" for filename in LAYER_FILENAMES.values()]
+        return names

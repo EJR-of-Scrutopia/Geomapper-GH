@@ -484,7 +484,16 @@ def _run_survey_once(
             outputs_by_source[source.id] = merged
             sink.emit("source_done", source=source.id, outputs=[p.name for p in merged])
 
-        _write_layer_files(outputs_by_source, paths)
+        layer_files = _write_layer_files(outputs_by_source, paths)
+
+        if state.complete:
+            produced = {
+                merged.resolve()
+                for outputs in outputs_by_source.values()
+                for merged in outputs
+            }
+            produced.update(layer.resolve() for layer in layer_files)
+            _sweep_stale_outputs(produced, paths, sink)
 
         # Urbano is one product of a survey among several (the OSM/Overture/
         # elevation data on disk are the others). A missing or failing
@@ -639,21 +648,64 @@ def _record_tile_outcomes(
 
 def _write_layer_files(
     outputs_by_source: dict[str, list[Path]], paths: PackagePaths
-) -> None:
+) -> list[Path]:
     """Copy the three phase 1 Overture layers into layers/ under friendly names.
 
     OvertureSource.merge names its raw output f"{stem}_{overture_type}.geojson"
     (see Task 20 finding 2: a bare type.geojson gave no clue which survey it
     belonged to), so the friendly-name lookup matches on that exact composed
     name rather than on the merged file's own path stem.
+
+    Returns the layer files it wrote, so the stale-output sweep can count
+    them as this run's own products rather than a previous attempt's.
     """
+    written: list[Path] = []
     for output in outputs_by_source.get("overture", []):
         for overture_type, friendly in LAYER_FILENAMES.items():
             if output.name == f"{paths.stem}_{overture_type}.geojson":
-                atomic_write_text(
-                    paths.layers_dir / friendly, output.read_text(encoding="utf-8")
-                )
+                target = paths.layers_dir / friendly
+                atomic_write_text(target, output.read_text(encoding="utf-8"))
+                written.append(target)
                 break
+    return written
+
+
+def _sweep_stale_outputs(
+    produced: set[Path], paths: PackagePaths, sink: ProgressSink
+) -> None:
+    """Remove merged outputs a previous attempt left in the package root.
+
+    Resume reuses an incomplete root, and the fingerprinted work directory
+    isolates each selection's raw tiles, but nothing isolated the MERGED
+    files: an old <stem>_water.geojson from a failed building-plus-water
+    attempt survived a completed buildings-only resume, so the folder
+    listing contradicted the survey.json beside it (final review residual,
+    HANDOFF item 4). The owner reads these folders straight into
+    Grasshopper, so a stale layer is not clutter, it is wrong data.
+
+    Candidates come only from each source's own possible_outputs(stem)
+    declaration, a closed list of names mapgen itself could ever write for
+    this exact stem. A file the user dropped into the folder can never
+    match it, survey.json is not a source output, and the Urbano bridge's
+    artifacts are deliberately out of scope: the bridge reruns every run
+    unless skipped, and survey.json's bridge block already records
+    honestly whether its outputs are this run's work.
+
+    Only called on a complete run. An incomplete run keeps everything,
+    because its survey.json already says complete: false and the next
+    resume will finish the job and sweep then; deleting the only merged
+    copy of anything mid-failure helps nobody.
+    """
+    for source in available_sources():
+        possible = getattr(source, "possible_outputs", None)
+        if not callable(possible):
+            continue
+        for relative in possible(paths.stem):
+            candidate = paths.root / relative
+            if not candidate.exists() or candidate.resolve() in produced:
+                continue
+            candidate.unlink()
+            sink.emit("stale_output_removed", name=relative)
 
 
 def _source_provenance(source) -> dict[str, object]:

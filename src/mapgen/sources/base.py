@@ -68,6 +68,17 @@ class LayerSource(Protocol):
     "opentopography_api_key"), so the panel is built from this registry
     rather than one hard-coded input per key. A source with no key omits
     it, the same as any other optional attribute here.
+
+    possible_outputs(stem) -> list[str] is the same convention once more,
+    for the stale-output sweep: every package-root-relative file this
+    source could EVER merge for the given stem, across all selections, not
+    only the ones the current request asked for. package.py deletes any of
+    these names it finds on disk that the current, complete run did not
+    itself produce, which is what stops a resumed run with a narrower
+    selection leaving the previous attempt's wider output beside a
+    survey.json that never mentions it. The closed list is the safety
+    property: a file the user dropped into the package folder can never
+    match it, so the sweep cannot touch anything mapgen did not write.
     """
 
     id: str

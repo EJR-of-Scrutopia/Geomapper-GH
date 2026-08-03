@@ -49,14 +49,17 @@ fixes, see `git log`) close everything the final whole-branch review raised:
    runs against the same package root: different fingerprints
    (`fc734627` then `7e467c3b`), and the final `.osm` file contained only
    the second run's own category, not a mix.
-   **Residual, disclosed, not fixed:** the MERGED output already sitting in
-   the package root (as opposed to the raw work_dir data this fix isolates)
-   is not itself cleaned up when a selection narrows. An old
-   `<stem>_water.geojson` can still survive alongside a new buildings-only
-   package. `survey.json` stays honest about the current request either
-   way; the file list can still show more. Needs its own design (something
-   like a source-level "what could this ever have produced" query before a
-   merge), not a quick follow-on to this fix.
+   **Residual, now CLOSED** (the owner said continue, so the coordinator
+   made the design call and fixed it inline): each source declares
+   `possible_outputs(stem)`, the closed list of package-root files it
+   could ever merge for that stem, and a COMPLETE run sweeps any of those
+   names it did not itself produce, emitting `stale_output_removed` per
+   file. User files can never match the closed list, survey.json and the
+   Urbano bridge artifacts are not source outputs and are left alone, and
+   an incomplete run keeps everything until a resume finishes the job.
+   Pinned by three tests in test_package.py plus one per source;
+   mutation-verified (sweep disabled fails exactly
+   test_a_complete_run_sweeps_stale_merged_outputs_and_nothing_else).
 4. **Important, fixed.** `cli.py` now catches `OsmDownloadError`,
    `OvertureError`, `ElevationError` and `UnknownCategoryError` alongside
    the original four, so a source failure prints one clean line instead of
@@ -83,10 +86,12 @@ not pytest alone.
    machine, so `tools/UrbanoBridge` has never run against a real install and
    `_project_setting.json` is untested as an actual Urbano input. Task 2's
    gate is still open.
-4. **A design decision**, not just a test: whether the residual root-level
-   stale-merged-file gap above (finding 3's leftover) is worth its own
-   follow-on task before this branch merges, or is acceptable given
-   `survey.json` stays truthful either way.
+4. **The push.** The permission layer on this machine denies `git push`
+   from the assistant's shells, so the owner runs it themselves:
+   `cd C:\Users\Param\mapgen-phase1` then
+   `git push -u origin main feat/phase1`. Local `main` is already
+   fast-forwarded to the same commit; the remote's initial commit is the
+   local history's root, so the push is a plain fast-forward.
 
 ## Then
 

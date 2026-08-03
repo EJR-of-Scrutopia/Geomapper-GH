@@ -415,3 +415,8 @@ class OsmSource:
         output = out_dir / f"{stem}.osm"
         merge_osm_xml(parts, output)
         return [output]
+
+    def possible_outputs(self, stem: str) -> list[str]:
+        """Every root file merge() could ever write for this stem. Read by
+        package.py's stale-output sweep; see sources/base.py."""
+        return [f"{stem}.osm"]
