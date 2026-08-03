@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -135,16 +136,27 @@ def test_build_tiles_at_or_under_the_cap_is_unaffected():
 
 
 def test_build_tiles_cap_check_runs_before_the_expensive_loop():
-    # Proves the check is on the cheap row*col arithmetic, not on
-    # len(tiles) after the fact: if it were checked after building the
-    # list, this would still raise, but only after doing the O(rows*cols)
-    # work the review specifically asked to avoid. This cannot directly
-    # measure "before the loop ran" from outside, so it instead pins the
-    # one observable consequence: TilingError, not a fully-built,
-    # over-cap tiles list, ever escapes build_tiles.
-    bbox = BBox.parse("-3.6626,51.3709,-3.1483,51.5476")
+    # A previous version of this test only checked that TilingError is
+    # eventually raised, which is equally true whether the cap is checked
+    # on the cheap row*col arithmetic or only after the nested loop has
+    # already built every Tile: moving the check to run after the loop
+    # still passed it. Reviewer-confirmed: the web-level tests only
+    # noticed that mutation as a 60-second socket timeout, twice, not as
+    # a failing assertion, which is a hang dressed up as a passing test,
+    # not a test of cheapness. Measured directly instead: this exact bbox
+    # and tile size take a confirmed 8.6s to actually build (1,341,256
+    # Tile objects), so a cheap, pre-loop rejection and an after-the-fact
+    # one are trivially distinguishable by elapsed time, with a wide
+    # margin on either side of that measurement.
+    bbox = BBox.parse("-10.0,35.0,30.0,60.0")  # roughly Western Europe
+    started = time.perf_counter()
     with pytest.raises(TilingError):
-        build_tiles(bbox, tile_size_m=5000.0, overlap_m=250.0, max_tiles=1)
+        build_tiles(bbox, tile_size_m=2500.0, overlap_m=250.0)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, (
+        f"expected a cheap, pre-loop rejection (milliseconds), took {elapsed:.3f}s: "
+        f"the cap check may have moved to run after the tile-building loop"
+    )
 
 
 def test_bbox_to_dict_returns_four_keys():

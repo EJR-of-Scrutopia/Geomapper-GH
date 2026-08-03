@@ -975,6 +975,40 @@ function ok(condition, message) {
     );
   });
 
+  await test(
+    "source metadata (id, display_name, licence) is HTML-escaped when rendered",
+    async () => {
+      // Review round 2: this code change shipped in round 1 with no
+      // dedicated test at all, so reverting the escaping passed every
+      // check in both suites. /api/sources is this server's own data,
+      // not third-party input, but the escaping is cheap and this closes
+      // the actual gap: nothing previously exercised it.
+      const stub = makeFetchStub(async (url) => {
+        if (url.pathname === "/api/config") return jsonResponse(200, DEFAULT_CONFIG);
+        if (url.pathname === "/api/sources") {
+          return jsonResponse(200, [
+            {
+              id: 'osm"><script>alert(1)</script>',
+              display_name: "<b>OpenStreetMap</b>",
+              licence: 'ODbL" onmouseover="alert(1)',
+              requires_api_key: false,
+            },
+          ]);
+        }
+        return null;
+      });
+      const sandbox = buildSandbox({ fetch: stub.fetch });
+      await flush(10);
+      const html = sandbox.document.getElementById("sources").innerHTML;
+      ok(!html.includes("<script>"), `expected the id's script tag escaped, got: ${html}`);
+      ok(!html.includes("<b>OpenStreetMap</b>"), `expected the display_name's tag escaped, got: ${html}`);
+      ok(
+        !html.includes('onmouseover="alert(1)"'),
+        `expected the licence's attribute breakout escaped, got: ${html}`
+      );
+    }
+  );
+
   await test("boot() pre-fills the API key field from the saved config", async () => {
     const stub = makeFetchStub(async (url) => {
       if (url.pathname === "/api/config") {
@@ -1005,22 +1039,26 @@ function ok(condition, message) {
   });
 
   await test(
-    "the API key is saved before the next estimate re-checks readiness, not raced against it",
+    "the API key change handler awaits the save before refreshing, not racing it",
     async () => {
-      // Review round 1: refreshEstimate and the persist handler used to
-      // be two independent "change" listeners on the same field. Both
-      // fire, but the server's own readiness check reads the SAVED
-      // config file, not this field's live value, so the estimate
-      // dispatched by refreshEstimate could reach the server before the
-      // PUT did, reporting "no key configured" for a key just typed in.
-      const callOrder = [];
-      const { sandbox } = await bootedSandbox((url, options) => {
+      // Review round 2: the previous version of this test asserted on
+      // DISPATCH order, which is set the moment each fetch() call is
+      // made, synchronously, regardless of whether the code actually
+      // awaits anything in between; removing the await reproduces the
+      // exact race and dispatch order is unchanged, so that version
+      // passed for a mutation it was meant to catch. This instead makes
+      // the PUT's own resolution controllable and checks what has been
+      // dispatched at each point in time: with the await in place,
+      // nothing calls /api/estimate until the PUT actually resolves.
+      let resolvePut;
+      const putResponsePromise = new Promise((resolve) => {
+        resolvePut = resolve;
+      });
+      const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {
         if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
-          callOrder.push("PUT config");
-          return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-new-key" });
+          return putResponsePromise;
         }
         if (url.pathname === "/api/estimate") {
-          callOrder.push("estimate");
           return jsonResponse(200, {
             tiles: 1,
             rows: 1,
@@ -1039,14 +1077,22 @@ function ok(condition, message) {
       setField(sandbox, "region", "R");
       setField(sandbox, "site", "S");
       await flush(10);
-      callOrder.length = 0;
+      fetchCalls.length = 0;
       setField(sandbox, "opentopo-key", "sk-new-key");
-      await flush(10);
-      ok(callOrder.includes("PUT config"), `expected a PUT config call, got: ${callOrder}`);
-      ok(callOrder.includes("estimate"), `expected a follow-up estimate call, got: ${callOrder}`);
+      await flush(10); // long enough for the change handler to reach its awaited PUT
       ok(
-        callOrder.indexOf("PUT config") < callOrder.indexOf("estimate"),
-        `expected the key saved before the next estimate, got order: ${callOrder}`
+        fetchCalls.some((c) => c.url.pathname === "/api/config"),
+        "expected the PUT to have been dispatched"
+      );
+      ok(
+        !fetchCalls.some((c) => c.url.pathname === "/api/estimate"),
+        "expected refreshEstimate NOT to have run yet: the PUT has not resolved"
+      );
+      resolvePut(jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-new-key" }));
+      await flush(10);
+      ok(
+        fetchCalls.some((c) => c.url.pathname === "/api/estimate"),
+        "expected refreshEstimate to run once the PUT resolved"
       );
     }
   );
