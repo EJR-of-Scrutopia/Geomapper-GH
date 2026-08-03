@@ -107,6 +107,11 @@ def command_survey(args: argparse.Namespace) -> int:
     result = run_survey(_request_from_args(args), progress=ConsoleProgress())
     print(f"\nPackage: {result.paths.root}")
     print(f"Urbano project setting: {result.paths.project_setting.name}")
+    bridge = result.survey.get("bridge") or {}
+    if bridge.get("attempted") and not bridge.get("ok"):
+        # A plain sentence, already produced by bridge.py or package.py, never
+        # a stack trace: the survey data itself is unaffected by this failure.
+        print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
     if not result.complete:
         print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
         return 1

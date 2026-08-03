@@ -21,6 +21,7 @@ from mapgen.sources.base import (
     get_source,
     register,
 )
+from mapgen.sources.osm import OsmSource
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
@@ -51,7 +52,7 @@ class StubSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / f"{self.id}.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -92,7 +93,7 @@ class CallRecordingStubSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / f"{self.id}.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -143,7 +144,7 @@ class SkipIfExistsStubSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / f"{self.id}.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -172,7 +173,7 @@ class SucceedsButWritesNothingSource:
     def fetch(self, bbox, tiles, work_dir, progress):
         return []
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / f"{self.id}.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -206,8 +207,16 @@ class ElevationShapedStubSource:
         progress.emit("tile_done", source=self.id, tile_id="whole-area")
         return [output]
 
-    def merge(self, parts, out_dir):
-        return list(parts)
+    def merge(self, parts, out_dir, stem):
+        # Mirrors ElevationSource's real merge: copy the whole-area file
+        # into out_dir under the package stem rather than passing it
+        # through unchanged at its old work_dir location.
+        if not parts:
+            return []
+        output = out_dir / f"{stem}.tif"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(parts[0].read_text(encoding="utf-8"), encoding="utf-8")
+        return [output]
 
 
 class ResumeAwareSource:
@@ -252,7 +261,7 @@ class ResumeAwareSource:
             paths.append(output)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / f"{self.id}.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -292,13 +301,13 @@ class OvertureShapedStubSource:
             progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         by_type: dict[str, list[Path]] = {}
         for part in parts:
             by_type.setdefault(part.parent.name, []).append(part)
         outputs = []
         for overture_type, type_parts in sorted(by_type.items()):
-            out = out_dir / f"{overture_type}.geojson"
+            out = out_dir / f"{stem}_{overture_type}.geojson"
             out.write_text(
                 "\n".join(p.read_text(encoding="utf-8") for p in type_parts),
                 encoding="utf-8",
@@ -341,13 +350,13 @@ class PartialOvertureStubSource:
             progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         by_type: dict[str, list[Path]] = {}
         for part in parts:
             by_type.setdefault(part.parent.name, []).append(part)
         outputs = []
         for overture_type, type_parts in sorted(by_type.items()):
-            out = out_dir / f"{overture_type}.geojson"
+            out = out_dir / f"{stem}_{overture_type}.geojson"
             out.write_text(
                 "\n".join(p.read_text(encoding="utf-8") for p in type_parts),
                 encoding="utf-8",
@@ -398,6 +407,31 @@ def test_estimate_rejects_a_path_that_would_be_too_long(tmp_path):
     deep = Path("C:/") / ("x" * 200)
     with pytest.raises(PathTooLongError):
         estimate_survey(_request(tmp_path, output_root=deep))
+
+
+def test_estimate_does_not_reject_an_osm_only_job_over_an_unselected_overture_path(tmp_path):
+    # Task 20 finding 3, reproduced with the real sources: a real
+    # `--source osm` run was refused over a 287-character path shaped like
+    # Overture's, though Overture was never selected. register_default_sources
+    # pulls in the real OsmSource/OvertureSource/ElevationSource;
+    # estimate_survey never touches the network here (source.estimate() is
+    # pure arithmetic on tile counts), so this is safe without mocking
+    # anything.
+    register_default_sources()
+    # _request's defaults are already region="South Wales", site="Barry
+    # Waterfront", matching the real reported run; only output_root and
+    # source_ids vary here.
+    deep = Path("C:/") / ("x" * 140)
+
+    # Guard: at this depth the OLD (fixed) behaviour, and today's behaviour
+    # whenever Overture genuinely is selected, must still raise. Otherwise
+    # this test would prove nothing about the fix.
+    with pytest.raises(PathTooLongError):
+        estimate_survey(_request(tmp_path, output_root=deep, source_ids=("osm", "overture")))
+
+    # osm only: Overture's path is not one this job will ever produce, so
+    # the same depth must not be refused.
+    estimate_survey(_request(tmp_path, output_root=deep, source_ids=("osm",)))
 
 
 # --- Task 18 item 7: the folder preview must be the real composed path,
@@ -866,6 +900,174 @@ def test_coordinate_stem_option_uses_the_coordinate_form(tmp_path):
     result = run_survey(_request(tmp_path, coordinate_stem=True))
     payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
     assert payload["urbano_stem"] == "51.39_51.38_-3.28_-3.29"
+
+
+class FakeCompletedProcess:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+
+
+class FakeBridgeRunner:
+    """Stands in for subprocess.run: records commands, returns a fixed exit
+    code, never actually shells out to dotnet. run_survey resolves the real
+    tools/UrbanoBridge/UrbanoBridge.csproj (it genuinely exists in this
+    repo), so run_bridge reaches this runner exactly as it would reach the
+    real dotnet executable in production.
+    """
+
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+        self.calls = []
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(command)
+        return FakeCompletedProcess(self.returncode)
+
+
+_MINIMAL_OSM_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<osm version="0.6" generator="test">\n'
+    '  <node id="1" version="1" lat="51.38" lon="-3.29"/>\n'
+    "</osm>\n"
+)
+
+
+class _FakeOsmResponse:
+    def __init__(self, status_code=200, text=_MINIMAL_OSM_XML):
+        self.status_code = status_code
+        self.text = text
+        self.headers: dict = {}
+
+
+class _FakeOsmSession:
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def get(self, url, **kwargs):
+        return self._responses.pop(0)
+
+    def post(self, url, **kwargs):
+        return self._responses.pop(0)
+
+
+# --- Task 20 finding 1: a failing Urbano bridge must not destroy the rest
+# of a survey. The owner has no Urbano installed, so run_bridge fails on
+# every single run they attempt; before this fix, that raised BridgeError
+# out of run_survey before survey.json was ever written, so a fully
+# successful download left no trace the tool itself would recognise. ------
+
+
+def test_a_bridge_failure_does_not_prevent_the_package_from_completing(tmp_path):
+    register(StubSource())
+    # The whole point of this test: run_survey must return normally rather
+    # than let BridgeError propagate. If the fix were removed, pytest would
+    # report this test as an ERROR (an uncaught BridgeError), not a failed
+    # assertion.
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        bridge_runner=FakeBridgeRunner(returncode=1),
+    )
+    assert result.complete is True
+    assert result.paths.survey_json.exists()
+    assert (result.paths.root / "stub.txt").exists()
+
+
+def test_a_bridge_failure_is_recorded_in_survey_json_in_plain_language(tmp_path):
+    register(StubSource())
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        bridge_runner=FakeBridgeRunner(returncode=1),
+    )
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["bridge"]["attempted"] is True
+    assert payload["bridge"]["ok"] is False
+    error = payload["bridge"]["error"]
+    assert "exit code 1" in error
+    # A plain sentence, not a stack trace.
+    assert "Traceback" not in error
+    assert 'File "' not in error
+    # complete tracks the survey DATA only: unaffected by the bridge result.
+    # See _build_survey_json's own comment for why the two are kept separate.
+    assert payload["complete"] is True
+
+
+def test_a_bridge_failure_is_emitted_through_the_progress_sink(tmp_path):
+    register(StubSource())
+    log = EventLog()
+    run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        progress=log,
+        bridge_runner=FakeBridgeRunner(returncode=1),
+    )
+    failures = [e for e in log.events if e["event"] == "bridge_failed"]
+    assert len(failures) == 1
+    assert "exit code 1" in failures[0]["error"]
+    assert any(e["event"] == "job_finished" for e in log.events)
+
+
+def test_a_successful_bridge_is_recorded_as_ok(tmp_path):
+    register(StubSource())
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["bridge"] == {"attempted": True, "ok": True, "error": None}
+
+
+def test_skipping_the_bridge_records_that_it_was_never_attempted(tmp_path):
+    register(StubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["bridge"] == {"attempted": False, "ok": None, "error": None}
+
+
+def test_a_bridge_failure_still_correctly_attributes_the_osm_endpoint_used(tmp_path):
+    # Ties Task 20 findings 1 and 4 together. Before finding 1 was fixed,
+    # the only way a survey.json was ever produced for a real osm run on
+    # this machine was a SECOND, resumed invocation, because the first
+    # attempt's crash never reached survey.json. A resumed run correctly
+    # and intentionally records no endpoint for tiles it skips because they
+    # already exist (see OsmSource's own class docstring and
+    # test_sources_osm.py's test_endpoints_used_is_empty_when_every_tile_is_skipped):
+    # that is documented, deliberate behaviour, not the bug. But it meant
+    # nobody ever saw a survey.json written on the SAME run that actually
+    # did the downloading. With the bridge failure no longer fatal, the
+    # very first attempt reaches survey.json, on the run that genuinely
+    # contacted the endpoint, so attribution is intact without changing
+    # anything about how endpoints_used is populated.
+    source = OsmSource(
+        session=_FakeOsmSession([_FakeOsmResponse() for _ in range(4)]),
+        sleeper=lambda _seconds: None,
+        min_interval_seconds=0.0,
+    )
+    register(source)
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm",), run_bridge_step=True),
+        bridge_runner=FakeBridgeRunner(returncode=1),
+    )
+    assert result.complete is True
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["bridge"]["ok"] is False
+    osm_entry = next(s for s in payload["sources"] if s["id"] == "osm")
+    assert osm_entry["endpoints_used"] == [source.osm_api_url]
+
+
+def test_merged_osm_output_on_disk_carries_the_package_stem(tmp_path):
+    # Task 20 finding 2, end to end: the file the owner actually finds in
+    # the package folder must carry the site/date stem, not a bare
+    # "all.osm" that gives no clue which survey it belongs to or which
+    # file Urbano needs to read.
+    source = OsmSource(
+        session=_FakeOsmSession([_FakeOsmResponse() for _ in range(4)]),
+        sleeper=lambda _seconds: None,
+        min_interval_seconds=0.0,
+    )
+    register(source)
+    result = run_survey(_request(tmp_path, source_ids=("osm",), run_bridge_step=False))
+    expected = result.paths.root / f"{result.paths.stem}.osm"
+    assert expected.is_file()
+    assert result.paths.stem == "Barry-Waterfront_2026-08-01"
 
 
 def test_register_default_sources_registers_the_three_phase_one_sources():

@@ -526,10 +526,23 @@ def test_readiness_problem_never_raises_even_though_resolve_api_key_does(monkeyp
     assert isinstance(source.readiness_problem(), str)
 
 
-def test_merge_passes_the_tiff_through(tmp_path):
+def test_merge_copies_the_tiff_into_out_dir_named_after_the_stem(tmp_path):
+    # Task 20 finding 2: merge() used to return parts unchanged, so the DEM
+    # kept OUTPUT_NAME's fixed, unidentified "elevation.tif" and never left
+    # work_dir, which a complete run then deletes (see run_survey). Now it
+    # is copied into the finished package under the package stem, the same
+    # fix applied consistently to OsmSource and OvertureSource.
     part = tmp_path / "elevation.tif"
     part.write_bytes(TIFF_LITTLE_ENDIAN)
-    assert ElevationSource(api_key="k").merge([part], tmp_path / "out") == [part]
+    out_dir = tmp_path / "out"
+    outputs = ElevationSource(api_key="k").merge([part], out_dir, "Barry-Waterfront_2026-08-01")
+    assert [p.name for p in outputs] == ["Barry-Waterfront_2026-08-01.tif"]
+    assert outputs[0].parent == out_dir
+    assert outputs[0].read_bytes() == TIFF_LITTLE_ENDIAN
+
+
+def test_merge_of_no_parts_produces_no_output(tmp_path):
+    assert ElevationSource(api_key="k").merge([], tmp_path / "out", "Barry-Waterfront_2026-08-01") == []
 
 
 def test_estimate_scales_with_bbox_area():

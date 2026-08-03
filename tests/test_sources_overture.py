@@ -272,8 +272,9 @@ def test_fetch_and_merge_deduplicates_across_tiles(tmp_path):
         tmp_path,
         NullProgress(),
     )
-    outputs = source.merge(paths, tmp_path / "merged")
+    outputs = source.merge(paths, tmp_path / "merged", "Barry-Waterfront_2026-08-01")
     assert len(outputs) == 1
+    assert outputs[0].name == "Barry-Waterfront_2026-08-01_water.geojson"
 
     merged_content = json.loads(outputs[0].read_text(encoding="utf-8"))
     assert len(merged_content["features"]) == 1
@@ -305,8 +306,25 @@ def test_merge_writes_one_file_per_type(tmp_path):
         work / "water" / "r00_c00.geojson",
         work / "building" / "r00_c00.geojson",
     ]
-    outputs = source.merge(parts, tmp_path / "out")
-    assert [p.name for p in outputs] == ["building.geojson", "water.geojson"]
+    outputs = source.merge(parts, tmp_path / "out", "Barry-Waterfront_2026-08-01")
+    assert [p.name for p in outputs] == [
+        "Barry-Waterfront_2026-08-01_building.geojson",
+        "Barry-Waterfront_2026-08-01_water.geojson",
+    ]
+
+
+def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
+    # Task 20 finding 2: the same fix as OsmSource.merge, applied
+    # consistently, so two different surveys never collide on plain
+    # "water.geojson" if their outputs are ever copied into one place.
+    work = tmp_path / "work"
+    (work / "water").mkdir(parents=True)
+    (work / "water" / "r00_c00.geojson").write_text(
+        '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+    )
+    source = OvertureSource(types=["water"])
+    outputs = source.merge([work / "water" / "r00_c00.geojson"], tmp_path / "out", "Cardiff-Bay_2026-09-01")
+    assert [p.name for p in outputs] == ["Cardiff-Bay_2026-09-01_water.geojson"]
 
 
 def test_estimate_scales_with_tiles_and_types():

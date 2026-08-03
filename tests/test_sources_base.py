@@ -35,7 +35,7 @@ class FakeSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / "fake.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
@@ -105,7 +105,7 @@ def test_a_conforming_source_round_trips_through_the_protocol(tmp_path):
     parts = source.fetch(bbox, tiles, tmp_path / "work", NullProgress())
     assert len(parts) == 2
 
-    outputs = source.merge(parts, tmp_path / "out")
+    outputs = source.merge(parts, tmp_path / "out", "test-stem")
     assert outputs[0].read_text(encoding="utf-8") == "r00_c00\nr00_c01"
 
 

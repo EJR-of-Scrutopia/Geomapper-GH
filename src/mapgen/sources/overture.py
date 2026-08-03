@@ -142,14 +142,19 @@ class OvertureSource:
             )
         temp_path.replace(output_path)
 
-    def merge(self, parts: Sequence[Path], out_dir: Path) -> list[Path]:
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
         by_type: dict[str, list[Path]] = {}
         for part in parts:
             by_type.setdefault(part.parent.name, []).append(part)
 
+        # Named after the package stem plus the type, not a bare
+        # "<type>.geojson": Task 20 finding 2 found the same unidentified
+        # merged-output problem here as in OsmSource.merge and asked for a
+        # consistent fix. package.py's _write_layer_files matches on this
+        # exact composed name to copy the three phase 1 layers into layers/.
         outputs: list[Path] = []
         for overture_type, type_parts in sorted(by_type.items()):
-            output = out_dir / f"{overture_type}.geojson"
+            output = out_dir / f"{stem}_{overture_type}.geojson"
             merge_geojson(type_parts, output)
             outputs.append(output)
         return outputs

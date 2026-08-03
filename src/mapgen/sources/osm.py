@@ -217,7 +217,10 @@ class OsmSource:
             timeout=(30, self.timeout_seconds + 60),
         )
 
-    def merge(self, parts: Sequence[Path], out_dir: Path) -> list[Path]:
-        output = out_dir / "all.osm"
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        # Named after the package stem, not a bare "all.osm": this is the
+        # file Urbano needs to read, and the owner's original brief asked
+        # that its name say which survey it belongs to (Task 20 finding 2).
+        output = out_dir / f"{stem}.osm"
         merge_osm_xml(parts, output)
         return [output]

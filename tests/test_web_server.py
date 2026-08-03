@@ -50,7 +50,7 @@ class StubSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / "stub.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")
@@ -90,7 +90,7 @@ class BlockingSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / "blocking.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")

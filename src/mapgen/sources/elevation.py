@@ -566,5 +566,22 @@ class ElevationSource:
         progress.emit("tile_done", source=self.id, tile_id="whole-area")
         return [output_path]
 
-    def merge(self, parts: Sequence[Path], out_dir: Path) -> list[Path]:
-        return list(parts)
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        """Copies the single whole-area DEM into out_dir under the package
+        stem, for example Barry-Waterfront_2026-08-03.tif.
+
+        There is nothing to combine (fetch() always produces exactly one
+        whole-area file, never one per tile), so earlier versions of this
+        method just returned parts unchanged, still sitting under work_dir
+        as the fixed, unidentified name OUTPUT_NAME. That had two problems,
+        not one: Task 20 finding 2's unidentified-filename issue, the same
+        as OsmSource's and OvertureSource's, AND the file never actually
+        reached the finished package, since a complete run deletes work_dir
+        (see run_survey). Copying rather than moving, because parts may
+        still be read again on a subsequent run's resume/skip check.
+        """
+        if not parts:
+            return []
+        output = out_dir / f"{stem}.tif"
+        atomic_write_bytes(output, parts[0].read_bytes())
+        return [output]

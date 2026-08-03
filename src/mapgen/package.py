@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mapgen import __version__
-from mapgen.bridge import BridgeRequest, run_bridge
+from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
 from mapgen.fsutil import (
     atomic_write_text,
     best_effort_rmtree,
@@ -134,7 +134,7 @@ def _plan(request: SurveyRequest):
         fingerprint,
         stem_override=stem_override,
     )
-    check_path_length(paths, request.effective_overture_types)
+    check_path_length(paths, request.effective_overture_types, source_ids=request.source_ids)
     return tiles, paths
 
 
@@ -288,12 +288,22 @@ def run_survey(
                 _record_tile_outcomes(
                     state, source.id, pending, source_work, fetch_succeeded, current_tile_ids
                 )
-            merged = source.merge(parts, paths.root)
+            merged = source.merge(parts, paths.root, paths.stem)
             outputs_by_source[source.id] = merged
             sink.emit("source_done", source=source.id, outputs=[p.name for p in merged])
 
         _write_layer_files(outputs_by_source, paths)
 
+        # Urbano is one product of a survey among several (the OSM/Overture/
+        # elevation data on disk are the others). A missing or failing
+        # Urbano install must not destroy those: the failure is recorded
+        # below, in survey.json and through the progress sink, and the
+        # package is still finished. See Task 20 finding 1: on the owner's
+        # machine, with no Urbano installed, this branch fails on every
+        # single run, and it used to take the whole survey down with it.
+        bridge_attempted = request.run_bridge_step
+        bridge_ok: bool | None = None
+        bridge_error: str | None = None
         if request.run_bridge_step:
             token.raise_if_cancelled()
             sink.emit("bridge_started")
@@ -307,13 +317,28 @@ def run_survey(
                 elevation_tiff_path=elevation_outputs[0] if elevation_outputs else None,
                 skip_elevation=not elevation_outputs,
             )
-            if bridge_runner is None:
-                run_bridge(bridge_request)
+            try:
+                if bridge_runner is None:
+                    run_bridge(bridge_request)
+                else:
+                    run_bridge(bridge_request, runner=bridge_runner)
+            except (BridgeError, OSError) as exc:
+                # BridgeError covers a missing project or a non-zero exit
+                # (today's case: Urbano.Core.dll/ProjectSetup.dll absent, so
+                # the bridge process itself runs and fails). OSError also
+                # covers dotnet itself being missing from PATH, which raises
+                # from the subprocess call rather than from bridge.py. Both
+                # are already plain, one-line messages, never a traceback.
+                bridge_ok = False
+                bridge_error = str(exc)
+                sink.emit("bridge_failed", error=bridge_error)
             else:
-                run_bridge(bridge_request, runner=bridge_runner)
-            sink.emit("bridge_done")
+                bridge_ok = True
+                sink.emit("bridge_done")
 
-    survey = _build_survey_json(request, paths, tiles, sources, state, started_at)
+    survey = _build_survey_json(
+        request, paths, tiles, sources, state, started_at, bridge_attempted, bridge_ok, bridge_error
+    )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     sink.emit("job_finished", complete=state.complete, root=str(paths.root))
 
@@ -423,16 +448,33 @@ def _record_tile_outcomes(
 def _write_layer_files(
     outputs_by_source: dict[str, list[Path]], paths: PackagePaths
 ) -> None:
-    """Copy the three phase 1 Overture layers into layers/ under friendly names."""
+    """Copy the three phase 1 Overture layers into layers/ under friendly names.
+
+    OvertureSource.merge names its raw output f"{stem}_{overture_type}.geojson"
+    (see Task 20 finding 2: a bare type.geojson gave no clue which survey it
+    belonged to), so the friendly-name lookup matches on that exact composed
+    name rather than on the merged file's own path stem.
+    """
     for output in outputs_by_source.get("overture", []):
-        friendly = LAYER_FILENAMES.get(output.stem)
-        if friendly:
-            atomic_write_text(
-                paths.layers_dir / friendly, output.read_text(encoding="utf-8")
-            )
+        for overture_type, friendly in LAYER_FILENAMES.items():
+            if output.name == f"{paths.stem}_{overture_type}.geojson":
+                atomic_write_text(
+                    paths.layers_dir / friendly, output.read_text(encoding="utf-8")
+                )
+                break
 
 
-def _build_survey_json(request, paths, tiles, sources, state, started_at) -> dict:
+def _build_survey_json(
+    request,
+    paths,
+    tiles,
+    sources,
+    state,
+    started_at,
+    bridge_attempted,
+    bridge_ok,
+    bridge_error,
+) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -466,7 +508,27 @@ def _build_survey_json(request, paths, tiles, sources, state, started_at) -> dic
             for source in sources
         ],
         "tiles": state.as_tile_records(),
+        # complete reports the survey DATA alone: every requested source's
+        # every tile downloaded and merged successfully. It intentionally
+        # says nothing about the Urbano bridge, decided and recorded
+        # separately below. Folding a bridge failure into complete would
+        # give it a second, unrelated meaning: complete already decides
+        # whether a folder is safe to reuse or must be suffixed _02 (see
+        # naming.build_package_paths) and whether _work/ gets cleaned up
+        # below. An owner with no Urbano install at all, which is Task 20's
+        # real, reproduced case, would then never see complete: true no
+        # matter how many times every source downloaded cleanly, the folder
+        # would never be considered finished, and _work/ would never be
+        # swept. The data either downloaded completely or it did not; the
+        # bridge either produced Urbano's files or it did not; those are two
+        # different questions and an owner reading this file deserves a
+        # straight answer to each.
         "complete": state.complete,
+        "bridge": {
+            "attempted": bridge_attempted,
+            "ok": bridge_ok,
+            "error": bridge_error,
+        },
         "started_at": started_at,
         "finished_at": _now(),
     }

@@ -27,7 +27,7 @@ class StubSource:
             paths.append(path)
         return paths
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / "stub.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")
@@ -53,7 +53,7 @@ class AlwaysFailsStubSource:
     def fetch(self, bbox, tiles, work_dir, progress):
         raise RuntimeError("stub source failure, on purpose")
 
-    def merge(self, parts, out_dir):
+    def merge(self, parts, out_dir, stem):
         out = out_dir / "stub.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")

@@ -282,7 +282,17 @@ def test_estimate_scales_with_tile_count():
 def test_merge_produces_a_single_osm_file(tmp_path):
     part = tmp_path / "r00_c00.osm"
     part.write_text(OSM_XML, encoding="utf-8")
-    outputs = OsmSource().merge([part], tmp_path / "out")
+    outputs = OsmSource().merge([part], tmp_path / "out", "Barry-Waterfront_2026-08-01")
     assert len(outputs) == 1
-    assert outputs[0].name == "all.osm"
+    assert outputs[0].name == "Barry-Waterfront_2026-08-01.osm"
     assert outputs[0].exists()
+
+
+def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
+    # Task 20 finding 2: the merged file must carry THIS package's stem, not
+    # a fixed name, so two different surveys never produce the same-named
+    # reference file that Urbano needs to read.
+    part = tmp_path / "r00_c00.osm"
+    part.write_text(OSM_XML, encoding="utf-8")
+    outputs = OsmSource().merge([part], tmp_path / "out", "Cardiff-Bay_2026-09-01")
+    assert outputs[0].name == "Cardiff-Bay_2026-09-01.osm"

@@ -159,16 +159,55 @@ def _survey_reports_complete(survey_json: Path) -> bool:
 def check_path_length(
     paths: PackagePaths,
     overture_types: Sequence[str],
+    source_ids: Sequence[str] | None = None,
     limit: int = DEFAULT_PATH_LIMIT,
 ) -> None:
-    longest_type = max(overture_types, key=len) if overture_types else "overture"
-    overture_path = paths.work_dir / "raw" / "overture" / longest_type / "r00_c00.geojson"
-    overture_length = len(str(overture_path.resolve() if not overture_path.is_absolute() else overture_path))
+    """Raises PathTooLongError if this job's worst-case path would be too long.
 
-    project_setting_length = len(str(paths.project_setting.resolve() if not paths.project_setting.is_absolute() else paths.project_setting))
+    source_ids is the sources the job actually requested. Each source's raw
+    tile path has a different, fixed shape (Overture nests an extra
+    "<type>/" segment beneath "raw/overture/", which is why it is normally
+    the longest of the three), and only a selected source's shape is a path
+    this job can ever produce. source_ids=None, the default, means "unknown,
+    assume every source": every caller inside this codebase always knows the
+    job's real source_ids and passes it, so None only arises from a caller
+    (or a test) that has not been told, and the safe, conservative answer
+    for an unknown job is to check all three rather than silently under
+    counting one of them.
 
-    longest_candidate = overture_path if overture_length >= project_setting_length else paths.project_setting
-    length = max(overture_length, project_setting_length)
+    project_setting is always a candidate: it exists for a package
+    regardless of which sources it contains, since naming.py builds it
+    unconditionally.
+    """
+    selected = None if source_ids is None else set(source_ids)
+
+    def _length(path: Path) -> int:
+        return len(str(path.resolve() if not path.is_absolute() else path))
+
+    # Ordered so a tie is broken exactly as it always has been: Overture's
+    # nested shape wins a tie over project_setting, which in turn wins over
+    # the (previously nonexistent) osm/elevation candidates added below.
+    candidates: list[tuple[int, Path]] = []
+
+    if selected is None or "overture" in selected:
+        longest_type = max(overture_types, key=len) if overture_types else "overture"
+        overture_path = paths.work_dir / "raw" / "overture" / longest_type / "r00_c00.geojson"
+        candidates.append((_length(overture_path), overture_path))
+
+    candidates.append((_length(paths.project_setting), paths.project_setting))
+
+    if selected is None or "osm" in selected:
+        osm_path = paths.work_dir / "raw" / "osm" / "r00_c00.osm"
+        candidates.append((_length(osm_path), osm_path))
+
+    if selected is None or "elevation" in selected:
+        elevation_path = paths.work_dir / "raw" / "elevation" / "elevation.tif"
+        candidates.append((_length(elevation_path), elevation_path))
+
+    length, longest_candidate = candidates[0]
+    for candidate_length, candidate_path in candidates[1:]:
+        if candidate_length > length:
+            length, longest_candidate = candidate_length, candidate_path
 
     if length > limit:
         raise PathTooLongError(

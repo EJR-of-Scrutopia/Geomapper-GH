@@ -9,6 +9,7 @@ import pytest
 from mapgen.naming import (
     FINGERPRINT_LENGTH,
     NamingError,
+    PackagePaths,
     PathTooLongError,
     build_package_paths,
     check_path_length,
@@ -310,3 +311,67 @@ def test_check_path_length_boundary_is_inclusive(tmp_path):
     check_path_length(paths, ["infrastructure"], limit=probe)
     with pytest.raises(PathTooLongError):
         check_path_length(paths, ["infrastructure"], limit=probe - 1)
+
+
+# --- Task 20 finding 3: the guard must measure the job that will actually
+# run, not every source the tool knows how to fetch. A real --source osm
+# run was refused over a path shaped like Overture's, though Overture was
+# never selected. ------------------------------------------------------
+
+
+def test_check_path_length_ignores_overture_when_it_is_not_among_the_selected_sources(tmp_path):
+    paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
+    overture_path = paths.work_dir / "raw" / "overture" / "infrastructure" / "r00_c00.geojson"
+    osm_path = paths.work_dir / "raw" / "osm" / "r00_c00.osm"
+    overture_length = len(str(overture_path))
+    osm_length = len(str(osm_path))
+    project_setting_length = len(str(paths.project_setting))
+    limit = overture_length - 1
+
+    # Guards: this scenario only isolates the fix if osm's own path and
+    # project_setting both genuinely fit under the limit that trips Overture.
+    assert osm_length <= limit, "test setup: osm path must fit under the probe limit"
+    assert project_setting_length <= limit, "test setup: project_setting must fit under the probe limit"
+
+    # Unselected-or-unknown still raises: this is what the guard has always
+    # done, and must keep doing, when Overture genuinely is (or might be)
+    # part of the job.
+    with pytest.raises(PathTooLongError):
+        check_path_length(paths, ["infrastructure"], limit=limit)
+    with pytest.raises(PathTooLongError):
+        check_path_length(paths, ["infrastructure"], source_ids=["osm", "overture"], limit=limit)
+
+    # osm-only must NOT raise at the same limit: Overture's path is not one
+    # this job will ever produce.
+    check_path_length(paths, ["infrastructure"], source_ids=["osm"], limit=limit)
+
+
+def test_check_path_length_still_checks_osms_own_path_when_it_is_selected(tmp_path):
+    # With Overture excluded, osm's own raw path must still be an
+    # independent candidate, proving exclusion did not turn the guard into
+    # a no-op for the sources that ARE selected. project_setting is
+    # deliberately given a short, fixed name here (rather than one derived
+    # from a long stem, as build_package_paths would produce) so it cannot
+    # be the one tripping the limit: this isolates the osm candidate
+    # specifically, the same way test_check_path_length_accounts_for_the_
+    # fingerprint_segment isolates the fingerprint segment.
+    work_dir = tmp_path / ("x" * 200) / "_work" / FINGERPRINT
+    paths = PackagePaths(
+        root=tmp_path,
+        stem="S",
+        layers_dir=tmp_path / "layers",
+        work_dir=work_dir,
+        survey_json=tmp_path / "survey.json",
+        project_setting=tmp_path / "short.json",
+    )
+    osm_path = work_dir / "raw" / "osm" / "r00_c00.osm"
+    osm_length = len(str(osm_path))
+    project_setting_length = len(str(paths.project_setting))
+    assert osm_length > project_setting_length, "test setup: osm's path must be the longer one here"
+
+    with pytest.raises(PathTooLongError) as excinfo:
+        check_path_length(paths, [], source_ids=["osm"], limit=osm_length - 1)
+    assert str(osm_path) in str(excinfo.value)
+
+    # And it must not be checked at all when osm itself is not selected.
+    check_path_length(paths, [], source_ids=["stub"], limit=osm_length - 1)

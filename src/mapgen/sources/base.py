@@ -77,7 +77,18 @@ class LayerSource(Protocol):
         progress: ProgressSink,
     ) -> list[Path]: ...
 
-    def merge(self, parts: Sequence[Path], out_dir: Path) -> list[Path]: ...
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        """merge()'s output filename(s) must embed stem (PackagePaths.stem: the
+        site and date, for example Barry-Waterfront_2026-08-03), not a bare
+        generic name. Task 20 finding 2: OsmSource.merge used to write a fixed
+        out_dir / "all.osm" regardless of which survey it belonged to, which
+        gave the owner no way to tell one package's reference file from
+        another's once copied elsewhere, and did not identify the file Urbano
+        needs to read. Every source's merge follows the same rule now, so a
+        bare, unidentifiable output name does not reappear the next time a
+        source is added.
+        """
+        ...
 
 
 _REGISTRY: dict[str, LayerSource] = {}
