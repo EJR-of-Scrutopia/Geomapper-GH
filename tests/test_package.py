@@ -1475,6 +1475,70 @@ class _FakeOvertureRunner:
         return type("FakeCompleted", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
+def test_a_stop_mid_overture_keeps_finished_types_marks_tiles_pending_and_resumes(tmp_path):
+    # Task 22's stop path, driven through the REAL OvertureSource on its new
+    # type loop rather than through a stub that could be more forgiving than
+    # the real thing. The checkpoint moved from (tile, type) to type in Task
+    # 23, and every rule Task 22 established has to survive that move: a
+    # type already downloaded is kept and merged, a tile the stop never
+    # reached reads "pending" and not "failed", and no tile_failed event is
+    # emitted for it.
+    token = CancelToken()
+    inner = _FakeOvertureRunner()
+
+    def cancelling_runner(command, **kwargs):
+        result = inner(command, **kwargs)
+        token.cancel()
+        return result
+
+    register(OvertureSource(runner=cancelling_runner, executable_finder=lambda _n: "overturemaps"))
+    log = EventLog()
+    request = _request(
+        tmp_path,
+        source_ids=("overture",),
+        overture_types=("water", "building"),
+        run_bridge_step=False,
+        keep_work=True,
+    )
+    result = run_survey(request, progress=log, cancel=token)
+
+    assert result.stopped is True
+    assert result.complete is False
+    assert len(inner.commands) == 1, (
+        f"the stop should have landed after the first type's download, got "
+        f"{len(inner.commands)} calls"
+    )
+
+    # The in-flight type finished and was kept, per the cancel convention.
+    overture_work = result.paths.work_dir / "raw" / "overture"
+    assert (overture_work / "water.geojson").exists()
+    assert not (overture_work / "building.geojson").exists()
+    assert (result.paths.root / f"{result.paths.stem}_water.geojson").exists()
+
+    # Task 22's rule, unchanged: never reached is pending, not failed.
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["stopped"] is True
+    statuses = {record["overture"] for record in payload["tiles"]}
+    assert statuses == {"pending"}, (
+        f"a stop that never reached a tile must leave it pending, got {statuses}"
+    )
+    assert [e for e in log.events if e["event"] == "tile_failed"] == []
+
+    # And it genuinely resumes: the kept type is skipped, only the missing
+    # one is fetched, and the package completes.
+    resume_runner = _FakeOvertureRunner()
+    clear_registry()
+    register(OvertureSource(runner=resume_runner, executable_finder=lambda _n: "overturemaps"))
+    resumed = run_survey(request)
+
+    assert resumed.complete is True
+    assert resumed.paths.root == result.paths.root
+    fetched = {cmd[cmd.index("--type") + 1] for cmd in resume_runner.commands}
+    assert fetched == {"building"}, (
+        f"the resume should have refetched only the missing type, got {fetched}"
+    )
+
+
 # --- Task 23 item 5: with no tile-stamped files left, Overture now
 # contributes no tile-stamped directory to _record_tile_outcomes, so it
 # falls into the `elif files:` branch and the batch outcome applies
