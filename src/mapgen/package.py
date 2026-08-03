@@ -766,23 +766,29 @@ def _record_tile_outcomes(
     fetch() is one Python call for potentially many tiles: it either returns
     once for all of them or raises once for all of them, which says nothing
     about which individual tiles actually got a usable file. Sources that
-    name output files after the tile id, which covers OSM, Overture and the
-    test stub, get true per-tile status here.
+    name output files after the tile id, which covers OSM and the test
+    stubs, get true per-tile status here.
 
     A tile is ok only if it has a non-empty, tile-stamped file in EVERY
     directory where this source keeps tile-stamped files, not just any one
-    of them. OSM writes flat into source_work, so that is one directory.
-    Overture writes one type per subdirectory, so a tile with water but not
-    building for the same id must not be marked ok on the strength of water
-    alone: the set of directories to check is derived from what is actually
-    on disk, never hardcoded, so this generalises to any future source shape
-    without package.py knowing anything about it.
+    of them. OSM writes flat into source_work, so that is one directory. No
+    source ships today that writes tile-stamped files into more than one
+    (Overture did, one type per subdirectory, until Task 23 stopped tiling
+    it), so the multi-directory case is currently exercised only by this
+    file's own stubs. It is kept rather than simplified away because the
+    set of directories to check is derived from what is actually on disk and
+    never hardcoded, which is what lets any future source shape work here
+    without package.py knowing anything about it; collapsing it to "the one
+    directory" would be a quiet assumption that no source ever splits again.
 
-    A source with no per-tile naming at all, such as elevation's single
-    whole-area file, contributes no tile-stamped directory at all. If it
-    still produced that whole-area file, there is no finer signal than the
-    batch outcome, so it applies uniformly, matching how such sources have
-    always behaved. But a fetch() that returns without raising while leaving
+    A source with no per-tile naming at all, which is elevation's single
+    whole-area file and, since Task 23, Overture's one file per type,
+    contributes no tile-stamped directory at all. If it still produced its
+    output, there is no finer signal than the batch outcome, so it applies
+    uniformly to every tile, matching how such sources have always behaved.
+    For Overture that is not a loss of resolution: one whole-extent download
+    either lands, in which case every tile's ground is genuinely covered, or
+    it does not, in which case none of them is. But a fetch() that returns without raising while leaving
     nothing at all on disk is not evidence of anything: that is vacuous, not
     done, so it is always failed regardless of what the batch call reported
     (this can never coincide with stopped=True: Cancelled is what sets

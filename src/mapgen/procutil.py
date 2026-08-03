@@ -9,12 +9,17 @@ the desktop shortcut, with no console of its own to inherit, each child gets
 a brand new window.
 
 The owner hit both halves of this during one download. A survey of a modest
-area is one CLI call per tile per Overture type, so windows flashed up every
-few seconds for the length of the run. Worse, they are real windows: closing
-one kills the child process inside it. That is exactly what happened, and
-because the process died before writing anything to stderr, the failure
-reached the log as "overturemaps failed for tile r00_c04, type segment:"
-with nothing after the colon, which explains nothing to anyone.
+area was, at the time, one CLI call per tile per Overture type, so windows
+flashed up every few seconds for the length of the run. Worse, they are real
+windows: closing one kills the child process inside it. That is exactly what
+happened, and because the process died before writing anything to stderr,
+the failure reached the log as "overturemaps failed for tile r00_c04, type
+segment:" with nothing after the colon, which explains nothing to anyone.
+
+Task 23 stopped tiling Overture, so that is now one call per type rather
+than one per tile per type: eight windows on a full run instead of a
+hundred and sixty. Fewer chances to hit this, not a reason to stop hiding
+them, and the dotnet bridge child was never tiled to begin with.
 
 CREATE_NO_WINDOW fixes both at once: no window to flash, and none to close
 by accident. It is Windows-only, so it is resolved once here rather than

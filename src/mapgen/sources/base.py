@@ -95,8 +95,9 @@ class LayerSource(Protocol):
     inspect.signature(source.fetch) actually names it (see package.py's
     _fetch_accepts_cancel). A source that accepts it should call
     cancel.raise_if_cancelled() between whole units of paid-for work, the
-    tile loop for OsmSource, the (tile, type) loop for OvertureSource,
-    so a tile already in flight is always allowed to finish and be kept,
+    tile loop for OsmSource, the type loop for OvertureSource (Task 23:
+    it was the (tile, type) loop while Overture was still tiled), so a
+    request already in flight is always allowed to finish and be kept,
     never interrupted mid-request. A source that omits the parameter
     entirely, including every stub in this project's own test suite, is
     still called exactly as before and still works: it is simply not
