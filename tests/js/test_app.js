@@ -2603,6 +2603,87 @@ function ok(condition, message) {
     ok(result.get("r00_c00") === "active", `expected active (not yet done), got ${result.get("r00_c00")}`);
   });
 
+  // --- Task 23: Overture stopped being tiled, and its progress events
+  // deliberately did not. These pin the browser half of that decision,
+  // because the whole reason the events stayed per tile is what
+  // classifyTiles does with them, and "we read the function and it looked
+  // right" is not the same as running it. ---------------------------
+
+  await test("classifyTiles: an Overture-only run still lights up the whole grid", async () => {
+    // The exact event stream OvertureSource.fetch now produces: one
+    // whole-extent download per type, and after each one lands, a
+    // tile_done for EVERY tile in the plan carrying that type. Nothing is
+    // emitted per tile per download any more, because there is only one
+    // download per type.
+    const { sandbox } = await bootedSandbox();
+    const tileIds = ["r00_c00", "r00_c01", "r01_c00", "r01_c01"];
+    const events = [];
+    for (const overtureType of ["water", "building"]) {
+      for (const tileId of tileIds) {
+        events.push({ event: "tile_done", source: "overture", tile_id: tileId, overture_type: overtureType });
+      }
+    }
+
+    const midRun = sandbox.classifyTiles(tileIds, ["overture"], events, true);
+    for (const tileId of tileIds) {
+      ok(
+        midRun.get(tileId) === "active",
+        `expected every tile active mid-run, got ${tileId} = ${midRun.get(tileId)}`
+      );
+    }
+
+    events.push({ event: "source_done", source: "overture" });
+    const finished = sandbox.classifyTiles(tileIds, ["overture"], events, true);
+    for (const tileId of tileIds) {
+      ok(
+        finished.get(tileId) === "done",
+        `expected every tile done once overture reported source_done, got ${tileId} = ${finished.get(tileId)}`
+      );
+    }
+  });
+
+  await test("classifyTiles: a whole-area tile_id would leave the grid entirely dead", async () => {
+    // Why Overture did NOT adopt ElevationSource's tile_id="whole-area"
+    // convention, which is the tidier-looking match for a source that no
+    // longer tiles. state.has(event.tile_id) is false for it, so every
+    // event is silently dropped and an Overture-only run, which the owner
+    // can select on its own, shows a dead grid from first second to last.
+    // Asserted rather than argued, so anyone tempted to "tidy this up"
+    // later meets the consequence as a failing test.
+    const { sandbox } = await bootedSandbox();
+    const tileIds = ["r00_c00", "r00_c01"];
+    const events = [
+      { event: "tile_done", source: "overture", tile_id: "whole-area", overture_type: "water" },
+      { event: "tile_done", source: "overture", tile_id: "whole-area", overture_type: "building" },
+    ];
+    const result = sandbox.classifyTiles(tileIds, ["overture"], events, true);
+    for (const tileId of tileIds) {
+      ok(
+        result.get(tileId) === "pending",
+        `whole-area events should be ignored entirely, got ${tileId} = ${result.get(tileId)}`
+      );
+    }
+  });
+
+  await test("classifyTiles: a resumed Overture run lights the grid from tile_skipped alone", async () => {
+    // On a resume every type is already on disk, so fetch emits
+    // tile_skipped rather than tile_done and never runs the CLI at all.
+    // The grid must still fill in, or a resume looks like a hung job.
+    const { sandbox } = await bootedSandbox();
+    const tileIds = ["r00_c00", "r00_c01"];
+    const events = tileIds.map((tileId) => ({
+      event: "tile_skipped",
+      source: "overture",
+      tile_id: tileId,
+      overture_type: "water",
+    }));
+    events.push({ event: "source_done", source: "overture" });
+    const result = sandbox.classifyTiles(tileIds, ["overture"], events, true);
+    for (const tileId of tileIds) {
+      ok(result.get(tileId) === "done", `expected done, got ${tileId} = ${result.get(tileId)}`);
+    }
+  });
+
   await test("classifyTiles: a tile is done once every selected source reports source_done", async () => {
     const { sandbox } = await bootedSandbox();
     const events = [
