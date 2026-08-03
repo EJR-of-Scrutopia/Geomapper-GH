@@ -1,4 +1,8 @@
+import logging
+import threading
 import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote_plus
 
 import pytest
 import requests
@@ -7,9 +11,12 @@ from mapgen.geo import BBox
 from mapgen.jobs import Cancelled
 from mapgen.sources.base import NullProgress
 from mapgen.sources.elevation import (
+    DEFAULT_OPENTOPOGRAPHY_URL,
+    REDACTION_PLACEHOLDER,
     ElevationError,
     ElevationSource,
     MissingApiKeyError,
+    _ApiKeyRedactingFilter,
     _redact,
     _scrub_exception_chain,
     is_tiff,
@@ -545,3 +552,375 @@ def test_estimate_returns_positive_for_tiny_bbox():
 
     assert est.bytes_estimate > 0
     assert est.seconds_estimate > 0
+
+
+# --- Review round 3: a third independent reviewer got the key out again,
+# through a bare space in the key that requests encodes as "+" (quote_plus
+# semantics), which the previous candidate list, quote() only, encoded as
+# "%20" and so never matched. The reviewer's diagnosis was that value
+# matching itself was the mistake, repeated for a third time under a new
+# encoding each round: fixed by making a structural, parameter-name match
+# ("API_Key=" and everything up to the next & or whitespace, regardless of
+# its value) the PRIMARY defence, with value matching (now also including
+# quote_plus) kept only as a secondary backstop for the one shape the
+# parameter pattern cannot see: the key appearing somewhere not shaped like
+# "API_Key=...". Four more findings outside the redaction function itself:
+# urllib3 logs the full request line at DEBUG level with no exception
+# involved at all; _scrub_exception_chain's own docstring falsely claimed
+# completeness while leaving non-string carriers (.filename, .request.url,
+# .response.url) untouched; api_key and params survived as frame locals
+# inspectable by pytest --showlocals or Sentry even after the raised
+# exception's own text and chain were clean; and the withhold safety net
+# self-triggered on a secret that is a substring of the word "REDACTED"
+# itself, by searching its own redacted output rather than the original.
+
+
+def test_redact_parameter_pattern_catches_an_encoding_nobody_added_a_candidate_for():
+    # The point of matching the parameter rather than the value: this
+    # text carries a shape of "API_Key=..." nobody wrote a candidate
+    # for (not secret, quote(secret), or quote_plus(secret) for ANY
+    # secret, since it is not even a well-formed percent-encoding of
+    # one), and the secret passed in does not even appear anywhere in
+    # the text. It is still removed, because the primary defence never
+    # looks at the secret's value to decide what to remove.
+    text = (
+        "GET /API/globaldem?demtype=COP30"
+        "&API_Key=totally-unanticipated-shape%zz-not-a-real-encoding"
+        "&outputFormat=GTiff HTTP/1.1"
+    )
+    redacted = _redact(text, "unrelated-secret-not-even-present-in-text")
+    assert "totally-unanticipated-shape" not in redacted
+    assert "API_Key=" + REDACTION_PLACEHOLDER in redacted
+    # Proves the match stops at the next parameter rather than eating the
+    # rest of the query string.
+    assert "demtype=COP30" in redacted
+    assert "outputFormat=GTiff" in redacted
+
+
+def test_redact_strips_the_parameter_pattern_even_when_no_secret_is_known():
+    # The primary defence does not need to know the secret's value at
+    # all, so it must not be gated behind one being supplied: a caller
+    # with no secret in hand (_ApiKeyRedactingFilter, below, is exactly
+    # such a caller) must still get the same structural protection as a
+    # caller that has one.
+    text = "GET /API/globaldem?demtype=COP30&API_Key=whatever-this-is HTTP/1.1"
+    redacted = _redact(text, None)
+    assert "whatever-this-is" not in redacted
+    assert "API_Key=" + REDACTION_PLACEHOLDER in redacted
+
+
+def test_redact_backstop_catches_the_plus_encoded_form_of_a_trailing_space_key():
+    # Isolates the SECONDARY (value-matching) backstop from the primary
+    # parameter-pattern defence: this text does not contain "API_Key="
+    # at all, so only the backstop's candidate list can catch it.
+    # Round 3's own finding was that requests encodes a query-string
+    # space as "+" (quote_plus semantics), which the old candidate
+    # list, quote() only, encoded as "%20" and so never matched.
+    secret_with_trailing_space = "sk-real-secret-with-trailing-space "
+    encoded = quote_plus(secret_with_trailing_space)
+    assert "+" in encoded, "the test needs quote_plus to actually produce a +"
+    text = f"upstream rejected the token: {encoded}"
+    redacted = _redact(text, secret_with_trailing_space)
+    assert encoded not in redacted
+    assert REDACTION_PLACEHOLDER in redacted
+
+
+def test_fetch_never_leaks_a_trailing_space_key_encoded_by_a_real_prepared_request(tmp_path):
+    # Every previous round's "never leaks" test hand-assembled the leaky
+    # URL as an f-string. That is exactly how this bug hid for two
+    # rounds: a hand-assembled URL always guesses an encoding, and every
+    # guess so far happened to already be on the candidate list. This
+    # one instead calls requests' own Request(...).prepare(), so
+    # whatever encoding requests actually uses for a trailing space is
+    # whatever ends up in the exception message, with no guessing at all.
+    secret_with_trailing_space = "sk-real-secret-with-trailing-space "
+    prepared = requests.Request(
+        "GET",
+        DEFAULT_OPENTOPOGRAPHY_URL,
+        params={"demtype": "COP30", "API_Key": secret_with_trailing_space},
+    ).prepare()
+    assert "+" in prepared.url, "needs requests' real space encoding for this test to be meaningful"
+
+    class RealEncodingLeakSession:
+        def get(self, url, **kwargs):
+            raise requests.exceptions.ConnectionError(
+                f"Max retries exceeded with url: {prepared.url}"
+            )
+
+    source = ElevationSource(api_key=secret_with_trailing_space, session=RealEncodingLeakSession())
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    message = str(excinfo.value)
+    assert secret_with_trailing_space.strip() not in message
+    assert "API_Key=" + REDACTION_PLACEHOLDER in message
+
+
+def test_redact_does_not_self_trigger_withhold_on_a_short_common_letter_secret():
+    # An earlier version of the withhold safety net searched its OWN
+    # redacted output for the secret, rather than the original text. A
+    # secret that is a common single letter is a case-insensitive
+    # substring of the word "REDACTED" itself (the placeholder every
+    # ordinary substitution inserts), so every ordinary redaction
+    # produced output that still matched the candidate, and the safety
+    # net destroyed a message that never contained the secret in any
+    # unredacted form at all, and had no NUL bytes anywhere in it.
+    secret = "a"
+    text = "an ordinary message about a cat, no secret involved"
+    redacted = _redact(text, secret)
+    assert "withheld" not in redacted.lower(), (
+        f"an innocent, NUL-free message was wrongly withheld: {redacted}"
+    )
+
+
+class _FakeUrlHolder:
+    """Stands in for the parts of a requests PreparedRequest or Response
+    that _scrub_exception_chain actually reads: nothing but a plain,
+    settable .url string attribute.
+    """
+
+    def __init__(self, url):
+        self.url = url
+
+
+def test_scrub_exception_chain_redacts_oserror_filename_attributes():
+    # requests' connection-level exceptions frequently wrap a raw
+    # socket/OSError, whose own .filename/.filename2 have, in practice,
+    # been used to carry the address or URL involved, entirely separate
+    # from anything in .args.
+    exc = OSError("connection failed")
+    exc.filename = f"https://portal.opentopography.org/API/globaldem?API_Key={SECRET}"
+    exc.filename2 = f"secondary path with {SECRET} embedded"
+    _scrub_exception_chain(exc, SECRET)
+    assert SECRET not in exc.filename
+    assert SECRET not in exc.filename2
+
+
+def test_scrub_exception_chain_redacts_request_and_response_url_attributes():
+    # requests itself sets .request (a PreparedRequest) and .response (a
+    # Response) on most of its own exception classes; each exposes a
+    # plain .url string carrying the exact query string that was sent,
+    # independent of whatever str(exc) says.
+    exc = requests.exceptions.ConnectionError("connection reset")
+    leaky_url = f"https://portal.opentopography.org/API/globaldem?API_Key={SECRET}"
+    exc.request = _FakeUrlHolder(leaky_url)
+    exc.response = _FakeUrlHolder(leaky_url)
+    _scrub_exception_chain(exc, SECRET)
+    assert SECRET not in exc.request.url
+    assert SECRET not in exc.response.url
+
+
+def test_scrub_exception_chain_redacts_url_attributes_through_the_whole_chain():
+    # Not only the newly-raised exception: __cause__/__context__ can
+    # themselves be genuine requests exceptions carrying their own
+    # populated .request, and the walk must reach it too.
+    root = requests.exceptions.ConnectionError("root connection error")
+    root.request = _FakeUrlHolder(
+        f"https://portal.opentopography.org/API/globaldem?API_Key={SECRET}"
+    )
+    try:
+        try:
+            raise root
+        except requests.exceptions.ConnectionError as caught:
+            raise ElevationError("wrapped") from caught
+    except ElevationError as top:
+        _scrub_exception_chain(top, SECRET)
+        assert SECRET not in top.__cause__.request.url
+
+
+def test_fetch_scrubs_request_url_attribute_on_the_original_exception(tmp_path):
+    # Proves the fix through fetch() itself, not only _scrub_exception_chain
+    # in isolation: a real ConnectionError carrying a populated .request,
+    # the way requests' own exceptions actually do, must come out clean
+    # on the chain fetch() leaves behind as __context__.
+    class LeakyAttributeSession:
+        def get(self, url, **kwargs):
+            exc = requests.exceptions.ConnectionError("connection reset by peer")
+            exc.request = _FakeUrlHolder(f"{url}?API_Key={SECRET}")
+            raise exc
+
+    source = ElevationSource(api_key=SECRET, session=LeakyAttributeSession())
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    original = excinfo.value.__context__
+    assert original is not None, "expected the original exception still present as __context__"
+    assert SECRET not in original.request.url
+
+
+class _UrlAwareStreamResponse(FakeStreamResponse):
+    """Like FakeStreamResponse, but with a real .url and .request.url, the
+    way an actual requests.Response object has, to exercise the non-TIFF
+    branch's own response.url redaction specifically.
+    """
+
+    def __init__(self, chunks, url, status_code=200):
+        super().__init__(chunks, status_code=status_code)
+        self.url = url
+        self.request = _FakeUrlHolder(url)
+
+
+def test_fetch_redacts_the_response_url_before_it_can_survive_as_a_frame_local(tmp_path):
+    # response (and response.request) are still bound in fetch()'s frame
+    # after the `with` block closes the connection; .url on each is the
+    # literal request URL, API_Key included, and no exception exists in
+    # this branch for _scrub_exception_chain to ever reach. If fetch()
+    # did not scrub them in place, the SAME object this test holds a
+    # reference to would still carry the raw key long after the call
+    # returns, regardless of what the raised exception's own message says.
+    leaky_url = f"https://portal.opentopography.org/API/globaldem?demtype=COP30&API_Key={SECRET}"
+    response = _UrlAwareStreamResponse([b"<html>not a tiff</html>"], url=leaky_url)
+    source = ElevationSource(api_key=SECRET, session=FakeSession(response))
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+    assert SECRET not in response.url
+    assert SECRET not in response.request.url
+
+
+def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_broad_except_path(tmp_path):
+    # pytest --showlocals, Sentry's local-variable capture, and a
+    # debugger's postmortem all read tb_frame.f_locals directly: none of
+    # that goes through _redact or _scrub_exception_chain, which only
+    # ever touch an exception's OWN text and attributes, never a frame's
+    # local variables. api_key and params must not still be bound in
+    # elevation.py's fetch() frame by the time the exception has
+    # propagated out of it.
+    session = ConnectFailureSession(requests.exceptions.ConnectionError)
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+
+    tb = excinfo.tb
+    checked_fetch_frame = False
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_name == "fetch":
+            checked_fetch_frame = True
+            for name, value in frame.f_locals.items():
+                if isinstance(value, str):
+                    assert SECRET not in value, f"local {name!r} in fetch() still holds the key"
+                elif isinstance(value, dict):
+                    assert not any(
+                        isinstance(v, str) and SECRET in v for v in value.values()
+                    ), f"local {name!r} in fetch() still holds the key in a dict value"
+        tb = tb.tb_next
+    assert checked_fetch_frame, "the traceback did not include elevation.py's fetch() frame"
+
+
+def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_non_tiff_path(tmp_path):
+    leaky_body = f"<html>Bad request: API_Key={SECRET}</html>".encode("utf-8")
+    session = FakeSession(FakeStreamResponse([leaky_body], status_code=200))
+    source = ElevationSource(api_key=SECRET, session=session)
+    with pytest.raises(ElevationError) as excinfo:
+        source.fetch(BBOX, [], tmp_path, NullProgress())
+
+    tb = excinfo.tb
+    checked_fetch_frame = False
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_name == "fetch":
+            checked_fetch_frame = True
+            for name, value in frame.f_locals.items():
+                if isinstance(value, str):
+                    assert SECRET not in value, f"local {name!r} in fetch() still holds the key"
+                elif isinstance(value, bytes):
+                    assert SECRET.encode("utf-8") not in value, (
+                        f"local {name!r} in fetch() still holds the key"
+                    )
+                elif isinstance(value, dict):
+                    assert not any(
+                        isinstance(v, str) and SECRET in v for v in value.values()
+                    ), f"local {name!r} in fetch() still holds the key in a dict value"
+        tb = tb.tb_next
+    assert checked_fetch_frame, "the traceback did not include elevation.py's fetch() frame"
+
+
+def test_resolve_api_key_strips_trailing_whitespace_from_the_explicit_value():
+    assert resolve_api_key("explicit-key  \n", {}) == "explicit-key"
+
+
+def test_resolve_api_key_strips_whitespace_from_environment_values():
+    assert resolve_api_key(None, {"OPENTOPOGRAPHY_API_KEY": "  env-key\t"}) == "env-key"
+
+
+def test_resolve_api_key_strips_whitespace_from_the_configured_value():
+    assert resolve_api_key(None, {}, "  from-config  ") == "from-config"
+
+
+def test_resolve_api_key_treats_an_all_whitespace_explicit_value_as_absent():
+    # A blank-but-present explicit value must fall through to the next
+    # tier, exactly as an unset one would, not win the precedence chain
+    # with a value that resolves to nothing once trimmed.
+    assert resolve_api_key("   ", {"OPENTOPOGRAPHY_API_KEY": "env-key"}) == "env-key"
+
+
+def test_resolve_api_key_treats_an_all_whitespace_configured_value_as_a_missing_key():
+    with pytest.raises(MissingApiKeyError):
+        resolve_api_key(None, {}, "   ")
+
+
+def test_api_key_redacting_filter_scrubs_a_record_in_place():
+    # Fast, deterministic companion to the real-server test below: proves
+    # the filter class itself, isolated from any actual networking.
+    filter_ = _ApiKeyRedactingFilter()
+    record = logging.LogRecord(
+        name="urllib3.connectionpool",
+        level=logging.DEBUG,
+        pathname=__file__,
+        lineno=1,
+        msg='%s "GET /API/globaldem?demtype=COP30&API_Key=%s HTTP/1.1" 200 None',
+        args=("https://portal.opentopography.org:443", SECRET),
+        exc_info=None,
+    )
+    result = filter_.filter(record)
+    assert result is True
+    assert SECRET not in record.getMessage()
+    assert record.args == ()
+
+
+def test_api_key_redacting_filter_is_installed_on_the_urllib3_connectionpool_logger():
+    filters = logging.getLogger("urllib3.connectionpool").filters
+    assert any(isinstance(f, _ApiKeyRedactingFilter) for f in filters)
+
+
+class _OkHandler(BaseHTTPRequestHandler):
+    """Answers every GET with a plain 200, deliberately quiet: the point
+    of this server is only to make urllib3 log a real request line, not
+    to exercise anything about the response.
+    """
+
+    def log_message(self, format, *args):  # noqa: A002 - matches BaseHTTPRequestHandler's own signature
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
+@pytest.fixture
+def local_http_server():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_urllib3_debug_logging_never_reveals_the_key(local_http_server, caplog):
+    # Confirmed empirically before writing the fix: urllib3.connectionpool
+    # logs the full request line, key included, at DEBUG level for every
+    # request it makes, success or failure alike, entirely independent of
+    # any exception. Nothing else in this module runs on this path at
+    # all: _redact and _scrub_exception_chain only ever run once
+    # something has already gone wrong, and here nothing does.
+    real_key = "sk-real-secret-in-a-debug-log-line"
+    with caplog.at_level(logging.DEBUG, logger="urllib3.connectionpool"):
+        requests.get(local_http_server, params={"API_Key": real_key}, timeout=10)
+    assert "API_Key=" in caplog.text, (
+        "sanity check failed: urllib3 apparently did not log the request "
+        "line at all, so this test cannot be proving the filter works"
+    )
+    assert real_key not in caplog.text, f"the key leaked into urllib3's own debug log: {caplog.text}"
