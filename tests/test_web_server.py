@@ -1942,7 +1942,7 @@ def test_serve_never_auto_shuts_down_when_heartbeat_timeout_is_not_given(monkeyp
     thread.join(timeout=5)
 
 
-def test_serve_auto_shuts_down_end_to_end_when_the_heartbeat_times_out():
+def test_serve_auto_shuts_down_end_to_end_when_the_heartbeat_times_out(capsys):
     # The real, public entry point the CLI's --windowless flag calls,
     # proving the parameter is actually wired through to the watchdog,
     # not just that _watch_heartbeat works in isolation.
@@ -1954,3 +1954,9 @@ def test_serve_auto_shuts_down_end_to_end_when_the_heartbeat_times_out():
     thread.start()
     thread.join(timeout=5)
     assert not thread.is_alive(), "expected serve() to return once the heartbeat timed out"
+    # Found by running this for real, launched windowless with no browser
+    # ever opened against it: it exited cleanly (confirmed by the process
+    # disappearing) but the log file never said why, indistinguishable
+    # from a silent crash short of noticing the process itself was gone.
+    out = capsys.readouterr().out
+    assert "Stopped" in out, f"expected an explanatory line on a watchdog-triggered exit, got: {out!r}"

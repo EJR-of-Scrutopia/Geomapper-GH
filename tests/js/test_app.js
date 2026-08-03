@@ -755,6 +755,86 @@ function ok(condition, message) {
   );
 
   // =======================================================================
+  // Task 19, item 4: the page's own half of "closing the interface stops
+  // the server": a periodic heartbeat ping, and a visible Stop server
+  // button. The server-side watchdog and /api/heartbeat/api/shutdown
+  // routes are tested directly in test_web_server.py; this is only
+  // whether the PAGE calls them the way that server expects.
+  // =======================================================================
+
+  // app.js's own HEARTBEAT_INTERVAL_MS is declared with const, which,
+  // unlike a function declaration, does NOT become a property of the vm
+  // sandbox's global object: sandbox.HEARTBEAT_INTERVAL_MS is undefined,
+  // not 5000. Duplicated here rather than read off the sandbox, the same
+  // way other debounce durations elsewhere in this file (400ms, 600ms)
+  // are already asserted against as plain literals rather than exported
+  // constants.
+  const EXPECTED_HEARTBEAT_INTERVAL_MS = 5000;
+
+  await test(
+    "the page pings /api/heartbeat on its own interval, unprompted by any action",
+    async () => {
+      // Real time, not simulated: this harness has no fake-timer support,
+      // so proving the interval genuinely fires means genuinely waiting
+      // slightly past it, the same trade-off already accepted elsewhere
+      // in this file for the job poller's 700ms tick.
+      const { fetchCalls, sandbox } = await bootedSandbox();
+      fetchCalls.length = 0;
+      await flush(EXPECTED_HEARTBEAT_INTERVAL_MS + 300);
+      const heartbeats = fetchCalls.filter((c) => c.url.pathname === "/api/heartbeat");
+      ok(heartbeats.length >= 1, `expected at least one heartbeat ping, got ${heartbeats.length}`);
+      ok((heartbeats[0].options.method || "").toUpperCase() === "POST");
+    }
+  );
+
+  await test("a single failed heartbeat ping is swallowed quietly, not thrown as unhandled", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/heartbeat") return jsonResponse(500, { error: "boom" });
+      return null;
+    });
+    // What this actually proves: app.js's heartbeat call ends in
+    // .catch(() => {}), so a failing ping's rejection is handled, not
+    // left unhandled. It does not fail cleanly through ok() if that
+    // .catch were removed; a genuinely unhandled rejection is a runtime
+    // event Node reports on its own (and, by default, exits non-zero
+    // for), which would surface as this whole test FILE crashing rather
+    // than one named check failing. Kept anyway: that crash is still a
+    // real, visible, CI-breaking signal, just a blunter one than ok().
+    await flush(EXPECTED_HEARTBEAT_INTERVAL_MS + 300);
+    ok(true, "expected the failed ping to be caught, not thrown");
+  });
+
+  await test("the Stop server button calls /api/shutdown and logs a confirmation", async () => {
+    const { fetchCalls, sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/shutdown") return jsonResponse(200, { stopping: true });
+      return null;
+    });
+    sandbox.document.getElementById("stop-server").fire("click");
+    await flush(10);
+    const call = fetchCalls.find((c) => c.url.pathname === "/api/shutdown");
+    ok(call, "expected a call to /api/shutdown");
+    ok((call.options.method || "").toUpperCase() === "POST");
+    const logLines = sandbox.document.getElementById("log").children;
+    ok(
+      logLines.some((l) => /stopped/i.test(l.textContent)),
+      `expected a confirmation log line, got: ${logLines.map((l) => l.textContent).join(" | ")}`
+    );
+  });
+
+  await test("a failed Stop server request logs a clean failure rather than throwing", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/shutdown") return jsonResponse(500, { error: "boom" });
+      return null;
+    });
+    sandbox.document.getElementById("stop-server").fire("click");
+    await flush(10);
+    const logLines = sandbox.document.getElementById("log").children;
+    const failLine = logLines.find((l) => l.className === "fail");
+    ok(failLine, "expected a fail-styled log line");
+    ok(/could not stop/i.test(failLine.textContent), `unexpected message: ${failLine.textContent}`);
+  });
+
+  // =======================================================================
   // boot() and the job poller must fail visibly, not silently
   // =======================================================================
 

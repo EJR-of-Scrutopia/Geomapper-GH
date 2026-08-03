@@ -53,10 +53,10 @@ Set it as an environment variable:
 $env:OPENTOPOGRAPHY_API_KEY = "your-key"
 ```
 
-or paste it into the "OpenTopography API key" field in the web interface,
-which saves it to `~/.mapgen/config.json`. The environment variable always
-wins if both are set. `OPENTOPO_API_KEY` is accepted as an older alias for
-the same variable.
+or paste it into the OpenTopography field under the Settings button in the
+web interface, which saves it to `~/.mapgen/config.json`. The environment
+variable always wins if both are set. `OPENTOPO_API_KEY` is accepted as an
+older alias for the same variable.
 
 ## Running it
 
@@ -73,20 +73,69 @@ the URL, so nothing else on the machine can drive it. On the page:
 - Draw a rectangle on the map, paste a `west,south,east,north` bbox string, or
   search a place name and pick a result. Whichever way you set it, the extent
   always shows as a rectangle.
-- Fill in Region and Site. These name the output folder.
-- Tile size and overlap default to 2000 m and 100 m and rarely need changing;
-  the hint text under each field explains what they trade off.
-- Tick which layers you want (OpenStreetMap, Overture Maps, elevation).
-- Set the output root, or accept the remembered one.
+- Region and Site fill in on their own: picking a place from the search
+  results uses that result's own name, and drawing or pasting a rectangle
+  reverse-geocodes its centre. Both stay ordinary editable text fields, and
+  neither is ever overwritten once you have typed into it; if one cannot be
+  worked out, the estimate panel says which is missing rather than guessing
+  from coordinates.
+- Tick which layers you want (OpenStreetMap, Overture Maps, elevation) and
+  which categories (buildings, roads, broken down into motorway, trunk,
+  primary, secondary, residential, service, footpath, cycleway and track,
+  water, vegetation and landuse, rail, boundaries, points of interest).
+  Categories are ticked by default, matching the everything-selected
+  behaviour before this control existed. Category selection reaches
+  Overture directly; it only reaches OpenStreetMap on the Overpass path,
+  which the browser and CLI do not use today (see "Limits worth knowing
+  about"), and the estimate panel says so plainly rather than pretending a
+  narrowed selection changed anything about the OSM data.
+- Output root, tile size and overlap live behind the Settings button:
+  defaults you set once, not per-survey choices. An API key field appears
+  there per data source that needs one (OpenTopography's, for the
+  elevation layer), driven by the same source registry the layer list
+  comes from, so a second or third keyed source in a later phase needs no
+  new panel.
 - Above the Download button you get the extent in kilometres, tile count,
   and an estimated download size and duration, computed before anything is
   fetched, so a mis-drawn box over the wrong country is obvious immediately.
 - The download runs with a live per-tile log and a Cancel button that stops
   cleanly at the next tile boundary.
+- A Stop server button ends the session immediately from the page itself,
+  useful under a terminal launch too, not only the windowless one below.
 
 Only one download runs at a time; starting a second while one is in progress
 is refused with a clear message rather than run concurrently, because
 simultaneous Overpass requests from one machine are how you get rate limited.
+
+#### Desktop shortcut, windowless
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+.\assets\make_shortcut.ps1
+```
+
+Creates (or refreshes) a `mapgen.lnk` on the Desktop that launches
+`pythonw.exe -m mapgen ui --windowless`: no console window, and the server
+stops itself once the page has been closed for a while (a heartbeat ping
+from the page every 5 seconds; the server waits 20 seconds of silence, long
+enough to survive a reload, before deciding the page is genuinely gone). The
+Stop server button on the page ends it immediately either way, so a crashed
+browser does not leave a process behind waiting out the full grace period.
+Safe to re-run any time: it overwrites the existing shortcut rather than
+needing to be deleted first, which is what makes the shortcut itself safe to
+regenerate instead of hand-edited.
+
+`mapgen ui` typed into a terminal is completely unaffected by any of this:
+console, output, and running until Ctrl+C regardless of the browser tab, all
+exactly as before. `--windowless` is what changes the behaviour, and only the
+shortcut passes it.
+
+With no console, `mapgen ui --windowless` has nowhere to print to: Python
+itself sets `sys.stdout`/`sys.stderr` to `None` under `pythonw.exe`, and an
+ordinary `print()` on `None` crashes outright. Output is redirected to
+`~/.mapgen/ui.log` instead, and a failure that stops the server before it can
+even open the page also raises a native Windows message box pointing at that
+log, so a windowless launch that cannot start is not a silent one.
 
 ### Command line
 
@@ -109,6 +158,18 @@ mapgen survey `
 types (building, place, segment, connector, infrastructure, land_use,
 land_cover, water) if omitted. `--region` and `--site` are always required.
 
+`--category` is repeatable and defaults to every category if omitted; run
+`mapgen categories` for the full list of ids, including the nine road
+subtypes. It reaches Overture's own type selection (mapped from category to
+type; `--overture-type`, if also given, wins outright over `--category` for
+Overture specifically, since they are two ways of choosing the same thing).
+It reaches OpenStreetMap only on the Overpass path (`use_overpass=True`,
+a Python-only constructor choice today, not exposed as a flag): the OSM map
+API this tool uses by default has no server-side filtering at all, and a
+narrowed `--category` selection combined with it is silently ignored for
+OSM specifically. `mapgen estimate` reports this as a warning when it
+applies, rather than a control that appears to work and does not.
+
 Other commands:
 
 ```powershell
@@ -117,6 +178,9 @@ mapgen estimate --bbox=-3.29,51.38,-3.28,51.39 --region "South Wales" --site "Ba
 
 # Lists every registered data source and its licence.
 mapgen sources
+
+# Lists every --category id, including the nine road subtypes.
+mapgen categories
 ```
 
 `mapgen survey` exits 0 on a complete package and 1 if any tile failed
@@ -194,8 +258,9 @@ Fields, as actually written:
 | `urbano_stem` | The file stem used for every named output in this package. |
 | `bbox` | The requested extent, `west`/`south`/`east`/`north`. |
 | `extent_km` | Width and height of that bbox in kilometres. |
-| `tiling` | `tile_size_m`, `overlap_m`, and the resulting `rows`/`cols`. |
-| `sources` | One entry per requested source: `id`, `licence`, `attribution`, and `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record). |
+| `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. On a node-cap retry (see "Limits worth knowing about") this is the size the retry settled on, which can be smaller than what was requested. |
+| `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
+| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), and, for Overture specifically, `types` (the actual Overture types this package's data was fetched with). |
 | `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"` status per source. |
 | `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
 | `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely. |

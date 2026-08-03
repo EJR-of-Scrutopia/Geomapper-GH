@@ -754,6 +754,41 @@ $("cancel").addEventListener("click", async () => {
   if (jobId) await api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
 });
 
+// --- keep-alive and shutdown -------------------------------------------
+//
+// A ping every HEARTBEAT_INTERVAL_MS while this page is open. This is the
+// whole client-side half of "closing the interface stops the server":
+// there is nothing to do on unload, since a closed or crashed tab simply
+// stops sending these, and the server's own watchdog (see mapgen.web.
+// server, only wired in for a --windowless launch) treats a long enough
+// silence as the page being gone. Sent unconditionally, launch mode
+// unknown to this page: harmless against a plain `mapgen ui` session,
+// which records the ping but has no watchdog thread reading it.
+//
+// Started at script load, not inside boot(): boot() awaits /api/config
+// and /api/sources before it can do anything else, and the first ping
+// should not wait on those, particularly since a slow or failed boot() is
+// exactly when the owner is most likely to be looking at a blank page
+// and takes longest to reach the point a human would call "the page is
+// up", the moment that actually matters for not being mistaken for "gone".
+const HEARTBEAT_INTERVAL_MS = 5000;
+setInterval(() => {
+  api("/api/heartbeat", { method: "POST" }).catch(() => {
+    // A single missed ping is well within the server's own grace period
+    // (see DEFAULT_HEARTBEAT_TIMEOUT_SECONDS); nothing useful to do here
+    // beyond letting the next interval try again.
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+$("stop-server").addEventListener("click", async () => {
+  try {
+    await api("/api/shutdown", { method: "POST" });
+    log("Server stopped. This page will no longer work; you can close it.");
+  } catch (error) {
+    log(`Could not stop the server: ${error.message}`, true);
+  }
+});
+
 // --- boot ------------------------------------------------------------
 
 // Split out of boot() itself now that there are three registry-driven

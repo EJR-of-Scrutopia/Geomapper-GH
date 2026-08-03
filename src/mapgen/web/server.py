@@ -611,6 +611,19 @@ def serve(
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+    else:
+        # serve_forever() only returns normally via an explicit
+        # shutdown() call from somewhere else: the heartbeat watchdog
+        # (the page went quiet) or /api/shutdown (its Stop server
+        # button). Confirmed directly: a real windowless run, launched
+        # with no browser ever opened against it, printed nothing at all
+        # here before this was added, and the log file simply stopped
+        # having new lines the moment it exited, with no way to tell
+        # "it stopped as designed" apart from "it crashed silently"
+        # short of noticing the process itself was gone. Printed the
+        # same way the Ctrl+C case above always has been, so every exit
+        # path leaves a line behind, not just that one.
+        print("\nStopped (server shut down: the page went quiet, or a shutdown was requested).")
     finally:
         # Set before server_close(), not after: the watchdog thread reads
         # httpd.last_heartbeat_at, not the socket itself, so it would
