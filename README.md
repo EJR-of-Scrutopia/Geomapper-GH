@@ -106,12 +106,30 @@ the URL, so nothing else on the machine can drive it. On the page:
   there per data source that needs one (OpenTopography's, for the
   elevation layer), driven by the same source registry the layer list
   comes from, so a second or third keyed source in a later phase needs no
-  new panel.
+  new panel. An Appearance setting there too: Match system (the default),
+  Light or Dark, applied to the whole page and to the tile grid below.
 - Above the Download button you get the extent in kilometres, tile count,
   and an estimated download size and duration, computed before anything is
   fetched, so a mis-drawn box over the wrong country is obvious immediately.
-- The download runs with a live per-tile log and a Cancel button that stops
-  cleanly at the next tile boundary.
+  The same request also draws the actual tiling as rectangles on the map,
+  from the server's own tile geometry rather than a client-side guess, so
+  what you see is the grid the pipeline is really about to use.
+- The download runs with a live per-tile log, and the tile grid shades each
+  rectangle as it goes: not started, in progress, done, or failed, the last
+  one drawn distinctly since it is the one worth noticing before deciding
+  you have enough. A Stop button ends the download: it does not discard
+  what has already been fetched. A tile already being downloaded is
+  finished and kept, whatever source is running next never starts,
+  everything fetched so far is merged into the package exactly as a
+  finished run would, and `survey.json` records the package as stopped, not
+  complete and not failed, so the folder and its own audit trail always
+  agree about how far the download actually got. Re-running the same
+  extent afterwards resumes rather than restarts, picking up from the
+  tiles the stop left unfetched, the same as it always has for an
+  interrupted or failed run. There is no separate Pause: stopping already
+  keeps everything, and resuming already continues from where it stopped,
+  so a second button promising the same outcome would only be one more
+  thing to explain.
 - A Stop server button ends the session immediately from the page itself,
   useful under a terminal launch too, not only the windowless one below.
 
@@ -319,9 +337,10 @@ Fields, as actually written:
 | `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. On a node-cap retry (see "Limits worth knowing about") this is the size the retry settled on, which can be smaller than what was requested. |
 | `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
 | `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), and, for Overture, `types` (the actual Overture types fetched). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
-| `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"` status per source. |
+| `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"`/`"pending"` status per source. `"pending"` means the source never got a turn on that tile at all, most often because a Stop request landed first; it is a different, more honest claim than `"failed"`, which means a real attempt came up short. |
 | `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
-| `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely. |
+| `stopped` | `true` only when a Stop request is the reason `complete` is `false`, never for an ordinary tile failure. Distinguishes the two ways a package can be short: `complete: false, stopped: true` is exactly as far as you asked it to go and is safe to hand to Grasshopper as is; `complete: false, stopped: false` means something failed. Re-running the same extent resumes either way. |
+| `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely, which a stopped run always does, on purpose: `attempted` is `false` and `ok` is `null` the same as `--skip-bridge`, since starting another external process after a Stop request works against stopping promptly. |
 | `started_at`, `finished_at` | UTC timestamps. |
 
 ## Using the output in Grasshopper, with Urbano 2
