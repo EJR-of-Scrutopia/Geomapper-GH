@@ -258,6 +258,57 @@ def test_sources_endpoint_lists_the_registry(server):
     assert payload[0]["requires_api_key"] is False
 
 
+def test_sources_endpoint_omits_the_api_key_field_for_a_source_with_no_key(server):
+    status, payload = _get(server, "/api/sources")
+    assert status == 200
+    assert payload[0]["api_key_config_field"] is None
+
+
+def test_sources_endpoint_names_the_config_field_for_a_source_that_needs_a_key(server):
+    # Task 19: the settings panel is driven from this rather than a
+    # hard-coded field per key, so a real keyed source must actually
+    # advertise which Config field its key is saved under.
+    from mapgen.sources.elevation import ElevationSource
+
+    clear_registry()
+    register(ElevationSource())
+    status, payload = _get(server, "/api/sources")
+    assert status == 200
+    elevation_entry = next(s for s in payload if s["id"] == "elevation")
+    assert elevation_entry["api_key_config_field"] == "opentopography_api_key"
+
+
+def test_categories_endpoint_requires_a_token(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(f"{server}/api/categories", timeout=10)
+    assert excinfo.value.code == 403
+
+
+def test_categories_endpoint_lists_every_leaf_id(server):
+    from mapgen.categories import ALL_CATEGORY_IDS
+
+    status, payload = _get(server, "/api/categories")
+    assert status == 200
+    leaf_ids = set()
+    for group in payload:
+        if group["children"]:
+            leaf_ids.update(child["id"] for child in group["children"])
+        else:
+            leaf_ids.add(group["id"])
+    assert leaf_ids == set(ALL_CATEGORY_IDS)
+
+
+def test_categories_endpoint_nests_road_subtypes_under_the_roads_group(server):
+    status, payload = _get(server, "/api/categories")
+    assert status == 200
+    roads_group = next(g for g in payload if g["id"] == "roads")
+    child_ids = [c["id"] for c in roads_group["children"]]
+    assert "footpath" in child_ids
+    assert "motorway" in child_ids
+    # "roads" itself is a grouping label, never a real category id.
+    assert "roads" not in {c["id"] for c in roads_group["children"]}
+
+
 def test_estimate_endpoint_returns_tile_count(server, tmp_path):
     status, payload = _post(
         server,
@@ -1304,16 +1355,18 @@ def test_index_html_references_at_least_one_local_asset():
     assert _REFERENCED_ASSETS, "expected index.html to reference at least one local file"
 
 
-def test_api_key_field_is_type_password():
-    # Review round 1: this was previously asserted nowhere. The brief
-    # requires type="password" specifically so the key is never shown in
-    # plain text on screen; flipping it to type="text" passed every
-    # existing test in both suites.
-    match = re.search(r"<input\b[^>]*id=\"opentopo-key\"[^>]*>", _INDEX_HTML_SOURCE)
-    assert match, 'expected an <input id="opentopo-key"> element in index.html'
-    assert 'type="password"' in match.group(0), (
-        f'expected the API key field to be type="password", got: {match.group(0)}'
-    )
+# test_api_key_field_is_type_password used to live here, grepping index.html
+# directly for a static <input id="opentopo-key"> element. Task 19 moved API
+# key fields out of static markup entirely: they are now rendered by app.js's
+# renderApiKeys, one per source that exposes api_key_config_field, so there is
+# no longer a fixed id or a static tag for a Python-side grep to find. The
+# same property (type="password", so a saved key is never shown in plain
+# text) is now pinned in tests/js/test_app.js's "boot() pre-fills a keyed
+# source's field from the saved config", against the REAL rendered output of
+# the real app.js, which is a stronger check than a static-text grep ever
+# was: it would catch renderApiKeys emitting the wrong type just as surely
+# as a hand-edited markup regression, matching this project's own stated
+# split (server behaviour in pytest, client logic in the Node harness).
 
 
 def test_root_is_served_as_html(server):

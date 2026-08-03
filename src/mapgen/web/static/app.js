@@ -423,6 +423,12 @@ function payload() {
     overlap_m: parseFloat($("overlap").value),
     keep_work: $("keep-work").checked,
     sources: [...document.querySelectorAll("#sources input:checked")].map((i) => i.value),
+    // Always the full, current set of checked boxes, never omitted when
+    // everything happens to be ticked: the server treats an ABSENT key
+    // as "every category" and a genuinely empty array as "none", and
+    // only ever sees an absent key from an older client or the CLI
+    // without --category, never from this page.
+    categories: [...document.querySelectorAll("#categories input:checked")].map((i) => i.value),
     // The OpenTopography key deliberately never travels through here.
     // ElevationSource reads it server-side from the saved config (or the
     // environment) at estimate/fetch time, so it never needs to appear in
@@ -553,9 +559,38 @@ async function refreshEstimate() {
 ["region", "site", "tile-size", "overlap", "output-root"].forEach((id) =>
   $(id).addEventListener("change", refreshEstimate)
 );
-// opentopo-key is deliberately not in the list above: see its own
-// dedicated listener further down, which must persist before refreshing,
+// API key fields are deliberately not in the list above: see their own
+// delegated listener further down, which must persist before refreshing,
 // not alongside it as an independent, unordered listener.
+
+// --- settings panel -----------------------------------------------------
+//
+// Output root, tile size and overlap are defaults the owner sets once and
+// rarely revisits; API keys belong to a source and are exactly the same
+// kind of thing. All three move here rather than sitting in the main
+// flow, which is otherwise entirely per-survey choices (region, site,
+// layers, categories). Nothing about the FIELDS themselves changes: their
+// ids, their persistence and their effect on the next estimate are
+// unchanged by which panel currently shows them.
+
+function closeSettingsPanel() {
+  $("settings-panel").hidden = true;
+}
+// Set explicitly rather than left to the markup's own `hidden` attribute:
+// index.html's copy of that attribute is what a real browser honours
+// before any script runs, but this line is what the Node test harness's
+// synthetic elements (built fresh on first getElementById, with no
+// knowledge of the real markup's own attributes) actually see, and it is
+// also just plainly clearer to have the panel's closed state asserted in
+// one place rather than split between markup and script.
+closeSettingsPanel();
+
+$("settings-toggle").addEventListener("click", () => {
+  $("settings-panel").hidden = false;
+});
+
+$("settings-close").addEventListener("click", closeSettingsPanel);
+$("settings-backdrop").addEventListener("click", closeSettingsPanel);
 
 // --- settings persistence ---------------------------------------------
 //
@@ -627,21 +662,32 @@ function maybePersistFieldSettings() {
   $(id).addEventListener("change", maybePersistFieldSettings)
 );
 
-// The API key has no equivalent to check_path_length: estimate_survey
-// never rejects the estimate over it, only adds a warning alongside a
-// still-successful one (see readiness_problem in mapgen.sources.elevation),
+// API keys have no equivalent to check_path_length: estimate_survey never
+// rejects the estimate over one, only adds a warning alongside a still-
+// successful estimate (see readiness_problem in mapgen.sources.elevation),
 // so there is no "value the estimate just rejected" case to defer past.
-// Persisted immediately, unconditionally, unlike the three fields above.
+// Persisted immediately, unconditionally, unlike the three settings fields
+// above.
+//
+// One delegated listener on the #api-keys container, not one listener per
+// rendered field: the fields themselves are built from the source
+// registry (see renderApiKeys), so their number and identity are not
+// known here, only that each one that exists carries a data-config-field
+// attribute naming which mapgen.config.Config field it belongs to. A
+// second or third keyed source in phase 2 is picked up by this
+// unchanged.
 //
 // Persisted AND AWAITED before refreshEstimate re-checks readiness, not
-// fired as a second, independent "change" listener racing it: the
-// server's own readiness check reads the SAVED config file, not this
-// field's live value, so a key typed in for the first time could
-// otherwise still be reported as "not configured" by the very estimate
-// meant to reflect it, if that estimate's request happened to reach the
-// server before this one's PUT did.
-$("opentopo-key").addEventListener("change", async () => {
-  await persistConfig({ opentopography_api_key: $("opentopo-key").value });
+// fired as a second, independent listener racing it: the server's own
+// readiness check reads the SAVED config file, not the field's live
+// value, so a key typed in for the first time could otherwise still be
+// reported as "not configured" by the very estimate meant to reflect it,
+// if that estimate's request happened to reach the server before this
+// one's PUT did.
+$("api-keys").addEventListener("change", async (event) => {
+  const field = event.target && event.target.getAttribute && event.target.getAttribute("data-config-field");
+  if (!field) return;
+  await persistConfig({ [field]: event.target.value });
   refreshEstimate();
 });
 
@@ -710,38 +756,108 @@ $("cancel").addEventListener("click", async () => {
 
 // --- boot ------------------------------------------------------------
 
+// Split out of boot() itself now that there are three registry-driven
+// checklists to render (sources, categories, and settings' API keys):
+// each function's only job is turning one API response into markup, so
+// boot() reads as "fetch these, render each", not one long block mixing
+// three unrelated templates together.
+
+function renderSources(sources) {
+  // Every source, elevation included, is ticked by default. Elevation
+  // needing a key is not a reason to untick it here: the owner's own
+  // ruling was to keep it selected and surface a plain warning on the
+  // estimate instead (see readiness_problem/estimate_survey), so a key
+  // typed in the settings panel takes effect without ever having to
+  // remember to re-tick a layer that was silently switched off.
+  // Escaped even though /api/sources is this same server's own data,
+  // not third-party input: it costs nothing here, and it is one fewer
+  // thing to have to reason about correctly if a future source's
+  // licence or display_name string ever comes from somewhere less
+  // trusted than a hardcoded class attribute.
+  $("sources").innerHTML = sources
+    .map(
+      (s) => `
+        <label title="${escapeHtml(s.licence)}">
+          <input type="checkbox" value="${escapeHtml(s.id)}" checked />
+          <span>${escapeHtml(s.display_name)}${s.requires_api_key ? " (needs an API key)" : ""}</span>
+        </label>`
+    )
+    .join("");
+}
+
+function renderCategories(groups) {
+  // A leaf group (every group except "roads" today) gets its own
+  // checkbox. A group with children ("roads") is a plain label over its
+  // children instead, never a checkbox of its own: there is nothing a
+  // tag filter or an Overture type selection could do with "every road"
+  // that ticking all nine children does not already do (see
+  // mapgen.categories's own module docstring), so it is not given a
+  // control that would only ever need to mirror them.
+  $("categories").innerHTML = groups
+    .map((group) => {
+      if (!group.children.length) {
+        return `
+        <label>
+          <input type="checkbox" value="${escapeHtml(group.id)}" checked />
+          <span>${escapeHtml(group.label)}</span>
+        </label>`;
+      }
+      const children = group.children
+        .map(
+          (child) => `
+        <label class="category-child">
+          <input type="checkbox" value="${escapeHtml(child.id)}" checked />
+          <span>${escapeHtml(child.label)}</span>
+        </label>`
+        )
+        .join("");
+      return `<div class="category-group-label">${escapeHtml(group.label)}</div>${children}`;
+    })
+    .join("");
+}
+
+function renderApiKeys(sources, config) {
+  // Driven from the source registry, not one hard-coded field per key:
+  // a source that needs one names its own mapgen.config.Config field via
+  // api_key_config_field (see sources/base.py's own documented
+  // convention), so a second or third keyed source in phase 2 appears
+  // here with no change to this function at all. data-config-field
+  // carries that name into the DOM for the delegated persistence
+  // listener below to read back; there is no id per field, the same
+  // convention #sources' own checkboxes already use, since the number
+  // of keyed sources is not fixed at markup time.
+  const keyed = sources.filter((s) => s.requires_api_key && s.api_key_config_field);
+  $("api-keys").innerHTML = keyed
+    .map((s) => {
+      const value = escapeHtml(config[s.api_key_config_field] || "");
+      return `
+        <label class="api-key-field">
+          <span>${escapeHtml(s.display_name)}</span>
+          <input type="password" data-config-field="${escapeHtml(s.api_key_config_field)}"
+                 value="${value}" autocomplete="off"
+                 placeholder="Only needed for this layer" />
+        </label>`;
+    })
+    .join("");
+}
+
 (async function boot() {
   try {
     const config = await api("/api/config");
     $("output-root").value = config.output_root;
     $("tile-size").value = config.tile_size_m;
     $("overlap").value = config.overlap_m;
-    $("opentopo-key").value = config.opentopography_api_key || "";
     if (config.last_region) $("region").value = config.last_region;
     savedConfig = config;
 
     const sources = await api("/api/sources");
-    // Every source, elevation included, is ticked by default. Elevation
-    // needing a key is not a reason to untick it here: the owner's own
-    // ruling was to keep it selected and surface a plain warning on the
-    // estimate instead (see readiness_problem/estimate_survey), so a key
-    // typed in the field just above takes effect without ever having to
-    // remember to re-tick a layer that was silently switched off.
-    // Escaped even though /api/sources is this same server's own data,
-    // not third-party input: it costs nothing here, and it is one fewer
-    // thing to have to reason about correctly if a future source's
-    // licence or display_name string ever comes from somewhere less
-    // trusted than a hardcoded class attribute.
-    $("sources").innerHTML = sources
-      .map(
-        (s) => `
-        <label title="${escapeHtml(s.licence)}">
-          <input type="checkbox" value="${escapeHtml(s.id)}" checked />
-          <span>${escapeHtml(s.display_name)}${s.requires_api_key ? " (needs an API key)" : ""}</span>
-        </label>`
-      )
-      .join("");
+    renderSources(sources);
+    renderApiKeys(sources, config);
     $("sources").addEventListener("change", refreshEstimate);
+
+    const categories = await api("/api/categories");
+    renderCategories(categories);
+    $("categories").addEventListener("change", refreshEstimate);
   } catch (error) {
     // Without this, a wrong or stale token throws on the very first await
     // and boot() just stops: no config, no sources, no estimate, and

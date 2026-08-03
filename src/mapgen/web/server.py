@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES
 from mapgen.config import load_config, save_config
 from mapgen.geo import BBox, BBoxError, build_tiles
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, NominatimClient
@@ -44,6 +45,8 @@ from mapgen.sources.base import available_sources
 _REQUEST_VALUE_ERRORS = (BBoxError, NamingError, KeyError, TypeError, ValueError)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+_ROAD_SUBTYPE_LABELS = dict(ROAD_SUBTYPES)
 
 # Matches /api/jobs/<id> and /api/jobs/<id>/cancel. The id itself is anything
 # without a slash, so a stray extra segment falls through to the 404 branch
@@ -259,8 +262,32 @@ def make_handler(
                             "display_name": s.display_name,
                             "licence": s.licence,
                             "requires_api_key": s.requires_api_key,
+                            # None for a source with no key: read the same
+                            # defensive, optional-attribute way as every
+                            # other source-specific extension documented
+                            # on LayerSource. The settings panel is built
+                            # from this rather than a hard-coded field per
+                            # key, so a second or third keyed source in
+                            # phase 2 needs no redesign here.
+                            "api_key_config_field": getattr(s, "api_key_config_field", None),
                         }
                         for s in available_sources()
+                    ],
+                )
+
+            if parsed.path == "/api/categories":
+                return self._send_json(
+                    200,
+                    [
+                        {
+                            "id": group.id,
+                            "label": group.label,
+                            "children": [
+                                {"id": child_id, "label": _ROAD_SUBTYPE_LABELS.get(child_id, child_id)}
+                                for child_id in group.children
+                            ],
+                        }
+                        for group in CATEGORY_GROUPS
                     ],
                 )
 

@@ -21,10 +21,17 @@ body {
 header {
   padding: 12px 20px;
   border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 header h1 { margin: 0; font-size: 18px; letter-spacing: 0.04em; }
 .tagline { margin: 2px 0 0; font-size: 13px; opacity: 0.7; }
+
+.header-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.header-actions button { font-size: 13px; padding: 7px 10px; }
 
 main {
   flex: 1;
@@ -135,6 +142,20 @@ legend { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; opa
 #sources label { flex-direction: row; align-items: center; gap: 8px; padding: 3px 0; }
 #sources input[disabled] + span { opacity: 0.5; }
 
+#categories label { flex-direction: row; align-items: center; gap: 8px; padding: 3px 0; }
+/* "Roads" is a plain label over its own nine children, never a checkbox
+   itself: see app.js's renderCategories for why a group with children
+   gets no control of its own. Indented so the relationship to the
+   checkboxes beneath it reads as a grouping, not another peer item. */
+.category-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 6px;
+  opacity: 0.75;
+}
+.category-group-label:first-child { margin-top: 0; }
+.category-child { padding-left: 14px; }
+
 .estimate {
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
@@ -199,6 +220,66 @@ button.armed {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(47, 93, 79, 0.35);
 }
+
+/* Settings panel: output root, tile size, overlap and API keys, the
+   defaults the owner sets once rather than the per-survey choices that
+   stay in the main form. A fixed overlay with a dismissible backdrop,
+   kept visually consistent with the rest of the page rather than
+   introducing a second style language for one panel. */
+.settings-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+}
+
+/* Without this, the class selector above and the UA stylesheet's own
+   [hidden] { display: none } rule have equal specificity, and an author
+   rule wins a specificity tie over a UA one: the panel would render
+   permanently visible, hidden attribute or not. Explicit rather than
+   relying on that tie resolving the way this comment says it does. */
+.settings-panel[hidden] { display: none; }
+
+.settings-panel-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(28, 28, 26, 0.35);
+}
+
+.settings-panel-body {
+  position: relative;
+  width: 360px;
+  max-width: 90vw;
+  max-height: 100vh;
+  overflow-y: auto;
+  background: var(--paper);
+  border-left: 1px solid var(--line);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: -6px 0 18px rgba(0, 0, 0, 0.15);
+}
+
+.settings-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.settings-panel-heading h2 { margin: 0; font-size: 16px; letter-spacing: 0.03em; }
+
+.settings-panel-intro {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.7;
+}
+
+.api-key-field input { margin-top: 2px; }
+#api-keys label { gap: 4px; padding: 4px 0; }
 
 footer { border-top: 1px solid var(--line); }
 

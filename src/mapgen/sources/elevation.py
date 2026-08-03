@@ -333,6 +333,18 @@ class ElevationSource:
     licence = "Copernicus DEM, free for any use with attribution"
     attribution = "(c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH"
     requires_api_key = True
+    # Task 19: the settings panel is driven from the source registry
+    # rather than one hard-coded field per key, so a source that needs a
+    # key must say which mapgen.config.Config field holds it. Not
+    # "elevation_api_key": that field was already named
+    # opentopography_api_key by Task 18 and is already saved in real
+    # config.json files on the owner's machine, so the field itself is
+    # not renamed to fit a tidier convention after the fact, only made
+    # discoverable from the source that owns it. GET /api/sources reads
+    # this the same defensive, optional-attribute way as
+    # requires_api_key's siblings elsewhere in this codebase; a source
+    # with no key does not define it at all.
+    api_key_config_field = "opentopography_api_key"
 
     def __init__(
         self,

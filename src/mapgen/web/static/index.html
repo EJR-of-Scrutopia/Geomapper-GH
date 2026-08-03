@@ -20,8 +20,14 @@
   </head>
   <body>
     <header>
-      <h1>mapgen</h1>
-      <p class="tagline">Draw an extent, name it, get a folder.</p>
+      <div class="header-text">
+        <h1>mapgen</h1>
+        <p class="tagline">Draw an extent, name it, get a folder.</p>
+      </div>
+      <div class="header-actions">
+        <button id="settings-toggle" type="button">Settings</button>
+        <button id="stop-server" type="button" class="danger">Stop server</button>
+      </div>
     </header>
 
     <main>
@@ -45,29 +51,15 @@
           <input id="site" type="text" placeholder="Barry Waterfront" />
         </label>
 
-        <div class="row">
-          <label>Tile size (m)
-            <input id="tile-size" type="number" min="500" step="100" value="2000" />
-            <span class="hint">Cuts the extent into tiles this many metres across. The OSM map API refuses any request over 50000 nodes, and a tile that dense fails rather than retrying automatically, so smaller tiles trade more requests for a lower chance of hitting that limit. 2000 m suits most sites; dense city centres want 1000 m or less.</span>
-          </label>
-          <label>Overlap (m)
-            <input id="overlap" type="number" min="0" step="10" value="100" />
-            <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
-          </label>
-        </div>
-
         <fieldset>
           <legend>Layers</legend>
           <div id="sources"></div>
         </fieldset>
 
-        <label>OpenTopography API key
-          <input id="opentopo-key" type="password" placeholder="Only needed for the elevation layer" autocomplete="off" />
-        </label>
-
-        <label>Output root
-          <input id="output-root" type="text" />
-        </label>
+        <fieldset>
+          <legend>Categories</legend>
+          <div id="categories"></div>
+        </fieldset>
 
         <label class="checkbox">
           <input id="keep-work" type="checkbox" />
@@ -85,6 +77,37 @@
         <button id="cancel" type="button" class="danger" hidden>Cancel</button>
       </section>
     </main>
+
+    <div id="settings-panel" class="settings-panel" hidden>
+      <div class="settings-panel-backdrop" id="settings-backdrop"></div>
+      <div class="settings-panel-body" role="dialog" aria-label="Settings">
+        <div class="settings-panel-heading">
+          <h2>Settings</h2>
+          <button id="settings-close" type="button">Close</button>
+        </div>
+        <p class="settings-panel-intro">Defaults the owner sets once, not per-survey choices. These apply to the next estimate or download, and are remembered from here on.</p>
+
+        <label>Output root
+          <input id="output-root" type="text" />
+        </label>
+
+        <div class="row">
+          <label>Tile size (m)
+            <input id="tile-size" type="number" min="500" step="100" value="2000" />
+            <span class="hint">Cuts the extent into tiles this many metres across. The OSM map API refuses any request over 50000 nodes; a tile that dense retries automatically at smaller sizes (2000, then 1500, then 1000 m) rather than failing outright. 2000 m suits most sites; dense city centres may still want to start smaller.</span>
+          </label>
+          <label>Overlap (m)
+            <input id="overlap" type="number" min="0" step="10" value="100" />
+            <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
+          </label>
+        </div>
+
+        <fieldset>
+          <legend>API keys</legend>
+          <div id="api-keys"></div>
+        </fieldset>
+      </div>
+    </div>
 
     <footer>
       <div id="log" class="log"></div>

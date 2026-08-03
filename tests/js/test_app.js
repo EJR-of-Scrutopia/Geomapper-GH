@@ -342,18 +342,52 @@ const DEFAULT_CONFIG = {
   opentopography_api_key: "",
 };
 const DEFAULT_SOURCES = [
-  { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false },
+  { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false, api_key_config_field: null },
+];
+// A compact but structurally real fixture: one plain leaf group and one
+// group with children, which is enough to exercise both branches of
+// renderCategories without needing to mirror mapgen.categories' full
+// fifteen ids in every test that merely needs boot() to succeed.
+const DEFAULT_CATEGORIES = [
+  { id: "buildings", label: "Buildings", children: [] },
+  {
+    id: "roads",
+    label: "Roads",
+    children: [
+      { id: "motorway", label: "Motorway" },
+      { id: "footpath", label: "Footpath" },
+    ],
+  },
 ];
 
 function bootRoutes(extra) {
-  return (url, options, call) => {
+  // extra is tried FIRST, not last: several tests need to override one of
+  // boot()'s own three fetches specifically (a custom /api/sources list,
+  // say, to test a keyed source's rendering) while still getting the
+  // other two defaults for free. None of the defaults below are ever
+  // needed once a test's own extra route recognises the same path, so
+  // trying extra first and falling back to these only when it answers
+  // null costs the ordinary case (an extra that only cares about some
+  // other endpoint entirely) nothing.
+  return async (url, options, call) => {
+    // Awaited before the truthiness check, not just called: extra is
+    // often an async function, which returns an already-truthy pending
+    // Promise object synchronously regardless of what it later resolves
+    // to, so checking its return value without awaiting first would
+    // always "win" here even when extra genuinely has nothing to say
+    // about this path and resolves to null.
+    const answer = extra ? await extra(url, options, call) : null;
+    if (answer) return answer;
     if (url.pathname === "/api/config" && (!options.method || options.method === "GET")) {
       return jsonResponse(200, DEFAULT_CONFIG);
     }
     if (url.pathname === "/api/sources") {
       return jsonResponse(200, DEFAULT_SOURCES);
     }
-    return extra ? extra(url, options, call) : null;
+    if (url.pathname === "/api/categories") {
+      return jsonResponse(200, DEFAULT_CATEGORIES);
+    }
+    return null;
   };
 }
 
@@ -392,7 +426,7 @@ function flush(ms = 0) {
 async function bootedSandbox(extraRoutes, token) {
   const stub = makeFetchStub(bootRoutes(extraRoutes));
   const sandbox = buildSandbox({ fetch: stub.fetch, token });
-  await flush(10); // let boot()'s two awaits settle
+  await flush(10); // let boot()'s three sequential awaits (config, sources, categories) settle
   return { sandbox, fetchCalls: stub.calls };
 }
 
@@ -410,6 +444,23 @@ function typeIntoPlace(sandbox, value) {
   const el = sandbox.document.getElementById("place");
   el.value = value;
   el.fire("input");
+}
+
+// API key fields (Task 19) are rendered without their own id, one per
+// keyed source, and app.js listens on the #api-keys CONTAINER rather
+// than on each field individually (see app.js's own comment on that
+// listener). setField's plain el.fire("change") only invokes listeners
+// registered on that exact element, so it cannot exercise a delegated
+// one: this fires "change" on the container instead, with the real
+// input as event.target, which is what a browser does when a change
+// event bubbles from a field up to a delegated ancestor listener.
+function setApiKeyField(sandbox, configField, value) {
+  const input = sandbox.document.querySelector(`#api-keys input[data-config-field="${configField}"]`);
+  if (!input) {
+    throw new Error(`no rendered api key field for data-config-field="${configField}"`);
+  }
+  input.value = value;
+  sandbox.document.getElementById("api-keys").fire("change", { target: input });
 }
 
 // --- tiny test runner ------------------------------------------------
@@ -1048,6 +1099,7 @@ function ok(condition, message) {
   await test("every source, elevation included, is ticked by default", async () => {
     const stub = makeFetchStub(async (url) => {
       if (url.pathname === "/api/config") return jsonResponse(200, DEFAULT_CONFIG);
+      if (url.pathname === "/api/categories") return jsonResponse(200, DEFAULT_CATEGORIES);
       if (url.pathname === "/api/sources") {
         return jsonResponse(200, [
           { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false },
@@ -1057,6 +1109,7 @@ function ok(condition, message) {
             display_name: "Elevation (OpenTopography COP30)",
             licence: "Copernicus DEM",
             requires_api_key: true,
+            api_key_config_field: "opentopography_api_key",
           },
         ]);
       }
@@ -1090,6 +1143,7 @@ function ok(condition, message) {
       // that needs two sources to tell apart.
       const stub = makeFetchStub(async (url) => {
         if (url.pathname === "/api/config") return jsonResponse(200, DEFAULT_CONFIG);
+        if (url.pathname === "/api/categories") return jsonResponse(200, DEFAULT_CATEGORIES);
         if (url.pathname === "/api/sources") {
           return jsonResponse(200, [
             { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false },
@@ -1119,6 +1173,7 @@ function ok(condition, message) {
       // the actual gap: nothing previously exercised it.
       const stub = makeFetchStub(async (url) => {
         if (url.pathname === "/api/config") return jsonResponse(200, DEFAULT_CONFIG);
+        if (url.pathname === "/api/categories") return jsonResponse(200, DEFAULT_CATEGORIES);
         if (url.pathname === "/api/sources") {
           return jsonResponse(200, [
             {
@@ -1143,33 +1198,156 @@ function ok(condition, message) {
     }
   );
 
-  await test("boot() pre-fills the API key field from the saved config", async () => {
+  // =======================================================================
+  // Task 19, item 3: the category checklist. Rendered from GET /api/
+  // categories (a leaf group gets its own checkbox; a group with children,
+  // "roads" today, is a label over its children instead), ticked by
+  // default, and reaching payload().categories the same way #sources
+  // reaches payload().sources.
+  // =======================================================================
+
+  await test("categories render one checkbox per leaf, all ticked by default", async () => {
+    const { sandbox } = await bootedSandbox();
+    const boxes = sandbox.document.querySelectorAll("#categories input");
+    // DEFAULT_CATEGORIES: "buildings" (leaf) plus "roads" with two
+    // children (motorway, footpath) = 3 leaf checkboxes total.
+    ok(boxes.length === 3, `expected 3 leaf checkboxes, got ${boxes.length}`);
+    ok(boxes.every((b) => b.checked === true), "expected every category ticked by default");
+    ok(
+      boxes.map((b) => b.value).sort().join(",") === "buildings,footpath,motorway",
+      `unexpected values: ${boxes.map((b) => b.value)}`
+    );
+  });
+
+  await test("\"roads\" itself is never a selectable checkbox value, only its children", async () => {
+    const { sandbox } = await bootedSandbox();
+    const boxes = sandbox.document.querySelectorAll("#categories input");
+    ok(!boxes.some((b) => b.value === "roads"), "expected no checkbox valued \"roads\"");
+    const html = sandbox.document.getElementById("categories").innerHTML;
+    ok(html.includes("Roads"), `expected the "Roads" group label rendered, got: ${html}`);
+  });
+
+  await test("unticking a category checkbox excludes it from the job's payload", async () => {
+    const { sandbox } = await bootedSandbox();
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    const boxes = sandbox.document.querySelectorAll("#categories input");
+    const footpathBox = boxes.find((b) => b.value === "footpath");
+    footpathBox.checked = false;
+    const selected = sandbox.payload().categories;
+    ok(!selected.includes("footpath"), `expected footpath excluded, got: ${selected}`);
+    ok(selected.includes("buildings") && selected.includes("motorway"), `expected the rest still included, got: ${selected}`);
+  });
+
+  await test("every category still selected sends the full set, not an omitted key", async () => {
+    // The server treats an ABSENT categories key as "everything" and a
+    // present empty array as "nothing"; this page must always send the
+    // explicit, current list, never omit the key just because nothing
+    // has been deselected.
+    const { sandbox } = await bootedSandbox();
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    ok("categories" in sandbox.payload(), "expected a categories key present");
+    ok(sandbox.payload().categories.length === 3);
+  });
+
+  await test("changing a category checkbox refreshes the estimate", async () => {
+    const { fetchCalls, sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000, seconds_estimate: 60, warnings: [], folder: "C:\\out",
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    setField(sandbox, "region", "R");
+    setField(sandbox, "site", "S");
+    await flush(10);
+    fetchCalls.length = 0;
+    const boxes = sandbox.document.querySelectorAll("#categories input");
+    boxes.find((b) => b.value === "buildings").checked = false;
+    sandbox.document.getElementById("categories").fire("change");
+    await flush(10);
+    ok(fetchCalls.some((c) => c.url.pathname === "/api/estimate"), "expected a fresh estimate after changing categories");
+  });
+
+  // =======================================================================
+  // Task 19, item 2: the settings panel. API key fields are rendered from
+  // the source registry (GET /api/sources' api_key_config_field), one per
+  // keyed source, rather than a single hard-coded field, so a second or
+  // third keyed source in phase 2 needs no new markup or JS here.
+  // =======================================================================
+
+  const ELEVATION_SOURCE_ENTRY = {
+    id: "elevation",
+    display_name: "Elevation (OpenTopography COP30)",
+    licence: "Copernicus DEM",
+    requires_api_key: true,
+    api_key_config_field: "opentopography_api_key",
+  };
+
+  await test("a source with no api_key_config_field renders no key field at all", async () => {
+    const { sandbox } = await bootedSandbox();
+    // DEFAULT_SOURCES' one entry has requires_api_key: false and no
+    // api_key_config_field: renderApiKeys must not render anything for it.
+    ok(sandbox.document.getElementById("api-keys").innerHTML.trim() === "");
+  });
+
+  await test("boot() pre-fills a keyed source's field from the saved config", async () => {
     const stub = makeFetchStub(async (url) => {
       if (url.pathname === "/api/config") {
         return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-saved-key" });
       }
-      if (url.pathname === "/api/sources") return jsonResponse(200, DEFAULT_SOURCES);
+      if (url.pathname === "/api/categories") return jsonResponse(200, DEFAULT_CATEGORIES);
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
       return null;
     });
     const sandbox = buildSandbox({ fetch: stub.fetch });
     await flush(10);
-    ok(sandbox.document.getElementById("opentopo-key").value === "sk-saved-key");
+    const field = sandbox.document.querySelector(
+      '#api-keys input[data-config-field="opentopography_api_key"]'
+    );
+    ok(field, "expected a rendered field for opentopography_api_key");
+    ok(field.value === "sk-saved-key", `expected the saved key prefilled, got: ${field.value}`);
+    ok(field.type === "password", `expected type="password", got: ${field.type}`);
   });
 
-  await test("the API key persists immediately on change, with no estimate to validate it against", async () => {
+  await test("a keyed source's field persists immediately on change, with no estimate to validate it against", async () => {
     const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
       if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
         return jsonResponse(200, { ...DEFAULT_CONFIG, opentopography_api_key: "sk-new-key" });
       }
       return null;
     });
     fetchCalls.length = 0;
-    setField(sandbox, "opentopo-key", "sk-new-key");
+    setApiKeyField(sandbox, "opentopography_api_key", "sk-new-key");
     await flush(10);
     const putCall = fetchCalls.find((c) => (c.options.method || "").toUpperCase() === "PUT");
     ok(putCall, "expected an immediate PUT /api/config call");
     const body = JSON.parse(putCall.options.body);
     ok(body.opentopography_api_key === "sk-new-key", `unexpected PUT body: ${putCall.options.body}`);
+  });
+
+  await test("the settings panel starts hidden and opens on the Settings button", async () => {
+    const { sandbox } = await bootedSandbox();
+    ok(sandbox.document.getElementById("settings-panel").hidden === true, "expected hidden initially");
+    sandbox.document.getElementById("settings-toggle").fire("click");
+    ok(sandbox.document.getElementById("settings-panel").hidden === false, "expected visible after Settings");
+  });
+
+  await test("the settings panel closes on its Close button", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("settings-toggle").fire("click");
+    sandbox.document.getElementById("settings-close").fire("click");
+    ok(sandbox.document.getElementById("settings-panel").hidden === true);
+  });
+
+  await test("the settings panel closes on clicking its backdrop", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("settings-toggle").fire("click");
+    sandbox.document.getElementById("settings-backdrop").fire("click");
+    ok(sandbox.document.getElementById("settings-panel").hidden === true);
   });
 
   await test(
@@ -1189,6 +1367,7 @@ function ok(condition, message) {
         resolvePut = resolve;
       });
       const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {
+        if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
         if (url.pathname === "/api/config" && (options.method || "").toUpperCase() === "PUT") {
           return putResponsePromise;
         }
@@ -1212,7 +1391,7 @@ function ok(condition, message) {
       setField(sandbox, "site", "S");
       await flush(10);
       fetchCalls.length = 0;
-      setField(sandbox, "opentopo-key", "sk-new-key");
+      setApiKeyField(sandbox, "opentopography_api_key", "sk-new-key");
       await flush(10); // long enough for the change handler to reach its awaited PUT
       ok(
         fetchCalls.some((c) => c.url.pathname === "/api/config"),
@@ -1263,6 +1442,7 @@ function ok(condition, message) {
   await test("the OpenTopography API key is never included in a job's start payload", async () => {
     const SECRET = "sk-test-secret-should-never-leak";
     const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/sources") return jsonResponse(200, [ELEVATION_SOURCE_ENTRY]);
       if (url.pathname === "/api/extent") {
         return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
       }
@@ -1292,7 +1472,7 @@ function ok(condition, message) {
       }
       return null;
     });
-    setField(sandbox, "opentopo-key", SECRET);
+    setApiKeyField(sandbox, "opentopography_api_key", SECRET);
     setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
     await flush(10);
     setField(sandbox, "region", "South Wales");

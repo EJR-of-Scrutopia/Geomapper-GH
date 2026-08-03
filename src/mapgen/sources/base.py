@@ -58,7 +58,16 @@ class LayerSource(Protocol):
     surface a missing API key as a warning on the estimate without knowing
     "elevation" by name. Any future source with its own pre-flight
     prerequisite gets the same treatment for free by defining the same
-    method; a source with nothing to check simply omits it.
+    method; a source with nothing to check simply omits it. OsmSource's
+    configure() and filtering_caveat() (Task 19: request-scoped category
+    selection) are the same convention again, for a different purpose.
+
+    api_key_config_field is the same convention for a different job (Task
+    19's settings panel): a source with requires_api_key = True names the
+    mapgen.config.Config field its own key is saved under (ElevationSource:
+    "opentopography_api_key"), so the panel is built from this registry
+    rather than one hard-coded input per key. A source with no key omits
+    it, the same as any other optional attribute here.
     """
 
     id: str
