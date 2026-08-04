@@ -901,16 +901,22 @@ def test_the_estimate_matches_the_owners_own_barry_extent():
 
 def test_a_type_list_longer_than_the_cap_costs_more_than_one_batch():
     # The cap is not decoration. --overture-type is repeatable and takes
-    # any string, so a caller can name more types than
-    # MAX_CONCURRENT_TYPE_DOWNLOADS, and the pool then runs them in
-    # batches: the ninth type waits for a free worker. An estimate that
-    # assumed everything always runs at once would report the same number
-    # for nine types as for eight.
+    # any string the CLI accepts, so a caller can name more types than
+    # MAX_CONCURRENT_TYPE_DOWNLOADS, and the pool then makes the ninth
+    # wait for a free worker. An estimate that charged one batch however
+    # long the list got would report the same number for nine types as
+    # for eight.
+    #
+    # Measured rather than reasoned, on 2026-08-04 over the same 4.17 sq
+    # km extent, against real Overture types so the pool did real work:
+    # the eight defaults plus building_part took 16.58s, 16.71s and
+    # 18.12s (mean 17.14s), and plus address, division and land as well,
+    # twelve in all, took 20.48s and 24.14s.
     #
     # The counts here are LITERAL and not derived from the cap, on
     # purpose. Deriving them would move the test's own input whenever the
-    # cap moved, and it would keep passing while saying nothing, which is
-    # the same defect the anchor test above exists to stop.
+    # cap moved, so it would keep passing while saying nothing, which is
+    # the defect the anchor test above exists to stop.
     bbox = BBox.parse("-3.2830,51.4000,-3.2530,51.4180")
     exotic = [f"unlikely_type_{index}" for index in range(9)]
     eight = OvertureSource(types=exotic[:8]).estimate(bbox, [])
@@ -922,8 +928,22 @@ def test_a_type_list_longer_than_the_cap_costs_more_than_one_batch():
         f"eight reads {eight.seconds_estimate:.1f}s and nine "
         f"{nine.seconds_estimate:.1f}s"
     )
-    # And the second batch is a second batch, not a second whole run.
+    # A second batch, not a second whole run.
     assert nine.seconds_estimate < 2 * eight.seconds_estimate
+    # And within a stated distance of what nine types actually took. The
+    # upper bound is deliberately the loose side: charging a whole second
+    # batch for one leftover type overstates a pool, which starts the
+    # ninth download the moment any of the first eight finishes rather
+    # than waiting for all eight (see estimate()'s own docstring, which
+    # says so and says why). Measured at 1.14x, and bounded at 1.20 so
+    # that pessimism stays a rounding matter rather than becoming a
+    # second whole run charged for one leftover type. Lowering the cap to
+    # four is what this catches: nine types would then be three batches
+    # and read 1.23x, which is no longer a rounding matter.
+    assert 1.0 <= nine.seconds_estimate / 17.14 <= 1.20, (
+        f"nine types measured 17.14s on average; the estimate says "
+        f"{nine.seconds_estimate:.1f}s"
+    )
 
 
 def test_the_time_estimate_is_not_calibrated_from_a_single_type():
