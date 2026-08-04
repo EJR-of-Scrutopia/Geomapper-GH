@@ -149,9 +149,14 @@ the URL, so nothing else on the machine can drive it. On the page:
   follow when you let go, not while you are dragging, and a drag that
   would leave the box with no area at all is refused and leaves the
   extent as it was. Escape puts back a rectangle you are part way
-  through moving. While a download is running the handles come off and
-  the extent cannot be edited, since the run has already been told what
-  to fetch; they come back when it ends.
+  through moving.
+- The extent is fixed for as long as a download is running, since the run
+  has already been told what to fetch and the grid on the map is that
+  run's own. The corner handles come off, and Draw extent, Select
+  viewport, the bbox box and the place search all go dead rather than
+  looking live and doing nothing. Everything comes back when the run ends,
+  however it ends: finished, stopped, failed, or the page losing contact
+  with it.
 - Region and Site fill in on their own: picking a place from the search
   results uses that result's own name, and drawing or pasting a rectangle
   reverse-geocodes its centre. Both stay ordinary editable text fields, and

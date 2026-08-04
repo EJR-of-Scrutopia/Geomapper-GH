@@ -6962,6 +6962,240 @@ function ok(condition, message) {
     );
   });
 
+  // --- the fix round: every way of changing the extent, not just three ---
+  //
+  // Item 2 locked the corner handles during a run and left Draw extent,
+  // Select viewport, the bbox field and the place search able to replace
+  // the extent, which is the worst way round: the gesture that does least
+  // damage was the one that was stopped. They all end at setBBox, so the
+  // refusal is there, and the controls are disabled so that nothing which
+  // is refused still looks live.
+
+  // A sandbox with a job that runs for one poll and then finishes, so a
+  // test can look at the page during a run and after it.
+  async function runningJobSandbox() {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox, fetchCalls } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        { state: "running", events: [{ event: "tile_done", source: "osm", tile_id: tileIds[0] }] },
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10);
+    return { sandbox, fetchCalls, tileIds };
+  }
+
+  await test("every control that changes the extent goes dead while a download runs", async () => {
+    const { sandbox } = await runningJobSandbox();
+    for (const id of ["draw", "viewport", "bbox", "place"]) {
+      ok(
+        sandbox.document.getElementById(id).disabled === true,
+        `expected #${id} disabled for the length of the run`
+      );
+    }
+    // And live again the moment it ends, by the same one call.
+    await flush(1500);
+    for (const id of ["draw", "viewport", "bbox", "place"]) {
+      ok(
+        sandbox.document.getElementById(id).disabled === false,
+        `expected #${id} live again once the run ended`
+      );
+    }
+  });
+
+  await test("Draw extent cannot arm mid-run, and arms again afterwards", async () => {
+    // The harness fires a listener whether or not the element is
+    // disabled, which a browser does not, so this is the guard inside the
+    // handler being tested rather than the attribute: it is what covers a
+    // click already on its way when the job started.
+    const { sandbox } = await runningJobSandbox();
+    sandbox.document.getElementById("draw").fire("click");
+    ok(
+      sandbox.document.getElementById("draw").className === "",
+      "expected the tool not to arm mid-run"
+    );
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "a refused arm must not switch the map's own panning off"
+    );
+    await flush(1500);
+    sandbox.document.getElementById("draw").fire("click");
+    ok(
+      sandbox.document.getElementById("draw").className === "armed",
+      "expected the tool to arm again once the run ended"
+    );
+  });
+
+  await test("Select viewport cannot capture mid-run, and captures again afterwards", async () => {
+    const { sandbox } = await runningJobSandbox();
+    const before = sandbox.document.getElementById("bbox").value;
+    sandbox.L._mapObject._setBounds({ west: -1.5, south: 53.1, east: -1.4, north: 53.2 });
+    // Counted, not just checked for an effect. setBBox refuses whatever
+    // this hands it, so a version with no guard of its own would leave
+    // the extent alone anyway and look identical from the outside; what
+    // says the button is dead rather than merely harmless is that it does
+    // not so much as read the map.
+    const realGetBounds = sandbox.L._mapObject.getBounds;
+    let reads = 0;
+    sandbox.L._mapObject.getBounds = function countingGetBounds() {
+      reads += 1;
+      return realGetBounds.call(this);
+    };
+    sandbox.document.getElementById("viewport").fire("click");
+    ok(reads === 0, "expected the button to do nothing at all mid-run, not to be refused later");
+    sandbox.L._mapObject.getBounds = realGetBounds;
+    ok(
+      sandbox.document.getElementById("bbox").value === before,
+      `expected the extent untouched mid-run, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    await flush(1500);
+    sandbox.document.getElementById("viewport").fire("click");
+    ok(
+      sandbox.document.getElementById("bbox").value === "-1.5,53.1,-1.4,53.2",
+      `expected the capture to work once the run ended, got ${sandbox.document.getElementById("bbox").value}`
+    );
+  });
+
+  await test("a pasted bbox cannot replace the extent mid-run", async () => {
+    const { sandbox } = await runningJobSandbox();
+    const rectanglesBefore = sandbox.L._rectangles.length;
+    setField(sandbox, "bbox", "-1.5,53.1,-1.4,53.2");
+    await flush(10);
+    ok(
+      sandbox.L._rectangles.length === rectanglesBefore,
+      "expected no new extent rectangle drawn from a paste mid-run"
+    );
+  });
+
+  await test("choosing a place cannot replace the extent mid-run", async () => {
+    // choosePlaceMatch fills the region and site fields BEFORE it calls
+    // setBBox, so this is the one of the four where a refusal at setBBox
+    // alone would still have left two fields rewritten. The field being
+    // disabled is what stops the choice being offered at all.
+    const { sandbox } = await runningJobSandbox();
+    ok(
+      sandbox.document.getElementById("place").disabled === true,
+      "expected the place search dead for the length of the run"
+    );
+    const rectanglesBefore = sandbox.L._rectangles.length;
+    sandbox.choosePlaceMatch({
+      display_name: "Sheffield",
+      site: "Sheffield",
+      region: "South Yorkshire",
+      west: -1.5,
+      south: 53.1,
+      east: -1.4,
+      north: 53.2,
+    });
+    await flush(10);
+    ok(
+      sandbox.L._rectangles.length === rectanglesBefore,
+      "expected no new extent rectangle from a chosen place mid-run"
+    );
+  });
+
+  await test("setBBox itself is what refuses, so a fifth way in is refused too", async () => {
+    // The controls are the visible half. This is the half that makes the
+    // claim true: the next thing on this page that learns to set an
+    // extent is refused without having to remember to ask.
+    const { sandbox } = await runningJobSandbox();
+    const rectanglesBefore = sandbox.L._rectangles.length;
+    const before = sandbox.document.getElementById("bbox").value;
+    sandbox.setBBox({ west: -1.5, south: 53.1, east: -1.4, north: 53.2 }, false);
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("bbox").value === before,
+      `expected setBBox to refuse outright mid-run, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    ok(sandbox.L._rectangles.length === rectanglesBefore, "expected no rectangle drawn either");
+  });
+
+  await test("a download starting puts away a half-drawn rectangle", async () => {
+    // Otherwise the tool is left armed behind a button that can no longer
+    // disarm it, with the map unpannable for the length of the run.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [{ state: "running", events: [] }],
+    });
+    sandbox.document.getElementById("draw").fire("click");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
+    ok(sandbox.L._rectangles.some((r) => !r.removed), "expected a live preview before the download");
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10);
+    ok(sandbox.document.getElementById("draw").className === "", "expected the tool disarmed");
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "expected the map pannable again, not stranded by an armed tool"
+    );
+    // And the release that follows commits nothing.
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.42, lng: -3.28 } });
+    ok(
+      sandbox.document.getElementById("bbox").value === "-3.29,51.38,-3.28,51.39",
+      `expected the run's own extent untouched, got ${sandbox.document.getElementById("bbox").value}`
+    );
+  });
+
+  await test("a run that is stopped or fails hands the controls back too", async () => {
+    // Every end, not just the tidy one: this is the same call on the same
+    // line of the poll loop, and a stop is the end the owner makes most.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        { state: "running", events: [] },
+        { state: "stopped", events: [{ event: "tile_done", source: "osm", tile_id: tileIds[0] }] },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10);
+    ok(sandbox.document.getElementById("draw").disabled === true, "expected them locked during the run");
+    await flush(1500);
+    for (const id of ["draw", "viewport", "bbox", "place"]) {
+      ok(
+        sandbox.document.getElementById(id).disabled === false,
+        `expected #${id} live again after a stopped run`
+      );
+    }
+    ok(liveHandles(sandbox).length === 4, "expected the corner handles back after a stopped run");
+  });
+
+  await test("losing contact with a job hands the controls back as well", async () => {
+    // The page cannot know whether that job is still going, but it has
+    // stopped watching it, so nothing here can be made inconsistent any
+    // more. Leaving the extent locked would need a reload to undo.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [{ state: "running", events: [] }, { httpError: true }],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(1600);
+    for (const id of ["draw", "viewport", "bbox", "place"]) {
+      ok(
+        sandbox.document.getElementById(id).disabled === false,
+        `expected #${id} live again once nothing is watching the job`
+      );
+    }
+  });
+
   await test("an armed draw tool takes the handles off the old rectangle", async () => {
     const { sandbox } = await editableSandbox();
     sandbox.document.getElementById("draw").fire("click");

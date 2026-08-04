@@ -1252,6 +1252,22 @@ const SUGGEST_DEBOUNCE_MS = 400;
 let suggestDebounce = null;
 
 function setBBox(next, fit = true) {
+  // The one choke point, and the one guard. Task 38, item 2 locked the
+  // corner handles while a download runs, and the fix round found that
+  // the lock was on three gestures rather than on the thing they all do:
+  // the draw tool, the viewport button, a pasted bbox and a chosen place
+  // could each still replace the extent mid-run, and each of them lands
+  // here. That matters more than it looks: this calls refreshEstimate,
+  // which calls renderTileGrid, which throws away the grid the running
+  // job is painting and replaces it with rectangles keyed by tile ids
+  // that job's events do not name, so the grid goes blank and the bar
+  // reads 0% for the rest of a run that is going perfectly well.
+  //
+  // Refused here rather than only at the four entry points, because a
+  // fifth way in is exactly the kind of thing this page grows: the
+  // controls below are disabled so nothing that is refused still looks
+  // live, and this is what makes the refusal true rather than tidy.
+  if (jobRunning) return;
   bbox = next;
   if (rectangle) map.removeLayer(rectangle);
   const bounds = [
@@ -1329,6 +1345,12 @@ function disarmDrawing() {
 }
 
 $("draw").addEventListener("click", () => {
+  // Not while a download is running. The button is disabled for the whole
+  // of a run (see syncExtentControls), so a real browser never delivers
+  // this click at all; the guard is what covers a click already on its
+  // way when the job started, and it is also what the test harness
+  // exercises, since firing a listener there does not consult `disabled`.
+  if (jobRunning) return;
   // Always starts from a clean slate: clicking the button again mid-draw
   // discards whatever corner and preview rectangle already existed,
   // rather than leaving them stranded with no way back short of Escape.
@@ -1425,6 +1447,11 @@ map.on("click", () => {
 // level, so the one thing it would reliably do is step the view the owner
 // just captured back out again.
 $("viewport").addEventListener("click", () => {
+  // Not while a download is running, for the same reason and by the same
+  // pair of measures as Draw extent above: this button is disabled for
+  // the whole of a run, and this guard covers the click that was already
+  // on its way.
+  if (jobRunning) return;
   // An armed draw tool is put away first: the owner has just said which
   // of the two ways of choosing an extent they meant, and leaving a
   // half-drawn preview and an unpannable map behind would answer neither.
@@ -1510,6 +1537,29 @@ let jobRunning = false;
 // not adjusting it) each take them away.
 function extentEditable() {
   return Boolean(bbox) && !jobRunning && !drawing;
+}
+
+// Everything that can change the extent, put in the state a running
+// download requires, and back again when it ends.
+//
+// Task 38's fix round. The corner handles were locked during a run and
+// the four older ways in were not, which is the worst of both: the
+// gesture that does the least damage was the one that was stopped. They
+// all end at setBBox, which refuses outright while a job runs, so this
+// function is the visible half of that refusal rather than the mechanism
+// of it. A control that quietly does nothing is the same broken thing as
+// a handle that does not move when pulled, which is exactly why the
+// handles are removed rather than left inert.
+//
+// The place search goes with them, and that is the one that needs saying:
+// searching is harmless, but CHOOSING a result fills the region and site
+// fields before it calls setBBox, so a refused choice would still have
+// rewritten two fields describing the run in flight.
+function syncExtentControls() {
+  for (const id of ["draw", "viewport", "bbox", "place"]) {
+    $(id).disabled = jobRunning;
+  }
+  syncExtentHandles();
 }
 
 function cornerLatLng(box, corner) {
@@ -3064,15 +3114,21 @@ $("download").addEventListener("click", async () => {
       body: JSON.stringify(requestPayload),
     });
     jobId = started.id;
-    // Task 38, item 2. The extent is now the server's business for as
-    // long as this job lasts: the handles come off the map and every
-    // edit gesture is refused until it ends, whichever way it ends. Set
-    // after the POST has been answered, so a job the server refused (a
-    // 409 from a busy server) never takes the handles away.
+    // Task 38, item 2, widened by the fix round. The extent is now the
+    // server's business for as long as this job lasts: the handles come
+    // off the map, Draw extent, Select viewport, the bbox field and the
+    // place search all go dead, and setBBox refuses regardless. Set after
+    // the POST has been answered, so a job the server refused (a 409 from
+    // a busy server) never locks anything.
     jobRunning = true;
     extentCornerDrag = null;
     extentBodyDrag = null;
-    syncExtentHandles();
+    // A half-drawn rectangle goes with them. Leaving the tool armed would
+    // leave the map unpannable behind a button that can no longer disarm
+    // it, which is the one state none of these controls should be able to
+    // strand the owner in.
+    disarmDrawing();
+    syncExtentControls();
     activeJobSourceIds = requestPayload.sources;
     activeJobSeconds = lastSizing && lastSizing.seconds > 0 ? lastSizing.seconds : 0;
     activeJobSourceSeconds = (lastSizing && lastSizing.sourceSeconds) || {};
@@ -3131,7 +3187,7 @@ $("download").addEventListener("click", async () => {
         // made inconsistent by an edit: the extent goes back to being the
         // owner's to change, exactly as it does when a run ends normally.
         jobRunning = false;
-        syncExtentHandles();
+        syncExtentControls();
         log(`Lost contact with the job: ${error.message}`, true);
         // The bar would otherwise sit frozen at whatever the last poll
         // saw, with a countdown still promising a number that nothing is
@@ -3177,7 +3233,7 @@ $("download").addEventListener("click", async () => {
         $("cancel").hidden = true;
         $("download").disabled = false;
         jobRunning = false;
-        syncExtentHandles();
+        syncExtentControls();
         if (job.state === "done") log(`Finished: ${job.result_root}`);
         // Stopped is a deliberate, successful outcome, not a failure: the
         // owner asked for this, and the package at result_root is real
