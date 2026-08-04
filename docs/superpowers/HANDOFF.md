@@ -170,47 +170,65 @@ disease, and the whole-branch review found a third. Assume there are more.
    shortcut, or `.venv\Scripts\mapgen.exe ui`.
 2. **Rhino test.** Run a survey on a site they know and open it. Nothing in
    this repo has verified the geometry is where an architect expects.
-3. **Urbano.** `Urbano.Core.dll` and `ProjectSetup.dll` exist nowhere on this
-   machine, so `tools/UrbanoBridge` has never run against a real install and
-   `_project_setting.json` is untested as an actual Urbano input. Task 2's
-   gate is narrowed but not closed, see below.
+3. **Urbano: solved on paper, not yet confirmed in Rhino.** This section was
+   wrong twice before it was right. Read the method note at the end before
+   trusting any future edit to it.
 
-   **Urbano IS installed, and the bridge targets an API that is not there.**
-   This is worse than a wrong filename, and an earlier version of this file
-   said otherwise. Corrected, with the method, because the wrong version was
-   reached by a method that looked convincing:
+   **The findings, all independently re-verified by the coordinator with a
+   built-and-run `System.Reflection.Metadata` tool, not inferred:**
 
    - Urbano 2.2.1.2 sits at
      `AppData\Roaming\McNeel\Rhinoceros\packages\8.0\Urbano2\2.2.1.2\` and
      ships exactly one assembly, `Urbano.SiteAnalysis.gha` (17.3 MB).
-   - `Urbano.Core.dll` and `ProjectSetup.dll`, the two files
-     `tools/UrbanoBridge/Program.cs` loads by name, exist **nowhere on this
-     machine**.
-   - A raw binary string search of the `.gha` finds "Urbano.Core" 30 times and
-     "ProjectSetup" 7 times. **That is not evidence those types are defined
-     there, and reading it that way was the error.** A string search cannot
-     tell a definition from a reference.
-   - Reading the metadata properly: the `.gha` defines 314 types across 99
-     namespaces and **not one** matches `Urbano.Core` or `ProjectSetup`. The
-     namespaces are vendored third-party libraries (Apache.Arrow, CsvHelper,
-     DnsClient, DotSpatial.Projections, FlatBuffers) plus `Ed.Eto`.
-   - The `.gha` **references** `Ed.Core` and `Ed.Common`. Both exist, at
-     `C:\Program Files\Rhino 8\System\`, shipped with Rhino rather than with
-     the Urbano package. `Ed.Core.dll` is 10.2 MB, identity
-     `Ed.Core, Version=1.0.0.0`.
-   - `Ed.Core.dll` could not be enumerated reflection-only (104 loader errors,
-     its dependencies do not resolve outside Rhino), and a string search of it
-     finds none of the bridge's required names, not even generic ones like
-     `WorldOrigin` or `ProgressBar`.
+   - That assembly defines **9,221 types across 419 namespaces**, including
+     `Urbano.Core.Data`, `Urbano.Core.Engine` and `Urbano.Core.Helpers`.
+     Everything the bridge needs is in there, in one file.
+   - `Urbano.Core.dll` and `ProjectSetup.dll`, the two filenames
+     `tools/UrbanoBridge/Program.cs` loads, do not exist. That is the bug.
+   - The namespace moved: `Urbano.Core.Helpers.WorldOrigin` exists,
+     `Urbano.Core.Process.WorldOrigin` does not. Confirmed both ways.
+   - `Ed.Core.dll` is **Rhino's Monaco script editor**, nothing to do with
+     Urbano. Searching it was searching the wrong file.
+   - Every string literal in the `.gha` is encrypted (the whole `#US` heap is
+     38 strings), so **no string search of it can ever find anything**. Type
+     and namespace names live in `#Strings` and are readable; string literals
+     are not.
 
-   So the bridge was written against an API surface that the installed Urbano
-   does not present. Retargeting it needs proper assembly inspection tooling
-   (ildasm, or Mono.Cecil under `dotnet`) run against `Ed.Core.dll`, not
-   another filename guess. Task 2's gate is still shut.
+   **The retarget** is four edits in `Program.cs`: find the `.gha` rather than
+   two DLLs, load one assembly rather than two, rename five types from
+   `Urbano.Core.Process.*` to `Urbano.Core.Helpers.*`, and delete
+   `ProjectSetup.Overture`, which genuinely no longer exists in 2.2.1.2. Plus
+   `_MISSING_URBANO_RE` in `bridge.py`.
 
-   Separately: `project_setting` appears nowhere in the `.gha` either, though
-   its embedded resources do include a `DeserializeProjectSettingComponent`
-   icon, so the concept exists in Urbano 2 even if the string does not.
+   **But the bridge may be the wrong shape anyway.** `ProjectSettingComponent`
+   takes a text input and a boolean; given a project setting JSON it rebuilds
+   every data path as `Folder + "\" + FileNameStr + <extension>` and **skips
+   any file already on disk**. mapgen's naming already matches that exactly.
+   So a mapgen package plus the right JSON makes the component a no-download
+   pass-through that just emits a `ProjectSettingParam` for the rest of the
+   canvas, with no bridge executable involved at all. Three of the bridge's
+   engine steps are US only and its traveller ONNX model is absent from this
+   machine, so for a UK survey the smaller shape may be the better one. That
+   is a design call the owner has not made yet.
+
+   `<stem>_project_setting.json` is confirmed by black-box test to be exactly
+   the right filename. The bridge already gets that right and has never
+   reached it.
+
+   Two traps: `NaN` or `Infinity` in the JSON breaks both of Urbano's readers,
+   which use default `JsonSerializer` options while Urbano's own `ToJson`
+   writes named float literals. And `ProjectSettingComponent.SolveInstance`
+   refuses to run on a missing or expired `UrbanoAuth` token, which is
+   unrelated to any of this but will look like a failure.
+
+   **Method note, worth more than the findings.** The first attempt read a raw
+   binary string search as proof that types existed. The second attempt
+   "corrected" it using `ReflectionOnlyLoadFrom`, whose `GetTypes()` threw and
+   returned a **partial** list of 314 types, which was taken as authoritative.
+   314 was 3% of the truth, and the correction was wrong in the opposite
+   direction. Neither a string search nor a failed reflection load is
+   evidence. Use a metadata reader that resolves no dependencies, and check
+   whether the result you got is partial before believing it.
 4. **The Barry package is abandoned deliberately.** The owner has said to drop
    it and download a fresh one from the interface instead, so the resume
    instructions that used to be here no longer apply. The folder can be
