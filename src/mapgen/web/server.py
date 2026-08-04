@@ -22,6 +22,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES
 from mapgen.config import load_config, save_config
 from mapgen.elevation_models import DEFAULT_DEMTYPE
+from mapgen.folderpicker import (
+    FolderPickerBusy,
+    FolderPickerError,
+    FolderPickerTimeout,
+    choose_directory,
+)
 from mapgen.geo import BBox, BBoxError, build_tiles
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, NominatimClient
 from mapgen.jobs import CancelToken, Cancelled, EventLog
@@ -289,8 +295,14 @@ def make_handler(
     token: str,
     static_dir: Path,
     geocode_client: NominatimClient | None = None,
+    folder_picker=None,
 ):
     geocode_client = geocode_client if geocode_client is not None else NominatimClient()
+    # Injectable for exactly the reason geocode_client is: the tests drive
+    # the route's own behaviour (a chosen path, a cancel, a timeout, a
+    # picker that cannot run at all) without a native dialog appearing on
+    # somebody's screen and waiting to be clicked.
+    folder_picker = folder_picker if folder_picker is not None else choose_directory
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -537,6 +549,38 @@ def make_handler(
                 if not manager.cancel(match.group(1)):
                     return self._send_json(404, {"error": "Unknown job."})
                 return self._send_json(200, {"cancelled": True})
+
+            if parsed.path == "/api/folder-dialog":
+                # Opens a real folder dialog, in a child process, and
+                # answers with the path chosen. Token gated like every
+                # other /api/ route: this one opens a window on the
+                # owner's desktop, so it is if anything the last route
+                # that should be reachable without one.
+                #
+                # Three distinct outcomes, three distinct statuses, and
+                # the browser treats all three the same way in the one
+                # respect that matters: it never touches the output root
+                # field. A picker is a convenience over a control that
+                # already works.
+                #
+                #   200 {"path": "C:\\..."}   chosen
+                #   200 {"path": null}        cancelled, which is a real
+                #                             answer and not an error
+                #   409                       a dialog is already open
+                #   503                       no picker on this machine
+                #   504                       open too long, closed
+                initial = payload.get("initial")
+                try:
+                    chosen = folder_picker(
+                        initial if isinstance(initial, str) and initial else None
+                    )
+                except FolderPickerBusy as exc:
+                    return self._send_json(409, {"error": str(exc)})
+                except FolderPickerTimeout as exc:
+                    return self._send_json(504, {"error": str(exc)})
+                except FolderPickerError as exc:
+                    return self._send_json(503, {"error": str(exc)})
+                return self._send_json(200, {"path": chosen})
 
             if parsed.path == "/api/heartbeat":
                 # Recorded unconditionally, whether or not a heartbeat

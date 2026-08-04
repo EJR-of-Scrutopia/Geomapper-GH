@@ -2355,3 +2355,175 @@ def test_config_get_reports_the_default_model_for_a_config_that_has_never_had_on
     status, payload = _get(server, "/api/config")
     assert status == 200
     assert payload["elevation_demtype"] == "COP30"
+
+
+# --- Task 28: POST /api/folder-dialog -------------------------------------
+#
+# The dialog itself runs in a child process and waits for a person, so
+# these drive the route with an injected picker rather than a real one: a
+# test suite must never open a native window and wait to be clicked. What
+# is under test here is the route's own contract, which is the part the
+# browser depends on. The picker's own three failure modes are exercised
+# against the real module in test_folderpicker.py.
+
+
+class StubFolderPicker:
+    """Returns a canned answer, or raises a canned error, per call."""
+
+    def __init__(self):
+        self.result = "C:\\Surveys"
+        self.error = None
+        self.calls = []
+
+    def __call__(self, initial_dir=None):
+        self.calls.append(initial_dir)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+@pytest.fixture
+def picker_server():
+    manager = JobManager()
+    picker = StubFolderPicker()
+    handler = make_handler(manager, TOKEN, STATIC_DIR, StubGeocodeClient(), picker)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}", picker
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_folder_dialog_requires_a_token(picker_server):
+    base, picker = picker_server
+    request = urllib.request.Request(
+        f"{base}/api/folder-dialog",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(request, timeout=10)
+    assert excinfo.value.code == 403
+    # And no window was opened on the owner's desktop by an unauthorised
+    # caller, which is the reason this route in particular has to be gated.
+    assert picker.calls == []
+
+
+def test_folder_dialog_returns_the_chosen_path(picker_server):
+    base, picker = picker_server
+    picker.result = "C:\\Users\\Param\\Surveys"
+    status, payload = _post(base, "/api/folder-dialog", {})
+    assert status == 200
+    assert payload["path"] == "C:\\Users\\Param\\Surveys"
+
+
+def test_folder_dialog_carries_a_welsh_path_back_unmangled(picker_server):
+    # The owner's ordinary input, not an edge case. JSON over the wire is
+    # UTF-8 encoded by _send_json, so this is the route's own half of the
+    # guarantee procutil makes for the child process.
+    base, picker = picker_server
+    picker.result = "C:\\Surveys\\Ynys Môn\\Rhoscolyn ŷ"
+    status, payload = _post(base, "/api/folder-dialog", {})
+    assert status == 200
+    assert payload["path"] == "C:\\Surveys\\Ynys Môn\\Rhoscolyn ŷ"
+
+
+def test_folder_dialog_opens_where_the_field_currently_points(picker_server):
+    base, picker = picker_server
+    _post(base, "/api/folder-dialog", {"initial": "C:\\Users\\Param\\Surveys"})
+    assert picker.calls == ["C:\\Users\\Param\\Surveys"]
+
+
+def test_a_missing_or_unusable_initial_directory_is_simply_not_passed(picker_server):
+    base, picker = picker_server
+    _post(base, "/api/folder-dialog", {})
+    _post(base, "/api/folder-dialog", {"initial": ""})
+    _post(base, "/api/folder-dialog", {"initial": 42})
+    assert picker.calls == [None, None, None]
+
+
+def test_cancelling_answers_200_with_no_path_rather_than_an_error(picker_server):
+    # The distinction the browser depends on: a cancel must be reliably
+    # tellable from a failure, because both leave the field alone but only
+    # one of them is worth saying anything about.
+    base, picker = picker_server
+    picker.result = None
+    status, payload = _post(base, "/api/folder-dialog", {})
+    assert status == 200
+    assert payload["path"] is None
+
+
+def test_a_picker_that_cannot_run_answers_503_with_a_plain_reason(picker_server):
+    from mapgen.folderpicker import FolderPickerUnavailable
+
+    base, picker = picker_server
+    picker.error = FolderPickerUnavailable("no tkinter here. Type the folder path instead.")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(base, "/api/folder-dialog", {})
+    assert excinfo.value.code == 503
+    body = json.loads(excinfo.value.read().decode("utf-8"))
+    assert "Type the folder path instead" in body["error"]
+
+
+def test_a_dialog_left_open_answers_504(picker_server):
+    from mapgen.folderpicker import FolderPickerTimeout
+
+    base, picker = picker_server
+    picker.error = FolderPickerTimeout("open too long, so it was closed. Nothing has changed.")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(base, "/api/folder-dialog", {})
+    assert excinfo.value.code == 504
+    body = json.loads(excinfo.value.read().decode("utf-8"))
+    assert "Nothing has changed" in body["error"]
+
+
+def test_a_second_dialog_answers_409(picker_server):
+    from mapgen.folderpicker import FolderPickerBusy
+
+    base, picker = picker_server
+    picker.error = FolderPickerBusy("A folder picker is already open.")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(base, "/api/folder-dialog", {})
+    assert excinfo.value.code == 409
+
+
+def test_the_folder_dialog_route_does_not_hold_the_server_for_other_requests(picker_server):
+    # ThreadingHTTPServer gives each request its own thread, so a dialog
+    # waiting on a person must not stop the page's own heartbeat, which is
+    # what keeps a windowless session alive while the owner is off looking
+    # for a folder.
+    base, picker = picker_server
+    opened = threading.Event()
+    release = threading.Event()
+
+    def slow_picker(initial_dir=None):
+        opened.set()
+        release.wait(timeout=5)
+        return "C:\\Surveys"
+
+    picker.__class__.__call__ = staticmethod(slow_picker)
+    answers = {}
+
+    def open_dialog():
+        try:
+            answers["dialog"] = _post(base, "/api/folder-dialog", {})
+        except Exception as exc:  # pragma: no cover - reported by the assert below
+            answers["dialog"] = exc
+
+    thread = threading.Thread(target=open_dialog)
+    thread.start()
+    try:
+        assert opened.wait(timeout=5), "the dialog request never reached the picker"
+        status, payload = _post(base, "/api/heartbeat", {})
+        assert status == 200
+        assert payload["ok"] is True
+    finally:
+        release.set()
+        thread.join(timeout=5)
+        del picker.__class__.__call__
+
+    assert answers["dialog"][0] == 200
