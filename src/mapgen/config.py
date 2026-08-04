@@ -56,6 +56,26 @@ class Config:
     # therefore reports a plain "Unknown elevation model" on the next
     # estimate rather than failing mid-download.
     elevation_demtype: str = DEFAULT_DEMTYPE
+    # Task 38, item 4: how much of the map's column the owner has given
+    # the log, in CSS pixels, set by dragging the divider above it.
+    #
+    # A preference and nothing more, which is what this module is mostly
+    # for. It is here rather than in the browser's own storage because
+    # the browser has nowhere durable to put it: mapgen serves on an
+    # ephemeral port (see web.server.serve, port 0), and every
+    # browser-side store is keyed by origin including that port, so the
+    # next launch would read an empty one. This file is the only thing
+    # about a session that outlives the session.
+    #
+    # 0.0 means "never chosen", not "no height": the stylesheet's own
+    # 120px is what a page with no saved split shows, and app.js only
+    # overrides it when this is set. It is a float for the same reason
+    # tile_size_m is, so load_config's numeric branch accepts a
+    # hand-edited 240 as readily as 240.0 while still refusing true.
+    # Nothing clamps it here, deliberately: what fits is a question about
+    # the window it is being restored into, which only the browser can
+    # answer, and it answers it on every restore (see setLogHeight).
+    log_height_px: float = 0.0
 
 
 def load_config(path: Path | None = None) -> Config:

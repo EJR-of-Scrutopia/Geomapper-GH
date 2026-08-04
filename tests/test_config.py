@@ -225,3 +225,54 @@ def test_an_unrecognised_but_string_model_is_loaded_unchanged(tmp_path):
     target = tmp_path / "config.json"
     target.write_text('{"elevation_demtype": "nonsense"}', encoding="utf-8")
     assert load_config(target).elevation_demtype == "nonsense"
+
+
+# --- Task 38, item 4: the split between the map and the log -------------
+
+
+def test_the_log_height_defaults_to_never_chosen():
+    # 0.0 means "the owner has never dragged the divider", which is a
+    # different thing from a log of no height: app.js leaves the
+    # stylesheet's own 120px alone until this is set.
+    assert Config().log_height_px == 0.0
+
+
+def test_a_config_written_before_the_log_height_existed_still_loads(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"output_root": "C:\Surveys", "tile_size_m": 2000}', encoding="utf-8")
+    loaded = load_config(target)
+    assert loaded.log_height_px == 0.0
+    assert loaded.tile_size_m == 2000.0
+
+
+def test_save_then_load_round_trips_the_log_height(tmp_path):
+    target = tmp_path / "config.json"
+    save_config(Config(log_height_px=240.0), target)
+    assert load_config(target).log_height_px == 240.0
+
+
+def test_a_hand_edited_integer_log_height_is_accepted(tmp_path):
+    # A pixel height is the kind of thing a person editing this file by
+    # hand writes as 240 rather than 240.0, and the float branch of
+    # load_config accepts an int for exactly that reason.
+    target = tmp_path / "config.json"
+    target.write_text('{"log_height_px": 240}', encoding="utf-8")
+    assert load_config(target).log_height_px == 240.0
+
+
+def test_a_non_numeric_log_height_falls_back_to_the_default(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"log_height_px": "tall"}', encoding="utf-8")
+    with pytest.warns(UserWarning, match="log_height_px"):
+        assert load_config(target).log_height_px == 0.0
+
+
+def test_an_absurd_log_height_is_loaded_unchanged(tmp_path):
+    # Nothing here clamps it, deliberately: what fits is a question about
+    # the window it is being restored into, and only the browser can
+    # answer that. It does, on every restore (see setLogHeight in
+    # app.js), so a height saved on a big monitor opens a laptop at that
+    # laptop's own maximum rather than with no map at all.
+    target = tmp_path / "config.json"
+    target.write_text('{"log_height_px": 99999}', encoding="utf-8")
+    assert load_config(target).log_height_px == 99999.0

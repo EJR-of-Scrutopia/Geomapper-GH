@@ -225,9 +225,10 @@ the URL, so nothing else on the machine can drive it. On the page:
   form pane beside it runs the full height of the window. The line
   directly above it is a divider: drag it up to give the log more height
   and the map less, down for the reverse. Neither can be crushed to
-  nothing, and the split you choose is remembered for as long as that
-  launch of the server lives, so it survives reloading the page but not
-  yet restarting mapgen.
+  nothing, and the split you choose is saved with the rest of your
+  settings, so it comes back on the next launch. One saved on a large
+  monitor is cut down to fit a smaller window rather than opening a page
+  with no map on it.
 - The download runs with a live per-tile log, and the tile grid shades each
   rectangle as it goes: not started, in progress, done, or failed, the last
   one drawn distinctly since it is the one worth noticing before deciding

@@ -2835,8 +2835,14 @@ function log(message, failed = false) {
 // Two floors, and neither is arbitrary. The log is worth having only if a
 // line or two of it is readable, and a map under about 160px is not one
 // an extent can be drawn on. Both are enforced against the height the two
-// of them actually share, measured when the drag starts, so the pair can
-// never be asked for more than the column has.
+// of them actually share, so the pair can never be asked for more than
+// the column has, and that clamp is on the restore as well as on the
+// drag: a split chosen on a big monitor must not open a laptop's window
+// with no map on it.
+//
+// The chosen split is a saved preference like the theme and the tile
+// size: config.json holds it (mapgen.config.Config.log_height_px), PUT
+// /api/config writes it at the end of a drag, and boot() applies it.
 //
 // Leaflet has to be told. A map whose container has changed size and has
 // not been told keeps the tile layout it had, which shows as tiles
@@ -2849,26 +2855,6 @@ function log(message, failed = false) {
 const LOG_MIN_PX = 60;
 const MAP_MIN_PX = 160;
 const LOG_DEFAULT_PX = 120;
-
-// Kept in localStorage, and this is the only setting in this file that
-// lives anywhere but config.json, so the reason belongs here rather than
-// being left to be discovered.
-//
-// PUT /api/config ignores any key that is not a declared field of
-// mapgen.config.Config (server.py: `if key in
-// current.__dataclass_fields__`), and GET /api/config only ever returns
-// that dataclass. A browser-invented key is therefore accepted with a
-// 200, silently dropped, and gone by the next launch. Keeping the split
-// there needs a Config field, which is a Python change this task was
-// scoped out of; the report says what the one line is.
-//
-// What this does instead survives what the brief asked it to survive, a
-// reload of the page. What it does not survive is a relaunch: serve()
-// binds port 0, an ephemeral port per launch, and localStorage is keyed
-// by origin including the port, so the next launch reads a different
-// store. That gap is real, it is named in the report, and it closes the
-// moment the field exists.
-const LOG_HEIGHT_KEY = "mapgen.log-height-px";
 
 // { startY, logHeight } for as long as the divider is being dragged.
 let logResize = null;
@@ -2907,28 +2893,6 @@ function setLogHeight(px) {
   return next;
 }
 
-function storedLogHeight() {
-  try {
-    const raw = window.localStorage && window.localStorage.getItem(LOG_HEIGHT_KEY);
-    const value = Number(raw);
-    return Number.isFinite(value) && value > 0 ? value : 0;
-  } catch (error) {
-    // Storage can be disabled or full, and neither is a reason for the
-    // page not to open. The stylesheet's own height is a fine answer.
-    return 0;
-  }
-}
-
-function storeLogHeight(px) {
-  try {
-    if (window.localStorage) window.localStorage.setItem(LOG_HEIGHT_KEY, String(Math.round(px)));
-  } catch (error) {
-    // A failed save costs the next reload its remembered split and
-    // nothing else, the same way a failed PUT /api/config costs the next
-    // launch its settings, and it stays quiet for the same reason.
-  }
-}
-
 $("log-resizer").addEventListener("mousedown", (event) => {
   logResize = { startY: Number(event.clientY), logHeight: logHeight() };
   // Or the drag selects the log's text on its way past.
@@ -2951,16 +2915,20 @@ document.addEventListener("mouseup", () => {
   logResize = null;
   // Saved once, at the end. This is one setting the owner chose, not the
   // sixty positions they passed through on the way to it.
-  storeLogHeight(logHeight());
+  //
+  // Through persistConfig like every other setting on this page, so it
+  // gets the same three properties for free rather than a second set of
+  // rules: only a value that actually changed is sent, a failed save is
+  // quiet because it costs the next launch and not this session, and
+  // nothing is sent at all before boot() has read the config, which is
+  // what stops a page whose GET failed from writing a default back over
+  // a file it never managed to read.
+  persistConfig({ log_height_px: logHeight() });
 });
 
-// The remembered split, put through the same clamp a live drag goes
-// through, so a height saved on a taller window does not come back on a
-// shorter one and leave no map.
-(function restoreLogHeight() {
-  const saved = storedLogHeight();
-  if (saved) setLogHeight(saved);
-})();
+// The restore is in boot(), from the config it has just read, beside the
+// theme and for the same reason: it is a saved preference, and this page
+// learns all of those in one place at one moment.
 
 // The sources this specific job was started with, for classifyTiles: read
 // from the same payload() the job start request itself sent, never
@@ -3438,6 +3406,25 @@ function renderApiKeys(sources, config) {
     if (config.last_region) $("region").value = config.last_region;
     $("theme").value = config.theme || "auto";
     applyTheme(config.theme || "auto");
+    // Task 38, item 4: the split between the map and the log. Applied
+    // through setLogHeight rather than written straight onto the element,
+    // so a height saved on a taller window is cut down to what this one
+    // can actually give it and the map keeps its floor.
+    //
+    // Only when there is one. 0 is what the field holds until the divider
+    // has ever been dragged, and it means "the stylesheet's own height",
+    // not "no height": a page with nothing saved must be left exactly as
+    // the stylesheet drew it, with no resize reported to Leaflet for a
+    // box that never changed.
+    //
+    // A GET that fails takes this with it, along with the output root,
+    // the tile size, the overlap and the theme, and lands in boot()'s own
+    // catch: the divider stays at the stylesheet's 120px. That is the
+    // right thing for it to do, and it is also the safe thing, because
+    // savedConfig is left null and persistConfig refuses to write
+    // anything until it is set, so a session that could not read the file
+    // can never write a default back over it.
+    if (config.log_height_px > 0) setLogHeight(config.log_height_px);
     savedConfig = config;
 
     const sources = await api("/api/sources");

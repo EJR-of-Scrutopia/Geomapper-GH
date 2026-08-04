@@ -458,24 +458,12 @@ function makeWindow() {
     _setPrefersDark(value) {
       prefersDark = value;
     },
-    // Task 38, item 4: where the log's height is remembered. The real
-    // Storage API's own shape in the two respects app.js depends on:
-    // getItem returns null for a key that was never set (not undefined),
-    // and setItem stores strings, so a number goes in and a string comes
-    // back out. A stub that handed back the number would let a version
-    // that never coerced it pass here and fail in a browser.
-    localStorage: {
-      _items: new Map(),
-      getItem(key) {
-        return this._items.has(key) ? this._items.get(key) : null;
-      },
-      setItem(key, value) {
-        this._items.set(key, String(value));
-      },
-      removeItem(key) {
-        this._items.delete(key);
-      },
-    },
+    // There is deliberately no localStorage here. The log's height was
+    // kept in one for as long as mapgen.config.Config had no field for
+    // it; it has one now, so the split is saved and restored through
+    // /api/config like every other setting and this page talks to no
+    // store but the server. A stub for an API app.js does not use would
+    // be surface that could only ever make a future mistake pass.
   };
 }
 
@@ -823,6 +811,11 @@ const DEFAULT_CONFIG = {
   overlap_m: 100,
   last_region: "",
   opentopography_api_key: "",
+  // Task 38, item 4. What mapgen.config.Config's own default is, and it
+  // means "never chosen": a page that reads this must leave the log at
+  // the height the stylesheet gave it. Carried here rather than left out
+  // so the ordinary fixture is the shape the real endpoint returns.
+  log_height_px: 0,
 };
 const DEFAULT_SOURCES = [
   { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false, api_key_config_field: null },
@@ -875,10 +868,9 @@ function bootRoutes(extra) {
 }
 
 // beforeRun runs against the built sandbox before app.js is evaluated in
-// it, which is the only moment some things can be arranged: what
-// localStorage already holds from a previous session, and what the page's
-// layout would have measured, since app.js reads both while it is being
-// evaluated rather than later. Added for Task 38, item 4.
+// it, which is the only moment the page's own layout can be arranged: the
+// heights a browser would have measured have to be there before boot()
+// restores a saved split against them. Added for Task 38, item 4.
 function buildSandbox({ fetch, token = DEFAULT_TOKEN, beforeRun }) {
   const document = makeDocument();
   const windowObject = makeWindow();
@@ -7117,13 +7109,47 @@ function ok(condition, message) {
   // and what is remembered.
   // =======================================================================
 
-  const LOG_HEIGHT_KEY = "mapgen.log-height-px";
-
   // A page whose layout has happened: a 400px map above a 120px log, so
   // the two of them share 520px.
   function layOutColumn(sandbox, { map = 400, log = 120 } = {}) {
     sandbox.document.getElementById("map").offsetHeight = map;
     sandbox.document.getElementById("log").offsetHeight = log;
+  }
+
+  // The split is a saved setting like the theme and the tile size, so a
+  // sandbox that is going to drag the divider needs the route every
+  // setting is written through. Returns what actually reached the server,
+  // parsed, which is what "saved once at the end and not sixty times on
+  // the way" has to be asserted against.
+  async function dividerSandbox(configOverrides, layout) {
+    const puts = [];
+    const config = { ...DEFAULT_CONFIG, ...(configOverrides || {}) };
+    const { sandbox } = await bootedSandbox(
+      async (url, options) => {
+        if (url.pathname !== "/api/config") return null;
+        const method = (options.method || "GET").toUpperCase();
+        if (method === "GET") return jsonResponse(200, config);
+        if (method === "PUT") {
+          const sent = JSON.parse(options.body);
+          puts.push(sent);
+          Object.assign(config, sent);
+          return jsonResponse(200, config);
+        }
+        return null;
+      },
+      undefined,
+      (built) => {
+        // Before app.js runs, because boot() restores the saved split
+        // against these the moment the config lands.
+        built.document.getElementById("map").offsetHeight = (layout || {}).map || 400;
+        built.document.getElementById("log").offsetHeight = (layout || {}).log || 120;
+      }
+    );
+    return { sandbox, puts };
+  }
+
+  function logHeightPuts(puts) {
+    return puts.filter((sent) => "log_height_px" in sent);
   }
 
   function dragDivider(sandbox, fromY, toY, { release = true } = {}) {
@@ -7181,68 +7207,134 @@ function ok(condition, message) {
     ok(logStyleHeight(sandbox) === 60, `expected the log's own floor, got ${logStyleHeight(sandbox)}`);
   });
 
-  await test("the split is remembered when the drag ends, and not before", async () => {
-    const { sandbox } = await bootedSandbox();
-    layOutColumn(sandbox);
+  await test("the split is saved when the drag ends, and not before", async () => {
+    // Once, at the end, through the same PUT /api/config every other
+    // setting on this page goes through. Sixty saves on the way to one
+    // choice would be sixty writes of config.json.
+    const { sandbox, puts } = await dividerSandbox();
     dragDivider(sandbox, 500, 420, { release: false });
-    ok(
-      sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === null,
-      "expected nothing saved from the middle of a drag"
-    );
+    await flush(10);
+    ok(logHeightPuts(puts).length === 0, `expected nothing saved mid-drag, got ${JSON.stringify(puts)}`);
     sandbox.document.fire("mouseup", {});
+    await flush(10);
+    const saved = logHeightPuts(puts);
+    ok(saved.length === 1, `expected exactly one save on the release, got ${JSON.stringify(puts)}`);
     ok(
-      sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === "200",
-      `expected the chosen split saved, got ${sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY)}`
+      saved[0].log_height_px === 200,
+      `expected the chosen split saved, got ${JSON.stringify(saved[0])}`
+    );
+    // A number, not the string an input's value would have given: the
+    // endpoint applies what it is handed with no type check of its own,
+    // and load_config would refuse a string on the next launch and fall
+    // back to the default with nothing on screen to say why.
+    ok(
+      typeof saved[0].log_height_px === "number",
+      `expected a real number, got ${typeof saved[0].log_height_px}`
     );
   });
 
-  await test("a remembered split is applied before anything is drawn", async () => {
-    // The reload case: the page opens with the height it was left at,
-    // rather than the stylesheet's default and a jump afterwards.
-    const { sandbox } = await bootedSandbox(null, undefined, (built) => {
-      built.window.localStorage.setItem(LOG_HEIGHT_KEY, "240");
-      built.document.getElementById("map").offsetHeight = 400;
-      built.document.getElementById("log").offsetHeight = 120;
-    });
-    ok(logStyleHeight(sandbox) === 240, `expected the remembered split, got ${logStyleHeight(sandbox)}`);
+  await test("a saved split is applied from the config the page boots with", async () => {
+    // The relaunch case, which is the one localStorage could not do: this
+    // comes back from config.json through GET /api/config, so it survives
+    // the server being restarted on a different port.
+    const { sandbox } = await dividerSandbox({ log_height_px: 240 });
+    ok(logStyleHeight(sandbox) === 240, `expected the saved split, got ${logStyleHeight(sandbox)}`);
   });
 
-  await test("a remembered split too tall for this window is cut down to fit it", async () => {
+  await test("a saved split too tall for this window is cut down to fit it", async () => {
     // Saved on a big monitor, opened on a laptop. The map keeps its floor
     // rather than the page opening with no map at all.
-    const { sandbox } = await bootedSandbox(null, undefined, (built) => {
-      built.window.localStorage.setItem(LOG_HEIGHT_KEY, "5000");
-      built.document.getElementById("map").offsetHeight = 400;
-      built.document.getElementById("log").offsetHeight = 120;
-    });
+    const { sandbox } = await dividerSandbox({ log_height_px: 5000 });
     ok(logStyleHeight(sandbox) === 360, `expected it clamped to fit, got ${logStyleHeight(sandbox)}`);
   });
 
-  await test("a page with nothing remembered is left exactly as the stylesheet drew it", async () => {
-    const { sandbox } = await bootedSandbox();
+  await test("a config with nothing saved leaves the log exactly as the stylesheet drew it", async () => {
+    // 0 is Config.log_height_px's own default and means "never chosen",
+    // not "no height".
+    const { sandbox } = await dividerSandbox({ log_height_px: 0 });
     ok(
       !sandbox.document.getElementById("log").style.height,
       `expected no height forced on a first visit, got ${sandbox.document.getElementById("log").style.height}`
     );
     ok(
       sandbox.L._mapObject._invalidateSizeCalls === 0,
-      "expected no resize reported for a page that was never resized"
+      "expected no resize reported for a box that never changed"
     );
   });
 
-  await test("a mouse moving with no drag in progress moves nothing", async () => {
-    const { sandbox } = await bootedSandbox();
+  await test("a config load that fails leaves the divider at the stylesheet's height", async () => {
+    // A stale token, or a server that has stopped: boot() throws on its
+    // first await and says so in the log. The split goes with the output
+    // root, the tile size and the theme, and the page opens at the
+    // stylesheet's own 120px.
+    //
+    // And nothing is written back. savedConfig is still null, which is
+    // what persistConfig refuses to write past, so a session that could
+    // not READ the file cannot overwrite it with a value derived from
+    // defaults.
+    const puts = [];
+    const { sandbox } = await bootedSandbox(async (url, options) => {
+      if (url.pathname !== "/api/config") return null;
+      if ((options.method || "GET").toUpperCase() === "PUT") {
+        puts.push(JSON.parse(options.body));
+        return jsonResponse(200, DEFAULT_CONFIG);
+      }
+      return jsonResponse(403, { error: "Bad token." });
+    });
     layOutColumn(sandbox);
+    ok(
+      !sandbox.document.getElementById("log").style.height,
+      `expected the stylesheet's height left alone, got ${sandbox.document.getElementById("log").style.height}`
+    );
+    dragDivider(sandbox, 500, 400);
+    await flush(10);
+    ok(logStyleHeight(sandbox) === 220, "the divider still works in a session whose config never loaded");
+    ok(
+      logHeightPuts(puts).length === 0,
+      `a page that could not read the config must not write to it: ${JSON.stringify(puts)}`
+    );
+  });
+
+  await test("a save the server refuses leaves the page working", async () => {
+    // persistConfig already swallows a failed save for every other
+    // setting, because it costs the next launch and not this session.
+    // What must not happen is the drag itself coming apart.
+    const rejections = [];
+    const onRejection = (reason) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const { sandbox } = await bootedSandbox(async (url, options) => {
+        if (url.pathname !== "/api/config") return null;
+        if ((options.method || "GET").toUpperCase() === "PUT") {
+          return jsonResponse(500, { error: "Disk full." });
+        }
+        return jsonResponse(200, DEFAULT_CONFIG);
+      });
+      layOutColumn(sandbox);
+      dragDivider(sandbox, 500, 400);
+      await flush(20);
+      ok(logStyleHeight(sandbox) === 220, "the split the owner chose is still on screen");
+      // And a second drag still works, so nothing was left in a state
+      // the first failure poisoned.
+      dragDivider(sandbox, 500, 450);
+      await flush(20);
+      ok(logStyleHeight(sandbox) === 270, `expected the second drag to work too, got ${logStyleHeight(sandbox)}`);
+      ok(rejections.length === 0, `expected no unhandled rejection, got ${rejections[0]}`);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  await test("a mouse moving with no drag in progress moves nothing", async () => {
+    const { sandbox, puts } = await dividerSandbox();
     sandbox.document.fire("mousemove", { clientY: 10 });
     sandbox.document.fire("mouseup", {});
+    await flush(10);
     ok(
       !sandbox.document.getElementById("log").style.height,
       `expected the log untouched by an ordinary mouse move, got ${sandbox.document.getElementById("log").style.height}`
     );
-    ok(
-      sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === null,
-      "expected an ordinary mouseup to save nothing"
-    );
+    ok(logHeightPuts(puts).length === 0, "expected an ordinary mouseup to save nothing");
   });
 
   // =======================================================================

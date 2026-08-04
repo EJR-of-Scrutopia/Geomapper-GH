@@ -2495,6 +2495,32 @@ def test_config_put_saves_and_round_trips_the_elevation_model(server, tmp_path, 
     assert reloaded["elevation_demtype"] == "EU_DTM"
 
 
+def test_config_put_saves_and_round_trips_the_log_height(server, tmp_path, monkeypatch):
+    # Task 38, item 4. The divider above the log writes this at the end of
+    # a drag and boot() reads it back, so the round trip through this one
+    # endpoint is the whole of how the split survives a relaunch. It could
+    # not be kept in the browser: mapgen serves on an ephemeral port and
+    # every browser-side store is keyed by origin including the port.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+
+    status, payload = _put(server, "/api/config", {"log_height_px": 240.0})
+    assert status == 200
+    assert payload["log_height_px"] == 240.0
+
+    status, reloaded = _get(server, "/api/config")
+    assert status == 200
+    assert reloaded["log_height_px"] == 240.0
+
+
+def test_config_get_reports_no_saved_log_height_for_a_config_that_has_never_had_one(
+    server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "no-such-config.json")
+    status, payload = _get(server, "/api/config")
+    assert status == 200
+    assert payload["log_height_px"] == 0.0
+
+
 def test_config_get_reports_the_default_model_for_a_config_that_has_never_had_one(
     server, tmp_path, monkeypatch
 ):
