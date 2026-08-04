@@ -1,0 +1,19 @@
+{
+  "Folder": "C:\\Users\\Param\\Surveys\\EXAMPLE",
+  "FileNameStr": "51.51_51.5_-0.118_-0.1425",
+  "Granularity": "Block",
+  "CoordinateReference": {
+    "Utm": "30U",
+    "BottomLeftUtm": { "Item1": 698324.116838298, "Item2": 5709412.24314333 },
+    "BottomRightUtm": { "Item1": 700024.2125871766, "Item2": 5709478.940665797 }
+  },
+  "Top": 51.51,
+  "Bottom": 51.501,
+  "Left": -0.1425,
+  "Right": -0.118,
+  "OsmFilePath": "C:\\Users\\Param\\Surveys\\EXAMPLE\\stem.osm.pbf",
+  "BlockFilePath": "",
+  "ElevationFilePath": "C:\\Users\\Param\\Surveys\\EXAMPLE\\stem.egrid",
+  "OvertureFilePath": "C:\\Users\\Param\\Surveys\\EXAMPLE\\stem_overture.parquet",
+  "Layers": [ "osm", "elevation", "overture" ]
+}
