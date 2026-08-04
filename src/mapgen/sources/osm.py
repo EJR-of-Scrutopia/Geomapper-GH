@@ -60,8 +60,57 @@ DEFAULT_OSM_API_URL = "https://api.openstreetmap.org/api/0.6/map"
 USER_AGENT = "mapgen/1.0 (architectural survey tool)"
 
 # Rough bytes per tile at 2000 m, from the South Wales reference package.
+#
+# Left where it was in Task 25, after measuring, because there is no
+# single honest value to move it to. Bytes per tile depend on what is on
+# the ground rather than on the tile: six tiles of Vale of Glamorgan
+# farmland at 2000 m came back at 582,178 to 1,189,116 bytes (mean
+# 900,558), while six tiles of central Barry at 1000 m, a quarter of the
+# area each, came back at 398,979 to 6,857,032 (mean 4,016,711). That is
+# eighteen times the density per sq km between one Welsh extent and
+# another twenty minutes away. 3,500,000 sits inside that spread. Moving
+# it to either end would be trading one wrong number for a differently
+# wrong one, and dense tiles at 2000 m cannot be measured at all because
+# they exceed the node cap and fail rather than arrive.
 BYTES_PER_TILE_ESTIMATE = 3_500_000
-SECONDS_PER_TILE_ESTIMATE = 14.0
+
+# Seconds per tile, one constant per endpoint, because the two differ by
+# an order of magnitude and this source picks between them per request
+# (see configure()). Measured 2026-08-04 through OsmSource.fetch itself.
+#
+# The single SECONDS_PER_TILE_ESTIMATE = 14.0 these replace was not
+# simply wrong. It was about right for Overpass and eight times too high
+# for the map API, which is the default and therefore the path almost
+# every run takes. On the owner's own Barry extent at the default 2000 m
+# tiling, 72 tiles, that one constant contributed 1008s to an estimate
+# panel whose real total is nearer 175s. It was the largest single error
+# in the panel, larger than Overture's, which is what this task was
+# called to fix.
+#
+# Map API: three runs of six tiles, two extents, two tile sizes, all
+# giving 10.17s to 10.27s for six, which is 1.69s to 1.71s per tile. The
+# governing cost is not the download at all, it is this module's own
+# RateLimiter: the gaps between tiles land within a few hundredths of
+# min_interval_seconds, and the transfer itself disappears inside them.
+# Six tiles pay five gaps, so the per-tile figure approaches the interval
+# as the tile count grows, which is why 2.0 rather than the 1.7 measured
+# over six.
+MAP_API_SECONDS_PER_TILE = 2.0
+
+# Overpass: four tiles of central Barry filtered to buildings, at 19.25s
+# per tile (3.84s, 49.93s, 13.38s, 9.86s), and that is the run that
+# WORKED. An identical second run failed outright after 217s, on a tile
+# that had exhausted all four attempts against both endpoints, having
+# already spent 59s on the first tile. HTTP 504 from Overpass is
+# ordinary, not exceptional.
+#
+# So this is a floor and is documented as one. An Overpass run can cost
+# far more than this says, or fail; what it cannot do is cost less. The
+# estimate panel is not the place to model a shared public service's bad
+# day, but it should not tell the owner that a category-filtered run
+# costs what an unfiltered one costs, because it costs about ten times
+# as much per tile.
+OVERPASS_SECONDS_PER_TILE = 19.0
 
 
 class OsmDownloadError(RuntimeError):
@@ -288,9 +337,35 @@ class OsmSource:
         )
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
+        """Per tile, unlike OvertureSource: this source really is tiled,
+        really does make one request per tile, and really does pay for
+        each of them in turn.
+
+        Which endpoint this run will use is already decided by the time
+        this is called. package.py's estimate_survey estimates through
+        _configured_sources, so self.use_overpass here is the same value
+        the fetch would run under, exactly as routing_note() relies on.
+        Reading it is what stops a category-filtered run, which costs
+        about ten times as much per tile, being quoted the unfiltered
+        price.
+
+        Deliberately NOT modelling the node-cap retry ladder, which is a
+        real and unquoted cost: a dense extent requested at 2000 m fails
+        part way through and package.py restarts the whole run at 1500 m
+        and then at 1000 m, four times the tiles, having already paid for
+        the tiles it got. Whether that happens depends on how dense the
+        ground is, which is precisely what cannot be known before
+        downloading it. An estimate that guessed would be inventing, and
+        an estimate that assumed the worst would overstate every rural
+        survey by 4x. Named here so the next person knows it is missing
+        on purpose.
+        """
+        seconds_per_tile = (
+            OVERPASS_SECONDS_PER_TILE if self.use_overpass else MAP_API_SECONDS_PER_TILE
+        )
         return Estimate(
             bytes_estimate=BYTES_PER_TILE_ESTIMATE * len(tiles),
-            seconds_estimate=SECONDS_PER_TILE_ESTIMATE * len(tiles),
+            seconds_estimate=seconds_per_tile * len(tiles),
         )
 
     def fetch(

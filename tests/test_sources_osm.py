@@ -611,6 +611,59 @@ def test_estimate_scales_with_tile_count():
     assert two.seconds_estimate > one.seconds_estimate
 
 
+# --- Task 25: the per-tile second is measured, per endpoint ------------
+
+
+def test_the_map_api_estimate_matches_the_rate_limiter_it_is_governed_by():
+    # Measured 2026-08-04 through OsmSource.fetch against the live map
+    # API: three runs of six tiles, Vale of Glamorgan farmland at 2000 m
+    # and central Barry at 1000 m, every one of them 10.17s to 10.27s for
+    # six tiles. The download itself is not what costs; the gaps between
+    # tiles land on min_interval_seconds almost exactly, so per-tile time
+    # approaches the rate limit as the tile count grows.
+    #
+    # This replaced a flat 14.0s per tile, which was 8x the measurement
+    # and, on the owner's own 72-tile Barry extent, contributed 1008s to
+    # a panel whose real total is nearer 175s.
+    source = OsmSource()
+    assert source.min_interval_seconds == 2.0
+    twelve = source.estimate(
+        BBox.parse("-3.29,51.38,-3.28,51.39"),
+        [_tile(f"r00_c{index:02d}") for index in range(12)],
+    )
+    per_tile = twelve.seconds_estimate / 12
+    assert source.min_interval_seconds * 0.9 <= per_tile <= source.min_interval_seconds * 1.3, (
+        f"the map API path is rate limited to one call every "
+        f"{source.min_interval_seconds}s and measured 1.71s per tile over six; "
+        f"the estimate says {per_tile:.2f}s per tile. A number far above the "
+        f"rate limit is not describing this endpoint"
+    )
+
+
+def test_a_category_filtered_run_is_estimated_at_the_overpass_price():
+    # The routing decision configure() makes has a cost, and until Task
+    # 25 the estimate did not know about it. Measured 2026-08-04: four
+    # tiles of central Barry filtered to buildings took 19.25s per tile
+    # against 1.71s on the map API, and a second identical run failed
+    # outright after 217s with repeated HTTP 504s. Overpass is roughly
+    # ten times the price per tile, when it works at all.
+    bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
+    tiles = [_tile(f"r00_c{index:02d}") for index in range(4)]
+    map_api = OsmSource().estimate(bbox, tiles)
+    overpass = OsmSource().configure(["buildings"]).estimate(bbox, tiles)
+
+    assert OsmSource().configure(["buildings"]).use_overpass is True
+    assert overpass.seconds_estimate > 5 * map_api.seconds_estimate, (
+        f"a category filter routes this run through Overpass, which measured "
+        f"about ten times the map API's cost per tile; the estimate says "
+        f"{overpass.seconds_estimate:.0f}s against {map_api.seconds_estimate:.0f}s"
+    )
+    assert overpass.seconds_estimate / len(tiles) >= 15.0, (
+        "Overpass measured 19.25s per tile on the run that succeeded and "
+        "failed on the run that did not, so this constant is a floor"
+    )
+
+
 def test_merge_produces_a_single_osm_file(tmp_path):
     part = tmp_path / "r00_c00.osm"
     part.write_text(OSM_XML, encoding="utf-8")
