@@ -4948,14 +4948,14 @@ def test_mapgens_project_setting_is_the_one_that_survives_a_bridge_run(tmp_path)
 
 
 def test_survey_json_records_the_project_setting_beside_the_bridge(tmp_path):
-    register(UrbanoReadableStubSource(suffixes=(".osm", ".tif")))
+    register(UrbanoReadableStubSource(suffixes=(".osm", "_building.geojson")))
     result = run_survey(_request(tmp_path, run_bridge_step=False))
 
     record = result.survey["project_setting"]
     assert record == {
         "written": True,
         "file": f"{result.paths.stem}_project_setting.json",
-        "layers": ["osm", "elevation"],
+        "layers": ["osm", "overture"],
         "error": None,
     }
     # Beside the bridge block rather than inside it: whether the package has
@@ -5007,15 +5007,23 @@ def test_a_project_setting_failure_never_costs_the_survey(tmp_path, monkeypatch)
 
 
 def test_the_project_setting_names_every_layer_the_package_actually_holds(tmp_path):
+    """Every layer the package holds AND Urbano can open from that field.
+
+    The `.tif` is on disk here and is deliberately absent from the setting:
+    Urbano's elevation field is a protobuf `ElevationGrid`, not a raster
+    path, so naming a GeoTIFF there crashes the components that read it.
+    See tests/test_urbano.py::test_a_geotiff_is_never_named_in_the_elevation_field.
+    """
     register(UrbanoReadableStubSource(suffixes=(".osm", ".tif", "_building.geojson")))
     result = run_survey(_request(tmp_path, run_bridge_step=False))
 
     setting = _project_setting(result)
-    assert setting["Layers"] == ["osm", "elevation", "overture"]
-    assert setting["ElevationFilePath"].endswith(".tif")
+    assert setting["Layers"] == ["osm", "overture"]
+    assert setting["ElevationFilePath"] == ""
+    assert (result.paths.root / f"{result.paths.stem}.tif").is_file()
     assert setting["OvertureFilePath"].endswith("_building.geojson")
     assert setting["BlockFilePath"] == ""
-    for field in ("OsmFilePath", "ElevationFilePath", "OvertureFilePath"):
+    for field in ("OsmFilePath", "OvertureFilePath"):
         assert Path(setting[field]).is_file(), f"{field} names a file that is not there"
 
 
@@ -5035,7 +5043,9 @@ def test_bridge_package_produces_the_project_setting_a_package_never_had(tmp_pat
         (root / payload["project_setting"]["file"]).read_text(encoding="utf-8")
     )
     assert setting["FileNameStr"] == payload["urbano_stem"]
-    assert setting["Layers"] == ["osm", "elevation"]
+    # `elevation` is not among them although the package holds a `.tif`: that
+    # field is a protobuf ElevationGrid and a GeoTIFF in it crashes Urbano.
+    assert setting["Layers"] == ["osm"]
     assert Path(setting["OsmFilePath"]).is_file()
 
 

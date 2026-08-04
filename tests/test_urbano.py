@@ -139,9 +139,11 @@ def test_a_real_welsh_package_produces_every_field_urbano_reads(tmp_path):
     assert setting["Right"] == -3.24
     assert setting["OsmFilePath"] == str(root / f"{STEM}.osm")
     assert setting["BlockFilePath"] == ""
-    assert setting["ElevationFilePath"] == str(root / f"{STEM}.tif")
+    # The DEM is on disk in this package and is deliberately not named. See
+    # test_a_geotiff_is_never_named_in_the_elevation_field.
+    assert setting["ElevationFilePath"] == ""
     assert setting["OvertureFilePath"] == str(root / f"{STEM}_building.geojson")
-    assert setting["Layers"] == ["osm", "elevation", "overture"]
+    assert setting["Layers"] == ["osm", "overture"]
     assert setting["CoordinateReference"]["Utm"] == "30U"
 
 
@@ -178,11 +180,81 @@ def test_only_the_layers_the_package_actually_holds_are_named(tmp_path):
     assert setting["BlockFilePath"] == ""
 
 
+def test_a_geotiff_is_never_named_in_the_elevation_field(tmp_path):
+    """The blocker task 37 found, pinned so it cannot come back.
+
+    `ElevationFilePath` is not a hint about where a DEM is. Every one of the
+    seven Urbano 2.2.1.2 components that reads it hands it straight to
+    `ProtoBuf.Serializer.Deserialize<ElevationGrid>`, and four of them
+    (Import Buildings 3D, Import Public Transits, Import Amenity, Import
+    Green Space) do it on any non-empty string, with no toggle and no
+    File.Exists in front of it. Import Terrain, the one component whose name
+    suggests it would take a raster, does the same.
+
+    So a GeoTIFF here is not an unused string, it is a crash: protobuf-net's
+    own `Unexpected end-group in source data; this usually means the source
+    data is corrupt`, which is verbatim what stopped Import Streets and
+    Import Buildings on the owner's canvas. Confirmed by running Urbano's own
+    Deserialize against a real mapgen `.tif` out of process.
+
+    The DEM is still produced, still in the package, and still recorded in
+    survey.json. It simply cannot be named in this field.
+    """
+    root = package(tmp_path / "pkg", f"{STEM}.osm", f"{STEM}.tif")
+    setting = build_project_setting(BARRY, root, STEM)
+    assert setting["ElevationFilePath"] == ""
+    assert "elevation" not in setting["Layers"]
+    assert (root / f"{STEM}.tif").is_file()
+    assert ".tif" not in json.dumps(setting)
+
+
+def test_the_elevation_field_takes_an_egrid_and_only_an_egrid(tmp_path):
+    """The other half of the same rule: a `.egrid` is exactly what that
+    field's readers expect, so one left by a successful bridge run is named.
+    """
+    root = package(tmp_path / "pkg", f"{STEM}.osm", f"{STEM}.egrid", f"{STEM}.tif")
+    setting = build_project_setting(BARRY, root, STEM)
+    assert setting["ElevationFilePath"] == str(root / f"{STEM}.egrid")
+    assert setting["Layers"] == ["osm", "elevation"]
+
+
+def test_the_osm_field_only_ever_names_one_of_urbanos_two_osm_extensions(tmp_path):
+    """Urbano dispatches the OSM reader on the extension, case sensitively:
+    `.osm` is parsed as OSM XML and `.osm.pbf` as OSM PBF. Established in
+    task 37 by feeding Urbano's own `ImportOsmGeometries` the same bytes
+    under seven different names: everything outside those two left it with
+    no source at all and threw before reading a byte.
+
+    mapgen writes OSM XML, so `.osm` is the only name it may use for it. A
+    sibling with any other extension is not a candidate.
+    """
+    root = package(
+        tmp_path / "pkg",
+        f"{STEM}.osm",
+        f"{STEM}.xml",
+        f"{STEM}.pbf",
+        f"{STEM}.OSM.bak",
+    )
+    setting = build_project_setting(BARRY, root, STEM)
+    assert setting["OsmFilePath"] == str(root / f"{STEM}.osm")
+
+    pbf_only = package(tmp_path / "pbf", f"{STEM}.osm.pbf", f"{STEM}.xml")
+    assert build_project_setting(BARRY, pbf_only, STEM)["OsmFilePath"] == str(
+        pbf_only / f"{STEM}.osm.pbf"
+    )
+
+    neither = tmp_path / "neither"
+    neither.mkdir()
+    (neither / f"{STEM}.xml").write_text("x", encoding="utf-8")
+    with pytest.raises(ProjectSettingError, match="would name nothing"):
+        build_project_setting(BARRY, neither, STEM)
+
+
 def test_layers_are_listed_in_urbanos_own_order(tmp_path):
     root = package(
         tmp_path / "pkg",
         f"{STEM}_water.geojson",
-        f"{STEM}.tif",
+        f"{STEM}.egrid",
         f"{STEM}.osm",
         f"{STEM}.blocks",
     )
@@ -207,7 +279,8 @@ def test_urbanos_own_native_formats_win_over_mapgens_when_both_are_there(tmp_pat
     successful bridge run.
 
     OSM is the exception and follows Urbano's own preference order, which
-    checks `.osm` before `.osm.pbf`.
+    checks `.osm` before `.osm.pbf`. Elevation is not a preference at all
+    any more: `.egrid` is the only thing that field can hold.
     """
     root = package(
         tmp_path / "pkg",
@@ -279,7 +352,7 @@ def test_urbanos_three_granularities_are_accepted(tmp_path, granularity):
 
 
 def test_resolve_data_files_reports_paths_by_layer(tmp_path):
-    root = package(tmp_path / "pkg", f"{STEM}.osm", f"{STEM}.tif")
+    root = package(tmp_path / "pkg", f"{STEM}.osm", f"{STEM}.egrid")
     files = resolve_data_files(root, STEM)
     assert set(files) == {"osm", "elevation"}
     assert files["osm"].name == f"{STEM}.osm"
@@ -388,7 +461,7 @@ def test_the_file_is_named_the_one_thing_urbano_looks_for(tmp_path):
 def test_writing_twice_replaces_rather_than_appends(tmp_path):
     root = package(tmp_path / "pkg", f"{STEM}.osm")
     write_project_setting(BARRY, root, STEM)
-    package(root, f"{STEM}.tif")
+    package(root, f"{STEM}.egrid")
     written = write_project_setting(BARRY, root, STEM)
     payload = json.loads(written.read_text(encoding="utf-8"))
     assert payload["Layers"] == ["osm", "elevation"]

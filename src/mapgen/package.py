@@ -1101,8 +1101,10 @@ def _write_project_setting_step(
         native formats where they are there (see mapgen.urbano.DATA_FILES),
         so the result is a superset rather than a downgrade: a successful
         bridge run's `.osm.pbf`, `.egrid` and `.parquet` are all still
-        named, and mapgen's `.tif` and `.geojson` are named too where the
-        bridge produced nothing.
+        named, and mapgen's own `.osm` and `.geojson` are named too where
+        the bridge produced nothing. The DEM is the one output never named:
+        Urbano's elevation field is a protobuf `ElevationGrid` and a
+        GeoTIFF in it crashes every component that reads it (task 37).
       * A failure here is recorded and the package is finished anyway,
         exactly as a bridge failure is. Losing a survey's real data because
         a JSON file could not be written would be the same mistake task 20

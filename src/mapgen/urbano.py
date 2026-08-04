@@ -34,16 +34,46 @@ Two consequences run through this module:
     `FileNameStr`.
   * Naming a layer commits Urbano to having it. An elevation layer with no
     `<stem>.egrid` beside it sends Urbano to the USGS 3DEP service, which is
-    United States only, and it reports the failure on the component. That is
-    a visible, honest warning rather than a silent absence, which is the
-    right side of this project's own rule, but it is worth knowing before it
-    is met.
+    United States only, and it reports the failure on the component. Since
+    task 37 this cannot arise from a mapgen package: `elevation` is listed
+    only when a `.egrid` is genuinely there, and mapgen does not produce
+    one, so on this route a UK package is a clean no-download pass-through
+    with no orange warning on the component.
 
 **Casting the text straight into a ProjectSettingParam**, which is what the
-Deserialize Project Setting component does. That route passes the path
-strings through verbatim, and is where pointing them at the files mapgen
-actually produced pays: `ElevationFilePath` and `OvertureFilePath` come out
-of it as real paths to the real GeoTIFF and GeoJSON in the package.
+Deserialize Project Setting component does, and what every Import component
+does with its own project setting input. That route passes the path strings
+through verbatim, which is where pointing them at the files mapgen actually
+produced pays, and it is also the route on which a wrong path is fatal
+rather than ignored.
+
+## Only ever name a file the field's own reader can open
+
+Established in task 37 by running Urbano's own code out of process rather
+than by reading it. Each of these fields is not a hint, it is an instruction
+to a specific parser:
+
+  * `OsmFilePath` is dispatched on its extension, case sensitively:
+    `.osm` is read as OSM XML, `.osm.pbf` as OSM PBF, and any other
+    extension leaves the reader with no source at all. mapgen writes OSM
+    XML named `.osm`, which is exactly right, and Urbano's own
+    `OsmExtension.ImportOsmGeometries` parsed a real mapgen `.osm` into 98
+    street polylines and a polygon.
+  * `ElevationFilePath` is passed straight to
+    `ProtoBuf.Serializer.Deserialize<ElevationGrid>` by every one of the
+    seven components that reads it, Import Terrain included. Four of them
+    do it on any non-empty string, with no toggle and no existence check.
+    A GeoTIFF there is not ignored, it is read as protobuf and throws.
+    So the field takes a `.egrid` or nothing.
+  * `OvertureFilePath` is read only by Import Buildings, and only when its
+    data source dropdown is set to Overture, where it goes to a parquet
+    reader that checks the file's magic bytes and refuses anything else by
+    name. mapgen's GeoJSON is kept in the field anyway, because the field
+    is inert on every other route and a real path is what Deserialize
+    Project Setting hands to the Import Geojson File component, which is
+    the component that actually reads it. Emptying it would not make the
+    Overture branch work; it would only change which sentence it fails
+    with.
 
 ## Never a NaN and never an infinity
 
@@ -115,10 +145,16 @@ class DataFile:
 #   would have chosen anyway. mapgen writes `.osm`.
 # census: mapgen never produces one. Listed so a `.blocks` left by a
 #   successful bridge run is picked up rather than ignored.
-# elevation: `.egrid` first, because if the bridge ever does succeed its
-#   output is the format Urbano reads natively, and `.tif` after it, because
-#   that is what mapgen actually produces and it is a real path to a real
-#   DEM for anything that reads the field rather than rebuilding it.
+# elevation: `.egrid`, and nothing else, ever. This field is handed
+#   verbatim to ProtoBuf.Serializer.Deserialize<ElevationGrid> by all seven
+#   of its readers, so a name it cannot deserialise is a crashed component
+#   rather than an unused string. mapgen's GeoTIFF was named here until
+#   task 37 and it is what stopped Import Streets and Import Buildings with
+#   protobuf-net's own "Unexpected end-group in source data; this usually
+#   means the source data is corrupt". The `.tif` is still written and
+#   still in the package, and Urbano has no reader for it in this field:
+#   Import Terrain, the component that sounds like it would take a raster,
+#   deserialises this same field as an ElevationGrid too.
 # overture: the bridge's `.parquet` first for the same reason, then the
 #   buildings GeoJSON, because building heights are the one thing Urbano is
 #   known to read Overture for (OVERTURE_KEY_BLDG_HEIGHT). A package with no
@@ -129,7 +165,7 @@ class DataFile:
 DATA_FILES = (
     DataFile(LAYER_OSM, "OsmFilePath", (".osm", ".osm.pbf")),
     DataFile(LAYER_CENSUS, "BlockFilePath", (".blocks",)),
-    DataFile(LAYER_ELEVATION, "ElevationFilePath", (".egrid", ".tif")),
+    DataFile(LAYER_ELEVATION, "ElevationFilePath", (".egrid",)),
     DataFile(LAYER_OVERTURE, "OvertureFilePath", ("_overture.parquet", "_building.geojson")),
 )
 
