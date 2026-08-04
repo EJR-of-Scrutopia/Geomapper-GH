@@ -36,11 +36,10 @@ string convention would send it looking for a file nobody has.
 **Naming a layer commits Urbano to fetching it.** The requested layer set is
 the `Layers` list unioned with every file path field that is not empty. For
 `elevation` with no `<stem>.egrid` beside it, that means
-`DownloadUsgs3DepTiffForBounds`, which is United States only. For a UK site
-it fails and the component shows an orange warning saying so. That is a
-truthful report and it costs the rest of the setting nothing, but it is worth
-expecting rather than meeting cold. `climate` is worse and mapgen never
-writes it: it is re-fetched with no file check at all.
+`DownloadUsgs3DepTiffForBounds`, which is United States only. Since task 37
+mapgen never names an elevation layer it cannot back with a `.egrid`, so a UK
+package no longer provokes that download at all. `climate` is worse and
+mapgen never writes it either: it is re-fetched with no file check at all.
 
 **Overture is not downloaded at all.** The routine has no Overture branch,
 and rewrites `OvertureFilePath` as an empty string. Urbano 2.2.1.2 still
@@ -52,15 +51,65 @@ runs, with its own recomputed origin and its own path conventions. mapgen's
 version is an input to that, not a permanent record. Re-run `mapgen bridge`
 over the folder to get mapgen's back.
 
-## Reading the GeoTIFF and the GeoJSON
+## What each path field actually is, and why the DEM is not in one
 
-Not through the project setting. Urbano 2's toolbar has an **Import Geojson
-File** component that takes a GeoJSON path directly, which is what makes
-mapgen's `<stem>_<type>.geojson` output first-class rather than something
-Urbano cannot open, and a separate Import Terrain component for the surface.
-The project setting's `ElevationFilePath` and `OvertureFilePath` are there
-for those, and for **Deserialize Project Setting**, which unpacks the file
-and passes its path strings through verbatim.
+Every one of these is an instruction to a specific parser, not a hint about
+where a file lives. Established in task 37 by running Urbano's own code out
+of process against a real mapgen package, not by reading it.
+
+**`OsmFilePath` is dispatched on its extension, case sensitively.** `.osm` is
+read as OSM XML and `.osm.pbf` as OSM PBF (`Key.OSM_EXTENSION` and
+`Key.OSM_PBF_EXTENSION`, read off `Key` at runtime). Anything else leaves
+`OsmExtension.ImportOsmGeometries` with a null source and throws before it
+reads a byte. mapgen writes OSM XML named `.osm`, which is exactly what
+Urbano wants: its own reader took a real mapgen `.osm` and returned 98 street
+polylines and 759 building polygons. **No PBF writer is needed and none was
+written.**
+
+**`ElevationFilePath` is a protobuf `ElevationGrid`, never a raster.** All
+seven components that read it hand it straight to
+`ProtoBuf.Serializer.Deserialize<ElevationGrid>`: Import Buildings 3D, Import
+Public Transits, Import Amenity and Import Green Space do it on any non-empty
+string with no toggle and no `File.Exists`; Import Streets and Import Block
+do it behind a toggle; and Import Terrain, the one whose name suggests it
+would take a GeoTIFF, does it too. mapgen named its `.tif` here until task 37
+and that is what produced
+
+> Solution exception: Unexpected end-group in source data; this usually means
+> the source data is corrupt
+
+on Import Streets and Import Buildings. It is protobuf-net reading a TIFF.
+mapgen now leaves the field empty unless a real `.egrid` is in the package,
+which also drops `elevation` from `Layers`. The DEM is still written, still
+named `<stem>.tif`, and still recorded in survey.json.
+
+**`OvertureFilePath` is a GeoParquet file, and mapgen keeps its GeoJSON there
+anyway.** Import Buildings 3D reads it only when its data source dropdown is
+set to Overture, and then through `GeoParquetReader`, which checks the magic
+bytes and refuses anything else by name (`not a parquet file, head: 7b227479`
+for our GeoJSON). Emptying the field would not make that branch work, and the
+field is inert on every other route, while a real path is exactly what
+**Deserialize Project Setting** hands to **Import Geojson File**, the
+component that does read it. So it stays. If Import Buildings says "not a
+parquet file", set its data source to OSM.
+
+## Wiring a real mapgen package into Import Streets and Import Buildings
+
+The shortest route, and the one the error above came from, does not involve
+the Project Setting component at all. `GH_ProjectSetting.CastFrom` is
+`JsonSerializer.Deserialize<UrbanoProjectSetting>(source.ToString())`, so any
+Grasshopper text wired into a `ProjectSettingParam` becomes a project
+setting. Read the package's `<stem>_project_setting.json` into a panel, wire
+the panel into Import Streets' or Import Buildings' first input, and the
+component reads mapgen's files by the paths in the file, verbatim. That is
+why those paths have to be ones Urbano can open.
+
+The Project Setting component route differs in one way worth knowing: when it
+runs, it rebuilds `ElevationFilePath` as `<folder>\<stem>.egrid` whenever the
+elevation layer was requested, **whether or not the download succeeded and
+whether or not the file exists**. A downstream Import component then opens a
+path that is not there. mapgen packages no longer request that layer, so this
+cannot arise from one, but a hand-edited setting can walk into it.
 
 ## Checking the coordinate reference without any of this
 

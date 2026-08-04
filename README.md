@@ -573,21 +573,31 @@ worth knowing, because both are visible from the canvas:
 - **It rebuilds the OSM path itself**, as the folder plus the file stem plus
   `.osm`, and skips the download if that file is already there. mapgen's
   naming matches, which is what makes a mapgen package a pass-through rather
-  than a fresh download.
-- **It does not read the elevation path.** It looks for `<stem>.egrid`, its
-  own format, and if that is missing it goes to the USGS 3DEP service, which
-  is United States only, and reports the failure on the component. For a UK
-  site expect an orange warning saying so. That is a truthful report that
-  Urbano's own elevation route does not work here, not a mapgen failure, and
-  it costs the rest of the setting nothing.
+  than a fresh download. A `.osm` is read as OSM XML, which is what mapgen
+  writes, and a `.osm.pbf` as OSM PBF.
+- **The DEM is deliberately not named in the setting.** Urbano's
+  `ElevationFilePath` is not a path to a raster: every component that reads
+  it, Import Terrain included, deserialises it as an `ElevationGrid`
+  protobuf, so a GeoTIFF there is not ignored, it stops the component with
+  "Unexpected end-group in source data". mapgen leaves the field empty and
+  omits `elevation` from `Layers`, which also means no attempt at Urbano's
+  United States only elevation download and no orange warning about it. The
+  `<stem>.tif` is still in the package and still recorded in `survey.json`;
+  read it with whatever handles a GeoTIFF.
 
-The GeoTIFF and the GeoJSON files are read separately, and Urbano 2 has
-components for both: **Import Geojson File** takes a GeoJSON path directly,
-and there is an Import Terrain component for the surface. The
-`<stem>_project_setting.json` paths for those layers are there for those
-components and for the **Deserialize Project Setting** component, which
-unpacks the file into its folder, bound string, granularity, layer names and
-file paths, verbatim.
+The GeoJSON files are read separately, and Urbano 2 has a component for
+them: **Import Geojson File** takes a GeoJSON path directly. The
+`<stem>_project_setting.json` Overture path is there for that, and for the
+**Deserialize Project Setting** component, which unpacks the file into its
+folder, bound string, granularity, layer names and file paths, verbatim. If
+Import Buildings' data source is set to Overture it will say "not a parquet
+file": that field wants GeoParquet, so use OSM as the source there and take
+the GeoJSON through Import Geojson File.
+
+You can also skip the Project Setting component altogether. Any Grasshopper
+panel holding the JSON can be wired straight into the project setting input
+of **Import Streets** or **Import Buildings**, and those read the paths in
+the file verbatim rather than rebuilding them.
 
 The `layers/*.geojson` files (and the `<stem>_<type>.geojson` files in the
 package root) are also independent of Urbano entirely, and read into any
