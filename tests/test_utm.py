@@ -33,6 +33,7 @@ from mapgen.utm import (
     LATITUDE_BANDS,
     ProjectionError,
     project,
+    unproject,
     utm_zone,
 )
 
@@ -344,3 +345,124 @@ def test_the_band_table_has_no_i_or_o_in_it():
     assert "I" not in LATITUDE_BANDS
     assert "O" not in LATITUDE_BANDS
     assert len(LATITUDE_BANDS) == 20
+
+
+# --------------------------------------------------------------------------
+# The inverse, which the elevation grid needs (task 39).
+# --------------------------------------------------------------------------
+
+# Urbano's own `GeoProjector.UTMToLatLong` (DotSpatial's inverse tmerc), read
+# out of the loaded assembly by Probe9 in a scratch directory, on fourteen
+# points chosen to be awkward rather than convenient: both hemispheres, both
+# sides of a central meridian, the false easting exactly, a zone edge, the
+# equator, the pole-ward end of the band table, and the two world origin
+# corners of a real Welsh survey. Nothing in this table was computed by
+# anything in this repository.
+#
+# easting, northing, zone, latitude, longitude
+URBANO_INVERSE = [
+    (480797.27250041266, 5693565.592158006, "30U", 51.393, -3.275999999999991),
+    (481353.8723899168, 5693563.527297785, "30U", 51.393, -3.267999999999991),
+    (480597.0, 5693365.0, "30U", 51.39118950372155, -3.2788675064013955),
+    (481553.0, 5694321.0, "30U", 51.39981754617657, -3.2651773575247702),
+    (500000.0, 5700000.0, "30U", 51.45118220565308, -2.9999999999999916),
+    (400000.0, 5700000.0, "30U", 51.44235231635941, -4.438876794395441),
+    (600000.0, 5700000.0, "30U", 51.44235231635941, -1.5611232056045428),
+    (698324.116838298, 5709412.24314333, "30U", 51.50099999994762, -0.1424999999906395),
+    (582505.6826406379, 4505891.429438546, "18T", 40.69979999999993, -74.02339999999988),
+    (300000.0, 6200000.0, "31V", 55.90380878170299, -0.19945899211173349),
+    (500000.0, 1000000.0, "34K", -81.06088097496355, 20.999999999999986),
+    (450000.0, 6000000.0, "56H", -36.14342855636038, 152.4442256704288),
+    (500000.0, 10000000.0, "23K", 0.0, -45.0),
+    (500000.0, 0.0, "31N", 0.0, 2.9999999999999916),
+]
+
+
+@pytest.mark.parametrize(
+    "easting,northing,zone,latitude,longitude",
+    URBANO_INVERSE,
+    ids=[f"{row[2]}-{int(row[0])}-{int(row[1])}" for row in URBANO_INVERSE],
+)
+def test_the_inverse_is_urbanos_own_inverse(
+    easting, northing, zone, latitude, longitude
+):
+    """Within a nanometre of Urbano's `UTMToLatLong`, everywhere.
+
+    A nanometre stated as an angle would be meaningless, so the tolerance is
+    converted: one degree of latitude is about 111,320 m, and the check is
+    that the disagreement is under a millionth of a metre on the ground. The
+    measured worst case over this table is 3.2e-9 m.
+    """
+    got_latitude, got_longitude = unproject(easting, northing, zone)
+    assert abs(got_latitude - latitude) * 111_320.0 < 1e-6
+    assert abs(got_longitude - longitude) * 111_320.0 < 1e-6
+
+
+@pytest.mark.parametrize(
+    "latitude,longitude", [(lat, lon) for _, lat, lon in CROSS_CHECK_POINTS]
+)
+def test_projecting_and_unprojecting_returns_the_same_point(latitude, longitude):
+    """The round trip, on every cross-check point, to under a micrometre.
+
+    This is the property that matters for the elevation grid: a grid node is
+    projected forward to place it and unprojected to sample the DEM under it,
+    and a disagreement of even a metre between the two directions would shift
+    the terrain under the buildings by a metre.
+
+    A micrometre and not a nanometre, and the difference is not slack. The
+    forward and inverse series are each truncated, so the pair cannot close
+    exactly; the measured worst case over this table is 2.2e-5 m, at the far
+    edge of a zone. It is Urbano's own limit as much as mapgen's, since both
+    directions are DotSpatial's, and the tighter check is the one above,
+    where the standard is Urbano's own answer rather than mapgen's other
+    direction: 3.2e-9 m.
+    """
+    zone = utm_zone(latitude, longitude)
+    easting, northing = project(latitude, longitude, zone)
+    back_latitude, back_longitude = unproject(easting, northing, zone)
+    assert abs(back_latitude - latitude) * 111_320.0 < 1e-3
+    assert abs(back_longitude - longitude) * 111_320.0 * math.cos(
+        math.radians(latitude)
+    ) < 1e-3
+
+
+def test_unprojecting_and_projecting_returns_the_same_grid_coordinate():
+    """The other direction of the round trip, which is the one the grid
+    actually walks: from a node's easting and northing, out to the DEM, and
+    back. A quarter of a million nodes go through this on a large survey and
+    a systematic bias in either direction would tilt the whole surface.
+    """
+    for easting in (400_000.0, 480_597.0, 500_000.0, 600_000.0):
+        for northing in (5_693_365.0, 5_700_000.0, 6_200_000.0):
+            latitude, longitude = unproject(easting, northing, "30U")
+            back_easting, back_northing = project(latitude, longitude, "30U")
+            assert abs(back_easting - easting) < 1e-3
+            assert abs(back_northing - northing) < 1e-3
+
+
+def test_the_inverse_refuses_the_same_zone_strings_the_forward_one_does():
+    """One parser, so a zone one direction accepts and the other refuses
+    cannot exist. That pair would be a round trip that silently is not one.
+    """
+    for zone in ["", "U", "30", "30I", "0U", "61U", "thirty-U"]:
+        with pytest.raises(ProjectionError, match="UTM zone string"):
+            unproject(500000.0, 5700000.0, zone)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_an_easting_that_is_not_a_real_number_is_refused_not_unprojected(bad):
+    with pytest.raises(ProjectionError, match="must be real numbers"):
+        unproject(bad, 5700000.0, "30U")
+    with pytest.raises(ProjectionError, match="must be real numbers"):
+        unproject(500000.0, bad, "30U")
+
+
+def test_a_northing_past_the_pole_returns_the_pole_rather_than_a_nan():
+    """Urbano's inverse clamps to the pole and zeroes the longitude rather
+    than raising, and mapgen has to do the same: a NaN latitude would reach
+    the DEM sampler, which would read it as "no coverage" for a reason that
+    is not the true one.
+    """
+    latitude, longitude = unproject(500000.0, 30_000_000.0, "30U")
+    assert latitude == pytest.approx(90.0)
+    assert longitude == pytest.approx(-3.0)

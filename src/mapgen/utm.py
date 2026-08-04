@@ -151,6 +151,60 @@ def _meridional_length(
     )
 
 
+def _angular_distance(arg: float, es: float, en: tuple[float, ...]) -> float:
+    """PROJ.4's `pj_inv_mlfn`, which is DotSpatial's
+    `MeridionalDistance.AngularDistance`: the latitude whose meridional
+    length is `arg`, by Newton iteration on _meridional_length.
+
+    Ten iterations at most and an absolute tolerance of 1e-11 radians, both
+    of them Urbano's own numbers rather than a choice made here. Urbano
+    returns the last iterate rather than raising when it does not converge,
+    and so does this: a projection that quietly disagreed with Urbano about
+    when to give up would be worse than one that agrees with it about
+    everything.
+    """
+    one_minus_es = 1.0 / (1.0 - es)
+    phi = arg
+    for _ in range(10):
+        sin_phi = math.sin(phi)
+        con = 1.0 - es * sin_phi * sin_phi
+        step = (
+            (_meridional_length(phi, sin_phi, math.cos(phi), en) - arg)
+            * (con * math.sqrt(con))
+            * one_minus_es
+        )
+        phi -= step
+        if abs(step) < 1e-11:
+            return phi
+    return phi
+
+
+def _parse_zone(zone: str) -> tuple[int, str]:
+    """A zone string such as `30U` as its number and its band letter.
+
+    One function rather than two copies, because project and unproject have
+    to refuse exactly the same set of strings: a zone one of them accepts
+    and the other does not would be a pair that cannot round trip.
+    """
+    band = zone[-1:].upper()
+    try:
+        zone_number = int(zone[:-1])
+    except ValueError:
+        raise ProjectionError(f"{zone!r} is not a UTM zone string such as 30U.") from None
+    if band not in LATITUDE_BANDS or not 1 <= zone_number <= 60:
+        raise ProjectionError(f"{zone!r} is not a UTM zone string such as 30U.")
+    return zone_number, band
+
+
+def central_meridian(zone_number: int) -> float:
+    """The longitude of a zone's central meridian, in degrees.
+
+    Named rather than inlined because it is the only place the zone number
+    enters the projection arithmetic at all, in either direction.
+    """
+    return -183.0 + 6.0 * zone_number
+
+
 def project(latitude: float, longitude: float, zone: str) -> tuple[float, float]:
     """Easting and northing of a point on the grid of a given zone string.
 
@@ -175,13 +229,7 @@ def project(latitude: float, longitude: float, zone: str) -> tuple[float, float]
             f"Cannot project latitude {latitude}, longitude {longitude}: "
             f"both must be real numbers."
         )
-    band = zone[-1:].upper()
-    try:
-        zone_number = int(zone[:-1])
-    except ValueError:
-        raise ProjectionError(f"{zone!r} is not a UTM zone string such as 30U.") from None
-    if band not in LATITUDE_BANDS or not 1 <= zone_number <= 60:
-        raise ProjectionError(f"{zone!r} is not a UTM zone string such as 30U.")
+    zone_number, band = _parse_zone(zone)
 
     es = FLATTENING * (2.0 - FLATTENING)
     en = _meridional_coefficients(es)
@@ -190,7 +238,7 @@ def project(latitude: float, longitude: float, zone: str) -> tuple[float, float]
     phi = math.radians(latitude)
     # The zone's central meridian, and the only place the zone number enters
     # the arithmetic at all.
-    lam = math.radians(longitude) - math.radians(-183.0 + 6.0 * zone_number)
+    lam = math.radians(longitude) - math.radians(central_meridian(zone_number))
 
     sin_phi = math.sin(phi)
     cos_phi = math.cos(phi)
@@ -245,3 +293,102 @@ def project(latitude: float, longitude: float, zone: str) -> tuple[float, float]
             f"{zone} did not produce a real coordinate."
         )
     return easting, northing
+
+
+def unproject(easting: float, northing: float, zone: str) -> tuple[float, float]:
+    """Latitude and longitude of a point given as a grid coordinate.
+
+    The exact inverse of `project`, and it exists for one reason: a UTM
+    elevation grid is built by walking its own nodes and asking a WGS84 DEM
+    what is under each of them, so every node needs its latitude and
+    longitude. See mapgen.egrid.
+
+    This is Urbano's `GeoProjector.UTMToLatLong(easting, northing, utmZone)`,
+    which hands the pair to DotSpatial's `Reproject.ReprojectPoints` and gets
+    back `TransverseMercator.EllipticalInverse`. That is PROJ.4's `tmerc`
+    inverse, term for term, and it is written out below in DotSpatial's own
+    evaluation order for the same reason `project` is: the claim this module
+    makes is that its numbers are Urbano's numbers, and rearranging
+    arithmetically equivalent terms moves the last couple of digits.
+
+    Nothing here is a second projection. The series is the inverse of the one
+    above, it takes the same ellipsoid constants and the same zone
+    arithmetic, and `tests/test_utm.py` pins the round trip both ways as well
+    as checking every value against Urbano's own `UTMToLatLong`.
+
+    The latitude that comes back is NOT range checked, unlike `project`'s
+    input. A grid node is a place to sample a raster, not a coordinate
+    reference mapgen has to stand behind, and Urbano's own inverse returns
+    whatever the series gives for a northing far outside the band table. The
+    zone string is checked, because a zone this cannot read is a caller
+    error rather than a datum.
+    """
+    if not (math.isfinite(easting) and math.isfinite(northing)):
+        raise ProjectionError(
+            f"Cannot unproject easting {easting}, northing {northing}: "
+            f"both must be real numbers."
+        )
+    zone_number, band = _parse_zone(zone)
+
+    es = FLATTENING * (2.0 - FLATTENING)
+    en = _meridional_coefficients(es)
+    esp = es / (1.0 - es)
+
+    x = (easting - FALSE_EASTING_M) / EQUATORIAL_RADIUS_M
+    y = (
+        northing - (FALSE_NORTHING_SOUTH_M if band in SOUTHERN_BANDS else 0.0)
+    ) / EQUATORIAL_RADIUS_M
+
+    # phi0 is zero for every UTM zone, so PROJ's ml0 term is zero and is not
+    # written out here, exactly as in `project`.
+    phi = _angular_distance(y / SCALE_FACTOR, es, en)
+    if abs(phi) >= math.pi / 2.0:
+        # A northing past the pole. Urbano returns the pole and a longitude
+        # of zero rather than raising, and so does this.
+        phi = -math.pi / 2.0 if y < 0.0 else math.pi / 2.0
+        lam = 0.0
+    else:
+        sin_phi = math.sin(phi)
+        cos_phi = math.cos(phi)
+        t = (sin_phi / cos_phi) if abs(cos_phi) > 1e-10 else 0.0
+        n = esp * cos_phi * cos_phi
+        con = 1.0 - es * sin_phi * sin_phi
+        d = x * math.sqrt(con) / SCALE_FACTOR
+        con *= t
+        t *= t
+        ds = d * d
+        phi -= (
+            con * ds / (1.0 - es) * 0.5 * (
+                1.0
+                - ds * (1.0 / 12.0) * (
+                    5.0 + t * (3.0 - 9.0 * n) + n * (1.0 - 4.0 * n)
+                    - ds * (1.0 / 30.0) * (
+                        61.0 + t * (90.0 - 252.0 * n + 45.0 * t) + 46.0 * n
+                        - ds * (1.0 / 56.0) * (
+                            1385.0 + t * (3633.0 + t * (4095.0 + 1574.0 * t))
+                        )
+                    )
+                )
+            )
+        )
+        lam = d * (
+            1.0
+            - ds * (1.0 / 6.0) * (
+                1.0 + 2.0 * t + n
+                - ds * 0.05 * (
+                    5.0 + t * (28.0 + 24.0 * t + 8.0 * n) + 6.0 * n
+                    - ds * (1.0 / 42.0) * (
+                        61.0 + t * (662.0 + t * (1320.0 + 720.0 * t))
+                    )
+                )
+            )
+        ) / cos_phi
+
+    latitude = math.degrees(phi)
+    longitude = math.degrees(lam) + central_meridian(zone_number)
+    if not (math.isfinite(latitude) and math.isfinite(longitude)):
+        raise ProjectionError(
+            f"Unprojecting easting {easting}, northing {northing} from zone "
+            f"{zone} did not produce a real coordinate."
+        )
+    return latitude, longitude
