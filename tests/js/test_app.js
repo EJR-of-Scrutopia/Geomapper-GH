@@ -37,8 +37,28 @@ const SOURCE = fs.readFileSync(APP_JS_PATH, "utf8");
 // for any id it is asked for cannot tell a typo'd $("draww") from a real
 // $("draw"), so a typo that would throw and blank the whole page in a
 // real browser instead ran clean here, 12/12, exit 0.
+const INDEX_HTML = fs.readFileSync(INDEX_HTML_PATH, "utf8");
 const KNOWN_IDS = new Set(
-  Array.from(fs.readFileSync(INDEX_HTML_PATH, "utf8").matchAll(/\bid="([^"]+)"/g), (m) => m[1])
+  Array.from(INDEX_HTML.matchAll(/\bid="([^"]+)"/g), (m) => m[1])
+);
+
+// The markup's own attributes for each <input id="...">, read from the
+// committed index.html rather than restated here, so an element that a
+// browser would treat specially because of what the markup says about it
+// (a type="range" with min/max/step, today) is treated the same way by
+// makeElement below. Review finding I9: the harness implemented no min,
+// max or step behaviour at all, even though applyTileSizeBounds's own
+// comment is written about clamping, so neither the clamping the
+// function was built for nor the step snapping it was missing could be
+// distinguished from doing nothing.
+const INPUT_MARKUP = new Map(
+  Array.from(INDEX_HTML.matchAll(/<input\b([^>]*)>/g), (match) => {
+    const attrs = {};
+    for (const attr of match[1].matchAll(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*"([^"]*)")?/g)) {
+      attrs[attr[1]] = attr[2] !== undefined ? attr[2] : "";
+    }
+    return [attrs.id, attrs];
+  }).filter(([id]) => id !== undefined)
 );
 
 // --- minimal DOM -----------------------------------------------------
@@ -106,6 +126,50 @@ function makeElement(id) {
   // rendered through innerHTML.
   let optionValues = [];
   let value = "";
+  // Review finding I9. A <input type="range">'s value is not an ordinary
+  // property either, and for a second reason on top of the select's: a
+  // browser runs the range state's value sanitization algorithm on every
+  // assignment, which CLAMPS to min/max and then SNAPS to the step grid
+  // ("when the element is suffering from a step mismatch, the user agent
+  // must round the element's value to the nearest number for which the
+  // element would not", and where two are equally near, the larger).
+  //
+  // Without this, applyTileSizeBounds could not be tested at all: its own
+  // comment is written about clamping, and a plain property models
+  // neither the clamping it was built for nor the snapping it was
+  // missing. The two checks that existed used 20000 and 300, both on the
+  // 100 m grid, so neither could have told the difference. This is the
+  // same reasoning the <select> above records: a plain property here
+  // would be more permissive than any browser.
+  //
+  // Driven off the committed markup, so only an element index.html
+  // actually declares as a range gets range semantics, and it picks up
+  // the real min/max/step rather than numbers restated here.
+  const markup = INPUT_MARKUP.get(id) || {};
+  const isRange = markup.type === "range";
+  const sanitiseRange = (next) => {
+    let number = Number(next);
+    const min = Number(element.min);
+    const max = Number(element.max);
+    if (!Number.isFinite(number)) {
+      number = Number.isFinite(min) ? min : 0;
+    }
+    if (Number.isFinite(min) && number < min) number = min;
+    if (Number.isFinite(max) && number > max) number = max;
+    const step = Number(element.step);
+    if (element.step !== "any" && Number.isFinite(step) && step > 0) {
+      const base = Number.isFinite(min) ? min : 0;
+      // Math.round breaks a tie upwards, which is what the spec asks for
+      // ("if two numbers satisfy all these constraints, user agents must
+      // use the one nearest to positive infinity"): 1250 on a grid based
+      // at 500 with a step of 100 becomes 1300, not 1200, which is what
+      // Chrome and Firefox both do.
+      number = base + Math.round((number - base) / step) * step;
+      if (Number.isFinite(min) && number < min) number += step;
+      if (Number.isFinite(max) && number > max) number -= step;
+    }
+    return String(number);
+  };
   // Attributes set through setAttribute, kept apart from the plain
   // properties above because they are not the same thing: app.js's
   // progress bar (Task 27) writes aria-valuenow here, which no property
@@ -115,12 +179,22 @@ function makeElement(id) {
   const attributes = {};
   const element = {
     id,
+    // The markup's own min/max/step to begin with, exactly as a browser
+    // starts from them, so a test that never touches these still sees
+    // index.html's real numbers rather than nothing at all.
+    min: markup.min !== undefined ? markup.min : "",
+    max: markup.max !== undefined ? markup.max : "",
+    step: markup.step !== undefined ? markup.step : "",
     get value() {
       return value;
     },
     set value(next) {
       if (optionValues.length && !optionValues.includes(String(next))) {
         value = "";
+        return;
+      }
+      if (isRange) {
+        value = sanitiseRange(next);
         return;
       }
       value = String(next);
@@ -3966,6 +4040,88 @@ function ok(condition, message) {
     const el = sandbox.document.getElementById("tile-size");
     ok(Number(el.min) <= 300, `expected the slider widened downwards, got min ${el.min}`);
     ok(Number(el.value) === 300, `expected the saved size kept, got ${el.value}`);
+  });
+
+  await test(
+    "a saved tile size off the slider's grid is kept, not snapped and saved back",
+    async () => {
+      // Review finding I9. applyTileSizeBounds widened min and max for a
+      // value outside the slider's range and never touched step, but a
+      // range input snaps an assigned value to its step grid as well as
+      // clamping it. Before Task 27 this control was <input type="number"
+      // min="500" step="100">, which does not snap, and nothing calls
+      // checkValidity, so a typed 1250 was read and saved; on the next
+      // launch the slider rounded it to 1300 (ties go to the larger),
+      // the estimate ran at 1300, and persistFieldSettings wrote 1300
+      // back over config.json. tile_size_m is hashed into
+      // naming.tiling_fingerprint, so an in-progress _work/<fingerprint>/
+      // at 1250 was orphaned and every tile refetched for a setting the
+      // owner never changed.
+      //
+      // Both existing bounds checks used 20000 and 300, which are on the
+      // 100 m grid, so neither could have distinguished this.
+      const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {
+        if (url.pathname === "/api/config") {
+          if (!options.method || options.method === "GET") {
+            return jsonResponse(200, { ...DEFAULT_CONFIG, tile_size_m: 1250 });
+          }
+          return jsonResponse(200, DEFAULT_CONFIG);
+        }
+        if (url.pathname === "/api/extent") {
+          return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
+        }
+        if (url.pathname === "/api/estimate") {
+          return jsonResponse(200, {
+            tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 },
+            bytes_estimate: 1000, seconds_estimate: 60, warnings: [], folder: "C:\\out",
+            tile_grid: [], sources: [],
+          });
+        }
+        return null;
+      });
+      const el = sandbox.document.getElementById("tile-size");
+      ok(Number(el.value) === 1250, `expected the saved 1250 kept, got ${el.value}`);
+
+      // And, the half that actually cost the owner their work directory:
+      // the first successful estimate persists the field, and it must not
+      // write a size back that nobody chose.
+      fetchCalls.length = 0;
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      setField(sandbox, "region", "R");
+      setField(sandbox, "site", "S");
+      await flush(20);
+      ok(
+        sandbox.document.getElementById("download").disabled === false,
+        "expected the estimate to have succeeded, so persistFieldSettings ran"
+      );
+      // persistConfig only sends what actually differs from the saved
+      // state, so the right outcome here is no tile size written back AT
+      // ALL. Asserted that way round rather than "a PUT carrying 1250":
+      // a page that sends nothing and a page that sends the same number
+      // are equally right, and only a page that sends a DIFFERENT number
+      // is the defect. The snapped 1300 differs from the saved 1250, so
+      // the old code did send one.
+      const written = fetchCalls
+        .filter((c) => (c.options.method || "").toUpperCase() === "PUT")
+        .map((c) => JSON.parse(c.options.body).tile_size_m)
+        .filter((size) => size !== undefined);
+      ok(
+        written.every((size) => size === 1250),
+        `expected no tile size written back but 1250, got ${JSON.stringify(written)}: a ` +
+          `different number here changes tiling_fingerprint and orphans any ` +
+          `in-progress _work directory`
+      );
+    }
+  );
+
+  await test("a saved tile size ON the grid leaves the slider's own step alone", async () => {
+    // The other half of the rule: the grid is only given up when a saved
+    // setting needs it to be, so the ordinary launch still drags in
+    // hundreds of metres.
+    const { sandbox } = await bootedSandbox();
+    const el = sandbox.document.getElementById("tile-size");
+    ok(el.step === "100", `expected the 100 m grid kept, got step ${el.step}`);
+    ok(Number(el.value) === 2000, `expected the saved default, got ${el.value}`);
   });
 
   await test("dragging the slider does not fire an estimate request per step", async () => {

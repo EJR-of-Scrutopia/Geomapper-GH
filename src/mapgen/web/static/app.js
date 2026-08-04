@@ -1209,15 +1209,45 @@ const TILE_SIZE_MAX_M = 10000;
 const TILE_SIZE_DEBOUNCE_MS = 400;
 let tileSizeDebounce = null;
 
+// The slider's own grid, matching index.html's step="100". A saved value
+// is only ever measured against this, never rewritten to fit it.
+const TILE_SIZE_STEP_M = 100;
+
 function applyTileSizeBounds(savedMetres) {
   const saved = Number(savedMetres);
-  const min = Number.isFinite(saved) && saved > 0 ? Math.min(TILE_SIZE_MIN_M, saved) : TILE_SIZE_MIN_M;
-  const max = Number.isFinite(saved) && saved > 0 ? Math.max(TILE_SIZE_MAX_M, saved) : TILE_SIZE_MAX_M;
+  const usable = Number.isFinite(saved) && saved > 0;
+  const min = usable ? Math.min(TILE_SIZE_MIN_M, saved) : TILE_SIZE_MIN_M;
+  const max = usable ? Math.max(TILE_SIZE_MAX_M, saved) : TILE_SIZE_MAX_M;
   // Set before the value is, not after: a browser clamps an out-of-range
   // value the moment it is assigned, so setting the value first would
   // lose the very setting these bounds exist to preserve.
   $("tile-size").min = String(min);
   $("tile-size").max = String(max);
+  // And the same argument for step, which review finding I9 found this
+  // function never touched. A range input does not only clamp on
+  // assignment, it also SNAPS to its step grid (HTML's value sanitization
+  // algorithm for the range state: "when the element is suffering from a
+  // step mismatch, the user agent must round the element's value to the
+  // nearest number for which the element would not", ties going to the
+  // larger). Before Task 27 this control was <input type="number"
+  // min="500" step="100">, which does not snap, and nothing here calls
+  // checkValidity, so a typed 1250 was read and saved. On the next launch
+  // the range input rounded it to 1300, the estimate ran at 1300, and
+  // persistFieldSettings wrote 1300 back over config.json. tile_size_m is
+  // hashed into naming.tiling_fingerprint, so an in-progress
+  // _work/<fingerprint>/ at 1250 was orphaned and every tile in it
+  // refetched, for a setting the owner never changed.
+  //
+  // The grid goes away for the session rather than the value being bent
+  // to fit it, which is the same ruling the min/max widening above
+  // already makes: the control adapts to the saved setting, never the
+  // other way round. The cost is real and worth naming: while the slider
+  // is continuous, dragging it can produce a size that is not a round
+  // hundred. That is a size the owner chose by moving the control, not
+  // one this page invented behind their back, and it lasts only until
+  // they land back on the grid.
+  const onGrid = usable && Number.isInteger((saved - min) / TILE_SIZE_STEP_M);
+  $("tile-size").step = onGrid || !usable ? String(TILE_SIZE_STEP_M) : "any";
 }
 
 // The trade, as a sentence, with no fabricated number in it. Three
