@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mapgen.naming import (
+    DEFAULT_PATH_LIMIT,
     FINGERPRINT_LENGTH,
     NamingError,
     PackagePaths,
@@ -457,3 +458,39 @@ def test_check_path_length_still_checks_osms_own_path_when_it_is_selected(tmp_pa
 
     # And it must not be checked at all when osm itself is not selected.
     check_path_length(paths, [], source_ids=["stub"], limit=osm_length - 1)
+
+
+def test_the_path_limit_leaves_room_for_a_subdivided_tiles_own_scratch_path(tmp_path):
+    # check_path_length measures OSM at raw/osm/r00_c00.osm, which is the
+    # longest path OSM could produce until Task 26 gave a tile too dense
+    # for one request a set of quarters to keep: raw/osm/_split/
+    # r00_c00_q00_q00.osm at the depth cap, fifteen characters longer.
+    #
+    # That is not modelled in the guard, deliberately: naming.py would
+    # have to import a constant from a source module to do it, and the
+    # 20 characters DEFAULT_PATH_LIMIT already holds back from Windows'
+    # own 260 absorb it. This is that argument, checked rather than
+    # asserted in prose, so raising the limit or deepening the split
+    # fails here instead of on a real package.
+    from mapgen.sources.osm import MAX_SUBDIVISION_DEPTH, SPLIT_DIR_NAME
+
+    windows_limit = 260
+    extra = len(SPLIT_DIR_NAME) + 1 + len("_q00") * MAX_SUBDIVISION_DEPTH
+    assert DEFAULT_PATH_LIMIT + extra <= windows_limit, (
+        f"a job the guard admits at {DEFAULT_PATH_LIMIT} characters could "
+        f"produce a quarter file {DEFAULT_PATH_LIMIT + extra} characters "
+        f"long, past Windows' own {windows_limit}"
+    )
+
+    # And the real thing, not just the arithmetic: a work directory sized
+    # so the tile file lands exactly on the limit still produces a
+    # quarter path Windows can resolve.
+    work_dir = tmp_path / "_work" / FINGERPRINT
+    tile_path = work_dir / "raw" / "osm" / "r00_c00.osm"
+    padding = DEFAULT_PATH_LIMIT - len(str(tile_path))
+    assert padding > 0, "test setup: tmp_path is already longer than the limit"
+    work_dir = tmp_path / ("x" * padding) / "_work" / FINGERPRINT
+    quarter_path = (
+        work_dir / "raw" / "osm" / SPLIT_DIR_NAME / f"r00_c00{'_q00' * MAX_SUBDIVISION_DEPTH}.osm"
+    )
+    assert len(str(quarter_path)) <= windows_limit

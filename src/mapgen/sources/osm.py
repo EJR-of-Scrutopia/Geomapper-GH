@@ -146,6 +146,12 @@ MAX_SUBDIVISION_DEPTH = 2
 # offered to merge() and never counted as tile output; see its own
 # docstring for why that rule, and not a change to _TILE_ID_SHAPE, is
 # what keeps them out.
+#
+# This name plus the deepest quarter's own suffix is the longest path
+# OSM can produce, fifteen characters past the raw/osm/rNN_cNN.osm that
+# naming.check_path_length actually measures. It fits inside the twenty
+# characters that guard already holds back from Windows' own 260 limit,
+# which test_naming.py checks rather than leaving as an assurance here.
 SPLIT_DIR_NAME = "_split"
 
 
