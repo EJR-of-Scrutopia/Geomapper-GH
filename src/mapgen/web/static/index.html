@@ -76,6 +76,21 @@
 
         <button id="download" type="button" class="primary" disabled>Download package</button>
         <button id="cancel" type="button" class="danger" hidden>Stop</button>
+
+        <!--
+          Task 27. Hidden until a download starts, and left on screen
+          afterwards showing how the run actually ended, since "it
+          stopped at 68%" is the thing worth still being able to read
+          once the log has scrolled. The bar itself is filled by app.js;
+          role/aria-valuenow are set here and updated there so a screen
+          reader gets the same number the bar is drawing.
+        -->
+        <div id="progress" class="progress" hidden role="progressbar"
+             aria-valuemin="0" aria-valuemax="100" aria-label="Download progress">
+          <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+          <div id="progress-text" class="progress-text"></div>
+          <div id="progress-note" class="progress-note" hidden></div>
+        </div>
       </section>
     </main>
 
@@ -101,16 +116,29 @@
           <input id="output-root" type="text" />
         </label>
 
-        <div class="row">
-          <label>Tile size (m)
-            <input id="tile-size" type="number" min="500" step="100" value="2000" />
-            <span class="hint">Cuts the extent into tiles this many metres across. The OSM map API refuses any request over 50000 nodes; a tile that dense is split into four and fetched in pieces, twice over if it needs it, rather than failing outright. The rest of the run is unaffected and nothing already downloaded is fetched again, so the whole download just takes a little longer. 2000 m suits most sites. Only ground still over the cap at a sixteenth of a tile fails, and the log says which piece and how large it was.</span>
-          </label>
-          <label>Overlap (m)
-            <input id="overlap" type="number" min="0" step="10" value="100" />
-            <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
-          </label>
-        </div>
+        <!--
+          Task 27: a slider rather than a number field, so the cost of
+          each size is visible while choosing rather than only after
+          committing to one. It keeps id="tile-size", so payload(),
+          persistence and boot() are untouched by the change; only the
+          control the owner touches is different. It no longer sits in a
+          two-column row beside Overlap, because a slider needs the
+          panel's full width to be usable and half of 360px is not it.
+        -->
+        <label>Tile size
+          <span class="tile-size-control">
+            <input id="tile-size" type="range" min="500" max="10000" step="100" value="2000" />
+            <output id="tile-size-readout" class="tile-size-readout">2000 m</output>
+          </span>
+          <span id="tile-size-cost" class="hint"></span>
+          <span id="tile-size-trade" class="hint"></span>
+          <span class="hint">There is no failure risk shown here on purpose. It would depend on how dense the OpenStreetMap data is on this particular ground, which nothing can know before downloading it. A tile that turns out to be over the map API's 50000 node limit is split into four and fetched in pieces, twice over if it needs it, rather than failing: the rest of the run is unaffected, nothing already downloaded is fetched again, and the download just takes a little longer. Only ground still over the limit at a sixteenth of a tile fails, and the log says which piece and how large it was.</span>
+        </label>
+
+        <label>Overlap (m)
+          <input id="overlap" type="number" min="0" step="10" value="100" />
+          <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
+        </label>
 
         <fieldset>
           <legend>API keys</legend>

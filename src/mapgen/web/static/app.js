@@ -192,9 +192,66 @@ function renderTileLegend() {
 // nothing to do. tile_failed itself stays unconditional, deliberately: a
 // genuine failure discovered after a tile was already marked done ought
 // to still register as failed, not be masked by having arrived "too late".
-function classifyTiles(tileIds, sourceIds, events, jobRunning) {
+// Task 27: one walk of the event stream, producing BOTH the per-tile
+// states the grid paints and the fractions the progress bar and the
+// countdown read. Deliberately one function and not two: the progress
+// numbers obey exactly the rules documented above (dedupe per (tile,
+// source), settle on source_done, failed is sticky), and a second walk
+// with "slightly different" rules is how two views of the same run come
+// to disagree with each other on screen. classifyTiles below is a thin
+// wrapper kept for the grid's own call sites and its tests.
+//
+// The fractions are weighted by each source's own seconds_estimate from
+// the estimate that enabled Download, not one equal share per source,
+// because the sources are nothing like equal: on the owner's Barry
+// extent at the default tiling, OpenStreetMap is about 144s of a 175s
+// run (72 tiles at MAP_API_SECONDS_PER_TILE), Overture about 18s and
+// elevation about 11s. Equal thirds would put the bar at 33% after 82%
+// of the run had actually happened, and the countdown reads off the same
+// fraction, so it would have projected minutes of remaining time onto a
+// run with seconds left. Weights come from the estimate Task 25 made
+// trustworthy; with no weights at all (an older or partial estimate
+// response) this falls back to equal shares rather than refusing.
+//
+// A source's own fraction is the share of the PLAN's tiles it has
+// reported, and 1 once it has emitted source_done. Two consequences are
+// deliberate:
+//
+//   ElevationSource reports one event for the whole extent under
+//   tile_id "whole-area", which is not a tile of the plan, so it shows
+//   no partial progress and moves from 0 to its full share at
+//   source_done. That is honest: a single whole-extent download has no
+//   partial signal to report, and inventing one would be a bar that
+//   moved because time passed rather than because work finished.
+//
+//   OvertureSource emits per tile AND per type, so its share is full
+//   once its FIRST type has landed rather than after all eight. That
+//   over-reads by at most its own weight (about 10% of a default run)
+//   for the few seconds between the first type landing and source_done,
+//   because the types download concurrently. The alternative, counting
+//   (tile, type) pairs, needs a type count the browser is never told,
+//   and guessing it would be a fabricated denominator.
+//
+// fetched and skipped are tracked apart because a resumed run is the
+// case the owner actually hits: Stop, then Download again over the same
+// extent, and every tile already on disk reports tile_skipped in the
+// first second. Those cost nothing, so measuring a rate from them would
+// project a run that is 90% "done" in one second as finishing
+// immediately, when everything genuinely left is still to be fetched.
+// The countdown therefore projects from fetched work only, and scales
+// the static estimate by the work that is genuinely left.
+function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const state = new Map(tileIds.map((id) => [id, "pending"]));
   const finishedSources = new Set();
+  const fetchedTiles = new Map(); // source id -> Set of plan tile ids
+  const skippedTiles = new Map(); // source id -> Set of plan tile ids
+  let subdivisions = 0;
+
+  const setFor = (bucket, source) => {
+    if (!bucket.has(source)) bucket.set(source, new Set());
+    return bucket.get(source);
+  };
+
   for (const event of events || []) {
     if (event.tile_id && state.has(event.tile_id)) {
       if (event.event === "tile_failed") {
@@ -205,11 +262,28 @@ function classifyTiles(tileIds, sourceIds, events, jobRunning) {
       ) {
         state.set(event.tile_id, "active");
       }
+      // Counted per (tile, source), never per event, which is the whole
+      // Overture problem: eight events for one tile are one tile's worth
+      // of progress, not eight. A tile_failed counts as work done, not
+      // as work outstanding: it took real time, it will not be attempted
+      // again in this run, and the grid already shows failure distinctly
+      // in the one place the owner is meant to notice it.
+      if (event.source) {
+        if (event.event === "tile_done" || event.event === "tile_failed") {
+          setFor(fetchedTiles, event.source).add(event.tile_id);
+        } else if (event.event === "tile_skipped") {
+          setFor(skippedTiles, event.source).add(event.tile_id);
+        }
+      }
     }
     if (event.event === "source_done" && event.source) {
       finishedSources.add(event.source);
     }
+    if (event.event === "tile_subdivided") {
+      subdivisions += 1;
+    }
   }
+
   const everySourceFinished =
     sourceIds.length > 0 && sourceIds.every((id) => finishedSources.has(id));
   if (everySourceFinished || !jobRunning) {
@@ -217,7 +291,183 @@ function classifyTiles(tileIds, sourceIds, events, jobRunning) {
       if (value === "active") state.set(tileId, "done");
     }
   }
-  return state;
+
+  // The tile states settle when the job stops running; the FRACTIONS
+  // never do. A stopped run that got two sources through of three is
+  // genuinely two thirds of the way through, and a bar that jumped to
+  // 100% because the job ended would be claiming work that was never
+  // done. Task 22's distinction between stopped and failed depends on
+  // this bar being able to say "stopped at 68%" at all.
+  const tileCount = tileIds.length;
+  let weightTotal = 0;
+  let doneTotal = 0;
+  let skippedTotal = 0;
+  for (const sourceId of sourceIds) {
+    const weight = weightForSource(sourceId, sourceSeconds);
+    const fetched = fetchedTiles.get(sourceId) || new Set();
+    const skipped = skippedTiles.get(sourceId) || new Set();
+    // A tile Overture skipped for one type and downloaded for another is
+    // fetched work, not skipped work: the union decides how much of the
+    // tile is finished, and only tiles with no fetched work at all count
+    // towards the skipped share.
+    let reported = fetched.size;
+    let skippedOnly = 0;
+    for (const tileId of skipped) {
+      if (!fetched.has(tileId)) {
+        reported += 1;
+        skippedOnly += 1;
+      }
+    }
+    const measured = tileCount > 0 ? Math.min(1, reported / tileCount) : 0;
+    const done = finishedSources.has(sourceId) ? 1 : measured;
+    const skippedShare =
+      tileCount > 0 ? Math.min(done, skippedOnly / tileCount) : 0;
+    weightTotal += weight;
+    doneTotal += weight * done;
+    skippedTotal += weight * skippedShare;
+  }
+
+  const fractionDone = weightTotal > 0 ? doneTotal / weightTotal : 0;
+  const fractionSkipped = weightTotal > 0 ? skippedTotal / weightTotal : 0;
+  return {
+    tileStates: state,
+    fractionDone,
+    fractionSkipped,
+    fractionFetched: Math.max(0, fractionDone - fractionSkipped),
+    subdivisions,
+  };
+}
+
+// A source with no estimate of its own weighs the same as every other
+// such source rather than nothing at all: a zero would drop it out of
+// the bar entirely, which is worse than weighting it roughly.
+function weightForSource(sourceId, sourceSeconds) {
+  const seconds = sourceSeconds ? Number(sourceSeconds[sourceId]) : NaN;
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : 1;
+}
+
+function classifyTiles(tileIds, sourceIds, events, jobRunning) {
+  return summariseJob(tileIds, sourceIds, events, jobRunning).tileStates;
+}
+
+// --- the countdown -------------------------------------------------------
+//
+// Remaining time, never elapsed time: "how much longer" is the question
+// the owner has while watching a download, and elapsed time answers a
+// different one they can already answer by looking at the clock.
+//
+// Two branches, and the copy says which one it is on, because they are
+// not equally good and pretending otherwise would be the dishonest part:
+//
+//   from the estimate    static seconds, scaled by the work this run
+//                        genuinely has to do, minus elapsed. Used early,
+//                        when there is not enough finished work to
+//                        measure a rate from.
+//   from the rate so far elapsed / fraction fetched, applied to the
+//                        fraction left. Adapts to a run going faster or
+//                        slower than estimated, which the static number
+//                        cannot, and is what makes a stalled or
+//                        subdivided run report a growing countdown
+//                        rather than a frozen one.
+//
+// The crossover is 10% of the weighted work FETCHED in this run and at
+// least 15 seconds of wall clock, both, and it is set from what the
+// per-tile costs were actually measured at rather than picked round:
+//
+//   The default path (the OSM map API, which is what an unfiltered
+//   category selection uses) is governed by this tool's own RateLimiter,
+//   not by the network: three runs of six tiles measured 10.17s to
+//   10.27s, so about 1.7s per tile with almost no spread. Ten percent of
+//   a 72-tile run is 8 or 9 tiles, roughly 15 seconds, and the two
+//   thresholds therefore cross at nearly the same moment on the run the
+//   owner actually makes.
+//
+//   The Overpass path (any genuine category restriction) is the opposite:
+//   four tiles measured 3.84s, 49.93s, 13.38s and 9.86s. No threshold
+//   makes that predictable, which is exactly why the answer is rounded
+//   coarsely below and labelled as coming from the run so far, rather
+//   than a threshold tuned until one sample looked good.
+//
+// The 15 second floor is what stops the second poll of a fast-starting
+// run projecting off two seconds of evidence, and the 10% floor is what
+// stops a projection from noise; a projection from 2% done is noise.
+const COUNTDOWN_CROSSOVER_FRACTION = 0.1;
+const COUNTDOWN_CROSSOVER_SECONDS = 15;
+
+// Never finer than a minute. The estimate underneath is +/- 20% at best,
+// so at three minutes the honest band is already +/- 36 seconds, and a
+// countdown reading "3 min 12 s" would be claiming a precision nothing
+// in this tool has. Past ten minutes it coarsens again to five, because
+// +/- 20% of twenty minutes is four.
+function formatRemaining(seconds) {
+  if (!(seconds > 0)) return "less than a minute";
+  if (seconds < 60) return "less than a minute";
+  const minutes = seconds / 60;
+  if (minutes < 10) return `about ${Math.round(minutes)} min`;
+  return `about ${Math.max(5, Math.round(minutes / 5) * 5)} min`;
+}
+
+// A pure function of the summary above plus elapsed wall clock and the
+// static estimate, so the awkward shapes (a stall, a resume, a run that
+// overruns) can be tested at the numbers rather than by waiting for a
+// real download to misbehave. Returns the countdown line, an optional
+// note, and which branch produced it.
+function remainingLabel({
+  fractionDone,
+  fractionFetched,
+  fractionSkipped,
+  elapsedSeconds,
+  staticSeconds,
+  subdivisions,
+}) {
+  // Subdivision costs extra requests that no estimate made before the
+  // run could have known about (density is only discoverable by asking
+  // for the data), so the countdown says so rather than quietly
+  // continuing to tick down against a total that has stopped being
+  // true. The projection branch already absorbs the cost numerically;
+  // this is what the estimate branch has instead of pretending.
+  const note =
+    subdivisions > 0
+      ? `${subdivisions === 1 ? "One tile was" : `${subdivisions} tiles were`} too dense ` +
+        `for one request and had to be split into pieces, so this run is longer than ` +
+        `the estimate expected.`
+      : "";
+
+  if (fractionDone >= 0.999) {
+    // Every selected source has reported. What is left is the merge into
+    // the package, the Urbano bridge step and survey.json, which is real
+    // work with no per-tile events of its own; a countdown here would be
+    // counting down to something it cannot see.
+    return { text: "Downloads finished, writing the package.", note, branch: "finishing" };
+  }
+
+  const fractionLeft = Math.max(0, 1 - fractionDone);
+
+  if (
+    fractionFetched >= COUNTDOWN_CROSSOVER_FRACTION &&
+    elapsedSeconds >= COUNTDOWN_CROSSOVER_SECONDS
+  ) {
+    const remaining = (elapsedSeconds / fractionFetched) * fractionLeft;
+    return { text: `${formatRemaining(remaining)} left, from the rate so far`, note, branch: "measured" };
+  }
+
+  if (!(staticSeconds > 0)) {
+    return { text: "Working out how much longer.", note, branch: "unknown" };
+  }
+
+  // Scaled by the work already on disk, not the flat total: a resumed
+  // run that skips four fifths of its tiles has a fifth of the estimate
+  // left to spend, and "estimate minus elapsed" would have it finishing
+  // minutes after it really does.
+  const expected = staticSeconds * Math.max(0, 1 - fractionSkipped);
+  const remaining = expected - elapsedSeconds;
+  if (remaining <= 0) {
+    // Never "0 seconds remaining" against a job that is still going. The
+    // true thing to say is that the estimate has been passed, and the
+    // grid and the log are what say how far along it actually is.
+    return { text: "Taking longer than the estimate. Still running.", note, branch: "overrun" };
+  }
+  return { text: `${formatRemaining(remaining)} left, from the estimate`, note, branch: "estimate" };
 }
 
 // Starts with no grid and the legend hidden. Set explicitly here rather
@@ -712,6 +962,37 @@ function hideFolderPreview() {
   $("folder-preview-path").textContent = "";
 }
 
+// Task 27: what the last successful estimate said, kept because two
+// things now need it after the response has been rendered and thrown
+// away. The tile size slider needs to show the time at the size it is
+// currently sitting at, and it lives in the settings panel, which
+// physically covers the estimate box, so it cannot just point at it. The
+// progress bar needs the same run's total seconds and its per-source
+// breakdown to weigh itself and to start its countdown from.
+//
+// tileSizeM is stored alongside so a reader can tell whether these
+// numbers still describe the slider's current position: mid-drag they do
+// not, and claiming a time for a size that was never estimated is the
+// one thing this must not do. seconds is 0 for the geometry-only
+// /api/extent reply, which knows the tile count but has no idea about
+// time, since it is answered without ever consulting a source.
+let lastSizing = null;
+
+function recordSizing(tiles, seconds, sources) {
+  const sourceSeconds = {};
+  for (const source of sources || []) {
+    const value = Number(source.seconds_estimate);
+    if (source.id && Number.isFinite(value)) sourceSeconds[source.id] = value;
+  }
+  lastSizing = {
+    tileSizeM: parseFloat($("tile-size").value),
+    tiles,
+    seconds: Number.isFinite(Number(seconds)) ? Number(seconds) : 0,
+    sourceSeconds,
+  };
+  renderTileSize();
+}
+
 function showEstimateError(message) {
   const box = $("estimate");
   box.className = "estimate error";
@@ -722,6 +1003,12 @@ function showEstimateError(message) {
   // showing rectangles for a configuration that just failed would
   // mislead rather than help.
   clearTileGrid();
+  // And it invalidates the tile count and time beside the slider for
+  // exactly the same reason: an absurd tiling is one of the things the
+  // slider itself can cause, so the numbers next to it must not go on
+  // describing the last size that worked.
+  lastSizing = null;
+  renderTileSize();
 }
 
 async function refreshEstimate() {
@@ -733,6 +1020,8 @@ async function refreshEstimate() {
     $("download").disabled = true;
     hideFolderPreview();
     clearTileGrid();
+    lastSizing = null;
+    renderTileSize();
     return;
   }
 
@@ -756,6 +1045,7 @@ async function refreshEstimate() {
       });
       $("estimate").innerHTML = `${formatGeometryLine(geometry)}<br />${escapeHtml(missing)}`;
       renderTileGrid(geometry.tile_grid);
+      recordSizing(geometry.tiles, 0, []);
     } catch (error) {
       // A genuine problem with the extent or tiling itself (an absurd
       // tiling, a zero-area box that slipped through some other path, a
@@ -766,6 +1056,8 @@ async function refreshEstimate() {
       // /api/estimate finally surfaced the same error. Shown alongside
       // the still-true missing-fields line, not instead of it.
       $("estimate").innerHTML = `${escapeHtml(error.message)}<br />${escapeHtml(missing)}`;
+      lastSizing = null;
+      renderTileSize();
     }
     return;
   }
@@ -806,6 +1098,7 @@ async function refreshEstimate() {
     // with a path it already knows is broken, with nothing on screen to
     // explain why.
     persistFieldSettings();
+    recordSizing(data.tiles, data.seconds_estimate, data.sources);
   } catch (error) {
     showEstimateError(error.message);
   }
@@ -817,6 +1110,126 @@ async function refreshEstimate() {
 // API key fields are deliberately not in the list above: see their own
 // delegated listener further down, which must persist before refreshing,
 // not alongside it as an independent, unordered listener.
+
+// --- tile size slider ----------------------------------------------------
+//
+// Task 27: the owner asked for a slider showing "time and failure risk"
+// at each size. Time is real and comes from the estimate endpoint, so it
+// is here. Failure risk is not shown, and that is a deliberate refusal
+// rather than an omission: it would depend on how dense the OSM data is
+// on this particular ground, which nothing in this tool can know before
+// downloading it, and a percentage or a traffic light would look
+// measured while being made up. Since Task 26 a too-dense tile is not a
+// failure at all, it is split into quarters and the run continues, so
+// the honest thing left to say is the trade itself, in a sentence that
+// changes with the slider's position. See tileSizeTrade below.
+//
+// The range is NOT the number input's range narrowed. It starts at the
+// same 500 m minimum the number input had, and the 10000 m top is new,
+// because a slider must have a maximum where a number field did not: at
+// a 10 km tile any site-scale extent is already one or two tiles, and a
+// larger size stops changing anything at all. It is the one genuine
+// narrowing this control introduces, which is why
+// applyTileSizeBounds widens either end rather than
+// clamping, so a saved setting outside this range keeps working and
+// keeps its own value instead of being silently rewritten to the nearest
+// end the first time the panel is opened.
+const TILE_SIZE_MIN_M = 500;
+const TILE_SIZE_MAX_M = 10000;
+// Long enough that dragging across the whole track is one request rather
+// than one per step, matched to the debounce the place search and the
+// name suggestions already use rather than inventing a third number.
+// Debounced rather than estimated from values already fetched: a
+// client-side curve through previous answers would be a second, drifting
+// copy of an estimate the server owns, and Task 25 has only just made
+// the server's copy trustworthy.
+const TILE_SIZE_DEBOUNCE_MS = 400;
+let tileSizeDebounce = null;
+
+function applyTileSizeBounds(savedMetres) {
+  const saved = Number(savedMetres);
+  const min = Number.isFinite(saved) && saved > 0 ? Math.min(TILE_SIZE_MIN_M, saved) : TILE_SIZE_MIN_M;
+  const max = Number.isFinite(saved) && saved > 0 ? Math.max(TILE_SIZE_MAX_M, saved) : TILE_SIZE_MAX_M;
+  // Set before the value is, not after: a browser clamps an out-of-range
+  // value the moment it is assigned, so setting the value first would
+  // lose the very setting these bounds exist to preserve.
+  $("tile-size").min = String(min);
+  $("tile-size").max = String(max);
+}
+
+// The trade, as a sentence, with no fabricated number in it. Three
+// positions rather than a continuum because there are only three things
+// true to say, and the middle one is the default the estimate panel and
+// the README already recommend.
+function tileSizeTrade(metres) {
+  if (!Number.isFinite(metres)) return "";
+  if (metres < 2000) {
+    return (
+      "Smaller than the 2000 m default: more requests up front, and less " +
+      "chance that any one tile is dense enough to need splitting."
+    );
+  }
+  if (metres > 2000) {
+    return (
+      "Larger than the 2000 m default: fewer requests, quicker on sparse " +
+      "ground. On dense ground more tiles need splitting, and each split " +
+      "costs the requests its pieces take."
+    );
+  }
+  return "The default. Fewest requests that rarely need splitting, on most ground.";
+}
+
+// The time at THIS position, or an honest account of why there is not
+// one yet. Never the last size's answer relabelled: lastSizing carries
+// the size it was measured at precisely so a mid-drag position, whose
+// estimate has not come back, says so instead of showing a number that
+// belongs to a different tiling.
+function tileSizeCost(metres) {
+  if (!bbox) return "Draw or paste an extent to see the time at each size.";
+  if (!lastSizing || lastSizing.tileSizeM !== metres) return "Working out the time at this size.";
+  const tileWord = lastSizing.tiles === 1 ? "tile" : "tiles";
+  if (!(lastSizing.seconds > 0)) {
+    return `${lastSizing.tiles} ${tileWord}. Enter a region and site to see the time.`;
+  }
+  const minutes = Math.max(1, Math.round(lastSizing.seconds / 60));
+  return `${lastSizing.tiles} ${tileWord}, about ${minutes} min.`;
+}
+
+function renderTileSize() {
+  const metres = parseFloat($("tile-size").value);
+  $("tile-size-readout").textContent = Number.isFinite(metres) ? `${Math.round(metres)} m` : "";
+  $("tile-size-cost").textContent = tileSizeCost(metres);
+  $("tile-size-trade").textContent = tileSizeTrade(metres);
+}
+
+// "input" fires on every step of a drag, "change" once on release. The
+// readout follows every step, because a slider whose number lags the
+// handle is unusable; the estimate request is debounced off the same
+// event so a drag across the track costs one request instead of one per
+// step.
+$("tile-size").addEventListener("input", () => {
+  renderTileSize();
+  clearTimeout(tileSizeDebounce);
+  tileSizeDebounce = setTimeout(refreshEstimate, TILE_SIZE_DEBOUNCE_MS);
+});
+
+// A release, or a click straight on the track, fires "change" as well as
+// "input". refreshEstimate is already bound to "change" (above) and
+// maybePersistFieldSettings is bound to it further down, both unchanged
+// by this task, so the release is fully handled without this listener;
+// all it does is cancel the debounce that would otherwise repeat the
+// same request 400ms later. Order among the three does not matter,
+// because cancelling a pending timer is the same act before or after the
+// work it would have duplicated.
+$("tile-size").addEventListener("change", () => {
+  clearTimeout(tileSizeDebounce);
+  renderTileSize();
+});
+
+// Populated at load, not only from boot(): a boot that fails on a stale
+// token (see its own catch) would otherwise leave the slider sitting
+// beside two blank lines of explanation.
+renderTileSize();
 
 // --- settings panel -----------------------------------------------------
 //
@@ -991,6 +1404,75 @@ function log(message, failed = false) {
 // change ticks while a job runs and this must describe the job actually
 // in flight, not whatever the form currently shows.
 let activeJobSourceIds = [];
+// The same reasoning applied to the estimate the progress bar weighs
+// itself by and the countdown starts from: snapshotted when Download is
+// pressed, so a later estimate for a different extent, which the owner
+// is free to ask for while this job runs, cannot retune a bar that is
+// describing the job already in flight.
+let activeJobSeconds = 0;
+let activeJobSourceSeconds = {};
+let jobStartedAt = 0;
+
+function hideProgress() {
+  $("progress").hidden = true;
+  $("progress").className = "progress";
+  $("progress").setAttribute("aria-valuenow", "0");
+  $("progress-fill").style.width = "0%";
+  $("progress-text").textContent = "";
+  $("progress-note").hidden = true;
+  $("progress-note").textContent = "";
+}
+// Set here rather than left to index.html's own hidden attribute, the
+// same reasoning clearTileGrid and closeSettingsPanel already document.
+hideProgress();
+
+// Draws the bar and its line of copy from the summary, the job's own
+// state, and the clock. Split from the poll loop so the whole of it is
+// reachable from a test with a fabricated job, and split from
+// remainingLabel so the arithmetic can be tested without a DOM at all.
+function renderProgress(summary, job, elapsedSeconds) {
+  const percent = Math.max(0, Math.min(100, Math.round(summary.fractionDone * 100)));
+  const progress = $("progress");
+  progress.hidden = false;
+  progress.className = "progress";
+  $("progress-fill").style.width = `${percent}%`;
+  progress.setAttribute("aria-valuenow", String(percent));
+
+  let note = "";
+  if (job.state === "running") {
+    const label = remainingLabel({
+      fractionDone: summary.fractionDone,
+      fractionFetched: summary.fractionFetched,
+      fractionSkipped: summary.fractionSkipped,
+      elapsedSeconds,
+      staticSeconds: activeJobSeconds,
+      subdivisions: summary.subdivisions,
+    });
+    $("progress-text").textContent = `${percent}% done, ${label.text}`;
+    note = label.note;
+  } else if (job.state === "done") {
+    // Forced to 100 from the job's own state rather than from the
+    // fraction: the server has said the package is complete, and that is
+    // the stronger fact. A bar left at 98% beside a finished download
+    // would make the owner go looking for what was missing.
+    $("progress-fill").style.width = "100%";
+    progress.setAttribute("aria-valuenow", "100");
+    $("progress-text").textContent = "Finished. Every tile downloaded.";
+  } else if (job.state === "stopped") {
+    // Never 100, and never the failure styling: a stop is a deliberate
+    // partial (Task 22), and how partial is the one thing worth being
+    // able to read afterwards.
+    progress.className = "progress stopped";
+    $("progress-text").textContent =
+      `Stopped at ${percent}%. The package holds everything that had already downloaded.`;
+  } else {
+    progress.className = "progress failed";
+    $("progress-text").textContent = `Failed at ${percent}%. See the log.`;
+  }
+
+  $("progress-note").textContent = note;
+  $("progress-note").hidden = !note;
+}
 
 $("download").addEventListener("click", async () => {
   $("log").innerHTML = "";
@@ -1002,6 +1484,16 @@ $("download").addEventListener("click", async () => {
     });
     jobId = started.id;
     activeJobSourceIds = requestPayload.sources;
+    activeJobSeconds = lastSizing && lastSizing.seconds > 0 ? lastSizing.seconds : 0;
+    activeJobSourceSeconds = (lastSizing && lastSizing.sourceSeconds) || {};
+    // Started before the first poll rather than at the first event: a run
+    // whose first tile takes half a minute has genuinely been running for
+    // half a minute, and elapsed time that only starts counting once
+    // something has happened would flatter every projection made from it.
+    // The POST above is already answered by this point, so this never
+    // includes time the server had not actually started the job.
+    jobStartedAt = Date.now();
+    hideProgress();
     // A fresh job restarts the grid's own bookkeeping (every rectangle
     // back to "pending") without redrawing the rectangles themselves:
     // the extent has not changed since the estimate that enabled
@@ -1029,6 +1521,13 @@ $("download").addEventListener("click", async () => {
         $("cancel").hidden = true;
         $("download").disabled = false;
         log(`Lost contact with the job: ${error.message}`, true);
+        // The bar would otherwise sit frozen at whatever the last poll
+        // saw, with a countdown still promising a number that nothing is
+        // updating any more. The job may well still be running; this
+        // page just cannot see it.
+        $("progress-text").textContent =
+          "Lost contact with the job. The bar has stopped updating.";
+        $("progress-note").hidden = true;
         return;
       }
       job.events.slice(seen).forEach((e) => {
@@ -1039,14 +1538,18 @@ $("download").addEventListener("click", async () => {
         log(`${e.event} ${detail}`.trim());
       });
       seen = job.events.length;
-      paintTileStates(
-        classifyTiles(
-          [...tileRectangles.keys()],
-          activeJobSourceIds,
-          job.events,
-          job.state === "running"
-        )
+      // One summary, read twice: the grid paints from its tile states and
+      // the bar reads its fractions, so the two can never disagree about
+      // the same run.
+      const summary = summariseJob(
+        [...tileRectangles.keys()],
+        activeJobSourceIds,
+        job.events,
+        job.state === "running",
+        activeJobSourceSeconds
       );
+      paintTileStates(summary.tileStates);
+      renderProgress(summary, job, (Date.now() - jobStartedAt) / 1000);
       if (job.state !== "running") {
         clearInterval(poller);
         $("cancel").hidden = true;
@@ -1240,7 +1743,12 @@ function renderApiKeys(sources, config) {
   try {
     const config = await api("/api/config");
     $("output-root").value = config.output_root;
+    // Bounds first, value second: see applyTileSizeBounds. A saved size
+    // outside the slider's own range widens the slider rather than being
+    // rewritten by it.
+    applyTileSizeBounds(config.tile_size_m);
     $("tile-size").value = config.tile_size_m;
+    renderTileSize();
     $("overlap").value = config.overlap_m;
     if (config.last_region) $("region").value = config.last_region;
     $("theme").value = config.theme || "auto";

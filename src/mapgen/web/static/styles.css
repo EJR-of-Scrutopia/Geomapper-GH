@@ -180,15 +180,35 @@ main {
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
 
-/* Tile size and overlap sitting side by side used to overflow the panel: a
-   number input's own default intrinsic width does not shrink to fit a
-   grid track just because the track is narrow (min-width: auto is the
-   grid/flex default). min-width: 0 on the grid item lets the track
-   actually shrink; width: 100% plus its own min-width: 0 on the input
-   makes it fill whatever width that leaves rather than falling back to
-   its intrinsic size. */
-.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; min-width: 0; }
-.row > label { min-width: 0; }
+/* Task 27: tile size and overlap no longer sit side by side. The .row
+   grid that paired them is gone with the number input it was written
+   for, because a slider is unusable in a 165px half-track. The lesson it
+   documented has not gone anywhere: an input's intrinsic width does not
+   shrink to fit a narrow container on its own, which is why the rule
+   further down still sets min-width: 0 and width: 100% on every field.
+
+   A range input is deliberately NOT in that rule's selector list: the
+   border, padding and surface background it applies are right for a box
+   you type into and wrong for a track you drag along, which browsers
+   style themselves. */
+input[type="range"] { width: 100%; margin: 0; }
+
+.tile-size-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tile-size-control input[type="range"] { flex: 1; min-width: 0; }
+
+/* Fixed width, and tabular figures, so the readout does not shuffle the
+   slider sideways every time the number under it changes width. */
+.tile-size-readout {
+  min-width: 62px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+}
 
 .hint {
   font-size: 11px;
@@ -368,6 +388,57 @@ button.armed {
 .api-key-status { font-size: 11px; }
 .api-key-status.saved { color: var(--accent); font-weight: 600; }
 .api-key-status.unsaved { opacity: 0.6; }
+
+/* Task 27: the progress bar and its countdown. Entirely CSS variables,
+   no second palette in JS the way the tile grid needed one: this is
+   ordinary markup, so the light/dark switching in the two blocks at the
+   top of this file already covers it and there is nothing for
+   effectiveTheme() to resolve. --line for the empty track and --accent
+   for the filled part keeps it the same two colours the estimate box
+   and the drawn extent already use, rather than introducing a third. */
+.progress {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  padding: 8px 10px;
+  font-size: 12px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.progress[hidden] { display: none; }
+
+.progress-track {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  /* Slow enough to read as movement rather than a jump, short enough
+     that it has always settled before the next 700ms poll arrives. */
+  transition: width 250ms linear;
+}
+
+.progress-text { line-height: 1.4; }
+.progress-note { line-height: 1.4; color: var(--warn); }
+.progress-note[hidden] { display: none; }
+
+/* A stopped run is not a failed one (Task 22), so it gets its own
+   settled look rather than borrowing the warning colour: the bar stays
+   where it stopped, still visible against the track, but dimmed so it
+   reads as finished-with rather than still moving. Dimmed rather than
+   recoloured to var(--line), which is the track's own colour and would
+   have made a stopped bar invisible. */
+.progress.stopped { border-left-color: var(--line); }
+.progress.stopped .progress-fill { opacity: 0.45; }
+.progress.failed { border-left-color: var(--warn); }
+.progress.failed .progress-fill { background: var(--warn); }
 
 footer { border-top: 1px solid var(--line); }
 

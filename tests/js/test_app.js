@@ -91,6 +91,13 @@ function _parseInputs(html) {
 
 function makeElement(id) {
   let html = "";
+  // Attributes set through setAttribute, kept apart from the plain
+  // properties above because they are not the same thing: app.js's
+  // progress bar (Task 27) writes aria-valuenow here, which no property
+  // on a real element mirrors, and a test that could only read
+  // textContent would be unable to tell whether a screen reader was
+  // being told the same number the bar was drawing.
+  const attributes = {};
   const element = {
     id,
     value: "",
@@ -103,6 +110,18 @@ function makeElement(id) {
     scrollHeight: 0,
     scrollTop: 0,
     children: [],
+    setAttribute(name, value) {
+      attributes[name] = String(value);
+    },
+    getAttribute(name) {
+      return name in attributes ? attributes[name] : null;
+    },
+    removeAttribute(name) {
+      delete attributes[name];
+    },
+    hasAttribute(name) {
+      return name in attributes;
+    },
     // The live pseudo-inputs parsed from whatever was last assigned to
     // innerHTML, consulted by document.querySelectorAll below. Present
     // on every element, empty for one nothing was ever assigned to.
@@ -342,6 +361,17 @@ function makeLeaflet() {
         removed: false,
         setBounds(newBounds) {
           handle.bounds = newBounds;
+        },
+        // Task 22 paints the tile grid by restyling each rectangle in
+        // place. Nothing here had setStyle, because no test before Task
+        // 27 ran a job with a real tile_grid behind it: every estimate
+        // stub returned no grid at all, so tileRectangles stayed empty
+        // and every setStyle call was a loop over nothing. The first
+        // test to supply a grid found app.js throwing on the first line
+        // of its Download handler, which is exactly the stub-more-
+        // permissive-than-the-browser gap this file exists to close.
+        setStyle(newOptions) {
+          handle.options = { ...handle.options, ...newOptions };
         },
         addTo() {
           return handle;
@@ -2904,6 +2934,792 @@ function ok(condition, message) {
     ok(
       stoppedLine.className !== "fail",
       "expected a stopped job logged as a normal outcome, not styled like a failure"
+    );
+  });
+
+  // =======================================================================
+  // Task 27, part 1: how far through the run is, and how much longer.
+  //
+  // summariseJob is the one walk of the event stream that both the grid
+  // and the bar read, and remainingLabel is the countdown's arithmetic
+  // with the clock and the DOM taken out of it, so the awkward shapes (a
+  // resume, a stall, an overrun) can be driven at the numbers instead of
+  // by waiting for a real download to misbehave. The seconds used
+  // throughout are the ones the estimate really produces for the owner's
+  // Barry extent at the default tiling: 144s of OpenStreetMap, 18s of
+  // Overture, 11s of elevation, 175s in total (see the constants in
+  // sources/osm.py, overture.py and elevation.py).
+  // =======================================================================
+
+  const BARRY_SECONDS = { osm: 144, overture: 18, elevation: 11 };
+
+  function tileIdsUpTo(count) {
+    return Array.from({ length: count }, (unused, index) => `r00_c${String(index).padStart(2, "0")}`);
+  }
+
+  await test(
+    "progress: Overture's many events per tile are one tile's worth of progress, not many",
+    async () => {
+      // The brief's own caution, at the numbers rather than at the tile
+      // colours. Eight types across two of eight tiles is sixteen
+      // events: counted per event that is 16/8 = two whole grids' worth
+      // of progress, counted per (tile, source) it is the quarter of the
+      // run it actually is. A partial tile set with every type is not a
+      // contrived shape: package.py hands fetch() only the tiles still
+      // pending, so a resumed run produces exactly this.
+      const { sandbox } = await bootedSandbox();
+      const tileIds = tileIdsUpTo(8);
+      const events = [];
+      for (const overtureType of ["water", "building", "land", "land_use", "infrastructure", "place", "segment", "connector"]) {
+        for (const tileId of tileIds.slice(0, 2)) {
+          events.push({ event: "tile_done", source: "overture", tile_id: tileId, overture_type: overtureType });
+        }
+      }
+      const summary = sandbox.summariseJob(tileIds, ["overture"], events, true, BARRY_SECONDS);
+      ok(
+        Math.abs(summary.fractionDone - 0.25) < 1e-9,
+        `expected two of eight tiles to read 25%, got ${summary.fractionDone}`
+      );
+    }
+  );
+
+  await test(
+    "progress: elevation reports no tile of its own, and the bar still reaches 100%",
+    async () => {
+      // ElevationSource emits one event for the whole extent under
+      // tile_id "whole-area", which is not a tile of the plan at all
+      // (classifyTiles has its own test for why Overture did not copy
+      // that convention). A denominator of tiles x sources therefore
+      // caps a completed three-layer run at two thirds, and the owner
+      // selects all three by default: the bar would finish every
+      // ordinary download stuck at 67%.
+      const { sandbox } = await bootedSandbox();
+      const tileIds = tileIdsUpTo(2);
+      const events = [
+        ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+        { event: "source_done", source: "osm" },
+        { event: "tile_done", source: "elevation", tile_id: "whole-area" },
+        { event: "source_done", source: "elevation" },
+      ];
+      const summary = sandbox.summariseJob(tileIds, ["osm", "elevation"], events, true, BARRY_SECONDS);
+      ok(
+        Math.abs(summary.fractionDone - 1) < 1e-9,
+        `expected a completed run to read 100%, got ${summary.fractionDone}`
+      );
+    }
+  );
+
+  await test(
+    "progress: elevation shows no partial progress before its source_done, rather than a made-up share",
+    async () => {
+      // The counterpart to the test above: the whole-area event must not
+      // be talked into meaning anything either. Elevation's share moves
+      // at source_done and nowhere else, so the bar sits just short of
+      // complete while the one download it has left is running.
+      const { sandbox } = await bootedSandbox();
+      const tileIds = tileIdsUpTo(2);
+      const events = [
+        ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+        { event: "source_done", source: "osm" },
+        { event: "tile_done", source: "elevation", tile_id: "whole-area" },
+      ];
+      const summary = sandbox.summariseJob(tileIds, ["osm", "elevation"], events, true, BARRY_SECONDS);
+      const expected = 144 / (144 + 11);
+      ok(
+        Math.abs(summary.fractionDone - expected) < 1e-9,
+        `expected osm's own 144s share of 155s, got ${summary.fractionDone}`
+      );
+    }
+  );
+
+  await test(
+    "progress: the sources are weighted by what the estimate says they cost, not one share each",
+    async () => {
+      // OpenStreetMap is 144s of a 162s two-layer run and Overture 18s.
+      // Equal shares would call a finished OSM pass half the run when it
+      // is nearly nine tenths of it, and the countdown reads off this
+      // same fraction: it would have projected minutes onto a run with
+      // seconds left.
+      const { sandbox } = await bootedSandbox();
+      const tileIds = tileIdsUpTo(4);
+      const events = [
+        ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+        { event: "source_done", source: "osm" },
+      ];
+      const weighted = sandbox.summariseJob(tileIds, ["osm", "overture"], events, true, BARRY_SECONDS);
+      ok(
+        Math.abs(weighted.fractionDone - 144 / 162) < 1e-9,
+        `expected 144/162, got ${weighted.fractionDone}`
+      );
+      // With no estimate to weigh by (an older or partial response), it
+      // falls back to equal shares rather than refusing to draw a bar.
+      const unweighted = sandbox.summariseJob(tileIds, ["osm", "overture"], events, true, {});
+      ok(
+        Math.abs(unweighted.fractionDone - 0.5) < 1e-9,
+        `expected equal shares without weights, got ${unweighted.fractionDone}`
+      );
+    }
+  );
+
+  await test(
+    "progress: a stopped run reports the fraction it reached, while its tiles still settle",
+    async () => {
+      // The one place the tile states and the fractions deliberately
+      // part company. classifyTiles settles every touched tile to done
+      // once the job stops running, because the run is over and nothing
+      // more is coming; the fraction must not, or a stop would always
+      // read 100% and Task 22's whole distinction between stopping and
+      // failing would be invisible on the bar.
+      const { sandbox } = await bootedSandbox();
+      const tileIds = tileIdsUpTo(4);
+      const events = [
+        ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+        { event: "source_done", source: "osm" },
+      ];
+      const summary = sandbox.summariseJob(tileIds, ["osm", "overture"], events, false, BARRY_SECONDS);
+      for (const tileId of tileIds) {
+        ok(summary.tileStates.get(tileId) === "done", `expected ${tileId} settled, got ${summary.tileStates.get(tileId)}`);
+      }
+      ok(
+        summary.fractionDone < 0.9 && summary.fractionDone > 0.8,
+        `expected a stopped run to report the 89% it reached, got ${summary.fractionDone}`
+      );
+    }
+  );
+
+  await test(
+    "progress: tiles skipped on a resume count as done but never as measured work",
+    async () => {
+      // Stop, then Download again over the same extent, which is an
+      // ordinary thing to do now that Stop keeps its data: every tile
+      // already on disk reports tile_skipped in the first second. Those
+      // are genuinely done, and they cost nothing, so the countdown must
+      // be able to tell them apart from work this run actually did.
+      const { sandbox } = await bootedSandbox();
+      const tileIds = tileIdsUpTo(10);
+      const events = [
+        ...tileIds.slice(0, 8).map((tileId) => ({ event: "tile_skipped", source: "osm", tile_id: tileId })),
+        { event: "tile_done", source: "osm", tile_id: tileIds[8] },
+      ];
+      const summary = sandbox.summariseJob(tileIds, ["osm"], events, true, BARRY_SECONDS);
+      ok(Math.abs(summary.fractionDone - 0.9) < 1e-9, `expected 90% done, got ${summary.fractionDone}`);
+      ok(Math.abs(summary.fractionSkipped - 0.8) < 1e-9, `expected 80% skipped, got ${summary.fractionSkipped}`);
+      ok(Math.abs(summary.fractionFetched - 0.1) < 1e-9, `expected 10% fetched, got ${summary.fractionFetched}`);
+    }
+  );
+
+  await test(
+    "progress: a tile Overture skipped for one type and downloaded for another is fetched work",
+    async () => {
+      // A partially resumed Overture pass emits both events for the same
+      // tile, one per type. Counting the skip would credit the run with
+      // free work it actually paid for, and the projection is measured
+      // off exactly that number.
+      const { sandbox } = await bootedSandbox();
+      const events = [
+        { event: "tile_skipped", source: "overture", tile_id: "r00_c00", overture_type: "water" },
+        { event: "tile_done", source: "overture", tile_id: "r00_c00", overture_type: "building" },
+      ];
+      const summary = sandbox.summariseJob(["r00_c00"], ["overture"], events, true, BARRY_SECONDS);
+      ok(Math.abs(summary.fractionDone - 1) < 1e-9, `expected the tile fully reported, got ${summary.fractionDone}`);
+      ok(summary.fractionSkipped === 0, `expected no skipped share, got ${summary.fractionSkipped}`);
+      ok(Math.abs(summary.fractionFetched - 1) < 1e-9, `expected it counted as fetched, got ${summary.fractionFetched}`);
+    }
+  );
+
+  await test("progress: a failed tile is work done, not work still outstanding", async () => {
+    const { sandbox } = await bootedSandbox();
+    const tileIds = tileIdsUpTo(4);
+    const events = [
+      { event: "tile_done", source: "osm", tile_id: tileIds[0] },
+      { event: "tile_failed", source: "osm", tile_id: tileIds[1] },
+    ];
+    const summary = sandbox.summariseJob(tileIds, ["osm"], events, true, BARRY_SECONDS);
+    ok(Math.abs(summary.fractionDone - 0.5) < 1e-9, `expected 50%, got ${summary.fractionDone}`);
+  });
+
+  await test("progress: subdivisions are counted from the events, once each", async () => {
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00", "r00_c01"],
+      ["osm"],
+      [
+        { event: "tile_subdivided", source: "osm", tile_id: "r00_c00", pieces: 4, depth: 1 },
+        { event: "tile_subdivided", source: "osm", tile_id: "r00_c00_q02", pieces: 4, depth: 2 },
+      ],
+      true,
+      BARRY_SECONDS
+    );
+    ok(summary.subdivisions === 2, `expected 2 subdivisions, got ${summary.subdivisions}`);
+  });
+
+  // --- the countdown's own arithmetic ------------------------------------
+
+  const RUNNING_RUN = {
+    fractionDone: 0,
+    fractionFetched: 0,
+    fractionSkipped: 0,
+    elapsedSeconds: 0,
+    staticSeconds: 175,
+    subdivisions: 0,
+  };
+
+  await test("countdown: before the crossover it counts down from the estimate", async () => {
+    const { sandbox } = await bootedSandbox();
+    const label = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.05,
+      fractionFetched: 0.05,
+      elapsedSeconds: 20,
+    });
+    ok(label.branch === "estimate", `expected the estimate branch, got ${label.branch}`);
+    ok(label.text.includes("about 3 min"), `expected 155s to read as about 3 min, got ${label.text}`);
+    ok(label.text.includes("from the estimate"), `expected the copy to say which branch it is on, got ${label.text}`);
+  });
+
+  await test("countdown: the crossover needs both enough work and enough clock", async () => {
+    // 10% of the weighted work fetched AND 15 seconds of it. Either one
+    // alone is a projection from noise: 9% is the brief's own "a
+    // projection from 2% done is noise" one step up, and a fast-starting
+    // run can pass 10% inside two seconds on skipped tiles alone.
+    const { sandbox } = await bootedSandbox();
+    const shortOfWork = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.09,
+      fractionFetched: 0.09,
+      elapsedSeconds: 40,
+    });
+    ok(shortOfWork.branch === "estimate", `9% fetched should not project, got ${shortOfWork.branch}`);
+    const shortOfClock = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.5,
+      fractionFetched: 0.5,
+      elapsedSeconds: 14,
+    });
+    ok(shortOfClock.branch === "estimate", `14 seconds should not project, got ${shortOfClock.branch}`);
+    const both = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.5,
+      fractionFetched: 0.5,
+      elapsedSeconds: 15,
+    });
+    ok(both.branch === "measured", `10% and 15s should project, got ${both.branch}`);
+  });
+
+  await test("countdown: past the crossover it projects from the run's own rate", async () => {
+    const { sandbox } = await bootedSandbox();
+    // Half the work in 60s, so half the work left is another 60s, even
+    // though the static estimate said the whole run was 175s and would
+    // therefore have claimed about 2 min left at this point.
+    const label = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.5,
+      fractionFetched: 0.5,
+      elapsedSeconds: 60,
+    });
+    ok(label.branch === "measured", `expected the projection branch, got ${label.branch}`);
+    ok(label.text.includes("about 1 min"), `expected about 1 min, got ${label.text}`);
+    ok(label.text.includes("from the rate so far"), `expected the copy to name the branch, got ${label.text}`);
+  });
+
+  await test("countdown: a run that stalls reports a growing wait, not a frozen one", async () => {
+    // The failure the brief warns a uniform event stream would never
+    // catch. Nothing finishes between these two calls; only the clock
+    // moves. A projection that measured the rate once and kept it would
+    // sit at the same number while the run went nowhere.
+    const { sandbox } = await bootedSandbox();
+    const early = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.5,
+      fractionFetched: 0.5,
+      elapsedSeconds: 60,
+    });
+    const stalled = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.5,
+      fractionFetched: 0.5,
+      elapsedSeconds: 240,
+    });
+    ok(early.text.includes("about 1 min"), `expected about 1 min at 60s, got ${early.text}`);
+    ok(stalled.text.includes("about 4 min"), `expected the wait to grow to about 4 min, got ${stalled.text}`);
+  });
+
+  await test(
+    "countdown: a resumed run projects from what it fetched, not from what it skipped",
+    async () => {
+      // Half the run arrives as skipped tiles in the first two seconds.
+      // Projecting from the total fraction would say two seconds left on
+      // a run with five minutes to go; counting down the flat estimate
+      // would say ten minutes on a run that only has half of it to do.
+      const { sandbox } = await bootedSandbox();
+      const label = sandbox.remainingLabel({
+        fractionDone: 0.5,
+        fractionFetched: 0,
+        fractionSkipped: 0.5,
+        elapsedSeconds: 2,
+        staticSeconds: 600,
+        subdivisions: 0,
+      });
+      ok(label.branch === "estimate", `expected the estimate branch with nothing fetched, got ${label.branch}`);
+      ok(
+        label.text.includes("about 5 min"),
+        `expected half of a 10 min estimate, got ${label.text}`
+      );
+    }
+  );
+
+  await test("countdown: a run past its estimate says so rather than sitting at zero", async () => {
+    const { sandbox } = await bootedSandbox();
+    const label = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.05,
+      fractionFetched: 0.05,
+      elapsedSeconds: 300,
+    });
+    ok(label.branch === "overrun", `expected the overrun branch, got ${label.branch}`);
+    ok(
+      /taking longer/i.test(label.text) && !/\b0\b/.test(label.text),
+      `expected an honest overrun line with no zero countdown, got ${label.text}`
+    );
+  });
+
+  await test("countdown: once every source has reported, it stops counting down", async () => {
+    // The job stays "running" through the merge, the Urbano bridge step
+    // and survey.json, none of which emit per-tile events. A countdown
+    // here would be counting down to something it cannot see.
+    const { sandbox } = await bootedSandbox();
+    const label = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 1,
+      fractionFetched: 1,
+      elapsedSeconds: 200,
+    });
+    ok(label.branch === "finishing", `expected the finishing branch, got ${label.branch}`);
+    ok(/writing the package/i.test(label.text), `got ${label.text}`);
+  });
+
+  await test("countdown: a subdivision is said out loud, not absorbed silently", async () => {
+    const { sandbox } = await bootedSandbox();
+    const one = sandbox.remainingLabel({ ...RUNNING_RUN, elapsedSeconds: 10, subdivisions: 1 });
+    ok(/one tile was/i.test(one.note), `expected a note about the split, got ${JSON.stringify(one.note)}`);
+    ok(/longer than/i.test(one.note), `expected the note to say the run got longer, got ${one.note}`);
+    const several = sandbox.remainingLabel({ ...RUNNING_RUN, elapsedSeconds: 10, subdivisions: 3 });
+    ok(/3 tiles were/i.test(several.note), `expected a plural note, got ${several.note}`);
+    const none = sandbox.remainingLabel({ ...RUNNING_RUN, elapsedSeconds: 10 });
+    ok(none.note === "", `expected no note without a subdivision, got ${JSON.stringify(none.note)}`);
+  });
+
+  await test("countdown: nothing is ever reported to the second", async () => {
+    // The estimate under this is +/- 20% at best and one measured
+    // Overture call came back at 28.48s against a 4.51s to 4.66s norm.
+    // A countdown reading "3 min 12 s" would be claiming a precision
+    // nothing in this tool has.
+    const { sandbox } = await bootedSandbox();
+    const samples = [1, 30, 59, 60, 95, 200, 599, 601, 700, 1800, 3600];
+    for (const seconds of samples) {
+      const text = sandbox.formatRemaining(seconds);
+      ok(!/\bs\b|sec/i.test(text), `expected no seconds in "${text}" for ${seconds}s`);
+    }
+    ok(sandbox.formatRemaining(59) === "less than a minute", sandbox.formatRemaining(59));
+    ok(sandbox.formatRemaining(95) === "about 2 min", sandbox.formatRemaining(95));
+    // Past ten minutes it coarsens to five, because +/- 20% of twenty
+    // minutes is four.
+    ok(sandbox.formatRemaining(700) === "about 10 min", sandbox.formatRemaining(700));
+    ok(sandbox.formatRemaining(1800) === "about 30 min", sandbox.formatRemaining(1800));
+  });
+
+  // --- the bar itself, driven through the real poll loop ------------------
+
+  const TWO_SOURCES = [
+    { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false, api_key_config_field: null },
+    { id: "overture", display_name: "Overture", licence: "CDLA", requires_api_key: false, api_key_config_field: null },
+  ];
+
+  function gridFor(tileIds) {
+    return tileIds.map((tileId, index) => ({
+      tile_id: tileId,
+      west: -3.3 + index * 0.01,
+      south: 51.4,
+      east: -3.29 + index * 0.01,
+      north: 51.41,
+    }));
+  }
+
+  // Boots a sandbox with a real estimate and a job whose status replies
+  // are handed out one per poll, so a test can walk a run through as many
+  // states as it needs without touching app.js's own timers.
+  async function jobSandbox({ tileIds, polls, sources = TWO_SOURCES, sourceSeconds }) {
+    let pollIndex = 0;
+    const { sandbox, fetchCalls } = await bootedSandbox((url, options) => {
+      const method = (options.method || "GET").toUpperCase();
+      if (url.pathname === "/api/sources") return jsonResponse(200, sources);
+      if (url.pathname === "/api/config" && method === "PUT") return jsonResponse(200, DEFAULT_CONFIG);
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: tileIds.length,
+          rows: 1,
+          cols: tileIds.length,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 175,
+          warnings: [],
+          folder: "C:\\out",
+          tile_grid: gridFor(tileIds),
+          sources: (sourceSeconds || [
+            { id: "osm", seconds_estimate: 144 },
+            { id: "overture", seconds_estimate: 18 },
+          ]),
+        });
+      }
+      if (url.pathname === "/api/jobs" && method === "POST") return jsonResponse(202, { id: "job1" });
+      if (url.pathname === "/api/jobs/job1") {
+        // The last reply repeats once a test runs out of them, and a
+        // test that supplies none at all (the slider tests, which never
+        // start a job) gets a harmless running job rather than a
+        // TypeError that would surface as an unrelated failure.
+        const reply = polls[Math.min(pollIndex, polls.length - 1)] || { state: "running", events: [] };
+        pollIndex += 1;
+        if (reply.httpError) return jsonResponse(500, { error: "server fell over" });
+        return jsonResponse(200, {
+          id: "job1",
+          error: null,
+          result_root: "C:\\out",
+          ...reply,
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    await flush(10);
+    return { sandbox, fetchCalls };
+  }
+
+  await test("the bar appears when a download starts and fills from the events", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "running",
+          events: tileIds.slice(0, 2).map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+        },
+      ],
+    });
+    ok(
+      sandbox.document.getElementById("progress").hidden === true,
+      "expected no bar before a download has been started"
+    );
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const progress = sandbox.document.getElementById("progress");
+    ok(progress.hidden === false, "expected the bar visible once a job is running");
+    ok(
+      sandbox.document.getElementById("progress-fill").style.width === "50%",
+      `expected a half-filled bar, got ${sandbox.document.getElementById("progress-fill").style.width}`
+    );
+    ok(
+      progress.getAttribute("aria-valuenow") === "50",
+      `expected a screen reader to be told the same 50, got ${progress.getAttribute("aria-valuenow")}`
+    );
+    const text = sandbox.document.getElementById("progress-text").textContent;
+    ok(text.includes("50% done"), `expected the percentage in the copy, got ${text}`);
+    ok(/left/.test(text), `expected a countdown, got ${text}`);
+  });
+
+  await test("the bar reaches a complete, plainly finished state on a finished job", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("progress-fill").style.width === "100%",
+      `expected a full bar, got ${sandbox.document.getElementById("progress-fill").style.width}`
+    );
+    ok(
+      /finished/i.test(sandbox.document.getElementById("progress-text").textContent),
+      sandbox.document.getElementById("progress-text").textContent
+    );
+    ok(
+      sandbox.document.getElementById("progress").className === "progress",
+      "a finished run is neither the stopped nor the failed styling"
+    );
+  });
+
+  await test("a stopped run settles the bar at what it reached, not at 100%", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      polls: [
+        {
+          state: "stopped",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const text = sandbox.document.getElementById("progress-text").textContent;
+    const width = sandbox.document.getElementById("progress-fill").style.width;
+    ok(width === "89%", `expected osm's 144 of 162 seconds, got ${width}`);
+    ok(/stopped at 89%/i.test(text), `expected the reached fraction in the copy, got ${text}`);
+    ok(
+      sandbox.document.getElementById("progress").className === "progress stopped",
+      `expected the stopped styling, got ${sandbox.document.getElementById("progress").className}`
+    );
+    ok(!/fail/i.test(text), `a stop is not a failure and must not be worded like one, got ${text}`);
+  });
+
+  await test("a failed run settles the bar into the failure state at the point it reached", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "failed",
+          error: "Some tiles failed. See survey.json.",
+          events: [
+            { event: "tile_done", source: "osm", tile_id: tileIds[0] },
+            { event: "tile_failed", source: "osm", tile_id: tileIds[1] },
+            { event: "source_failed", source: "osm", error: "boom" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("progress").className === "progress failed",
+      sandbox.document.getElementById("progress").className
+    );
+    ok(
+      /failed at 50%/i.test(sandbox.document.getElementById("progress-text").textContent),
+      sandbox.document.getElementById("progress-text").textContent
+    );
+  });
+
+  await test("a subdivision mid-run is carried onto the bar, not only into the log", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "running",
+          events: [
+            { event: "tile_done", source: "osm", tile_id: tileIds[0] },
+            { event: "tile_subdivided", source: "osm", tile_id: tileIds[1], pieces: 4, depth: 1 },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const note = sandbox.document.getElementById("progress-note");
+    ok(note.hidden === false, "expected the note shown once a tile has been split");
+    ok(/split/i.test(note.textContent), note.textContent);
+  });
+
+  await test("losing contact with the job stops the bar promising a countdown", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "running",
+          events: [{ event: "tile_done", source: "osm", tile_id: tileIds[0] }],
+        },
+        { httpError: true },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(1600); // two polls: one good, one that fails
+    const text = sandbox.document.getElementById("progress-text").textContent;
+    ok(/lost contact/i.test(text), `expected the bar to say it has stopped updating, got ${text}`);
+    ok(!/left/.test(text), `expected no countdown left promising anything, got ${text}`);
+  });
+
+  await test("a second download starts the bar over rather than continuing the last one", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(sandbox.document.getElementById("progress-fill").style.width === "100%");
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10); // started, but no poll has come back yet
+    ok(
+      sandbox.document.getElementById("progress").hidden === true,
+      "expected the previous run's full bar cleared, not left claiming this one is finished"
+    );
+  });
+
+  // =======================================================================
+  // Task 27, part 2: tile size is a slider, and it says what each size
+  // costs. Time is real and comes from the estimate; failure risk is not
+  // shown at all, because it depends on how dense the data is on that
+  // ground and nothing can know that before downloading it.
+  // =======================================================================
+
+  function dragTileSize(sandbox, value) {
+    const el = sandbox.document.getElementById("tile-size");
+    el.value = String(value);
+    el.fire("input");
+  }
+
+  await test("the slider keeps the number field's own minimum", async () => {
+    const { sandbox } = await bootedSandbox();
+    const el = sandbox.document.getElementById("tile-size");
+    ok(Number(el.min) === 500, `expected the 500 m minimum kept, got ${el.min}`);
+    ok(Number(el.max) === 10000, `expected a 10000 m top, got ${el.max}`);
+  });
+
+  await test(
+    "a saved tile size outside the slider's range widens the slider instead of rewriting the setting",
+    async () => {
+      // A slider must have a maximum where the number field had none, so
+      // this is the one way the change could silently narrow what the
+      // owner had already chosen: open Settings once with a saved 20000
+      // and have it quietly become 10000, then be persisted.
+      const { sandbox } = await bootedSandbox((url, options) => {
+        if (url.pathname === "/api/config" && (!options.method || options.method === "GET")) {
+          return jsonResponse(200, { ...DEFAULT_CONFIG, tile_size_m: 20000 });
+        }
+        return null;
+      });
+      const el = sandbox.document.getElementById("tile-size");
+      ok(Number(el.max) >= 20000, `expected the slider widened to fit, got max ${el.max}`);
+      ok(Number(el.value) === 20000, `expected the saved size kept, got ${el.value}`);
+    }
+  );
+
+  await test("a saved tile size below the slider's minimum is kept too", async () => {
+    const { sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/config" && (!options.method || options.method === "GET")) {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, tile_size_m: 300 });
+      }
+      return null;
+    });
+    const el = sandbox.document.getElementById("tile-size");
+    ok(Number(el.min) <= 300, `expected the slider widened downwards, got min ${el.min}`);
+    ok(Number(el.value) === 300, `expected the saved size kept, got ${el.value}`);
+  });
+
+  await test("dragging the slider does not fire an estimate request per step", async () => {
+    const { sandbox, fetchCalls } = await jobSandbox({ tileIds: tileIdsUpTo(4), polls: [] });
+    fetchCalls.length = 0;
+    for (let metres = 500; metres <= 4000; metres += 100) {
+      dragTileSize(sandbox, metres);
+      await flush(5);
+    }
+    await flush(600); // past the slider debounce
+    const estimates = fetchCalls.filter((c) => c.url.pathname === "/api/estimate");
+    ok(estimates.length === 1, `expected exactly one estimate for the whole drag, got ${estimates.length}`);
+    ok(
+      JSON.parse(estimates[0].options.body).tile_size_m === 4000,
+      `expected the size the drag finished on, got ${estimates[0].options.body}`
+    );
+  });
+
+  await test("releasing the slider does not fire a second estimate for the same size", async () => {
+    // A click straight on the track fires input and change together. The
+    // change listener refreshEstimate is already bound to would run, and
+    // the pending debounce would then repeat it 400ms later.
+    const { sandbox, fetchCalls } = await jobSandbox({ tileIds: tileIdsUpTo(4), polls: [] });
+    fetchCalls.length = 0;
+    dragTileSize(sandbox, 3000);
+    setField(sandbox, "tile-size", "3000"); // the release
+    await flush(600);
+    const estimates = fetchCalls.filter((c) => c.url.pathname === "/api/estimate");
+    ok(estimates.length === 1, `expected one estimate for one release, got ${estimates.length}`);
+  });
+
+  await test("the readout follows the handle without waiting for the debounce", async () => {
+    const { sandbox } = await jobSandbox({ tileIds: tileIdsUpTo(4), polls: [] });
+    dragTileSize(sandbox, 3500);
+    ok(
+      sandbox.document.getElementById("tile-size-readout").textContent === "3500 m",
+      sandbox.document.getElementById("tile-size-readout").textContent
+    );
+  });
+
+  await test("the time beside the slider is never the previous size's answer", async () => {
+    // The whole point of showing a time per size is that it belongs to
+    // that size. Mid-drag the estimate for the new position has not come
+    // back, and relabelling the old one would be the exact lie this is
+    // meant to avoid.
+    const { sandbox } = await jobSandbox({ tileIds: tileIdsUpTo(4), polls: [] });
+    const cost = sandbox.document.getElementById("tile-size-cost");
+    ok(/about 3 min/.test(cost.textContent), `expected the settled estimate, got ${cost.textContent}`);
+    dragTileSize(sandbox, 5000);
+    ok(
+      /working out/i.test(cost.textContent),
+      `expected an honest "not yet known" mid-drag, got ${cost.textContent}`
+    );
+    await flush(600);
+    ok(/about 3 min/.test(cost.textContent), `expected the new size's estimate, got ${cost.textContent}`);
+    ok(/4 tiles/.test(cost.textContent), `expected the tile count alongside it, got ${cost.textContent}`);
+  });
+
+  await test("the slider's sentence changes with position and states no risk figure", async () => {
+    const { sandbox } = await bootedSandbox();
+    const small = sandbox.tileSizeTrade(500);
+    const middle = sandbox.tileSizeTrade(2000);
+    const large = sandbox.tileSizeTrade(6000);
+    ok(new Set([small, middle, large]).size === 3, "expected three genuinely different sentences");
+    ok(/more requests/i.test(small), small);
+    ok(/fewer requests/i.test(large), large);
+    for (const sentence of [small, middle, large]) {
+      ok(!sentence.includes("%"), `no fabricated percentage belongs here: ${sentence}`);
+      ok(
+        !/\b(low|medium|high|likely to fail|risk)\b/i.test(sentence),
+        `no invented risk rating belongs here: ${sentence}`
+      );
+    }
+  });
+
+  await test("with no extent yet, the slider says so rather than showing a time", async () => {
+    const { sandbox } = await bootedSandbox();
+    ok(
+      /draw or paste an extent/i.test(sandbox.document.getElementById("tile-size-cost").textContent),
+      sandbox.document.getElementById("tile-size-cost").textContent
     );
   });
 
