@@ -464,6 +464,32 @@ def run_survey(
             source_work = paths.work_dir / "raw" / source.id
             ensure_dir(source_work)
             pending = [t for t in tiles if not state.is_done(t.tile_id, source.id)]
+            # Review finding I6. A tile state.json already records as ok
+            # is filtered out here, before fetch() is ever called, so the
+            # source never sees it and never emits anything for it. That
+            # is right (there is nothing to fetch), but it left the
+            # browser with no way to know the work was already done: it
+            # counts progress from events alone, and app.js's own comment
+            # on the fetched/skipped split says "every tile already on
+            # disk reports tile_skipped in the first second", which was
+            # true when it was written and stopped being true the moment
+            # a clean Stop started marking landed tiles ok (Task 22). A
+            # 60-of-72 resume showed the bar climbing 0 to 17 percent and
+            # then jumping to 100, with the countdown quoting the full
+            # 144s for 24s of remaining work.
+            #
+            # Emitted here rather than inside each source because here is
+            # where the skipping actually happens: a source is handed
+            # `pending` and is told nothing about what was withheld from
+            # it, so asking all three to re-derive that from state.json
+            # would be three copies of one fact. It is the same event
+            # OsmSource already emits for the other resume shape (a file
+            # on disk that state.json does not record as ok, the
+            # hard-kill resume), so the browser needs no new vocabulary
+            # and the two resume paths finally look alike to it.
+            for tile in tiles:
+                if state.is_done(tile.tile_id, source.id):
+                    sink.emit("tile_skipped", source=source.id, tile_id=tile.tile_id)
             fetch_succeeded = False
             fetch_kwargs = {"cancel": token} if _fetch_accepts_cancel(source) else {}
             try:

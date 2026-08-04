@@ -240,6 +240,17 @@ function renderTileLegend() {
 // immediately, when everything genuinely left is still to be fetched.
 // The countdown therefore projects from fetched work only, and scales
 // the static estimate by the work that is genuinely left.
+//
+// "every tile already on disk reports tile_skipped" read as a
+// description of the world and was, for two tasks, a wish. package.py
+// filtered every tile its state.json already recorded as ok out of the
+// list handed to fetch(), so no source ever saw those tiles and none of
+// them reported anything, and a Stop-then-resume, the exact case this
+// paragraph is about, arrived here with fractionSkipped stuck at 0. See
+// review finding I6: package.py now emits the event where it does the
+// skipping. Nothing in this function changed for it. The note is here so
+// the next reader knows the sentence above rests on package.py's own
+// resume loop rather than on each source remembering to be helpful.
 function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const state = new Map(tileIds.map((id) => [id, "pending"]));
   const finishedSources = new Set();

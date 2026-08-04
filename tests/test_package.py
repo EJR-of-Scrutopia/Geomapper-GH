@@ -1157,6 +1157,59 @@ def test_a_stopped_run_keeps_work_dir_and_a_resume_completes_it(tmp_path):
     assert payload["stopped"] is False
 
 
+def test_a_resume_reports_the_tiles_it_skips_rather_than_saying_nothing(tmp_path):
+    # Review finding I6. package.py filters tiles state.json already
+    # records as ok out of `pending` BEFORE fetch() is called, so the
+    # source never sees them and never emits anything for them. The
+    # browser counts progress from events alone, so a Stop-then-resume,
+    # which is the resume the owner actually performs, looked to the page
+    # like a run with all the work still ahead of it: the bar climbed from
+    # zero over the few tiles that were genuinely left and then jumped to
+    # 100, and remainingLabel's estimate branch computed
+    # staticSeconds * (1 - 0), quoting the whole run for a resume with a
+    # sixth of it to do. app.js's own comment ("every tile already on disk
+    # reports tile_skipped in the first second") described a world that
+    # stopped existing when a clean Stop started marking landed tiles ok.
+    source = CancelAwareStubSource()
+    register(source)
+    first = run_survey(_request(tmp_path))
+    assert first.stopped is True
+    first_state = {
+        record["tile_id"]: record["stub"]
+        for record in json.loads(first.paths.survey_json.read_text(encoding="utf-8"))["tiles"]
+    }
+    already_ok = sorted(t for t, status in first_state.items() if status == "ok")
+    assert already_ok, "expected the stop to have kept at least one finished tile"
+
+    clear_registry()
+    register(StubSource())
+    resumed = EventLog()
+    second = run_survey(_request(tmp_path), progress=resumed)
+    assert second.complete is True
+
+    skipped = sorted(
+        event["tile_id"]
+        for event in resumed.snapshot()
+        if event["event"] == "tile_skipped" and event.get("source") == "stub"
+    )
+    assert skipped == already_ok, (
+        "every tile the resume skipped must say so, or the browser has no way "
+        "to tell finished work from work still ahead of it"
+    )
+    # And exactly once each: a tile reported twice would inflate the same
+    # numbers in the other direction.
+    assert len(skipped) == len(set(skipped))
+    # The tiles that genuinely still needed fetching are reported as
+    # fetched work, not as skipped, which is the distinction the countdown
+    # measures its rate from.
+    fetched = {
+        event["tile_id"]
+        for event in resumed.snapshot()
+        if event["event"] == "tile_done" and event.get("source") == "stub"
+    }
+    assert not (fetched & set(skipped))
+
+
 class LegacyNoCancelStubSource(StubSource):
     """Predates Task 22: fetch(bbox, tiles, work_dir, progress), no
     `cancel` parameter at all. Cancels the very token package.py is using
