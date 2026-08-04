@@ -442,10 +442,12 @@ def run_survey(
     # `cancel`, or between the last source and the bridge). A stop is a
     # deliberate, honest partial, never treated like a failure from here
     # on: whatever was already fetched is still merged below (see the
-    # Cancelled branch), no further source is attempted, the bridge is
-    # skipped, and the stale-output sweep never runs against a package
-    # this incomplete on purpose. See _build_survey_json for how this is
-    # told apart from an ordinary failure in survey.json.
+    # Cancelled branch), no further source is attempted and the bridge is
+    # skipped. See _build_survey_json for how this is told apart from an
+    # ordinary failure in survey.json.
+    #
+    # This is the control-flow flag and not, since finding I1, what
+    # survey.json reports: see reported_stopped after the loop.
     stopped = False
 
     # The scope always keeps the directory. Removal is decided after the job,
@@ -550,14 +552,42 @@ def run_survey(
             # raising past this point.
             stopped = True
 
+        # Review finding I1, and the handling both survey.json's own
+        # `stopped` comment and README's schema table already claimed was
+        # here without it ever being written. `stopped` above is the
+        # CONTROL FLOW flag: it is what breaks the source loop and skips
+        # the bridge, and it is set by any stop at any of the three
+        # checkpoints, including one that lands after every tile has
+        # genuinely finished. What survey.json reports is narrower, and
+        # is the published invariant: stopped means a stop is the reason
+        # this run is short. A run that is not short has nothing to be
+        # honest about here, which is exactly how JobManager's own worker
+        # has always read the same race (it checks result.complete first
+        # and reports "done"), so this is survey.json being made to agree
+        # with the state the browser already shows for the same run
+        # rather than a new rule.
+        reported_stopped = stopped and not state.complete
+
         layer_files = _write_layer_files(outputs_by_source, paths)
 
-        # Never on a stopped run, whatever state.complete happens to say:
-        # a stop is a deliberate, honest partial (see _sweep_stale_
-        # outputs's own docstring on why an incomplete run is never swept),
-        # and sweeping it risks removing a merged file a resume would
-        # still want to find sitting in the root next time.
-        if state.complete and not stopped:
+        # Swept whenever the DATA is complete, stop or no stop, and the
+        # "not stopped" half of this gate is what finding I1 removed. The
+        # old reasoning was that a stop's stale outputs are "deferred to a
+        # later, ordinary run rather than risking removing something a
+        # resume might still want". There is no later run: naming.
+        # _survey_reports_complete reads complete: true, so
+        # build_package_paths refuses to reuse this folder and the next
+        # survey of the same site and date lands on _02. Skipping the
+        # sweep here left an earlier, wider attempt's <stem>_water.geojson
+        # in a package that names no water source, permanently, in a
+        # folder the owner reads straight into Grasshopper. Nothing about
+        # a complete run's sweep is made riskier by a stop having landed:
+        # every file this run produced is in `produced`, and the candidate
+        # list is still only each source's own possible_outputs. The
+        # work_dir cleanup twenty lines below has always been gated on
+        # state.complete alone, for this same reason, spelled out in its
+        # own comment.
+        if state.complete:
             produced = {
                 merged.resolve()
                 for outputs in outputs_by_source.values()
@@ -581,6 +611,19 @@ def run_survey(
         # provide once the survey data itself is complete. Recorded the
         # same honest way a --skip-bridge run already is: attempted=False,
         # ok=None, not a fabricated failure.
+        #
+        # Gated on the control-flow `stopped`, deliberately NOT on
+        # reported_stopped above: a Stop press means "do not start another
+        # external process", and that is true whether or not the tiles
+        # happened to have all landed by the time it arrived. The
+        # consequence is worth naming, because it is the one thing finding
+        # I1's sweep change does not also settle: a complete run that a
+        # stop caught at the very end keeps its data and its sweep, and
+        # never gets its Urbano files, since the folder is complete and so
+        # is never revisited. survey.json says so in the only way that
+        # matters, attempted=False, exactly as --skip-bridge does; running
+        # the bridge anyway would be this function deciding a Stop means
+        # something narrower than the owner pressed it to mean.
         bridge_attempted = request.run_bridge_step and not stopped
         bridge_ok: bool | None = None
         bridge_error: str | None = None
@@ -625,10 +668,18 @@ def run_survey(
         bridge_attempted,
         bridge_ok,
         bridge_error,
-        stopped,
+        reported_stopped,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
-    sink.emit("job_finished", complete=state.complete, stopped=stopped, root=str(paths.root))
+    # reported_stopped here too, not the control-flow flag: the browser
+    # reads this event and survey.json for the same run, and the one thing
+    # they must never do is disagree about whether it was stopped.
+    sink.emit(
+        "job_finished",
+        complete=state.complete,
+        stopped=reported_stopped,
+        root=str(paths.root),
+    )
 
     # Removed only on a clean, complete run. A failed or partial job keeps its
     # tiles, because that is what makes the next run resume rather than restart.
@@ -645,7 +696,9 @@ def run_survey(
     if state.complete and not request.keep_work:
         best_effort_rmtree(paths.work_dir.parent)
 
-    return SurveyResult(paths=paths, complete=state.complete, survey=survey, stopped=stopped)
+    return SurveyResult(
+        paths=paths, complete=state.complete, survey=survey, stopped=reported_stopped
+    )
 
 
 _TILE_ID_SHAPE = re.compile(r"^r\d+_c\d+$")
@@ -858,6 +911,16 @@ def _sweep_stale_outputs(
     because its survey.json already says complete: false and the next
     resume will finish the job and sweep then; deleting the only merged
     copy of anything mid-failure helps nobody.
+
+    "Complete" is the only condition, and finding I1 is why that is worth
+    stating: a stop that lands after every tile has already finished used
+    to skip this as well, on the reasoning that a stopped run's sweep
+    could be left to a later, ordinary run. That reasoning holds for an
+    incomplete run and is false for a complete one. A complete package is
+    never reused (naming._survey_reports_complete, read by
+    build_package_paths, sends the next survey of the same site and date
+    to _02), so "later" never arrives and the stale layer stays in the
+    folder for good.
     """
     for source in available_sources():
         possible = getattr(source, "possible_outputs", None)
@@ -993,7 +1056,9 @@ def _build_survey_json(
         # failure (with or without --force), and never true once complete
         # is true (a stop noticed only after every tile had already
         # genuinely finished has nothing left to be honest about here,
-        # see run_survey's own handling of that exact race). Read this
+        # see run_survey's own reported_stopped for that exact race, which
+        # this comment described for a whole task before finding I1 found
+        # it was describing something nothing implemented). Read this
         # alongside `tiles`, which already carries the true per-tile
         # picture this field is a one-word summary of: complete=false,
         # stopped=true, the tiles the stop caught before they were

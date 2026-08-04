@@ -1214,20 +1214,25 @@ def test_a_source_with_no_cancel_parameter_still_stops_the_run_between_sources(t
     assert all(status == "pending" for status in second_records.values())
 
 
-def test_a_stop_noticed_only_after_every_tile_genuinely_finished_still_skips_the_sweep(
+def test_a_stop_noticed_only_after_every_tile_genuinely_finished_still_sweeps(
     tmp_path,
 ):
-    # The one edge case where state.complete and stopped are BOTH true at
-    # once: a single source that finishes every tile normally (no
-    # exception anywhere, so state.complete is genuinely True), but flips
-    # the token to cancelled right as its own fetch() returns, landing
-    # exactly in the gap between the last source finishing and
-    # run_survey's own post-loop cancellation check. This is the case the
-    # brief's "do not sweep on a stopped run" is explicit about even
-    # though the data is not actually short: the sweep is skipped
-    # regardless of what state.complete says, deferred to a later,
-    # ordinary run rather than risking removing something a resume might
-    # still want (see _run_survey_once's own comment on this).
+    # The one edge case where the control-flow `stopped` and state.complete
+    # are both true at once: a single source that finishes every tile
+    # normally (no exception anywhere, so state.complete is genuinely
+    # True), but flips the token to cancelled right as its own fetch()
+    # returns, landing exactly in the gap between the last source
+    # finishing and run_survey's own post-loop cancellation check.
+    #
+    # This test used to assert the opposite, and justified it as the sweep
+    # being "deferred to a later, ordinary run rather than risking removing
+    # something a resume might still want". Review finding I1: there is no
+    # later run. naming._survey_reports_complete reads complete: true, so
+    # build_package_paths refuses to reuse this folder and the next survey
+    # of the same site and date lands on _02. The stale layer stayed in a
+    # finished package for good, which is the exact failure the sweep
+    # exists to prevent, in a folder the owner reads straight into
+    # Grasshopper.
     class SweepingLegacyNoCancelStubSource(LegacyNoCancelStubSource):
         def possible_outputs(self, stem):
             return [f"{self.id}.txt", f"{stem}_water.geojson", "layers/water.geojson"]
@@ -1238,9 +1243,24 @@ def test_a_stop_noticed_only_after_every_tile_genuinely_finished_still_skips_the
     result = run_survey(_request(tmp_path), cancel=token)
 
     assert result.complete is True, "expected every tile to have genuinely finished"
-    assert result.stopped is True, "expected the post-loop checkpoint to catch the cancellation"
-    assert (root / f"{stem}_water.geojson").exists(), "the sweep must not have run"
-    assert (root / "layers" / "water.geojson").exists()
+    # And the published invariant, stated in survey.json's own comment and
+    # in README's schema table long before anything implemented it:
+    # stopped means a stop is the reason the run is SHORT. This run is not
+    # short, so there is nothing for it to be honest about, and
+    # JobManager's worker has always reported this same race as "done".
+    assert result.stopped is False, "complete and stopped must never both be true"
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["complete"] is True
+    assert payload["stopped"] is False
+    # The stale outputs an earlier, wider attempt left in the root are
+    # gone, because this is the last run that will ever see this folder.
+    assert not (root / f"{stem}_water.geojson").exists(), "the sweep must have run"
+    assert not (root / "layers" / "water.geojson").exists()
+    # The bridge is still skipped: a Stop press means "start no further
+    # external process", whether or not the tiles all happened to land
+    # first. Recorded honestly rather than fabricated either way.
+    assert payload["bridge"]["attempted"] is False
+    assert payload["bridge"]["ok"] is None
 
 
 def test_coordinate_stem_option_uses_the_coordinate_form(tmp_path):
