@@ -9,7 +9,22 @@ description = "Site survey data packaging for architectural work"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.32,<3",
-    "overturemaps>=0.10,<1",
+    # Floor 0.19, ceiling 0.21, replacing >=0.10,<1.
+    #
+    # 0.19.0 and 0.20.0 are the only versions this project has actually been
+    # run against, and they differ in two ways that both reach the owner's
+    # finished package. 0.20.0 writes a .state sidecar beside every --output
+    # (worked around in OvertureSource, see _state_sidecar) and writes its
+    # GeoJSON in the process locale codepage, which truncates a Welsh
+    # download part way through under cp1252 (worked around in
+    # procutil.child_environment). Both are covered by live tests pinned to
+    # 0.20.x specifically.
+    #
+    # <1 was a bet that a 0.x project keeps compatibility across minor
+    # releases; 0.19 to 0.20 disproved it, and the old range would install a
+    # future 0.21 nobody here has seen. >=0.10 was wrong the other way,
+    # admitting nine untested releases beneath everything we have run.
+    "overturemaps>=0.19,<0.21",
 ]
 
 [project.optional-dependencies]
