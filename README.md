@@ -160,25 +160,32 @@ the URL, so nothing else on the machine can drive it. On the page:
   category is required: unticking the last one disables Download with a
   plain reason, the same way a missing site name already does, rather
   than letting you press it and get an error back.
-- Output root, tile size and overlap live behind the Settings button:
-  defaults you set once, not per-survey choices. An API key field appears
-  there per data source that needs one (OpenTopography's, for the
-  elevation layer), driven by the same source registry the layer list
-  comes from, so a second or third keyed source in a later phase needs no
-  new panel. The elevation model select is built from that same registry
-  (see "Which elevation model"), and it says on the page that nothing in
-  it is sharper than the default. An Appearance setting there too: Match
-  system (the default), Light or Dark, applied to the whole page and to
-  the tile grid below.
-- Output root has a Browse button beside it that opens a real Windows
-  folder dialog and writes the chosen path into the field. A browser
-  cannot hand a page a filesystem path, so the dialog is opened by the
-  local server, in a short-lived child process; the text field is
-  unchanged and still does the whole job on its own. Cancelling, a
-  dialog left open for two minutes, and a machine with no picker at all
-  each leave the field exactly as it was and say so underneath it. If
-  the dialog does not appear, look behind the browser window: it is a
-  native window and can open behind a maximised one.
+- Where the download lands sits in the main form, directly above the
+  Download button: a text field holding the folder everything is saved
+  under, and a Browse button beneath it. Above both, once a region and
+  site are filled in, is the exact folder this run will create, dated and
+  named, composed by the same code that creates it. The field holds the
+  root; the line above holds the whole path. There is one such field on
+  the page and not a copy of one, so the path you type there is the path
+  the download uses.
+- Browse opens a real Windows folder dialog and writes the chosen path
+  into the field. A browser cannot hand a page a filesystem path, so the
+  dialog is opened by the local server, in a short-lived child process;
+  the text field is unchanged and still does the whole job on its own.
+  Cancelling, a dialog left open for two minutes, and a machine with no
+  picker at all each leave the field exactly as it was and say so
+  underneath it. If the dialog does not appear, look behind the browser
+  window: it is a native window and can open behind a maximised one.
+- Tile size and overlap live behind the Settings button: defaults you set
+  once, not per-survey choices. An API key field appears there per data
+  source that needs one (OpenTopography's, for the elevation layer),
+  driven by the same source registry the layer list comes from, so a
+  second or third keyed source in a later phase needs no new panel. The
+  elevation model select is built from that same registry (see "Which
+  elevation model"), and it says on the page that nothing in it is
+  sharper than the default. An Appearance setting there too: Match system
+  (the default), Light or Dark, applied to the whole page and to the tile
+  grid below.
 - Tile size is a slider, and it says what each size costs for the extent
   currently drawn: the tile count and the estimated time, re-estimated
   from the server a moment after you stop moving it rather than on every

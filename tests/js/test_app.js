@@ -38,8 +38,20 @@ const SOURCE = fs.readFileSync(APP_JS_PATH, "utf8");
 // $("draw"), so a typo that would throw and blank the whole page in a
 // real browser instead ran clean here, 12/12, exit 0.
 const INDEX_HTML = fs.readFileSync(INDEX_HTML_PATH, "utf8");
+
+// Comments stripped before anything below reads ids or attributes out of
+// the markup. index.html is heavily commented, and those comments discuss
+// the very elements underneath them, so an id or an <input> quoted inside
+// one used to be indistinguishable here from an element that genuinely
+// exists. That is the same class of gap as every other one this file
+// records: it makes the harness MORE permissive than a browser, which
+// parses a comment as a comment and nothing else, and it would have let a
+// $("...") call survive against an element that had been deleted and
+// merely left described in the prose above where it used to be.
+const INDEX_HTML_MARKUP = INDEX_HTML.replace(/<!--[\s\S]*?-->/g, "");
+
 const KNOWN_IDS = new Set(
-  Array.from(INDEX_HTML.matchAll(/\bid="([^"]+)"/g), (m) => m[1])
+  Array.from(INDEX_HTML_MARKUP.matchAll(/\bid="([^"]+)"/g), (m) => m[1])
 );
 
 // The markup's own attributes for each <input id="...">, read from the
@@ -52,7 +64,7 @@ const KNOWN_IDS = new Set(
 // function was built for nor the step snapping it was missing could be
 // distinguished from doing nothing.
 const INPUT_MARKUP = new Map(
-  Array.from(INDEX_HTML.matchAll(/<input\b([^>]*)>/g), (match) => {
+  Array.from(INDEX_HTML_MARKUP.matchAll(/<input\b([^>]*)>/g), (match) => {
     const attrs = {};
     for (const attr of match[1].matchAll(/([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*"([^"]*)")?/g)) {
       attrs[attr[1]] = attr[2] !== undefined ? attr[2] : "";
@@ -4686,6 +4698,90 @@ function ok(condition, message) {
     ok(
       sandbox.document.getElementById("output-root-browse").disabled === false,
       "a picker that failed once must not leave the button dead for the session"
+    );
+  });
+
+  // =======================================================================
+  // Task 31, part 1: the destination belongs beside Download, not behind
+  // the Settings button.
+  //
+  // These are assertions about the committed markup, not about the
+  // sandbox, and they are the only kind that can be: this harness models
+  // elements by id with no tree between them, so "above Download" and
+  // "not inside the settings panel" are facts about index.html itself and
+  // are checked there. Everything else about the field, that it persists,
+  // that the picker writes to it, that a typed path reaches an estimate,
+  // is already checked through the real app.js above and is unchanged by
+  // the move, which is the point of the ids being stable.
+  // =======================================================================
+
+  // The settings panel's own markup, from its opening tag to the end of
+  // the file's <div id="settings-panel"> block. Sliced at the footer that
+  // follows it rather than by counting nested tags, which a regex cannot
+  // do: the assertion below only needs to know whether the picker's
+  // markup is anywhere inside that region.
+  const SETTINGS_PANEL_MARKUP = INDEX_HTML_MARKUP.slice(
+    INDEX_HTML_MARKUP.indexOf('<div id="settings-panel"'),
+    INDEX_HTML_MARKUP.indexOf("<footer>")
+  );
+
+  await test("the output root is out of the settings panel entirely, not copied out of it", () => {
+    ok(
+      SETTINGS_PANEL_MARKUP.length > 0 && SETTINGS_PANEL_MARKUP.includes('id="theme"'),
+      "expected to have actually found the settings panel's markup to check"
+    );
+    ok(
+      !SETTINGS_PANEL_MARKUP.includes('id="output-root"'),
+      "the owner asked for this out of Settings; it is still in there"
+    );
+    ok(
+      !SETTINGS_PANEL_MARKUP.includes('id="output-root-browse"'),
+      "the Browse button is still in the settings panel"
+    );
+    // Moved, not mirrored. Two elements editing one value is two places
+    // for a path to be typed and one question nobody can answer about
+    // which of them a download uses; there is exactly one of each here,
+    // so the question cannot be asked.
+    const fields = INDEX_HTML_MARKUP.match(/id="output-root"/g) || [];
+    ok(fields.length === 1, `expected exactly one output root field, found ${fields.length}`);
+    const buttons = INDEX_HTML_MARKUP.match(/id="output-root-browse"/g) || [];
+    ok(buttons.length === 1, `expected exactly one Browse button, found ${buttons.length}`);
+  });
+
+  await test("the text box, then the button, then Download, in the owner's own order", () => {
+    const field = INDEX_HTML_MARKUP.indexOf('id="output-root"');
+    const browse = INDEX_HTML_MARKUP.indexOf('id="output-root-browse"');
+    const download = INDEX_HTML_MARKUP.indexOf('id="download"');
+    ok(field !== -1 && browse !== -1 && download !== -1, "expected all three controls in the markup");
+    ok(field < browse, "the text box must come above the button");
+    ok(browse < download, "the button must sit just above Download");
+    // And between the two: nothing else that draws a path. The folder
+    // preview stays where it was, above the field, because it is the one
+    // element that shows the whole destination including the dated,
+    // named subfolder; a second copy of a path between the field and
+    // Download would be the third path this page does not need.
+    const between = INDEX_HTML_MARKUP.slice(browse, download);
+    ok(
+      !between.includes("folder-preview"),
+      "the folder preview must not have been duplicated below the field"
+    );
+  });
+
+  await test("the destination is usable without ever opening Settings", async () => {
+    // The whole complaint. A picker reached only by opening a panel is
+    // the thing that was wrong, so this drives the real Browse flow and
+    // then asserts the panel was never involved.
+    const { sandbox } = await bootedWithPicker(() => jsonResponse(200, { path: "D:\\NewSurveys" }));
+    ok(
+      sandbox.document.getElementById("settings-panel").hidden === true,
+      "expected the settings panel closed at boot"
+    );
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(outputRoot(sandbox) === "D:\\NewSurveys", `got: ${outputRoot(sandbox)}`);
+    ok(
+      sandbox.document.getElementById("settings-panel").hidden === true,
+      "picking a folder must not have needed the settings panel opened"
     );
   });
 

@@ -74,6 +74,32 @@
           <code id="folder-preview-path"></code>
         </div>
 
+        <!--
+          Task 31. This was put in the settings panel by Task 28 and that
+          was wrong: the owner asked for the destination beside Download,
+          not behind a panel. The field itself is unchanged, ids and all,
+          so payload(), persistence, boot() and the picker below are the
+          same code they were; only where it sits on the page is new.
+
+          It is MOVED, not mirrored. There is exactly one element in this
+          document with id="output-root", so there is no second copy of
+          the same value to fall out of step with this one and no question
+          about which of two typed paths a download uses.
+
+          The order is the owner's own: the button sits directly above
+          Download, and the text box directly above the button. The line
+          above both is the folder preview, unchanged, which is the only
+          thing on this page that shows the whole destination including
+          the dated, named subfolder the server composes. This field holds
+          the root that path starts from; the preview holds the path
+          itself. That is why there is no third thing here showing a path.
+        -->
+        <label class="destination">Save downloads to
+          <input id="output-root" type="text" />
+          <span id="output-root-note" class="hint"></span>
+        </label>
+        <button id="output-root-browse" type="button">Browse for a folder</button>
+
         <button id="download" type="button" class="primary" disabled>Download package</button>
         <button id="cancel" type="button" class="danger" hidden>Stop</button>
 
@@ -110,24 +136,6 @@
             <option value="dark">Dark</option>
           </select>
           <span class="hint">Applies to the whole page, including the tile grid drawn on the map while a download runs.</span>
-        </label>
-
-        <!--
-          Task 28. The text field is unchanged and still does the whole
-          job on its own; Browse is a convenience beside it, never a
-          replacement for it. A browser cannot hand a page a real
-          filesystem path, so the button asks the local server to open a
-          real folder dialog in a child process (see mapgen.folderpicker)
-          and writes the answer back into this same field. Cancelling,
-          timing out, or there being no picker on the machine all leave
-          the field exactly as it is and say so in the line underneath.
-        -->
-        <label>Output root
-          <span class="path-control">
-            <input id="output-root" type="text" />
-            <button id="output-root-browse" type="button">Browse</button>
-          </span>
-          <span id="output-root-note" class="hint"></span>
         </label>
 
         <!--

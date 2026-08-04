@@ -1326,13 +1326,19 @@ renderTileSize();
 
 // --- settings panel -----------------------------------------------------
 //
-// Output root, tile size and overlap are defaults the owner sets once and
-// rarely revisits; API keys belong to a source and are exactly the same
-// kind of thing. All three move here rather than sitting in the main
-// flow, which is otherwise entirely per-survey choices (region, site,
-// layers, categories). Nothing about the FIELDS themselves changes: their
-// ids, their persistence and their effect on the next estimate are
-// unchanged by which panel currently shows them.
+// Tile size and overlap are defaults the owner sets once and rarely
+// revisits; the theme, the elevation model and the API keys are the same
+// kind of thing. They live here rather than in the main flow, which is
+// otherwise entirely per-survey choices (region, site, layers,
+// categories). Nothing about the FIELDS themselves changes: their ids,
+// their persistence and their effect on the next estimate are unchanged
+// by which panel currently shows them.
+//
+// The output root was here too, and Task 31 moved it back out. It is not
+// a default of the same kind: it is where this download is about to land,
+// which is the one thing worth being able to read and change without
+// opening anything. Nothing about that field changed either, which is the
+// point of ids being stable across a move.
 
 function closeSettingsPanel() {
   $("settings-panel").hidden = true;
@@ -1445,6 +1451,12 @@ function maybePersistFieldSettings() {
 // owner can always type the path, which is what they did before this
 // button existed and what they will go on doing if the picker turns out
 // not to work on some future machine.
+//
+// Task 31 moved both the field and this button into the main form, above
+// Download. Not one line below changed for it, and that is worth saying
+// rather than leaving to be noticed: everything here is addressed by id,
+// so the whole picker, its cancel, its timeout, its unavailable and its
+// busy handling came across the page intact.
 
 function setOutputRootNote(message) {
   const note = $("output-root-note");

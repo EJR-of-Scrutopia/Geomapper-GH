@@ -193,33 +193,24 @@ label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
    style themselves. */
 input[type="range"] { width: 100%; margin: 0; }
 
-/* Task 28: the output root's field and its Browse button on one line.
-   The same flex-with-min-width-0 shape .tile-size-control below uses,
-   for the reason recorded there: an input's intrinsic width does not
-   shrink to fit a narrow container on its own, and this one sits in a
-   360px panel. The button is sized down from the page default so it does
-   not out-weigh the field it assists, which is the honest visual order
-   of the two: the field is the control, the button is help. Both themes
-   are covered already, since every colour it inherits is a variable the
-   two palettes at the top of this file each define. */
-.path-control {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
+/* Task 31: the destination, in the main form above Download rather than
+   in the settings panel where Task 28 put it. The .path-control flex row
+   that had the field and the button side by side in a 360px panel is
+   gone with it: the owner asked for the button UNDER the box and directly
+   above Download, so the two are ordinary full-width children of the
+   form's own flex column and need no shape of their own. Browse and
+   Download therefore line up as a pair, which is the honest reading of
+   them: same width, and the accent fill on Download alone says which one
+   is the act and which one is help.
 
-.path-control input[type="text"] { flex: 1; min-width: 0; }
-
-.path-control button {
-  padding: 7px 10px;
-  font-size: 13px;
-  white-space: nowrap;
-}
+   Both themes are covered already, since every colour here is inherited
+   from a variable the two palettes at the top of this file each define. */
+.destination { gap: 4px; }
 
 /* A dialog is open and being waited on, which is the one place in this
    interface where a disabled control means "in progress" rather than
    "not available". */
-.path-control button:disabled { opacity: 0.5; cursor: progress; }
+#output-root-browse:disabled { opacity: 0.5; cursor: progress; }
 
 .tile-size-control {
   display: flex;
@@ -350,11 +341,13 @@ button.armed {
   box-shadow: 0 0 0 2px rgba(47, 93, 79, 0.35);
 }
 
-/* Settings panel: output root, tile size, overlap and API keys, the
-   defaults the owner sets once rather than the per-survey choices that
-   stay in the main form. A fixed overlay with a dismissible backdrop,
-   kept visually consistent with the rest of the page rather than
-   introducing a second style language for one panel. */
+/* Settings panel: appearance, tile size, overlap, elevation model and
+   API keys, the defaults the owner sets once rather than the per-survey
+   choices that stay in the main form. The output root used to be here
+   too and is not any more (Task 31): where a download lands is not a
+   thing to go hunting for behind a button. A fixed overlay with a
+   dismissible backdrop, kept visually consistent with the rest of the
+   page rather than introducing a second style language for one panel. */
 .settings-panel {
   position: fixed;
   inset: 0;
