@@ -460,37 +460,126 @@ def test_check_path_length_still_checks_osms_own_path_when_it_is_selected(tmp_pa
     check_path_length(paths, [], source_ids=["stub"], limit=osm_length - 1)
 
 
-def test_the_path_limit_leaves_room_for_a_subdivided_tiles_own_scratch_path(tmp_path):
-    # check_path_length measures OSM at raw/osm/r00_c00.osm, which is the
-    # longest path OSM could produce until Task 26 gave a tile too dense
-    # for one request a set of quarters to keep: raw/osm/_split/
-    # r00_c00_q00_q00.osm at the depth cap, fifteen characters longer.
-    #
-    # That is not modelled in the guard, deliberately: naming.py would
-    # have to import a constant from a source module to do it, and the
-    # 20 characters DEFAULT_PATH_LIMIT already holds back from Windows'
-    # own 260 absorb it. This is that argument, checked rather than
-    # asserted in prose, so raising the limit or deepening the split
-    # fails here instead of on a real package.
+# --- what the 240 character limit does and does not cover ------------------
+#
+# check_path_length measures OSM at raw/osm/r00_c00.osm, and Task 26 gave a
+# tile too dense for one request a set of quarters to keep, whose deepest
+# file is raw/osm/_split/r00_c00_q11_q11.osm, fifteen characters longer.
+# Neither is modelled in the guard: naming.py would have to import a
+# constant from a source module to do it.
+#
+# The first version of these tests concluded that DEFAULT_PATH_LIMIT's own
+# 20 characters of headroom below Windows' 260 absorbed those fifteen, and
+# called the remainder five characters of slack. That was wrong, and wrong
+# in the way this project keeps producing: a guard that reads like one and
+# is not. The file the deepest quarter path names is never the file that
+# gets created. Every write in mapgen goes through fsutil.atomic_writer,
+# which writes to _temp_path first, and that appends
+# .{pid}.{thread ident}.{8 hex}.part to the name.
+#
+# So the two tests below say the two true things separately, because they
+# have different answers.
+
+
+WINDOWS_MAX_PATH = 260
+
+
+def _length_at_the_limit(tmp_path, relative_parts):
+    """The length a path of this shape reaches for a job admitted at
+    exactly DEFAULT_PATH_LIMIT, built for real under tmp_path rather than
+    added up, so a separator miscount cannot hide in the arithmetic."""
+    work_dir = tmp_path / "_work" / FINGERPRINT
+    reference = work_dir / "raw" / "osm" / "r00_c00.osm"
+    # One character of the padding pays for the separator the padding
+    # segment itself introduces. Built and measured rather than added up
+    # for exactly this reason.
+    padding = DEFAULT_PATH_LIMIT - len(str(reference)) - 1
+    assert padding > 0, "test setup: tmp_path is already longer than the limit"
+    padded_work_dir = tmp_path / ("x" * padding) / "_work" / FINGERPRINT
+    assert (
+        len(str(padded_work_dir / "raw" / "osm" / "r00_c00.osm")) == DEFAULT_PATH_LIMIT
+    ), "test setup: the reference tile path should land exactly on the limit"
+    return padded_work_dir.joinpath("raw", "osm", *relative_parts)
+
+
+def test_a_subdivided_tiles_own_file_stays_inside_max_path(tmp_path):
+    # The FINAL name, which is the one that persists: it is what a resume
+    # looks for, what the recombine reads, and what anyone opening _work/
+    # sees. For a job admitted at exactly the limit it lands at 255, so
+    # raising DEFAULT_PATH_LIMIT or deepening MAX_SUBDIVISION_DEPTH fails
+    # here rather than on a real package.
     from mapgen.sources.osm import MAX_SUBDIVISION_DEPTH, SPLIT_DIR_NAME
 
-    windows_limit = 260
-    extra = len(SPLIT_DIR_NAME) + 1 + len("_q00") * MAX_SUBDIVISION_DEPTH
-    assert DEFAULT_PATH_LIMIT + extra <= windows_limit, (
-        f"a job the guard admits at {DEFAULT_PATH_LIMIT} characters could "
-        f"produce a quarter file {DEFAULT_PATH_LIMIT + extra} characters "
-        f"long, past Windows' own {windows_limit}"
+    quarter = _length_at_the_limit(
+        tmp_path,
+        (SPLIT_DIR_NAME, f"r00_c00{'_q11' * MAX_SUBDIVISION_DEPTH}.osm"),
+    )
+    assert len(str(quarter)) <= WINDOWS_MAX_PATH, (
+        f"a job the guard admits at {DEFAULT_PATH_LIMIT} characters keeps a "
+        f"quarter file {len(str(quarter))} characters long, past Windows' "
+        f"own {WINDOWS_MAX_PATH}"
     )
 
-    # And the real thing, not just the arithmetic: a work directory sized
-    # so the tile file lands exactly on the limit still produces a
-    # quarter path Windows can resolve.
-    work_dir = tmp_path / "_work" / FINGERPRINT
-    tile_path = work_dir / "raw" / "osm" / "r00_c00.osm"
-    padding = DEFAULT_PATH_LIMIT - len(str(tile_path))
-    assert padding > 0, "test setup: tmp_path is already longer than the limit"
-    work_dir = tmp_path / ("x" * padding) / "_work" / FINGERPRINT
-    quarter_path = (
-        work_dir / "raw" / "osm" / SPLIT_DIR_NAME / f"r00_c00{'_q00' * MAX_SUBDIVISION_DEPTH}.osm"
+
+def test_the_path_limit_does_not_cover_the_temp_path_a_write_really_creates(tmp_path):
+    """Characterisation, not a promise: DEFAULT_PATH_LIMIT does not protect
+    against MAX_PATH at all once the temp suffix is counted, and mapgen
+    depends on long paths being enabled.
+
+    fsutil._temp_path appends .{pid}.{thread ident}.{8 hex}.part, which
+    measured 26 characters on this machine. A job admitted at exactly the
+    240 character limit therefore CREATES a path of about 266 characters
+    for an ordinary tile and about 281 for a subdivided tile's deepest
+    quarter. Both are past 260. The guard's 20 characters of headroom
+    cannot cover a suffix of this size: 16 of those characters are fixed
+    (four dots, eight hex, "part"), leaving four for the pid and the
+    thread id together, which no real pair of those fits in.
+
+    This predates Task 26 and is not about subdivision. Every OSM tile
+    mapgen has ever written took the same 26 characters, so the ordinary
+    tile above was already 266 before quarters existed; subdivision adds
+    fifteen to a figure that was already over. It is also not a live
+    failure here: LongPathsEnabled is 1 on this machine, Python has been
+    long path aware since 3.6, and a write through a 288 character temp
+    path was confirmed to succeed. What the 240 limit really buys is that
+    the paths which PERSIST, the ones Grasshopper and Explorer and a
+    resume all have to deal with, stay inside 260 (see the test above),
+    and that a job is refused before it starts rather than part way
+    through.
+
+    Deliberately NOT done, and named so the next reader does not re-derive
+    them: lowering DEFAULT_PATH_LIMIT (it would reject jobs that work
+    today), \\\\?\\ prefixing every write, and shortening the split
+    directory to save characters. All three are out of proportion to
+    something that does not currently bite, and none of them is the
+    binding constraint. If a machine without long path support ever runs
+    this, that is the moment, and this test is the note explaining why.
+    """
+    from mapgen.fsutil import _temp_path
+    from mapgen.sources.osm import MAX_SUBDIVISION_DEPTH, SPLIT_DIR_NAME
+
+    tile = _length_at_the_limit(tmp_path, ("r00_c00.osm",))
+    quarter = _length_at_the_limit(
+        tmp_path,
+        (SPLIT_DIR_NAME, f"r00_c00{'_q11' * MAX_SUBDIVISION_DEPTH}.osm"),
     )
-    assert len(str(quarter_path)) <= windows_limit
+    assert len(str(tile)) == DEFAULT_PATH_LIMIT, "test setup: the tile should sit on the limit"
+
+    tile_written = len(str(_temp_path(tile)))
+    quarter_written = len(str(_temp_path(quarter)))
+    suffix = tile_written - len(str(tile))
+
+    # The headroom the first version of this test claimed, against the
+    # suffix that actually gets appended.
+    assert suffix > WINDOWS_MAX_PATH - DEFAULT_PATH_LIMIT, (
+        f"the temp suffix is {suffix} characters and the guard holds back "
+        f"{WINDOWS_MAX_PATH - DEFAULT_PATH_LIMIT}; if that has stopped being "
+        f"true, the docstring above needs rewriting, not this assertion"
+    )
+    # An ORDINARY tile, with no subdivision anywhere near it, is already
+    # over. This is the sentence that matters.
+    assert tile_written > WINDOWS_MAX_PATH
+    # And subdivision's own contribution is the fifteen characters between
+    # the two, not the overrun itself.
+    assert quarter_written - tile_written == 15
+    assert quarter_written > WINDOWS_MAX_PATH

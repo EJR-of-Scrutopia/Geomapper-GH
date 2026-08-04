@@ -148,10 +148,20 @@ MAX_SUBDIVISION_DEPTH = 2
 # what keeps them out.
 #
 # This name plus the deepest quarter's own suffix is the longest path
-# OSM can produce, fifteen characters past the raw/osm/rNN_cNN.osm that
-# naming.check_path_length actually measures. It fits inside the twenty
-# characters that guard already holds back from Windows' own 260 limit,
-# which test_naming.py checks rather than leaving as an assurance here.
+# OSM can produce: 15 characters past the raw/osm/rNN_cNN.osm that
+# naming.check_path_length actually measures, so a job admitted at that
+# guard's 240 character limit KEEPS a quarter file 255 characters long,
+# inside Windows' 260.
+#
+# The path mapgen CREATES is longer than either, and not by a margin the
+# guard covers. Every write goes through fsutil.atomic_writer, which
+# writes to .{pid}.{thread ident}.{8 hex}.part first, 26 characters as
+# measured here, so the same job creates 266 characters for an ordinary
+# tile and 281 for the deepest quarter. That predates subdivision,
+# applies to every OSM tile mapgen has ever written, and works only
+# because long paths are enabled on this machine. See test_naming.py's
+# own two tests, which say those two things separately because they have
+# different answers.
 SPLIT_DIR_NAME = "_split"
 
 
