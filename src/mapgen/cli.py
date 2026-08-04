@@ -48,6 +48,7 @@ from mapgen.sources.base import (
 from mapgen.sources.elevation import ElevationError
 from mapgen.sources.osm import OsmDownloadError
 from mapgen.sources.overture import OvertureError
+from mapgen.urbano import describe_layers
 
 # Task 19 item 4: where a windowless launch's own errors go when there is
 # no console to print them to. Alongside ~/.mapgen/config.json, the same
@@ -299,26 +300,49 @@ def _empty_layer_lines(survey: dict) -> list[str]:
     return lines
 
 
+def _project_setting_lines(survey: dict) -> list[str]:
+    """What to say about the one file Urbano 2 is pointed at.
+
+    Read from survey.json's own `project_setting` block rather than from the
+    bridge block, which is what this used to do and which had become a lie:
+    the bridge failing no longer has anything to do with whether the file
+    exists (task 35). It names the layers the file actually carries, because
+    "which of my layers will Urbano see" is the next question the owner
+    asks, and a run that got no DEM should not have to be discovered by
+    opening the JSON.
+
+    Shared by `mapgen survey` and `mapgen bridge` so the two say the same
+    thing about the same file.
+    """
+    record = survey.get("project_setting") or {}
+    if record.get("written"):
+        return [
+            f"Urbano project setting: {record.get('file')}",
+            f"  carries {describe_layers([str(l) for l in record.get('layers') or []])}",
+        ]
+    error = record.get("error")
+    if error:
+        return [f"Urbano project setting: not written. {error}"]
+    # No block at all, which only a package written before this existed can
+    # produce. Said plainly rather than guessed at either way.
+    return ["Urbano project setting: this package's record does not say."]
+
+
 def command_survey(args: argparse.Namespace) -> int:
     result = run_survey(_request_from_args(args), progress=ConsoleProgress())
     print(f"\nPackage: {result.paths.root}")
     for line in _empty_layer_lines(result.survey):
         print(line)
+    for line in _project_setting_lines(result.survey):
+        print(line)
     bridge = result.survey.get("bridge") or {}
-    if bridge.get("ok"):
-        print(f"Urbano project setting: {result.paths.project_setting.name}")
-    elif bridge.get("attempted"):
-        # Urbano itself writes this file as part of a successful bridge run;
-        # a failed bridge never produced it, whatever name survey.json's
-        # stem predicts it would have had. Naming a file that does not
-        # exist here would send the owner looking for it, or worse, into
-        # Grasshopper pointed at nothing.
-        print("Urbano project setting: not produced, the Urbano bridge step failed.")
+    if bridge.get("attempted") and not bridge.get("ok"):
         # A plain sentence, already produced by bridge.py or package.py, never
-        # a stack trace: the survey data itself is unaffected by this failure.
+        # a stack trace. Since task 35 it is no longer the reason the package
+        # has no project setting, so it is reported for what it now is: one
+        # optional step that did not work, on a package that is otherwise
+        # finished and ready for Grasshopper.
         print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
-    else:
-        print("Urbano project setting: not produced, the bridge step was skipped.")
     # Task 30, section 5: a scripted run must not be silent about what it
     # could not get. This is the same account survey.json carries and the
     # same one IncompleteSurveyError raises out of an unforced run,
@@ -362,27 +386,31 @@ def command_bridge(args: argparse.Namespace) -> int:
     """`mapgen bridge <package-dir>`: the Urbano files for a package that
     already exists, without downloading it again.
 
-    Exits 1 on a bridge that ran and failed, where `mapgen survey` exits 0
-    for the same failure. That is not an inconsistency. A survey whose
-    bridge fails still delivered the OSM, Overture and elevation data it
-    was asked for, which is most of what it was for; this command was asked
-    for exactly one thing, so a failure here is the whole of it. The
-    package is unharmed either way, and survey.json says what happened.
+    Exits on whether the PROJECT SETTING was produced, not on whether the
+    C# bridge succeeded, and task 35 is why. What this command is for is
+    the one file Urbano 2 is pointed at, and mapgen now writes that file
+    itself. A bridge that failed is one optional extra that did not happen,
+    reported on stderr; it is no longer the difference between a package
+    that works in Grasshopper and one that does not.
+
+    Still exits 1 when there is no project setting, where `mapgen survey`
+    exits 0 for the same outcome. That is not an inconsistency. A survey
+    whose Urbano step fails still delivered the OSM, Overture and elevation
+    data it was asked for, which is most of what it was for; this command
+    was asked for exactly one thing, so a failure here is the whole of it.
+    The package is unharmed either way, and survey.json says what happened.
     """
     payload = bridge_package(args.package_dir, progress=ConsoleProgress())
-    bridge = payload.get("bridge") or {}
     print(f"\nPackage: {args.package_dir}")
-    if bridge.get("ok"):
-        # Named from the package's own recorded stem, which is what was
-        # handed to the bridge as --file-name-stem, so this is the file
-        # that was actually just written rather than a prediction.
-        print(f"Urbano project setting: {payload.get('urbano_stem')}_project_setting.json")
-        return 0
-    # A plain sentence, already produced by bridge.py, never a stack trace:
-    # the survey data in the folder is untouched by this failure.
-    print("Urbano project setting: not produced, the Urbano bridge step failed.")
-    print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
-    return 1
+    for line in _project_setting_lines(payload):
+        print(line)
+    bridge = payload.get("bridge") or {}
+    if bridge.get("attempted") and not bridge.get("ok"):
+        # A plain sentence, already produced by bridge.py, never a stack
+        # trace: the survey data in the folder is untouched by this failure,
+        # and so, now, is the project setting.
+        print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
+    return 0 if (payload.get("project_setting") or {}).get("written") else 1
 
 
 def _install_windowless_safety() -> bool:

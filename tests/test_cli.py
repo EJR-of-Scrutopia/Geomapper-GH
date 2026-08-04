@@ -523,48 +523,93 @@ def _survey_args(tmp_path):
     ]
 
 
-def test_survey_summary_names_the_project_setting_when_the_bridge_succeeded(
+def _written(name="S_2026-08-01_project_setting.json", layers=("osm",)):
+    return {"written": True, "file": name, "layers": list(layers), "error": None}
+
+
+def test_survey_summary_names_the_project_setting_and_what_it_carries(
     tmp_path, capsys, monkeypatch
 ):
     project_setting = tmp_path / "S_2026-08-01_project_setting.json"
     fake_result = _FakeSurveyResult(
         paths=_FakePaths(root=tmp_path, project_setting=project_setting),
         complete=True,
-        survey={"bridge": {"attempted": True, "ok": True, "error": None}},
+        survey={
+            "bridge": {"attempted": False, "ok": None, "error": None},
+            "project_setting": _written(layers=("osm", "elevation", "overture")),
+        },
     )
     monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
     exit_code = main(_survey_args(tmp_path))
     out = capsys.readouterr().out
     assert exit_code == 0
     assert f"Urbano project setting: {project_setting.name}" in out
+    # Which layers reached Urbano's side of the package is the next thing
+    # the owner asks, and it should not need the JSON opening.
+    assert "carries osm, elevation and overture" in out
 
 
-def test_survey_summary_does_not_claim_a_project_setting_when_the_bridge_failed(
+def test_survey_summary_names_the_project_setting_even_when_the_bridge_failed(
     tmp_path, capsys, monkeypatch
 ):
-    # The exact bug reported: after a failed bridge, the directory holds
-    # only survey.json and the merged data, never the project setting, but
-    # the old summary printed its name anyway.
+    """The inverse of the bug this used to guard. The old summary read the
+    bridge block to decide whether the file existed, which was right when
+    the bridge was the only writer of it. mapgen writes it now, so a failed
+    bridge no longer means a missing file, and saying it does would send
+    the owner looking for a file that is sitting in the folder.
+    """
     project_setting = tmp_path / "S_2026-08-01_project_setting.json"
     error = "The Urbano bridge failed with exit code 1. See the output above for details."
     fake_result = _FakeSurveyResult(
         paths=_FakePaths(root=tmp_path, project_setting=project_setting),
         complete=True,
-        survey={"bridge": {"attempted": True, "ok": False, "error": error}},
+        survey={
+            "bridge": {"attempted": True, "ok": False, "error": error},
+            "project_setting": _written(),
+        },
     )
     monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
     exit_code = main(_survey_args(tmp_path))
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert project_setting.name not in captured.out
-    assert "not produced" in captured.out
+    assert f"Urbano project setting: {project_setting.name}" in captured.out
+    assert "not written" not in captured.out
+    # The bridge failure is still reported, on stderr, as what it now is:
+    # one optional step that did not work.
     assert f"Urbano bridge step failed: {error}" in captured.err
 
 
-def test_survey_summary_says_the_bridge_was_skipped_when_it_was(tmp_path, capsys, monkeypatch):
-    project_setting = tmp_path / "S_2026-08-01_project_setting.json"
+def test_survey_summary_says_why_when_no_project_setting_could_be_written(
+    tmp_path, capsys, monkeypatch
+):
+    reason = (
+        "No file Urbano can read was found in C:\\x for S_2026-08-01, so a "
+        "project setting would name nothing."
+    )
     fake_result = _FakeSurveyResult(
-        paths=_FakePaths(root=tmp_path, project_setting=project_setting),
+        paths=_FakePaths(root=tmp_path, project_setting=tmp_path / "unused.json"),
+        complete=True,
+        survey={
+            "bridge": {"attempted": False, "ok": None, "error": None},
+            "project_setting": {
+                "written": False, "file": None, "layers": [], "error": reason,
+            },
+        },
+    )
+    monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
+    exit_code = main(_survey_args(tmp_path))
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Urbano project setting: not written." in captured.out
+    assert reason in captured.out
+    assert captured.err == ""
+
+
+def test_survey_summary_does_not_guess_for_a_package_written_before_this_existed(
+    tmp_path, capsys, monkeypatch
+):
+    fake_result = _FakeSurveyResult(
+        paths=_FakePaths(root=tmp_path, project_setting=tmp_path / "unused.json"),
         complete=True,
         survey={"bridge": {"attempted": False, "ok": None, "error": None}},
     )
@@ -572,9 +617,8 @@ def test_survey_summary_says_the_bridge_was_skipped_when_it_was(tmp_path, capsys
     exit_code = main(_survey_args(tmp_path))
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert project_setting.name not in captured.out
-    assert "skipped" in captured.out
-    assert captured.err == ""
+    assert "does not say" in captured.out
+    assert "unused.json" not in captured.out
 
 
 def test_estimate_with_no_output_root_survives_a_corrupt_config(tmp_path, capsys, monkeypatch):
@@ -1208,44 +1252,88 @@ def test_bridge_reports_a_package_with_no_survey_json_without_a_traceback(tmp_pa
     assert "Traceback" not in err
 
 
-def test_bridge_names_the_project_setting_when_it_succeeds(tmp_path, capsys, monkeypatch):
+def test_bridge_names_the_project_setting_it_wrote(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(
         "mapgen.cli.bridge_package",
         lambda *a, **k: {
             "urbano_stem": "Barry-Waterfront_2026-08-01",
             "bridge": {"attempted": True, "ok": True, "error": None, "ran_at": "2026-08-04T10:00:00Z"},
+            "project_setting": {
+                "written": True,
+                "file": "Barry-Waterfront_2026-08-01_project_setting.json",
+                "layers": ["osm", "elevation"],
+                "error": None,
+            },
         },
     )
     exit_code = main(["bridge", str(tmp_path)])
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "Urbano project setting: Barry-Waterfront_2026-08-01_project_setting.json" in captured.out
+    assert "carries osm and elevation" in captured.out
     assert captured.err == ""
 
 
-def test_bridge_exits_1_and_says_why_when_the_bridge_ran_and_failed(tmp_path, capsys, monkeypatch):
-    # The owner's normal case today, and the reason this exits 1 where
-    # `mapgen survey` exits 0 for the same failure: a survey that cannot
-    # bridge still delivered its data, and this command was asked for
-    # nothing else.
+def test_bridge_succeeds_when_it_wrote_the_file_and_only_the_c_sharp_step_failed(
+    tmp_path, capsys, monkeypatch
+):
+    """The owner's normal case, and the whole point of task 35: this command
+    exists to give an existing package the one file Urbano is pointed at,
+    and mapgen now writes that file itself. The C# bridge failing is an
+    optional extra that did not happen, not a failure of the command.
+
+    Before this it exited 1 and printed "not produced", on a run that would
+    now leave a perfectly usable project setting in the folder.
+    """
     error = (
-        "Urbano is not installed: no Urbano.Core.dll or ProjectSetup.dll was found "
-        "under C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2. "
-        "Urbano is optional; the rest of the package does not need it."
+        "The Urbano bridge did not start: it looked under "
+        "C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2 "
+        "for Urbano.Core.dll and ProjectSetup.dll, and Urbano 2 ships neither."
     )
     monkeypatch.setattr(
         "mapgen.cli.bridge_package",
         lambda *a, **k: {
             "urbano_stem": "Barry-Waterfront_2026-08-01",
             "bridge": {"attempted": True, "ok": False, "error": error, "ran_at": "2026-08-04T10:00:00Z"},
+            "project_setting": {
+                "written": True,
+                "file": "Barry-Waterfront_2026-08-01_project_setting.json",
+                "layers": ["osm"],
+                "error": None,
+            },
+        },
+    )
+    exit_code = main(["bridge", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Barry-Waterfront_2026-08-01_project_setting.json" in captured.out
+    assert error in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_bridge_exits_1_and_says_why_when_no_project_setting_could_be_written(
+    tmp_path, capsys, monkeypatch
+):
+    # This command was asked for exactly one thing, so failing to produce it
+    # is the whole of the outcome, where `mapgen survey` exits 0 for the
+    # same thing because it still delivered its data.
+    reason = "No file Urbano can read was found in C:\\x for S, so a project setting would name nothing."
+    monkeypatch.setattr(
+        "mapgen.cli.bridge_package",
+        lambda *a, **k: {
+            "urbano_stem": "Barry-Waterfront_2026-08-01",
+            "bridge": {"attempted": True, "ok": False, "error": "bridge said no", "ran_at": "x"},
+            "project_setting": {
+                "written": False, "file": None, "layers": [], "error": reason,
+            },
         },
     )
     exit_code = main(["bridge", str(tmp_path)])
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "not produced" in captured.out
+    assert "not written" in captured.out
+    assert reason in captured.out
     assert "Barry-Waterfront_2026-08-01_project_setting.json" not in captured.out
-    assert error in captured.err
     assert "Traceback" not in captured.err
 
 

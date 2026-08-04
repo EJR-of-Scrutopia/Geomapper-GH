@@ -35,7 +35,12 @@ _MISSING_URBANO_RE = re.compile(
 
 def _missing_urbano_directory(output: str) -> str | None:
     """The directory UrbanoBridge looked in, if its output says plainly that
-    no Urbano install was found there; None for any other failure shape.
+    it found no package holding the two DLLs it expects; None for any other
+    failure shape.
+
+    The regex is unchanged and must be: it quotes Program.cs's own message
+    verbatim, and Program.cs still emits exactly that. What task 35 changed
+    is what mapgen SAYS about it. See run_bridge.
     """
     match = _MISSING_URBANO_RE.search(output)
     return match.group(1).strip() if match else None
@@ -126,16 +131,32 @@ def run_bridge(
         stderr = getattr(result, "stderr", "") or ""
         missing_dir = _missing_urbano_directory(stdout + stderr)
         if missing_dir:
-            # Expected and harmless on a machine with no Urbano installed,
-            # which is every run this owner makes today: reported as a
-            # plain sentence, not the DirectoryNotFoundException and C#
-            # stack trace that would otherwise print before it on every
-            # single survey. The raw output is deliberately NOT printed
-            # here, unlike the genuinely-unexpected branch below.
+            # Expected and harmless: reported as a plain sentence, not the
+            # DirectoryNotFoundException and C# stack trace that would
+            # otherwise print before it on every single survey. The raw
+            # output is deliberately NOT printed here, unlike the
+            # genuinely-unexpected branch below.
+            #
+            # This message used to say "Urbano is not installed", and task
+            # 34 established that it is wrong on the owner's own machine.
+            # Urbano 2.2.1.2 IS installed there. It simply does not ship
+            # Urbano.Core.dll or ProjectSetup.dll: both were merged into
+            # Urbano.SiteAnalysis.gha, along with every type this bridge
+            # asks for. So the old message sent the owner to check a Rhino
+            # install that was never broken, for a failure that is entirely
+            # this bridge's own out of date expectation.
+            #
+            # It also used to matter. It does not any more: mapgen writes
+            # <stem>_project_setting.json itself now (see mapgen.urbano), so
+            # this failure costs the package nothing, and the message says
+            # so rather than leaving the owner to wonder.
             raise BridgeError(
-                f"Urbano is not installed: no Urbano.Core.dll or ProjectSetup.dll "
-                f"was found under {missing_dir}. Urbano is optional; the rest of "
-                f"the package does not need it."
+                f"The Urbano bridge did not start: it looked under {missing_dir} "
+                f"for Urbano.Core.dll and ProjectSetup.dll, and Urbano 2 ships "
+                f"neither. Both were merged into Urbano.SiteAnalysis.gha, so this "
+                f"says nothing about whether Urbano is installed. The bridge needs "
+                f"retargeting; see docs/urbano/README.md. Nothing in the package "
+                f"depends on it: mapgen writes the Urbano project setting itself."
             )
         # A genuinely unexpected failure: nothing here recognises it, so the
         # raw subprocess output is the only place the real detail lives.

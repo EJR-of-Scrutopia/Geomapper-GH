@@ -55,6 +55,12 @@ from mapgen.sources.base import (
 )
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.osm import OsmSource
+from mapgen.urbano import (
+    LAYER_ORDER,
+    ProjectSettingError,
+    resolve_data_files,
+    write_project_setting,
+)
 from mapgen.sources.overture import (
     DEFAULT_OVERTURE_TYPES,
     LAYER_FILENAMES,
@@ -921,6 +927,30 @@ def run_survey(
                 bridge_runner=bridge_runner,
             )
 
+        # Task 35, and the whole point of it: this happens on EVERY run, in
+        # every outcome, whether the bridge ran, failed, was skipped by
+        # --skip-bridge or was never reached because the run was stopped or
+        # is about to raise.
+        #
+        # Unconditional, deliberately, because the failure this replaces is
+        # "the folder does not have the file and you have to know why". The
+        # owner met that once already, in Grasshopper, with a real survey.
+        # Every condition that could be put on this brings back a version of
+        # it.
+        #
+        # It cannot claim more than the folder holds: every path and every
+        # layer name in the file is resolved off the disk (see
+        # mapgen.urbano.resolve_data_files), so a partial package gets a
+        # project setting describing exactly the partial package, and one
+        # with nothing in it at all gets none and says so.
+        #
+        # AFTER the bridge step, never before, so that when both write the
+        # file mapgen's is the one that survives. See _write_project_setting_
+        # step for why that is the right way round.
+        project_setting = _write_project_setting_step(
+            bbox=request.bbox, root=paths.root, stem=paths.stem, sink=sink
+        )
+
     survey = _build_survey_json(
         request,
         paths,
@@ -940,6 +970,7 @@ def run_survey(
                 for record in verified["failures"]
             }
         ),
+        project_setting,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -1045,6 +1076,55 @@ def _run_bridge_step(
         return False, error
     sink.emit("bridge_done")
     return True, None
+
+
+def _write_project_setting_step(
+    bbox: BBox, root: Path, stem: str, sink: ProgressSink
+) -> dict[str, object]:
+    """Write `<stem>_project_setting.json`, reported the way the bridge step
+    is reported: as a record, never as an exception that costs the package.
+
+    The ONLY place in mapgen that calls write_project_setting, for the same
+    reason _run_bridge_step is the only place that calls run_bridge: two call
+    sites would have to be kept agreeing about which failures are survivable
+    and which events are emitted, forever, with nothing but vigilance holding
+    them together.
+
+    **Which writer wins.** Both this and the C# bridge write the same file
+    name. This one runs second, so it wins, and that is the intended
+    ordering rather than an accident of layout:
+
+      * The bridge has never once succeeded on the owner's machine, so on
+        every run to date there is nothing of its to overwrite.
+      * When it does succeed, it names the files IT produced. This names
+        whatever is actually in the folder, preferring the bridge's own
+        native formats where they are there (see mapgen.urbano.DATA_FILES),
+        so the result is a superset rather than a downgrade: a successful
+        bridge run's `.osm.pbf`, `.egrid` and `.parquet` are all still
+        named, and mapgen's `.tif` and `.geojson` are named too where the
+        bridge produced nothing.
+      * A failure here is recorded and the package is finished anyway,
+        exactly as a bridge failure is. Losing a survey's real data because
+        a JSON file could not be written would be the same mistake task 20
+        already fixed once.
+
+    OSError is caught alongside ProjectSettingError because this writes to
+    the owner's own output root, where a full disk, a permission and a file
+    held open by something else are all ordinary rather than exotic.
+    """
+    sink.emit("project_setting_started")
+    try:
+        written = write_project_setting(bbox, root, stem)
+    except (ProjectSettingError, OSError) as exc:
+        error = str(exc)
+        sink.emit("project_setting_failed", error=error)
+        return {"written": False, "file": None, "layers": [], "error": error}
+    # Re-read off the disk rather than returned by the writer, so this record
+    # is derived by the same function the file itself was, and the two cannot
+    # form different opinions about which layers a package holds.
+    layers = [layer for layer in LAYER_ORDER if layer in resolve_data_files(Path(root), stem)]
+    sink.emit("project_setting_written", file=written.name, layers=layers)
+    return {"written": True, "file": written.name, "layers": layers, "error": None}
 
 
 class UnbridgeablePackageError(ValueError):
@@ -1340,6 +1420,15 @@ def bridge_package(
         bridge_runner=bridge_runner,
     )
 
+    # Task 35. The reason this command exists, restated: every package the
+    # owner already has was downloaded by a run whose bridge failed, so
+    # every one of them is missing its project setting. That is now fixed
+    # here by mapgen itself rather than by whether the bridge can be made to
+    # work, which is why this runs unconditionally after the bridge attempt
+    # rather than only when it succeeded.
+    payload["project_setting"] = _write_project_setting_step(
+        bbox=bbox, root=root, stem=stem, sink=sink
+    )
     payload["bridge"] = _rebridged_block(payload.get("bridge"), ok, error, _now())
     atomic_write_text(survey_json, json.dumps(payload, indent=2))
     return payload
@@ -2320,9 +2409,13 @@ def _build_survey_json(
     outputs_by_source=None,
     verified=None,
     retries=None,
+    project_setting=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
+    project_setting = project_setting or {
+        "written": False, "file": None, "layers": [], "error": None,
+    }
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
@@ -2453,6 +2546,19 @@ def _build_survey_json(
             "ok": bridge_ok,
             "error": bridge_error,
         },
+        # Task 35. Whether this package has the one file Urbano 2 is pointed
+        # at, which is a different question from whether the bridge ran and
+        # is now answered separately from it. mapgen writes this file itself,
+        # so a run whose bridge failed, was skipped or was never reached
+        # still has one.
+        #
+        # `layers` is what the file actually names, so a reader can tell
+        # without opening it whether the elevation or Overture data reached
+        # Urbano's side of the package. `error` is one plain sentence when it
+        # could not be written at all, which for a package with none of
+        # Urbano's four data files in it is the honest outcome rather than a
+        # file describing nothing.
+        "project_setting": project_setting,
         "started_at": started_at,
         "finished_at": _now(),
     }

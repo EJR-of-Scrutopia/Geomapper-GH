@@ -2521,6 +2521,11 @@ def test_resume_replicates_the_owners_real_interrupted_package_and_completes(tmp
     assert root_outputs == [
         f"{paths.stem}.osm",
         f"{paths.stem}_building.geojson",
+        # Task 35. The owner's own resumed package now ends with the one
+        # file Urbano 2 is actually pointed at, which is the whole reason
+        # that task exists: every package they already have was produced by
+        # a run whose bridge failed, so none of them had it.
+        f"{paths.stem}_project_setting.json",
         f"{paths.stem}_water.geojson",
         "survey.json",
     ], f"a stale tile id reached the package root as a merged output: {root_outputs}"
@@ -3329,9 +3334,15 @@ def test_bridge_package_records_the_owner_s_real_missing_urbano_message(tmp_path
     )
 
     error = payload["bridge"]["error"]
-    assert "Urbano is not installed" in error
+    assert "Urbano.SiteAnalysis.gha" in error
+    assert "Urbano is not installed" not in error, (
+        "task 34 established that it is, and the message used to say otherwise"
+    )
     assert "DirectoryNotFoundException" not in error
     assert "Program.cs" not in error
+    # And the package still gets the file it is actually for, from mapgen,
+    # on the very run whose bridge failed this way.
+    assert payload["project_setting"]["written"] is True
 
 
 def test_a_later_success_keeps_the_download_s_own_failed_attempt(tmp_path):
@@ -3384,10 +3395,15 @@ def test_a_second_bridge_run_still_reports_the_download_not_the_previous_one(tmp
     }
 
 
-def test_a_bridge_run_changes_nothing_in_survey_json_but_the_bridge_block(tmp_path):
+def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_path):
     # survey.json is the package's record of ITSELF, and this command was
     # not there for the download. complete and stopped describe that
     # download and nothing else; so do tiles, sources and both timestamps.
+    #
+    # Two blocks are the exception rather than one since task 35: `bridge`,
+    # and `project_setting`, which is what this command now produces whether
+    # or not the bridge itself is working. Everything else is still read and
+    # never written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
     before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
@@ -3397,8 +3413,9 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_the_bridge_block(tmp_pa
     after = json.loads((root / "survey.json").read_text(encoding="utf-8"))
     assert after["complete"] is False
     assert after["stopped"] is True
-    del before["bridge"]
-    del after["bridge"]
+    for changed in ("bridge", "project_setting"):
+        before.pop(changed, None)
+        after.pop(changed, None)
     assert after == before
     assert list(after) == list(before), "field order is part of a file a person reads"
 
@@ -3410,7 +3427,15 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
 
     bridge_package(root, progress=log, bridge_runner=FakeBridgeRunner(returncode=1))
 
-    assert [e["event"] for e in log.events] == ["bridge_started", "bridge_failed"]
+    # The project setting is written after the bridge attempt and regardless
+    # of it, which is exactly what run_survey does, so the two commands go
+    # on emitting the same vocabulary in the same order (task 35).
+    assert [e["event"] for e in log.events] == [
+        "bridge_started",
+        "bridge_failed",
+        "project_setting_started",
+        "project_setting_written",
+    ]
     assert "exit code 1" in log.events[1]["error"]
 
 
@@ -4804,3 +4829,259 @@ def test_no_api_key_reaches_survey_json_or_the_event_stream_by_any_route(tmp_pat
     assert "API_Key" not in written
     for event in log.events:
         assert secret not in json.dumps(event, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Task 35: the Urbano project setting, written by mapgen on every run.
+# ---------------------------------------------------------------------------
+
+
+class UrbanoReadableStubSource(StubSource):
+    """A stub whose merged output carries the names Urbano reads.
+
+    StubSource writes `stub.txt`, which Urbano has no idea what to do with,
+    so a plain stub run correctly produces no project setting at all. This
+    one names its outputs the way OsmSource, ElevationSource and
+    OvertureSource name theirs, so the wiring can be exercised end to end
+    through run_survey without a network call or a real OSM parser.
+    """
+
+    def __init__(self, source_id="stub", suffixes=(".osm",), **kwargs):
+        super().__init__(source_id=source_id, **kwargs)
+        self._suffixes = suffixes
+
+    def merge(self, parts, out_dir, stem):
+        outputs = []
+        for suffix in self._suffixes:
+            out = out_dir / f"{stem}{suffix}"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(
+                "\n".join(p.read_text(encoding="utf-8") for p in parts), encoding="utf-8"
+            )
+            outputs.append(out)
+        return outputs
+
+
+def _project_setting(result):
+    path = result.paths.root / f"{result.paths.stem}_project_setting.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_run_writes_the_urbano_project_setting_without_the_bridge(tmp_path):
+    """The whole of task 35 in one test.
+
+    Before it, this file was written in exactly one place, the C# bridge,
+    which fails on every run on the owner's machine, so the file had never
+    once been produced. A real survey went into Grasshopper with only
+    survey.json in the folder, and Urbano answered that no data was
+    collected.
+    """
+    register(UrbanoReadableStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    written = result.paths.root / f"{result.paths.stem}_project_setting.json"
+    assert written.is_file()
+    setting = json.loads(written.read_text(encoding="utf-8"))
+    assert setting["FileNameStr"] == result.paths.stem
+    assert setting["Folder"] == str(result.paths.root)
+    assert setting["OsmFilePath"] == str(result.paths.root / f"{result.paths.stem}.osm")
+    assert setting["Layers"] == ["osm"]
+    assert setting["CoordinateReference"]["Utm"] == "30U"
+    assert setting["Top"] == BBOX.north
+    assert setting["Bottom"] == BBOX.south
+
+
+def test_the_project_setting_is_written_even_when_the_bridge_fails(tmp_path):
+    """The requirement in the owner's own words: a run where the bridge
+    fails must still produce a usable project setting. That is every run
+    they have ever made.
+    """
+    register(UrbanoReadableStubSource())
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        bridge_runner=FakeBridgeRunner(returncode=1),
+    )
+
+    assert result.survey["bridge"]["ok"] is False
+    assert result.survey["project_setting"]["written"] is True
+    assert _project_setting(result)["FileNameStr"] == result.paths.stem
+
+
+def test_the_project_setting_is_written_when_the_bridge_step_is_skipped(tmp_path):
+    register(UrbanoReadableStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    assert result.survey["bridge"]["attempted"] is False
+    assert result.survey["project_setting"]["written"] is True
+
+
+def test_mapgens_project_setting_is_the_one_that_survives_a_bridge_run(tmp_path):
+    """Which writer wins, made checkable rather than asserted in a comment.
+
+    Both write the same file name. mapgen's step runs after the bridge, so
+    a bridge that wrote its own version is overwritten by one that names
+    the files actually in the folder rather than the ones the bridge meant
+    to produce.
+    """
+    register(UrbanoReadableStubSource())
+    written_by_the_bridge = []
+
+    class _BridgeThatWritesItsOwn(FakeBridgeRunner):
+        def __call__(self, command, **kwargs):
+            output_folder = Path(command[command.index("--output-folder") + 1])
+            stem = command[command.index("--file-name-stem") + 1]
+            target = output_folder / f"{stem}_project_setting.json"
+            target.write_text(
+                json.dumps({"FileNameStr": "written by the bridge"}), encoding="utf-8"
+            )
+            written_by_the_bridge.append(target)
+            return super().__call__(command, **kwargs)
+
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        bridge_runner=_BridgeThatWritesItsOwn(returncode=0),
+    )
+
+    assert written_by_the_bridge, "the fake bridge wrote nothing, so this proves nothing"
+    setting = _project_setting(result)
+    assert setting["FileNameStr"] == result.paths.stem
+    assert "OsmFilePath" in setting
+
+
+def test_survey_json_records_the_project_setting_beside_the_bridge(tmp_path):
+    register(UrbanoReadableStubSource(suffixes=(".osm", ".tif")))
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["project_setting"]
+    assert record == {
+        "written": True,
+        "file": f"{result.paths.stem}_project_setting.json",
+        "layers": ["osm", "elevation"],
+        "error": None,
+    }
+    # Beside the bridge block rather than inside it: whether the package has
+    # the file Urbano is pointed at, and whether the bridge ran, are now two
+    # different questions.
+    assert "project_setting" not in result.survey["bridge"]
+
+
+def test_a_package_urbano_cannot_read_says_so_and_still_finishes(tmp_path):
+    """A stub run produces stub.txt, which is not one of Urbano's four data
+    files, so there is nothing for a project setting to point at. Recorded
+    as a plain sentence rather than written as a file describing nothing,
+    and the survey itself is untouched by it.
+    """
+    register(StubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.complete is True
+    record = result.survey["project_setting"]
+    assert record["written"] is False
+    assert record["file"] is None
+    assert "would name nothing" in record["error"]
+    assert not list(result.paths.root.glob("*_project_setting.json"))
+
+
+def test_a_project_setting_failure_never_costs_the_survey(tmp_path, monkeypatch):
+    """The same ruling task 20 made for the bridge: real work already on
+    disk is never discarded because one late step failed.
+    """
+    import mapgen.package as package_module
+
+    register(UrbanoReadableStubSource())
+
+    def _explode(*args, **kwargs):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(package_module, "write_project_setting", _explode)
+    log = EventLog()
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.complete is True
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+    assert result.survey["project_setting"]["written"] is False
+    assert "the disk is full" in result.survey["project_setting"]["error"]
+    assert [e["event"] for e in log.events if e["event"].startswith("project_setting")] == [
+        "project_setting_started",
+        "project_setting_failed",
+    ]
+
+
+def test_the_project_setting_names_every_layer_the_package_actually_holds(tmp_path):
+    register(UrbanoReadableStubSource(suffixes=(".osm", ".tif", "_building.geojson")))
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    setting = _project_setting(result)
+    assert setting["Layers"] == ["osm", "elevation", "overture"]
+    assert setting["ElevationFilePath"].endswith(".tif")
+    assert setting["OvertureFilePath"].endswith("_building.geojson")
+    assert setting["BlockFilePath"] == ""
+    for field in ("OsmFilePath", "ElevationFilePath", "OvertureFilePath"):
+        assert Path(setting[field]).is_file(), f"{field} names a file that is not there"
+
+
+def test_bridge_package_produces_the_project_setting_a_package_never_had(tmp_path):
+    """Every package the owner already has is in exactly this state: real
+    data, a survey.json recording a failed bridge, and no project setting.
+    """
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("osm", "elevation"))
+    assert not list(root.glob("*_project_setting.json"))
+
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=1))
+
+    assert payload["bridge"]["ok"] is False
+    assert payload["project_setting"]["written"] is True
+    setting = json.loads(
+        (root / payload["project_setting"]["file"]).read_text(encoding="utf-8")
+    )
+    assert setting["FileNameStr"] == payload["urbano_stem"]
+    assert setting["Layers"] == ["osm", "elevation"]
+    assert Path(setting["OsmFilePath"]).is_file()
+
+
+def test_bridge_package_reads_the_extent_from_the_package_not_the_folder_name(tmp_path):
+    """The coordinate reference is the one thing a wrong answer here would
+    silently misplace, so it comes from the package's own recorded bbox.
+    """
+    register_default_sources()
+    far_away = BBox.parse("151.20,-33.88,151.22,-33.86")
+    root = _package_on_disk(tmp_path, bbox=far_away)
+
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=1))
+
+    setting = json.loads(
+        (root / payload["project_setting"]["file"]).read_text(encoding="utf-8")
+    )
+    assert setting["CoordinateReference"]["Utm"] == "56H"
+    assert setting["Bottom"] == pytest.approx(-33.88)
+
+
+def test_a_stop_at_the_very_end_still_leaves_a_project_setting(tmp_path):
+    """Task 22's ruling is that a stop starts no further external process,
+    which is why such a run has no bridge attempt and, before this, no
+    project setting. A complete folder is never surveyed again (see
+    naming._survey_reports_complete), so for that package the gap was
+    permanent. Writing a local file is not starting a process, so it happens
+    anyway, and `mapgen bridge` is no longer the only way to recover one.
+    """
+    token = CancelToken()
+
+    class _ReadableLegacyStub(LegacyNoCancelStubSource, UrbanoReadableStubSource):
+        """Stops the run the way a source written before task 22 does, and
+        names its merged output the way the real sources do."""
+
+        def __init__(self, cancel_token):
+            UrbanoReadableStubSource.__init__(self)
+            self._token = cancel_token
+
+    register(_ReadableLegacyStub(token))
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        cancel=token,
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+
+    assert result.complete is True
+    assert result.survey["bridge"]["attempted"] is False, "the stop skipped the bridge, as ruled"
+    assert result.survey["project_setting"]["written"] is True
+    assert _project_setting(result)["Layers"] == ["osm"]

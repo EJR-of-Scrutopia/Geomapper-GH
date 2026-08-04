@@ -157,17 +157,31 @@ def test_missing_urbano_directory_returns_none_for_an_unrelated_failure():
     assert _missing_urbano_directory("Segmentation fault (core dumped)\n") is None
 
 
-def test_run_bridge_reports_a_missing_urbano_install_as_one_plain_sentence(tmp_path):
+def test_run_bridge_does_not_blame_the_owners_rhino_install_for_the_bridges_own_fault(
+    tmp_path,
+):
+    """Task 34 established that Urbano 2.2.1.2 IS installed on the owner's
+    machine and simply does not ship Urbano.Core.dll or ProjectSetup.dll:
+    both were merged into Urbano.SiteAnalysis.gha, along with every type
+    this bridge asks for. The message used to read "Urbano is not
+    installed", which sent the owner to check a Rhino install that was
+    never broken, for a failure that is entirely the bridge's own out of
+    date expectation.
+    """
     runner = FakeRunner(returncode=1, stderr=REAL_MISSING_URBANO_OUTPUT)
     with pytest.raises(BridgeError) as excinfo:
         run_bridge(_request(tmp_path), _project(tmp_path), runner=runner)
     message = str(excinfo.value)
-    assert "Urbano is not installed" in message
+
+    assert "Urbano is not installed" not in message
+    assert "Urbano.SiteAnalysis.gha" in message, "it must name where they really are"
     assert (
         "C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2"
         in message
-    )
-    assert "optional" in message
+    ), "the directory it actually looked in is the useful half"
+    # And it says what this failure now costs, which since task 35 is
+    # nothing: mapgen writes the project setting itself.
+    assert "project setting" in message
     # No C# framing anywhere in the message the caller actually raises with.
     assert "DirectoryNotFoundException" not in message
     assert "Program.cs" not in message
