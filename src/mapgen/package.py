@@ -853,14 +853,48 @@ def _record_tile_outcomes(
     contributes no tile-stamped directory at all. If it still produced its
     output, there is no finer signal than the batch outcome, so it applies
     uniformly to every tile, matching how such sources have always behaved.
-    For Overture that is not a loss of resolution: one whole-extent download
-    either lands, in which case every tile's ground is genuinely covered, or
-    it does not, in which case none of them is. But a fetch() that returns without raising while leaving
-    nothing at all on disk is not evidence of anything: that is vacuous, not
-    done, so it is always failed regardless of what the batch call reported
-    (this can never coincide with stopped=True: Cancelled is what sets
-    stopped, and Cancelled means fetch() never reached its own return at
-    all, so fetch_succeeded is always False whenever stopped is True).
+
+    That used to be justified here as "one whole-extent download either
+    lands, in which case every tile's ground is genuinely covered, or it
+    does not, in which case none of them is". Review finding I2: that was
+    true when Overture was one download, and Task 23 made it eight while
+    Task 24 made them concurrent and independently failing. The partial
+    case, one bad type name or one type 503ing, is now the ordinary one,
+    and a single type failing marks all 72 tiles FAILED while seven real
+    layers are merged into the package.
+
+    The uniform application is still right, and the reason is now a
+    different one. It is not that the outcome is all-or-nothing; it is
+    that a type's download covers the whole extent, so whatever it did or
+    did not deliver, it delivered the same thing to every tile. There is
+    no per-tile fact to record here that would be finer than this, and
+    inventing one would be fabricating a denominator.
+
+    What it costs is worth stating plainly, because the alternative was
+    weighed and refused. A tile that got seven of eight types is not
+    wholly failed, and painting it red over-reports the damage. But the
+    only other status available is one that does not emit tile_failed,
+    and the grid then settles those tiles to "done" off Overture's own
+    per-type tile_done events: measured on the real path, one type of
+    eight failing turns a 16-tile grid from 16 failed to 16 DONE, on a
+    package that is missing a layer. Over-reporting damage is recoverable
+    by reading the log, which carries source_failed naming exactly which
+    types failed; under-reporting it hands the owner a folder that looks
+    finished and is not, into a workflow that reads these folders straight
+    into Grasshopper. This module's rule everywhere else is never to claim
+    more than it has, and red is the side of that line to be on.
+
+    survey.json no longer contradicts the folder while it says so: the
+    Overture entry's `types` reports what actually landed (see
+    _source_provenance and OvertureSource.fetched_types), so a reader who
+    finds seven layers is told about seven types.
+
+    A fetch() that returns without raising while leaving nothing at all on
+    disk is not evidence of anything: that is vacuous, not done, so it is
+    always failed regardless of what the batch call reported (this can
+    never coincide with stopped=True: Cancelled is what sets stopped, and
+    Cancelled means fetch() never reached its own return at all, so
+    fetch_succeeded is always False whenever stopped is True).
     """
     files = _existing_output_files(source_work, current_tile_ids)
     pending_ids = {tile.tile_id for tile in pending}
@@ -974,6 +1008,16 @@ def _source_provenance(source) -> dict[str, object]:
     contains, not require cross-referencing category selection against a
     mapping table kept somewhere else to work that out.
 
+    Read from fetched_types in preference to types, since review finding
+    I2. Task 24 made the eight downloads independent and independently
+    failing, so "the selection" and "what the package holds" stopped
+    being the same list: one type failing left seven real layers merged
+    into the folder beside a survey.json still naming all eight. The
+    fallback matters as much as the preference does. fetched_types is
+    None until fetch() has run, so a source a stop caught before its turn
+    reports the selection rather than an empty list, which would read as
+    "this package deliberately contains no Overture types".
+
     routing_note is OsmSource-specific today: endpoints_used already says
     WHICH endpoint a run actually contacted, but not WHY it was that one
     rather than the other, which matters here specifically because a
@@ -986,7 +1030,9 @@ def _source_provenance(source) -> dict[str, object]:
         "attribution": source.attribution,
         "endpoints_used": list(getattr(source, "endpoints_used", [])),
     }
-    types = getattr(source, "types", None)
+    types = getattr(source, "fetched_types", None)
+    if types is None:
+        types = getattr(source, "types", None)
     if types is not None:
         entry["types"] = list(types)
     # demtype is ElevationSource-specific today (Task 28), read the same

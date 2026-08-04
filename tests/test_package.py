@@ -1560,6 +1560,61 @@ class _FakeOvertureRunner:
         return type("FakeCompleted", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
+class _PartiallyFailingOvertureRunner(_FakeOvertureRunner):
+    """Fails exactly one Overture type and writes real output for the
+    rest, which since Task 24 is the ordinary shape of an Overture
+    failure rather than an exotic one: a single bad type name, one type
+    503ing, one type slow enough to time out."""
+
+    def __init__(self, bad):
+        super().__init__()
+        self.bad = bad
+
+    def __call__(self, command, **kwargs):
+        if command[command.index("--type") + 1] == self.bad:
+            with self.lock:
+                self.commands.append(command)
+            return type(
+                "FakeCompleted", (), {"returncode": 1, "stdout": "", "stderr": "boom"}
+            )()
+        return super().__call__(command, **kwargs)
+
+
+def test_survey_json_names_only_the_overture_types_the_package_actually_holds(tmp_path):
+    # Review finding I2, through the REAL OvertureSource. One type of
+    # eight fails on a forced run: seven layers are merged into the
+    # package and the record used to go on naming all eight, which README
+    # documents as "the actual Overture types fetched". The folder and the
+    # record contradicted each other.
+    runner = _PartiallyFailingOvertureRunner(bad="segment")
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+    result = run_survey(_request(tmp_path, source_ids=("overture",), force=True))
+
+    assert result.complete is False, "a missing layer is a package that is short"
+    entry = next(s for s in result.survey["sources"] if s["id"] == "overture")
+    assert "segment" not in entry["types"], (
+        "survey.json names a type that is not in the folder"
+    )
+    assert len(entry["types"]) == 7
+    on_disk = sorted(
+        path.name[len(f"{result.paths.stem}_"):-len(".geojson")]
+        for path in result.paths.root.glob(f"{result.paths.stem}_*.geojson")
+    )
+    assert sorted(entry["types"]) == on_disk, (
+        "the record and the folder must agree about which layers this package has"
+    )
+
+    # And the per-tile record deliberately stays "failed" for every tile.
+    # A type's download covers the whole extent, so it delivered the same
+    # thing to every tile, and there is no finer per-tile fact to report.
+    # The only other status available does not emit tile_failed, and the
+    # grid then settles these tiles to "done" off Overture's own per-type
+    # tile_done events: a package missing a layer would read as finished.
+    # See _record_tile_outcomes' own docstring for the full argument.
+    statuses = {record["overture"] for record in result.survey["tiles"]}
+    assert statuses == {"failed"}
+
+
 def test_a_stop_mid_overture_keeps_finished_types_marks_tiles_pending_and_resumes(tmp_path):
     # Task 22's stop path, driven through the REAL OvertureSource rather
     # than through a stub that could be more forgiving than the real thing.

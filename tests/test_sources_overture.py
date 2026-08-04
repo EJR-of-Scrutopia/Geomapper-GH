@@ -1431,6 +1431,47 @@ def test_a_failing_type_does_not_discard_the_types_that_succeeded(tmp_path):
     assert not (tmp_path / "segment.geojson").exists()
 
 
+def test_a_partial_failure_records_the_types_that_actually_landed(tmp_path):
+    # Review finding I2. Seven types landing and an eighth failing leaves
+    # seven real layers merged into the package, and survey.json went on
+    # listing all eight under `types`, which README documents as "the
+    # actual Overture types fetched". The folder and the record
+    # disagreed, in the same shape as finding I8's licence line.
+    #
+    # Recorded before the exception is raised, which is the whole point:
+    # the raising path is the partial one.
+    runner = _FailingTypes(bad={"segment"})
+    source = _source(runner, types=("building", "segment", "water"))
+    assert source.fetched_types is None, (
+        "nothing fetched yet must not read as nothing landed"
+    )
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    assert source.fetched_types == ["building", "water"]
+    # The configured selection itself is untouched: possible_outputs and
+    # the debris sweep both read it and both need the full closed list,
+    # not just what landed.
+    assert source.types == ["building", "segment", "water"]
+
+
+def test_a_clean_run_records_every_type_as_fetched(tmp_path):
+    source = _source(FakeRunner(), types=("building", "water"))
+    source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert source.fetched_types == ["building", "water"]
+
+
+def test_a_type_already_on_disk_counts_as_fetched(tmp_path):
+    # A resume skips a type it already has and the package holds it just
+    # the same, so survey.json must still name it.
+    (tmp_path / "water.geojson").write_text("{}", encoding="utf-8")
+    runner = FakeRunner()
+    source = _source(runner, types=("building", "water"))
+    source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert source.fetched_types == ["building", "water"]
+    assert len(runner.commands) == 1, "the type already on disk was downloaded again"
+
+
 def test_every_failing_type_is_named_not_only_the_first(tmp_path):
     # Six types failing and one type failing are very different
     # situations, most likely a dead network against one bad type name,

@@ -307,6 +307,16 @@ class OvertureSource:
         # None is the only value this treats as "use the default"; anything
         # else, including [], is taken exactly as given.
         self.types = list(types) if types is not None else list(DEFAULT_OVERTURE_TYPES)
+        # Which of those types this instance's fetch() actually got onto
+        # disk, set at the end of fetch() and read by package.py's
+        # _source_provenance (review finding I2). None until fetch() has
+        # run at all, which is what tells "not attempted" apart from
+        # "attempted and got none", so a source that never got its turn
+        # still has survey.json report the selection rather than an empty
+        # list. self.types itself stays exactly as configured, because
+        # possible_outputs and _remove_earlier_version_debris both read it
+        # and both need the full closed list, not just what landed.
+        self.fetched_types: list[str] | None = None
         self.release = release
         self._runner = runner
         self._find = executable_finder
@@ -592,6 +602,18 @@ class OvertureSource:
                     # deliberately NOT caught: a KeyboardInterrupt should
                     # end the run, not be filed as a type that failed.
                     failures[overture_type] = exc
+
+        # Recorded before anything is raised, and that ordering is the
+        # point (review finding I2): the partial case is the one this
+        # exists for. Seven types landing and an eighth failing leaves
+        # seven real layers merged into the package, and survey.json used
+        # to go on listing all eight under `types`, which README documents
+        # as "the actual Overture types fetched". The folder and the
+        # record disagreed, in the same shape as finding I8's licence
+        # line. `downloaded` covers a type that was freshly downloaded and
+        # one that was already on disk and skipped equally, because both
+        # mean the package holds it.
+        self.fetched_types = [t for t in work_types if t in downloaded]
 
         if failures:
             raise _combined_failure(failures)
