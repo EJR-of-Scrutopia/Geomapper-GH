@@ -1602,3 +1602,198 @@ def test_a_real_failure_is_reported_rather_than_swallowed_by_a_stop(tmp_path):
         _source(runner, types=types).fetch(
             REQUEST_BBOX, [_tile()], tmp_path, NullProgress(), cancel=token
         )
+
+
+# --- Task 32: a failed type says what kind of failure it was --------------
+#
+# What is genuinely distinguishable from this CLI is narrower than it
+# looks, and the direction is the opposite of the obvious one.
+# overturemaps 0.20.0's _create_s3_record_batch_reader catches EVERY
+# exception, prints it to its own stdout, and returns None; the download
+# command answers a None reader with a bare `return`. So a failed read of
+# the Overture store exits ZERO and writes no file, and a NON-zero exit is
+# mostly click refusing the invocation.
+#
+# Three tests below are therefore about exit codes and files, and none of
+# them matches on the CLI's English, which is the only place the actual
+# cause is written and is exactly what this project keeps refusing to
+# parse.
+
+RETRYABLE = frozenset({"timeout", "unreachable", "rate_limited", "service_error"})
+
+
+class SilentRunner(FakeRunner):
+    """Exits zero and writes nothing, which is what overturemaps does when
+    its own read of the Overture store failed."""
+
+    def __init__(self, bad=(), stdout="", **kwargs):
+        super().__init__(**kwargs)
+        self.bad = set(bad)
+        self._stdout = stdout
+
+    def __call__(self, command, **kwargs):
+        overture_type = command[command.index("--type") + 1]
+        if overture_type in self.bad or not self.bad:
+            self.record(command)
+            return FakeCompleted(0, stdout=self._stdout)
+        return super().__call__(command, **kwargs)
+
+
+def test_a_successful_fetch_records_no_failure_at_all(tmp_path):
+    source = _source(FakeRunner())
+    source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert source.tile_failures == []
+
+
+def test_a_clean_exit_that_downloaded_nothing_is_the_retryable_one(tmp_path):
+    # The failure the owner will actually hit: a type's S3 read dying part
+    # way through a batch of eight on a home link. It presents as exit
+    # zero and no file, and it is the one Overture failure worth asking
+    # again about.
+    source = _source(SilentRunner())
+    with pytest.raises(OvertureError, match="wrote nothing"):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    failure = source.tile_failures[0]
+    assert failure.kind in RETRYABLE
+    assert "water" in failure.reason
+    # And it admits what it does not know, rather than naming a cause.
+    assert "timeout, a rate limit or a genuine error" in failure.reason
+
+
+def test_a_non_zero_exit_is_treated_conservatively_and_never_retried(tmp_path):
+    # A bad --overture-type exits 2 through click, and a crashed release
+    # lookup exits 1. Both are non-zero and mapgen cannot tell them apart
+    # without reading click's exit-code convention as though it were an
+    # API, so neither is retried.
+    source = _source(FakeRunner(returncode=2, stderr="Unknown type 'watr'"))
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    failure = source.tile_failures[0]
+    assert failure.kind == "refused"
+    assert failure.kind not in RETRYABLE
+    assert "exit code 2" in failure.reason
+
+
+def test_a_missing_cli_is_never_retried_because_no_retry_installs_one(tmp_path):
+    source = OvertureSource(
+        types=["water"], runner=FakeRunner(), executable_finder=lambda _name: None
+    )
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert source.tile_failures[0].kind == "refused"
+    assert "not installed" in source.tile_failures[0].reason
+
+
+def test_the_clis_own_words_reach_the_exception_but_never_the_reason(tmp_path):
+    # TileFailure's rule: a reason is composed from a closed vocabulary,
+    # never from what a third party printed. survey.json outlives the run
+    # and the browser renders it; the CLI's output goes to the exception
+    # and to package.py's source_failed event instead.
+    source = _source(SilentRunner(stdout="Error reading data from path s3://bucket/key: boom"))
+    with pytest.raises(OvertureError) as excinfo:
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    assert "s3://bucket/key" in str(excinfo.value), (
+        "the CLI's only account of the failure was thrown away"
+    )
+    assert "s3://" not in source.tile_failures[0].reason
+    assert "boom" not in source.tile_failures[0].reason
+
+
+def test_a_batch_with_one_recoverable_type_stays_recoverable(tmp_path):
+    # A typo in one --overture-type must not cost the owner a layer that a
+    # second attempt would have got. The retry re-runs fetch(), which
+    # skips every type already on disk, so what it repeats is exactly the
+    # failed set: retrying the typo costs a second of a command that will
+    # refuse it again.
+    class MixedRunner(FakeRunner):
+        def __call__(self, command, **kwargs):
+            overture_type = command[command.index("--type") + 1]
+            if overture_type == "watr":
+                self.record(command)
+                return FakeCompleted(2, stderr="Unknown type 'watr'")
+            if overture_type == "segment":
+                self.record(command)
+                return FakeCompleted(0)
+            return super().__call__(command, **kwargs)
+
+    source = _source(MixedRunner(), types=("watr", "segment", "water"))
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    failure = source.tile_failures[0]
+    assert failure.kind in RETRYABLE, (
+        "one unrecoverable type made the recoverable one unrecoverable too"
+    )
+    # And both are named, so the owner is not told about one of two.
+    assert "watr" in failure.reason
+    assert "segment" in failure.reason
+
+
+def test_a_batch_of_only_unrecoverable_types_stays_unrecoverable(tmp_path):
+    source = _source(FakeRunner(returncode=2, stderr="nope"), types=("watr", "bilding"))
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert source.tile_failures[0].kind not in RETRYABLE
+
+
+def test_one_failure_is_recorded_against_every_tile_it_covers(tmp_path):
+    # A whole-extent download covers every tile equally, so a type that
+    # did not arrive did not arrive for any of them. This is what lets
+    # package.py's retry pass, which is written in tiles, reach a source
+    # that has none.
+    tiles = [_tile("r00_c00"), _tile("r00_c01"), _tile("r01_c00")]
+    source = _source(SilentRunner())
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, tiles, tmp_path, NullProgress())
+
+    assert [f.tile_id for f in source.tile_failures] == [
+        "r00_c00", "r00_c01", "r01_c00"
+    ]
+    assert len({f.reason for f in source.tile_failures}) == 1
+
+
+def test_the_record_is_reset_by_the_next_fetch_and_never_accumulates(tmp_path):
+    runner = SilentRunner()
+    source = _source(runner)
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert len(source.tile_failures) == 1
+
+    source._runner = FakeRunner()
+    source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert source.tile_failures == []
+
+
+def test_a_stop_records_no_failure_because_a_stop_is_not_a_failure(tmp_path):
+    token = CancelToken()
+    token.cancel()
+    source = _source(FakeRunner())
+    with pytest.raises(Cancelled):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress(), cancel=token)
+    assert source.tile_failures == []
+
+
+def test_calling_fetch_again_re_downloads_only_the_type_that_failed(tmp_path):
+    # The mechanism the whole of Task 32's first section rests on, asserted
+    # directly rather than assumed: a retry is one more fetch() call, and
+    # fetch() skips every type whose file is already on disk. So a retry
+    # repeats the failed type and nothing else, and the concurrent batch
+    # is not restarted in any sense that costs a download.
+    runner = _FailingTypes(bad={"segment"})
+    source = _source(runner, types=("building", "segment", "water"))
+    with pytest.raises(OvertureError):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert len(runner.commands) == 3
+
+    runner.bad.clear()
+    source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    retried = [cmd[cmd.index("--type") + 1] for cmd in runner.commands[3:]]
+    assert retried == ["segment"], (
+        f"the retry re-downloaded types that had already landed: {retried}"
+    )
+    assert source.tile_failures == []
+    assert source.fetched_types == ["building", "segment", "water"]

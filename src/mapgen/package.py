@@ -36,11 +36,14 @@ from mapgen.naming import (
 )
 from mapgen.sources.base import (
     FAILURE_NO_OUTPUT,
-    FAILURE_RATE_LIMITED,
-    FAILURE_SERVICE_ERROR,
-    FAILURE_TIMEOUT,
     FAILURE_UNKNOWN,
-    FAILURE_UNREACHABLE,
+    # Task 32 moved this to base.py, beside the vocabulary it is a subset
+    # of, because OvertureSource now has to read it (see its own comment
+    # there). Imported rather than redefined, and re-exported under this
+    # module's own name so mapgen.package.RETRYABLE_FAILURE_KINDS still
+    # resolves: there is one policy, and this is still the only module
+    # that acts on it.
+    RETRYABLE_FAILURE_KINDS,
     EmptySourceSelectionError,
     NullProgress,
     ProgressSink,
@@ -84,44 +87,28 @@ SCHEMA_VERSION = 1
 # only ask the same question faster.
 RETRY_PASS_BUDGET = 1
 
-# Which causes a retry could plausibly fix. Everything else is asked once
-# and reported, because asking again is either useless or harmful.
+# The longest a retry will wait because a service asked it to, in
+# seconds (Task 32).
 #
-# Retried:
-#   timeout        the service or the link was too slow this time; the
-#                  next request is a different roll of the dice
-#   unreachable    a dropped connection or a DNS blip, the same
-#   rate_limited   the service asked for less traffic, and the whole
-#                  point of this layer is that it comes back later
-#   service_error  a 5xx is the service saying the fault is its own
+# ElevationSource attaches a Retry-After to a rate-limited failure when
+# OpenTopography sends one, and the retry pass honours it rather than
+# coming straight back at a service that has just said, in writing, when
+# to return. That is the whole point of respecting the header: a retry
+# that ignores it is worse than no retry at all, because it costs the
+# owner's own quota to be told the same thing again.
 #
-# Not retried, and each for its own reason:
-#   not_authorised a wrong, missing or expired key answers 401 every
-#                  time. Retrying it wastes the owner's time and, on a
-#                  keyed service, can count against them. This is
-#                  elevation's most common failure by a wide margin.
-#   refused        a 4xx that is not a rate limit means the request
-#                  itself was rejected. The same request will be
-#                  rejected again.
-#   node_cap       the tile is too dense, and OsmSource has already
-#                  split it as far as splitting goes (Task 26). The
-#                  answer is a smaller extent, not another identical
-#                  request. Retrying this would also quietly undo that
-#                  whole mechanism by turning a bounded subdivision into
-#                  an unbounded re-ask.
-#   no_output      the layer finished and left nothing, with no reason
-#                  given. mapgen does not know what to fix.
-#   unknown        by construction the kind a source uses when it cannot
-#                  say what happened. An unrecognised cause retried
-#                  blind is how a rate-limited API gets hammered.
-RETRYABLE_FAILURE_KINDS = frozenset(
-    {
-        FAILURE_TIMEOUT,
-        FAILURE_UNREACHABLE,
-        FAILURE_RATE_LIMITED,
-        FAILURE_SERVICE_ERROR,
-    }
-)
+# A ceiling exists because the header is not always a small number. A
+# daily quota that is genuinely exhausted can answer with an hour, and a
+# survey the owner is watching must not silently stop for an hour inside
+# a step that presents itself as automatic. Past this line the retry is
+# not made at all, which is the honest outcome: if the service will not
+# serve this run for another hour, this run cannot have the layer, and
+# saying so now is better than saying so in an hour.
+#
+# Sixty seconds, matching the ceiling osm.py's own retry_delay_seconds
+# already puts on its exponential backoff. One number for "the longest
+# this project ever pauses", rather than a second one chosen separately.
+MAX_RETRY_AFTER_WAIT_SECONDS = 60.0
 
 
 class IncompleteSurveyError(RuntimeError):

@@ -52,14 +52,22 @@ import concurrent.futures
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from mapgen.fsutil import best_effort_rmtree, ensure_dir
 from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.jobs import Cancelled, CancelToken
 from mapgen.merge import merge_geojson
 from mapgen.procutil import run_hidden
-from mapgen.sources.base import Estimate, ProgressSink
+from mapgen.sources.base import (
+    RETRYABLE_FAILURE_KINDS,
+    FAILURE_REFUSED,
+    FAILURE_UNKNOWN,
+    FAILURE_UNREACHABLE,
+    Estimate,
+    ProgressSink,
+    TileFailure,
+)
 
 DEFAULT_OVERTURE_TYPES = [
     "building",
@@ -208,7 +216,25 @@ MAX_CONCURRENT_TYPE_DOWNLOADS = 8
 
 
 class OvertureError(RuntimeError):
-    """Raised when the overturemaps CLI is missing or fails."""
+    """Raised when the overturemaps CLI is missing or fails.
+
+    `kind` is the shared failure vocabulary's term for what went wrong,
+    added in Task 32 so package.py can decide whether a second attempt is
+    worth making without reading this message in English. It defaults to
+    `unknown`, which is the kind that is never retried, so an
+    OvertureError raised anywhere that has not thought about the question
+    is treated as unrecoverable rather than retried blind.
+
+    `phrase` is the same fact written for a person, and it is what ends
+    up in survey.json. Kept beside the kind rather than derived from the
+    message, because the message carries the CLI's own output and that is
+    exactly what a reason must not (see TileFailure's own docstring).
+    """
+
+    def __init__(self, message: str, kind: str = FAILURE_UNKNOWN, phrase: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.phrase = phrase or "did not download, and gave no reason"
 
 
 def _temp_download_path(output_path: Path) -> Path:
@@ -274,8 +300,58 @@ def _combined_failure(failures: dict[str, BaseException]) -> BaseException:
     names = ", ".join(failures)
     detail = "; ".join(f"{name}: {exc}" for name, exc in failures.items())
     return OvertureError(
-        f"overturemaps failed for {len(failures)} types ({names}). {detail}"
+        f"overturemaps failed for {len(failures)} types ({names}). {detail}",
+        kind=_combined_kind(failures),
     )
+
+
+def _failure_kind(exc: BaseException) -> str:
+    """The shared vocabulary's term for one type's failure.
+
+    An OvertureError classified itself when it was raised (see
+    _download). Anything else that came out of a worker, an OSError from
+    the filesystem being the realistic case, is unknown: mapgen has no
+    account of it, and the vocabulary's rule is that an unrecognised
+    cause is never retried blind.
+    """
+    return getattr(exc, "kind", FAILURE_UNKNOWN) or FAILURE_UNKNOWN
+
+
+def _failure_phrase(overture_type: str, exc: BaseException) -> str:
+    """One failed type, as a sentence for the owner.
+
+    Composed from the phrase the failure carried, never from str(exc).
+    The exception's own message quotes the CLI's output, which is where
+    a path, an S3 URL and, for a source that one day needs a key, a key
+    would live; TileFailure's own docstring is explicit that a reason is
+    assembled from a closed vocabulary rather than from whatever a
+    service said. The CLI's own words still reach the owner, through the
+    raised exception and through package.py's source_failed event.
+    """
+    phrase = getattr(exc, "phrase", "") or f"failed with {type(exc).__name__}"
+    return f"Overture {overture_type}: {phrase}."
+
+
+def _combined_kind(failures: Mapping[str, BaseException]) -> str:
+    """One kind for however many types failed in the same batch.
+
+    Retryable if ANY of them is, and that direction is deliberate. The
+    retry re-runs fetch(), which skips every type already on disk, so
+    what it actually repeats is exactly the set that failed. A bad
+    --overture-type sitting in the same batch as a genuine transient
+    would, under the opposite rule, cost the owner the layer that could
+    have been recovered, to save one second of a command that will
+    refuse the typo again.
+
+    Otherwise the first failure's kind, in the order the caller asked
+    for the types, so the answer does not depend on which download the
+    network happened to finish first.
+    """
+    kinds = [_failure_kind(exc) for exc in failures.values()]
+    for kind in kinds:
+        if kind in RETRYABLE_FAILURE_KINDS:
+            return kind
+    return kinds[0] if kinds else FAILURE_UNKNOWN
 
 
 class OvertureSource:
@@ -322,6 +398,17 @@ class OvertureSource:
         # nothing here" rather than leaving it as a silent gap (Task 30).
         # None until merge() has run.
         self.merged_features: int | None = None
+        # The per-tile account of the most recent fetch(), for package.py's
+        # retry pass (Task 32). The optional LayerSource extension
+        # sources/base.py documents: reset at the top of every fetch(), so
+        # it always describes THAT call and never accumulates.
+        #
+        # This source has no tiles of its own either (Task 23 made every
+        # download whole-extent), so a type that did not arrive did not
+        # arrive for every tile equally, and the record says so against
+        # each of them. Exactly the reasoning package.py's own
+        # _record_tile_outcomes already applies here.
+        self.tile_failures: list[TileFailure] = []
         self.release = release
         self._runner = runner
         self._find = executable_finder
@@ -512,6 +599,11 @@ class OvertureSource:
         # own .part and sidecar. Nothing here is worth parallelising in any
         # case: it is a handful of unlink calls against a directory that is
         # normally empty.
+        # Reset before anything else, so this list always describes THIS
+        # call. A retry that recovers a type must not leave the previous
+        # attempt's reason attached to a layer that is now on disk.
+        self.tile_failures = []
+
         self._remove_earlier_version_debris(work_dir)
 
         # Deduplicated, and in the order asked for. Duplicates are only
@@ -621,6 +713,16 @@ class OvertureSource:
         self.fetched_types = [t for t in work_types if t in downloaded]
 
         if failures:
+            # Recorded before the raise, and against every tile, because
+            # package.py's retry pass is written in tiles and this source
+            # has none of its own. What the record buys is the whole of
+            # Task 32's first section: a failed TYPE is one download to
+            # repeat, and repeating it is exactly what calling fetch()
+            # again does, since download_one skips every type that is
+            # already on disk. No type that succeeded is fetched twice,
+            # and the concurrent batch is not restarted; what the pool
+            # re-runs is the failed types and a handful of instant skips.
+            self.tile_failures = self._tile_failures_for(tiles, failures)
             raise _combined_failure(failures)
         if cancelled is not None:
             # A genuine download failure is reported ahead of a stop, on
@@ -635,6 +737,34 @@ class OvertureSource:
         # order, which under a pool is whatever the network decided. See
         # the module docstring.
         return [downloaded[t] for t in work_types if t in downloaded]
+
+    def _tile_failures_for(
+        self, tiles: Sequence[Tile], failures: Mapping[str, BaseException]
+    ) -> list[TileFailure]:
+        """The per-tile record for however many types failed in one batch.
+
+        One reason, naming every failed type and what happened to each,
+        repeated against every tile. Not one record per (tile, type):
+        package.py's ledger is keyed by (source, tile) and always has
+        been, and a second record for the same tile would silently
+        replace the first, leaving a reason that named one of five failed
+        types and gave no clue there were four more.
+
+        No retry_after_seconds. The overturemaps CLI reports nothing of
+        the kind: it has no HTTP response to carry a header, and its own
+        error text is printed and discarded. Attaching a made-up period
+        would be exactly the fabricated distinction this task was told
+        not to invent.
+        """
+        reason = " ".join(
+            _failure_phrase(overture_type, exc)
+            for overture_type, exc in failures.items()
+        )
+        kind = _combined_kind(failures)
+        return [
+            TileFailure(source=self.id, tile_id=tile.tile_id, kind=kind, reason=reason)
+            for tile in tiles
+        ]
 
     def _remove_earlier_version_debris(self, work_dir: Path) -> None:
         """Remove what an earlier version of mapgen, or of the overturemaps
@@ -667,7 +797,9 @@ class OvertureSource:
         if not executable:
             raise OvertureError(
                 "Could not find the overturemaps CLI on PATH. Run bootstrap.ps1, "
-                "or install it with: pip install overturemaps"
+                "or install it with: pip install overturemaps",
+                kind=FAILURE_REFUSED,
+                phrase="the overturemaps command is not installed on this machine",
             )
 
         ensure_dir(output_path.parent)
@@ -715,14 +847,68 @@ class OvertureSource:
             if result.returncode != 0:
                 temp_path.unlink(missing_ok=True)
                 detail = (result.stderr or result.stdout or "").strip()
+                # Never retried, and this is the conservative half of Task
+                # 32's Overture classification rather than a claim to know
+                # what happened. A non-zero exit from this CLI is USUALLY
+                # click rejecting the invocation (an --overture-type it
+                # does not recognise exits 2), which no number of
+                # attempts fixes. It can also be an exception escaping the
+                # release or STAC lookup, which would be transient. The
+                # two are not distinguishable from here without reading
+                # click's own exit-code convention as though it were an
+                # API, so the reported kind is the one that does not
+                # invent a distinction.
                 raise OvertureError(
-                    f"overturemaps failed for type {overture_type}: {detail}"
+                    f"overturemaps failed for type {overture_type}: {detail}",
+                    kind=FAILURE_REFUSED,
+                    phrase=(
+                        f"the overturemaps command refused the request "
+                        f"(exit code {result.returncode})"
+                    ),
                 )
 
             if not temp_path.exists():
+                # Retried, and this is the one Overture failure that is
+                # genuinely worth another attempt. It looks like the
+                # weakest signal here and it is in fact the strongest,
+                # because of what overturemaps 0.20.0 actually does:
+                # _create_s3_record_batch_reader catches EVERY exception,
+                # prints "Error reading data from path ...: ..." to its
+                # own stdout, and returns None, and the download command
+                # answers a None reader with a bare `return`. So a failed
+                # read of the Overture store exits ZERO and writes no
+                # file. That is what this branch is.
+                #
+                # It is not the empty case. A bbox with nothing in it
+                # still builds a reader (an empty STAC result falls back
+                # to the full dataset path) and still writes an empty
+                # FeatureCollection, so a legitimately empty type leaves
+                # a real file and never reaches here.
+                #
+                # What mapgen cannot tell is WHICH read failure it was: a
+                # timeout, S3 asking for less traffic, or a genuine
+                # error. All three are printed as English on the CLI's
+                # stdout and are distinguishable only by matching that
+                # text, which is the mistake this codebase keeps naming.
+                # unreachable is the retryable kind that claims least:
+                # the store was not read. The reason below says plainly
+                # that the cause is not known.
+                detail = (result.stdout or result.stderr or "").strip()
                 raise OvertureError(
                     f"overturemaps exited cleanly but wrote nothing for type "
-                    f"{overture_type}."
+                    f"{overture_type}. It said: {detail}"
+                    if detail
+                    else (
+                        f"overturemaps exited cleanly but wrote nothing for type "
+                        f"{overture_type}."
+                    ),
+                    kind=FAILURE_UNREACHABLE,
+                    phrase=(
+                        "the overturemaps command finished without downloading "
+                        "anything, which is how it reports a failed read of the "
+                        "Overture data store. It does not say whether that was a "
+                        "timeout, a rate limit or a genuine error"
+                    ),
                 )
             temp_path.replace(output_path)
         finally:

@@ -1774,6 +1774,15 @@ def test_an_overture_only_run_whose_fetch_raises_marks_every_tile_failed(tmp_pat
     # The other half. A whole-extent download either lands or it does not,
     # so there is no per-tile signal to be had and every tile is failed
     # together, which is honest: none of them has data.
+    #
+    # Task 32 changed WHICH exception an unforced run ends on, and only
+    # that. Overture now says why it failed, per tile, so the run defers
+    # the decision to the end (exactly as it has done for OSM since Task
+    # 30) instead of dying inside the source loop, and what raises is
+    # IncompleteSurveyError. Everything this test was written to pin is
+    # asserted here still, plus the two things the deferral buys: the
+    # package writes a survey.json that explains itself, and the CLI's own
+    # words are not lost, they arrive through source_failed.
     class ExplodingRunner:
         def __init__(self):
             self.commands = []
@@ -1790,15 +1799,34 @@ def test_an_overture_only_run_whose_fetch_raises_marks_every_tile_failed(tmp_pat
         OvertureSource(runner=ExplodingRunner(), executable_finder=lambda _n: "overturemaps")
     )
     failures = []
+    source_errors = []
 
     class Sink:
         def emit(self, event, **fields):
             if event == "tile_failed":
                 failures.append(fields["tile_id"])
+            elif event == "source_failed":
+                source_errors.append(fields["error"])
 
     request = _request(tmp_path, source_ids=("overture",), overture_types=("water",))
-    with pytest.raises(OvertureError, match="the release is on fire"):
+    with pytest.raises(IncompleteSurveyError) as excinfo:
         run_survey(request, progress=Sink())
+
+    # Every tile, together, unchanged.
+    assert sorted(set(failures)) == ["r00_c00", "r00_c01", "r01_c00", "r01_c01"]
+    assert "overture" in str(excinfo.value)
+
+    # The CLI's own message is still delivered, in the one place that can
+    # carry it without putting a third party's output into survey.json.
+    assert any("the release is on fire" in error for error in source_errors)
+
+    # And the package now explains itself instead of being scratch files.
+    root = tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront"
+    payload = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    assert payload["complete"] is False
+    assert all(record["overture"] == "failed" for record in payload["tiles"])
+    assert {r["source"] for r in payload["tile_failures"]} == {"overture"}
+    assert {r["kind"] for r in payload["tile_failures"]} == {"refused"}
 
     tile_ids = ["r00_c00", "r00_c01", "r01_c00", "r01_c01"]
     assert sorted(failures) == tile_ids, (

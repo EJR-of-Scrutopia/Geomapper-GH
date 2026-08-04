@@ -47,6 +47,55 @@ FAILURE_NODE_CAP = "node_cap"
 FAILURE_NO_OUTPUT = "no_output"
 FAILURE_UNKNOWN = "unknown"
 
+# Which causes a retry could plausibly fix. Everything else is asked once
+# and reported, because asking again is either useless or harmful.
+#
+# Retried:
+#   timeout        the service or the link was too slow this time; the
+#                  next request is a different roll of the dice
+#   unreachable    a dropped connection or a DNS blip, the same
+#   rate_limited   the service asked for less traffic, and the whole
+#                  point of the retry layer is that it comes back later
+#   service_error  a 5xx is the service saying the fault is its own
+#
+# Not retried, and each for its own reason:
+#   not_authorised a wrong, missing or expired key answers 401 every
+#                  time. Retrying it wastes the owner's time and, on a
+#                  keyed service, can count against them. This is
+#                  elevation's most common failure by a wide margin.
+#   refused        the request itself was rejected, by a 4xx that is not
+#                  a rate limit or by a command line tool that would not
+#                  accept the invocation. The same request will be
+#                  rejected again.
+#   node_cap       the tile is too dense, and OsmSource has already
+#                  split it as far as splitting goes (Task 26). The
+#                  answer is a smaller extent, not another identical
+#                  request. Retrying this would also quietly undo that
+#                  whole mechanism by turning a bounded subdivision into
+#                  an unbounded re-ask.
+#   no_output      the layer finished and left nothing, with no reason
+#                  given. mapgen does not know what to fix.
+#   unknown        by construction the kind a source uses when it cannot
+#                  say what happened. An unrecognised cause retried
+#                  blind is how a rate-limited API gets hammered.
+#
+# Lives here rather than in package.py, where Task 30 wrote it, because
+# Task 32 gave a source a reason to read it: OvertureSource can have
+# several types fail at once with different kinds, one record has to
+# stand for all of them, and the one it reports must be the one that
+# lets the recoverable type be recovered. package.py re-exports the
+# name, so this is still the ONE policy every layer is judged by; what
+# moved is only which module it is written in. package.py remains the
+# only place that ACTS on it.
+RETRYABLE_FAILURE_KINDS = frozenset(
+    {
+        FAILURE_TIMEOUT,
+        FAILURE_UNREACHABLE,
+        FAILURE_RATE_LIMITED,
+        FAILURE_SERVICE_ERROR,
+    }
+)
+
 
 def classify_transport_failure(exc: BaseException) -> tuple[str, str]:
     """Why a request never produced a response at all, as (kind, phrase).
