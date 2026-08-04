@@ -31,9 +31,11 @@ from mapgen.elevation_models import (
 from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
+    IncompleteSurveyError,
     SurveyRequest,
     UnbridgeablePackageError,
     bridge_package,
+    describe_tile_failures,
     estimate_survey,
     register_default_sources,
     run_survey,
@@ -215,9 +217,40 @@ def command_estimate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _empty_layer_lines(survey: dict) -> list[str]:
+    """One line per layer that ran fine and found nothing.
+
+    Task 30's ruling means such a layer leaves no merged file, so without
+    this the owner opens the folder and finds a file missing with nothing
+    anywhere on screen accounting for it. survey.json explains it; a run
+    watched at a terminal should not need the file opened to learn it.
+
+    A layer with failed tiles is deliberately excluded, however empty its
+    output is. "Nothing was found here" and "we could not get it" are the
+    two things this whole task exists to keep apart, and the failures have
+    their own lines a few lines below this one.
+    """
+    failed = {
+        record.get("source") for record in (survey.get("tile_failures") or [])
+    }
+    lines = []
+    for entry in survey.get("sources") or []:
+        if entry.get("id") in failed:
+            continue
+        if entry.get("features_merged") != 0 or entry.get("merged_files"):
+            continue
+        lines.append(
+            f"{entry.get('id')}: nothing was found in this extent, so no file "
+            f"was written."
+        )
+    return lines
+
+
 def command_survey(args: argparse.Namespace) -> int:
     result = run_survey(_request_from_args(args), progress=ConsoleProgress())
     print(f"\nPackage: {result.paths.root}")
+    for line in _empty_layer_lines(result.survey):
+        print(line)
     bridge = result.survey.get("bridge") or {}
     if bridge.get("ok"):
         print(f"Urbano project setting: {result.paths.project_setting.name}")
@@ -233,6 +266,16 @@ def command_survey(args: argparse.Namespace) -> int:
         print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
     else:
         print("Urbano project setting: not produced, the bridge step was skipped.")
+    # Task 30, section 5: a scripted run must not be silent about what it
+    # could not get. This is the same account survey.json carries and the
+    # same one IncompleteSurveyError raises out of an unforced run,
+    # composed by the same function, so the three cannot drift apart.
+    # Printed even on a complete run, which cannot happen today (a failed
+    # tile is never complete) but would be the more dangerous silence if
+    # it ever did.
+    failures = result.survey.get("tile_failures") or []
+    for line in describe_tile_failures(failures):
+        print(line, file=sys.stderr)
     if not result.complete:
         print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
         return 1
@@ -476,6 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         EmptySourceSelectionError,
         UnknownDemTypeError,
         UnbridgeablePackageError,
+        IncompleteSurveyError,
         OsmDownloadError,
         OvertureError,
         ElevationError,
@@ -508,6 +552,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # short of a file the bridge needs. Each is already one plain
         # sentence naming the folder and what to do next, which is the
         # whole reason they are exceptions rather than return codes.
+        # IncompleteSurveyError (Task 30) is the same idea for the one
+        # failure this list did not previously have to carry, because it
+        # did not previously exist: an unforced run that ends with tiles
+        # still missing. Its message is several lines rather than one,
+        # naming every tile and why, and that is deliberate. It is the
+        # command line half of "if nothing then it should say".
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

@@ -1124,3 +1124,169 @@ def test_bridge_exits_1_and_says_why_when_the_bridge_ran_and_failed(tmp_path, ca
     assert "Barry-Waterfront_2026-08-01_project_setting.json" not in captured.out
     assert error in captured.err
     assert "Traceback" not in captured.err
+
+
+# --- Task 30: the command line is the third place a failure has to show ---
+#
+# "the progress log, so the owner sees it while watching; survey.json, so
+# the package explains itself later; the command line summary, so a
+# scripted run is not silent about it". The first two are asserted in
+# test_package.py; these are the same records, through the real command.
+
+
+class _CollectsFailuresSource:
+    """A source shaped like the tiled ones: it reports which tiles failed
+    and why, through the tile_failures convention, and raises at the end
+    of its loop rather than on the first bad tile.
+
+    Deliberately NOT a source that merely raises. That shape is already
+    covered above and takes a different path through run_survey entirely;
+    what these tests are about is the account a tiled source produces,
+    which is the thing the terminal has to print.
+    """
+
+    id = "collects-failures"
+    display_name = "Collects Failures"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self, fail_on=("r00_c01",)):
+        from mapgen.sources.base import TileFailure
+
+        self._fail_on = set(fail_on)
+        self._TileFailure = TileFailure
+        self.tile_failures = []
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.tile_failures = []
+        paths = []
+        for tile in tiles:
+            if tile.tile_id in self._fail_on:
+                self.tile_failures.append(
+                    self._TileFailure(
+                        source=self.id,
+                        tile_id=tile.tile_id,
+                        kind="not_authorised",
+                        reason="the service refused the request as not allowed (HTTP 401).",
+                    )
+                )
+                continue
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            paths.append(path)
+        if self.tile_failures:
+            raise RuntimeError("collects-failures: 1 tile failed")
+        return paths
+
+    def merge(self, parts, out_dir, stem):
+        out = out_dir / "collects-failures.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("merged", encoding="utf-8")
+        self.merged_features = len(parts)
+        return [out]
+
+
+class _FindsNothingSource:
+    """Fetches every tile successfully and merges to nothing, which is
+    what an OSM run over open sea does."""
+
+    id = "finds-nothing"
+    display_name = "Finds Nothing"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self):
+        self.merged_features = None
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=100, seconds_estimate=1.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        paths = []
+        for tile in tiles:
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            paths.append(path)
+        return paths
+
+    def merge(self, parts, out_dir, stem):
+        self.merged_features = 0
+        return []
+
+
+def test_a_forced_run_names_every_tile_it_could_not_get(tmp_path, capsys):
+    register(_CollectsFailuresSource())
+    exit_code = main(
+        _survey_error_case_args(
+            tmp_path, "collects-failures", tile_size_m=600, overlap_m=50
+        )
+        + ["--force"]
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "1 tile did not download:" in captured.err
+    assert "collects-failures r00_c01" in captured.err
+    assert "HTTP 401" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_an_unforced_run_says_the_same_thing_through_its_own_error(tmp_path, capsys):
+    # Same records, same composer, different route to the terminal: the
+    # forced run prints them, the unforced one carries them out in the
+    # exception main() turns into plain lines.
+    register(_CollectsFailuresSource())
+    exit_code = main(
+        _survey_error_case_args(
+            tmp_path, "collects-failures", tile_size_m=600, overlap_m=50
+        )
+    )
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "1 tile did not download:" in captured.err
+    assert "collects-failures r00_c01" in captured.err
+    assert "HTTP 401" in captured.err
+    assert "--force" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_layer_that_found_nothing_says_so_rather_than_leaving_a_gap(tmp_path, capsys):
+    # No file is written for it, by ruling, so without this line the owner
+    # opens the folder and finds something missing with nothing on screen
+    # accounting for it.
+    register(_FindsNothingSource())
+    exit_code = main(_survey_error_case_args(tmp_path, "finds-nothing"))
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "finds-nothing: nothing was found in this extent" in captured.out
+    assert "did not download" not in captured.err
+
+
+def test_a_layer_that_failed_is_never_described_as_having_found_nothing(tmp_path, capsys):
+    # The two must not collapse into one sentence. This source merges no
+    # file either, but for the opposite reason.
+    register(_CollectsFailuresSource(fail_on=("r00_c00", "r00_c01", "r01_c00", "r01_c01")))
+    main(
+        _survey_error_case_args(
+            tmp_path, "collects-failures", tile_size_m=600, overlap_m=50
+        )
+        + ["--force"]
+    )
+    captured = capsys.readouterr()
+    assert "nothing was found in this extent" not in captured.out
+    assert "did not download" in captured.err
+
+
+def test_an_ordinary_complete_run_says_nothing_new_at_all(tmp_path, capsys):
+    # StubSource is registered by the autouse fixture above.
+    exit_code = main(_survey_error_case_args(tmp_path, "stub"))
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "did not download" not in captured.err
+    assert "nothing was found" not in captured.out
