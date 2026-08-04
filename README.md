@@ -135,9 +135,13 @@ mapgen ui
 opens a local page, served on `127.0.0.1` with a per-launch access token in
 the URL, so nothing else on the machine can drive it. On the page:
 
-- Draw a rectangle on the map, paste a `west,south,east,north` bbox string, or
-  search a place name and pick a result. Whichever way you set it, the extent
-  always shows as a rectangle.
+- Draw a rectangle on the map by pressing, dragging and releasing, press
+  **Select viewport** to take exactly what the map is currently showing,
+  paste a `west,south,east,north` bbox string, or search a place name and
+  pick a result. Whichever way you set it, the extent always shows as a
+  rectangle. A viewport capture is a snapshot, not a binding: panning or
+  zooming afterwards leaves the rectangle where it is, and pressing the
+  button again captures the new view.
 - Region and Site fill in on their own: picking a place from the search
   results uses that result's own name, and drawing or pasting a rectangle
   reverse-geocodes its centre. Both stay ordinary editable text fields, and
@@ -210,13 +214,19 @@ the URL, so nothing else on the machine can drive it. On the page:
 - The download runs with a live per-tile log, and the tile grid shades each
   rectangle as it goes: not started, in progress, done, or failed, the last
   one drawn distinctly since it is the one worth noticing before deciding
-  you have enough.
+  you have enough. Tiles go green one at a time, as each one is finished:
+  a tile is done when every layer you selected has finished with that tile,
+  which for a layer that downloads the whole extent in one request means
+  when that layer lands. A tile too dense for one request is drawn with a
+  dashed outline over whatever state it is in, and its tooltip says into
+  how many pieces it was split, so a square that has gone quiet explains
+  itself rather than looking stuck.
 - A red tile says why it is red. Hover one, or tap it on a touchscreen, and
   the reason the run actually recorded appears on the tile: the service
   timed out, or answered 429, or answered 503 four times over, and whether
   it was retried and failed again. The same reasons are listed under the
-  progress bar as well, so the account is there without having to know to
-  hover anything, and clicking a red tile marks its entry in that list,
+  Download button as well, so the account is there without having to know
+  to hover anything, and clicking a red tile marks its entry in that list,
   which is how you tell one rectangle from seventy-one others. The
   sentences are the ones `survey.json` records under `tile_failures` and
   the ones the command line prints, composed in one place, so the page, the
@@ -226,8 +236,11 @@ the URL, so nothing else on the machine can drive it. On the page:
   all is corrected the same way. A tile that downloaded successfully and
   happened to contain nothing is a success, is not red, and is offered no
   explanation, because it does not need one.
-- A progress bar underneath answers the other question,
-  how much longer. It is derived from the same progress events the grid
+- A progress bar on the strip directly under the map, to the right of the
+  tile legend, answers the other question, how much longer. Beside it, one
+  short line says what is happening now: downloading a named layer,
+  checking the files, writing the package. It is derived from the same
+  progress events the grid
   is, weighted by what each layer's own estimate says it costs, so a
   finished OpenStreetMap pass reads as the large majority of the run it
   actually is. The countdown starts from the estimate and switches to the
