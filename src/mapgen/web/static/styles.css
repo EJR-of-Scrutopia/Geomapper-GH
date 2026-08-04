@@ -130,6 +130,18 @@ main {
   display: inline-block;
 }
 
+/* Task 36, item 4: a tile that was too dense and had to be split. Not a
+   fifth colour (see app.js's TILE_SPLIT_STYLE for why), so the swatch
+   cannot be a fill: it is the dashed outline the rectangle itself takes
+   on, in the text's own colour, over whichever of the four state fills
+   the tile already has. Wider than the square swatches beside it because
+   two dashes are the whole of what it has to show. */
+.tile-legend-swatch.split {
+  width: 16px;
+  background: none;
+  border: 1px dashed currentColor;
+}
+
 .map-tools > input { flex: 1; }
 
 /* The place search box and its typeahead dropdown. A wrapper is needed so
@@ -548,6 +560,26 @@ button.armed {
 .leaflet-tooltip-bottom.tile-failure-tooltip:before { border-bottom-color: var(--warn); }
 .leaflet-tooltip-left.tile-failure-tooltip:before { border-left-color: var(--warn); }
 .leaflet-tooltip-right.tile-failure-tooltip:before { border-right-color: var(--warn); }
+
+/* Task 36, item 4: the same box for a tile that has a note but nothing
+   wrong with it, in the ordinary line colour. A tile that was split is
+   not a problem, and borrowing the warning colour for it would make the
+   one signal that means "something did not arrive" mean two things. */
+.leaflet-tooltip.tile-note-tooltip {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  white-space: normal;
+  max-width: 260px;
+  line-height: 1.4;
+  font: 12px/1.4 "Segoe UI", system-ui, sans-serif;
+}
+
+.leaflet-tooltip-top.tile-note-tooltip:before { border-top-color: var(--line); }
+.leaflet-tooltip-bottom.tile-note-tooltip:before { border-bottom-color: var(--line); }
+.leaflet-tooltip-left.tile-note-tooltip:before { border-left-color: var(--line); }
+.leaflet-tooltip-right.tile-note-tooltip:before { border-right-color: var(--line); }
 
 footer { border-top: 1px solid var(--line); }
 

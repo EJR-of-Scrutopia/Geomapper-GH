@@ -97,8 +97,45 @@ const TILE_STATE_LABELS = {
   failed: "Failed",
 };
 
+// Task 36, item 4: "if a tile needs to subdivide show the subdivision
+// too". Drawn as a dashed, heavier outline OVER whichever of the four
+// state colours the tile already has, and deliberately neither a fifth
+// state nor four smaller rectangles.
+//
+// Not the quarters themselves, and that is the argued part. The client
+// has never computed a single piece of tile geometry: every rectangle on
+// this map comes from the server's own tile_grid (see package.py's
+// _geometry_summary, which sends the plan's rectangles keyed by the same
+// tile_id the progress events carry), and that is what makes it
+// impossible for the grid to disagree with the run about where a tile
+// is. tile_subdivided carries a count and a depth, never four
+// rectangles, so drawing the quarters would mean this file working out
+// where the halfway lines of a tile fall from bounds it was handed for a
+// different purpose. The first time that arithmetic and build_tiles
+// disagreed, the map would be quietly wrong with nothing to say so. The
+// parent is marked instead, and the tooltip says into how many pieces.
+//
+// Not a colour either, for the reason Task 31 already settled when it
+// refused one for "failed, and there is a sentence about it": a fifth
+// colour has to MEAN a fifth condition. Being split is not a state a
+// tile is in INSTEAD of pending, active, done or failed. It is a second
+// fact about a tile that is in one of those four, it outlives the state
+// it happened in, and a split tile can and usually does finish
+// perfectly well. So it is drawn as a second property of the same
+// rectangle, which is what lets one read as "in progress, and doing four
+// times the work of its neighbours" at a glance. That is the question
+// the owner actually asked this to answer: why one square is taking so
+// long.
+const TILE_SPLIT_STYLE = { dashArray: "5 4", weight: 2 };
+const TILE_SPLIT_LABEL = "Split into pieces";
+
 let tileRectangles = new Map(); // tile_id -> Leaflet rectangle
 let tileState = new Map(); // tile_id -> "pending" | "active" | "done" | "failed"
+// tile_id -> { pieces, depth } for a tile this run had to split. Kept
+// beside the state rather than folded into it for the reason above: the
+// two are independent, and a tile carries its split through every state
+// it goes on to reach.
+let tileSubdivided = new Map();
 // The tooltip html currently bound to each rectangle, so a poll that
 // changes nothing rebinds nothing: bindTooltip on a layer whose tooltip
 // is open closes it first (see Leaflet's own implementation), and doing
@@ -111,14 +148,22 @@ let tileTooltips = new Map(); // tile_id -> bound tooltip html
 let lastTileFailures = [];
 let selectedFailedTile = null;
 
-function tileStyleFor(state) {
-  return TILE_COLOURS[effectiveTheme()][state] || TILE_COLOURS[effectiveTheme()].pending;
+function tileStyleFor(state, subdivided = false) {
+  const palette = TILE_COLOURS[effectiveTheme()];
+  const base = palette[state] || palette.pending;
+  // dashArray is always present, null when this tile did not split.
+  // Leaflet's SVG renderer sets stroke-dasharray when the option is
+  // truthy and REMOVES it when it is not, so the explicit null is what
+  // actually takes the dashes back off a rectangle being repainted for
+  // some other reason, a second run over the same extent in particular.
+  return subdivided ? { ...base, ...TILE_SPLIT_STYLE } : { ...base, dashArray: null };
 }
 
 function clearTileGrid() {
   for (const rect of tileRectangles.values()) map.removeLayer(rect);
   tileRectangles = new Map();
   tileState = new Map();
+  tileSubdivided = new Map();
   tileTooltips = new Map();
   renderTileFailures([]);
   renderTileLegend();
@@ -175,13 +220,48 @@ const TILE_FAILURE_TOOLTIP = {
   className: "tile-failure-tooltip",
 };
 
+// The same box for a tile that has a note but no failure, in the page's
+// ordinary line colour rather than the warning one.
+const TILE_NOTE_TOOLTIP = { ...TILE_FAILURE_TOOLTIP, className: "tile-note-tooltip" };
+
+// A split tile's own sentence, Task 36 item 4. The dashes say a tile was
+// split; this says into how many pieces, which is the difference between
+// "something is happening here" and "this square is four requests, which
+// is why it has gone quiet". Same shape as the failure sentence, and in
+// the same tooltip, because a tile can be both and the owner should not
+// have to find two places to read about one rectangle.
+//
+// depth is on the event and is deliberately not said. For a tile OF THE
+// PLAN it is always 1: a quarter that is itself over the cap reports its
+// own tile_subdivided under the quarter's id ("<parent>_q10"), which is
+// not a tile of the plan at all and is dropped by the same
+// state.has(tile_id) guard that keeps the subdivision COUNT honest (see
+// review finding I5 in summariseJob). Printing a number that is 1 in
+// every run this server can produce would be dressing a constant up as
+// information.
+function tileSubdivisionLine(record) {
+  const count =
+    record.pieces > 0
+      ? `${record.pieces} ${record.pieces === 1 ? "piece" : "pieces"}`
+      : "pieces";
+  return `Too dense for one request: split into ${count} and fetched a piece at a time.`;
+}
+
 // Leaflet assigns a string tooltip through innerHTML, so this escapes.
 // The reasons are composed server-side from a fixed vocabulary and never
 // from a URL or a raw exception (see TileFailure's own docstring), so
 // there is nothing hostile expected here; escaping is what makes that a
 // property of this line rather than of a promise made somewhere else.
-function tileFailureTooltip(records) {
-  return records.map((record) => escapeHtml(tileFailureLine(record))).join("<br />");
+//
+// One composer for both facts about a rectangle, rather than two that
+// each bind their own tooltip: bindTooltip REPLACES whatever was bound
+// before, so two owners of one tooltip would mean whichever ran last won
+// and the other fact vanished.
+function tileTooltipHtml(records, split) {
+  const lines = [];
+  if (split) lines.push(escapeHtml(tileSubdivisionLine(split)));
+  for (const record of records || []) lines.push(escapeHtml(tileFailureLine(record)));
+  return lines.join("<br />");
 }
 
 function failuresByTile(records) {
@@ -193,19 +273,24 @@ function failuresByTile(records) {
   return byTile;
 }
 
-// Binds a tooltip to every rectangle that has a live reason and takes it
-// off every rectangle that does not. The second half is the half that
+// Binds a tooltip to every rectangle that has something to say and takes
+// it off every rectangle that does not. The second half is the half that
 // matters: a tile whose retry succeeded, or one the verify pass found on
 // disk after all, must not be left carrying the sentence explaining a
 // problem it no longer has.
-function paintTileFailures(records) {
+function paintTileTooltips(records, subdivisions) {
   const byTile = failuresByTile(records);
   for (const [tileId, rect] of tileRectangles) {
     const forTile = byTile.get(tileId);
-    const html = forTile ? tileFailureTooltip(forTile) : "";
+    const split = subdivisions ? subdivisions.get(tileId) : null;
+    const html = tileTooltipHtml(forTile, split);
     if ((tileTooltips.get(tileId) || "") === html) continue;
     if (html) {
-      rect.bindTooltip(html, TILE_FAILURE_TOOLTIP);
+      // The warning border belongs to a reason a tile is red. A tile that
+      // only split is not a problem at all, so it gets the neutral box
+      // rather than borrowing the colour that means something did not
+      // arrive.
+      rect.bindTooltip(html, forTile ? TILE_FAILURE_TOOLTIP : TILE_NOTE_TOOLTIP);
       tileTooltips.set(tileId, html);
     } else {
       rect.unbindTooltip();
@@ -298,13 +383,35 @@ function renderTileGrid(tileGrid) {
   renderTileLegend();
 }
 
-function paintTileStates(states) {
+function paintTileStates(states, subdivisions = new Map()) {
+  const hadSplits = tileSubdivided.size > 0;
+  // Splits first, and in their own pass, because a tile can split without
+  // its state changing at all: the event arrives while the tile is
+  // active and it stays active for however long the pieces take. A
+  // single loop keyed on the state map would skip exactly that tile, on
+  // the "nothing changed" line, which is the one moment the owner is
+  // asking the grid about.
+  //
+  // A tile never un-splits within a run, so this only ever grows. A new
+  // run empties it (see the Download handler) and a new extent empties it
+  // with the whole grid (see clearTileGrid).
+  for (const [tileId, record] of subdivisions) {
+    if (tileSubdivided.has(tileId)) continue;
+    tileSubdivided.set(tileId, record);
+    const rect = tileRectangles.get(tileId);
+    if (rect) rect.setStyle(tileStyleFor(tileState.get(tileId) || "pending", true));
+  }
   for (const [tileId, state] of states) {
     if (tileState.get(tileId) === state) continue;
     tileState.set(tileId, state);
     const rect = tileRectangles.get(tileId);
-    if (rect) rect.setStyle(tileStyleFor(state));
+    if (rect) rect.setStyle(tileStyleFor(state, tileSubdivided.has(tileId)));
   }
+  // Only when the legend's own content would actually change, not every
+  // 700ms poll: rebuilding its innerHTML is what would make a legend the
+  // owner is reading flicker, the same argument the tooltip memo above
+  // makes.
+  if (hadSplits !== tileSubdivided.size > 0) renderTileLegend();
 }
 
 // Repaints every rectangle already on the map in its current state, using
@@ -313,7 +420,7 @@ function paintTileStates(states) {
 // changed, only which colours represent it.
 function repaintTileGridTheme() {
   for (const [tileId, rect] of tileRectangles) {
-    rect.setStyle(tileStyleFor(tileState.get(tileId) || "pending"));
+    rect.setStyle(tileStyleFor(tileState.get(tileId) || "pending", tileSubdivided.has(tileId)));
   }
   renderTileLegend();
 }
@@ -326,16 +433,27 @@ function renderTileLegend() {
     return;
   }
   legend.hidden = false;
-  legend.innerHTML = Object.keys(TILE_STATE_LABELS)
-    .map((state) => {
-      const style = tileStyleFor(state);
-      return (
-        `<span class="tile-legend-item">` +
-        `<span class="tile-legend-swatch" style="background:${style.fillColor}"></span>` +
-        `${escapeHtml(TILE_STATE_LABELS[state])}</span>`
-      );
-    })
-    .join("");
+  const items = Object.keys(TILE_STATE_LABELS).map((state) => {
+    const style = tileStyleFor(state);
+    return (
+      `<span class="tile-legend-item">` +
+      `<span class="tile-legend-swatch" style="background:${style.fillColor}"></span>` +
+      `${escapeHtml(TILE_STATE_LABELS[state])}</span>`
+    );
+  });
+  // Only once a tile has actually split. A legend entry for something
+  // that has not happened is a fifth thing to read past on every run,
+  // and this strip has one line to work with (see the progress bar
+  // beside it): the entry appears when there is something to explain and
+  // takes its width back when there is not.
+  if (tileSubdivided.size > 0) {
+    items.push(
+      `<span class="tile-legend-item">` +
+        `<span class="tile-legend-swatch split"></span>` +
+        `${escapeHtml(TILE_SPLIT_LABEL)}</span>`
+    );
+  }
+  legend.innerHTML = items.join("");
 }
 
 // Classifies every tile from the job's progress events alone: a pure
@@ -462,7 +580,7 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const finishedSources = new Set();
   const fetchedTiles = new Map(); // source id -> Set of plan tile ids
   const skippedTiles = new Map(); // source id -> Set of plan tile ids
-  const subdividedTiles = new Set(); // plan tile ids that needed splitting
+  const subdividedTiles = new Map(); // plan tile id -> { pieces, depth }
   const liveFailures = new Map(); // failureKey(source, tile_id) -> record
 
   const setFor = (bucket, source) => {
@@ -518,8 +636,15 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     // the note would have said "5 tiles were". A Set for the same reason
     // every other per-tile figure here uses one: the note claims a number
     // of TILES, so counting one twice is the single thing it must not do.
+    // A Map rather than a Set since Task 36, item 4: the grid now says
+    // into how many pieces as well as that it happened. Keyed the same
+    // way and guarded the same way, so the count the note beside the bar
+    // quotes (subdividedTiles.size) is exactly the number of TILES it
+    // always was.
     if (event.event === "tile_subdivided" && state.has(event.tile_id)) {
-      subdividedTiles.add(event.tile_id);
+      if (!subdividedTiles.has(event.tile_id)) {
+        subdividedTiles.set(event.tile_id, subdivisionRecord(event));
+      }
     }
   }
 
@@ -589,6 +714,21 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     fractionSkipped,
     fractionFetched: Math.max(0, fractionDone - fractionSkipped),
     subdivisions: subdividedTiles.size,
+    tileSubdivisions: subdividedTiles,
+  };
+}
+
+// pieces and depth, read once and defaulted, for the same reason
+// failureRecord reads a failure's fields once: everything downstream can
+// then assume numbers. A missing or nonsensical count is carried as 0 and
+// the sentence says "pieces" rather than inventing a number, which is
+// what a page served against an older server would meet.
+function subdivisionRecord(event) {
+  const pieces = Number(event.pieces);
+  const depth = Number(event.depth);
+  return {
+    pieces: Number.isFinite(pieces) && pieces > 0 ? pieces : 0,
+    depth: Number.isFinite(depth) && depth > 0 ? depth : 0,
   };
 }
 
@@ -2141,11 +2281,19 @@ $("download").addEventListener("click", async () => {
     // the extent has not changed since the estimate that enabled
     // Download, so the geometry is still correct, only the progress is
     // new.
+    // And the previous run's splits go with the previous run's states:
+    // whether a tile was too dense is a fact about a run, not about the
+    // ground, and a resumed run that finds the pieces already on disk
+    // never splits it again.
+    tileSubdivided = new Map();
     for (const [tileId, rect] of tileRectangles) {
       tileState.set(tileId, "pending");
       rect.setStyle(tileStyleFor("pending"));
       rect.unbindTooltip();
     }
+    // Which also takes the split entry back out of the legend, since
+    // nothing has split in this run yet.
+    renderTileLegend();
     // And the previous run's reasons go with its colours. A second
     // download over the same extent is a fresh account of that ground,
     // and last run's failures sitting beside a bar that has gone back to
@@ -2198,14 +2346,14 @@ $("download").addEventListener("click", async () => {
         job.state === "running",
         activeJobSourceSeconds
       );
-      paintTileStates(summary.tileStates);
+      paintTileStates(summary.tileStates, summary.tileSubdivisions);
       // The same records twice, on purpose: on the map, where the owner
       // is already looking at the red rectangle, and in the list, which
       // is the only one of the two that can be read without knowing it
       // is there. renderTileFailures first, so a click that lands
       // between this tick and the next has the current set to look up.
       renderTileFailures(summary.tileFailures);
-      paintTileFailures(summary.tileFailures);
+      paintTileTooltips(summary.tileFailures, summary.tileSubdivisions);
       renderProgress(summary, job, (Date.now() - jobStartedAt) / 1000);
       if (job.state !== "running") {
         clearInterval(poller);

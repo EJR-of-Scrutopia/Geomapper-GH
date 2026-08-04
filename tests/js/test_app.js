@@ -5666,6 +5666,178 @@ function ok(condition, message) {
     ok(verifyLine.includes("phase=after_retry"), `a scalar must still print plainly: ${verifyLine}`);
   });
 
+  // =======================================================================
+  // Task 36, item 4: a tile that had to be split says so on the grid.
+  // The parent is marked, not the quarters, because the client has never
+  // computed tile geometry and tile_subdivided carries a count rather
+  // than four rectangles (see app.js's TILE_SPLIT_STYLE).
+  // =======================================================================
+
+  const SPLIT_R00_C01 = {
+    event: "tile_subdivided",
+    source: "osm",
+    tile_id: "r00_c01",
+    pieces: 4,
+    depth: 1,
+  };
+
+  function legendHtml(sandbox) {
+    return sandbox.document.getElementById("tile-legend").innerHTML;
+  }
+
+  await test("a split tile is marked on the grid, and only that tile", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      SPLIT_R00_C01,
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      { event: "source_done", source: "osm" },
+    ]);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(rects[1].options.dashArray === "5 4", `expected the split tile dashed, got ${rects[1].options.dashArray}`);
+    ok(!rects[0].options.dashArray, `expected its neighbour undashed, got ${rects[0].options.dashArray}`);
+    ok(!rects[2].options.dashArray, `expected its neighbour undashed, got ${rects[2].options.dashArray}`);
+    // A split is not a failure and must not read as one: the tile still
+    // finishes in the ordinary done colour, dashes and all.
+    ok(
+      rects[1].options.fillColor === "#2f5d4f",
+      `expected the split tile to still finish done, got ${rects[1].options.fillColor}`
+    );
+  });
+
+  await test("the legend explains the dashes, and only once something has split", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      { event: "source_done", source: "osm" },
+    ]);
+    ok(
+      !/Split into pieces/.test(legendHtml(sandbox)),
+      `a run with no split needs no entry for one: ${legendHtml(sandbox)}`
+    );
+
+    const split = await runWithFailures([
+      SPLIT_R00_C01,
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      { event: "source_done", source: "osm" },
+    ]);
+    ok(
+      /Split into pieces/.test(legendHtml(split.sandbox)),
+      `expected the split entry once a tile has split: ${legendHtml(split.sandbox)}`
+    );
+  });
+
+  await test("a split tile says how many pieces, in its own tooltip", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      SPLIT_R00_C01,
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      { event: "source_done", source: "osm" },
+    ]);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(/4 pieces/.test(rects[1].tooltip), `expected the piece count, got ${rects[1].tooltip}`);
+    ok(
+      rects[1].tooltipOptions.className === "tile-note-tooltip",
+      `a split is not a failure, so it gets the neutral box, got ${rects[1].tooltipOptions.className}`
+    );
+    ok(rects[0].tooltip === null, "a tile that did not split carries no tooltip");
+  });
+
+  await test("a tile that split AND failed says both things, in the failure box", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      SPLIT_R00_C01,
+      OSM_TIMEOUT, // the same tile, r00_c01
+      { event: "source_done", source: "osm" },
+    ]);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(/4 pieces/.test(rects[1].tooltip), `expected the split sentence, got ${rects[1].tooltip}`);
+    ok(/did not answer/.test(rects[1].tooltip), `expected the failure sentence too, got ${rects[1].tooltip}`);
+    ok(
+      rects[1].tooltipOptions.className === "tile-failure-tooltip",
+      `a tile with a failure keeps the warning box, got ${rects[1].tooltipOptions.className}`
+    );
+  });
+
+  await test("a quarter's own split is not a second split of the plan's tile", async () => {
+    // OsmSource emits one tile_subdivided per SPLIT, and a quarter that
+    // is itself too dense emits another under "<parent>_q10", which is
+    // not a tile of the plan at all. The same guard that keeps the COUNT
+    // honest (review finding I5) has to keep the grid honest too.
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00", "r00_c01"],
+      ["osm"],
+      [
+        SPLIT_R00_C01,
+        { event: "tile_subdivided", source: "osm", tile_id: "r00_c01_q10", pieces: 4, depth: 2 },
+      ],
+      true
+    );
+    ok(summary.subdivisions === 1, `one tile was split, got ${summary.subdivisions}`);
+    ok(summary.tileSubdivisions.size === 1, "expected exactly one marked tile");
+    ok(
+      summary.tileSubdivisions.get("r00_c01").pieces === 4,
+      JSON.stringify(summary.tileSubdivisions.get("r00_c01"))
+    );
+    ok(
+      !summary.tileSubdivisions.has("r00_c01_q10"),
+      "a quarter must not become a rectangle of its own"
+    );
+  });
+
+  await test("a split with no piece count says so rather than inventing a number", async () => {
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00"],
+      ["osm"],
+      [{ event: "tile_subdivided", source: "osm", tile_id: "r00_c00" }],
+      true
+    );
+    ok(summary.tileSubdivisions.get("r00_c00").pieces === 0, "expected no fabricated count");
+  });
+
+  await test("a second download starts the grid over with no dashes and no legend entry", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      SPLIT_R00_C01,
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      { event: "source_done", source: "osm" },
+    ]);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(rects[1].options.dashArray === "5 4", "expected the first run to have marked it");
+
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10);
+    ok(
+      !rects[1].options.dashArray,
+      `a fresh run over the same ground has not split anything yet, got ${rects[1].options.dashArray}`
+    );
+    ok(
+      !/Split into pieces/.test(legendHtml(sandbox)),
+      `expected the legend entry gone with it: ${legendHtml(sandbox)}`
+    );
+  });
+
+  await test("changing the theme keeps a split tile's dashes", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      SPLIT_R00_C01,
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      { event: "source_done", source: "osm" },
+    ]);
+    const rects = gridRectangles(sandbox, tileIds);
+    setField(sandbox, "theme", "dark");
+    await flush(10);
+    ok(
+      rects[1].options.fillColor === "#6fc3a3",
+      `expected the dark done colour, got ${rects[1].options.fillColor}`
+    );
+    ok(
+      rects[1].options.dashArray === "5 4",
+      `expected the dashes to survive a repaint, got ${rects[1].options.dashArray}`
+    );
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );
