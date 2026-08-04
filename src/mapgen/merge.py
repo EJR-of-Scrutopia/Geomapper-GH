@@ -58,7 +58,26 @@ def _element_id_or_zero(element: ET.Element) -> int:
         return 0
 
 
-def merge_osm_xml(input_paths: Iterable[Path], output_path: Path) -> int:
+def merge_osm_xml(
+    input_paths: Iterable[Path], output_path: Path, write_when_empty: bool = True
+) -> int:
+    """Combine .osm files into one, returning how many elements it held.
+
+    write_when_empty defaults to True, which is what this always did and
+    what OsmSource._fetch_tile still needs: recombining the quarters of a
+    subdivided tile must always leave a <tile_id>.osm on disk, because
+    that file's presence is what package.py reads as "this tile arrived".
+    A tile that was subdivided is by definition dense, so this case does
+    not arise in practice, but a recombine that silently wrote nothing
+    would turn a successful subdivision into a failed tile, which is a
+    worse trap than the one being fixed.
+
+    False is Task 30's ruling, and OsmSource.merge is where it applies:
+    a package must not hold a merged artefact for data that was never
+    there. See that method for the full reasoning and for why the caller,
+    not this function, is also responsible for removing a previous
+    attempt's file.
+    """
     deduped: OrderedDict[str, ET.Element] = OrderedDict()
 
     for input_path in input_paths:
@@ -78,6 +97,9 @@ def merge_osm_xml(input_paths: Iterable[Path], output_path: Path) -> int:
         deduped.values(),
         key=lambda el: (OSM_TYPE_ORDER.index(el.tag), _element_id_or_zero(el)),
     )
+
+    if not ordered and not write_when_empty:
+        return 0
 
     with atomic_writer(output_path) as handle:
         handle.write('<?xml version="1.0" encoding="UTF-8"?>\n')
@@ -107,11 +129,23 @@ def _iter_features(path: Path) -> Iterator[tuple[str, str]]:
         yield str(feature_id), json.dumps(feature, separators=(",", ":"))
 
 
-def merge_geojson(input_paths: Iterable[Path], output_path: Path) -> int:
+def merge_geojson(
+    input_paths: Iterable[Path], output_path: Path, write_when_empty: bool = True
+) -> int:
+    """Combine GeoJSON files into one, returning how many features it held.
+
+    write_when_empty is the same switch merge_osm_xml has, for the same
+    Task 30 ruling: OvertureSource.merge passes False so a type that
+    returned no features leaves no <stem>_<type>.geojson behind. The
+    default is unchanged for every other caller.
+    """
     deduped: OrderedDict[str, str] = OrderedDict()
     for input_path in input_paths:
         for feature_id, compact in _iter_features(input_path):
             deduped.setdefault(feature_id, compact)
+
+    if not deduped and not write_when_empty:
+        return 0
 
     with atomic_writer(output_path) as handle:
         handle.write('{"type":"FeatureCollection","features":[')

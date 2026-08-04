@@ -317,6 +317,11 @@ class OvertureSource:
         # possible_outputs and _remove_earlier_version_debris both read it
         # and both need the full closed list, not just what landed.
         self.fetched_types: list[str] | None = None
+        # How many features the last merge() actually wrote, across every
+        # type, so survey.json can explain a missing file as "there was
+        # nothing here" rather than leaving it as a silent gap (Task 30).
+        # None until merge() has run.
+        self.merged_features: int | None = None
         self.release = release
         self._runner = runner
         self._find = executable_finder
@@ -743,11 +748,27 @@ class OvertureSource:
         # merged-output problem here as in OsmSource.merge and asked for a
         # consistent fix. package.py's _write_layer_files matches on this
         # exact composed name to copy the three phase 1 layers into layers/.
+        #
+        # A type that returned no features leaves no file, per Task 30's
+        # ruling, and a previous attempt's file for that type is removed
+        # rather than left to contradict the record. Applied per TYPE and
+        # not only per source, because each type is its own merged file
+        # and an empty <stem>_water.geojson is the same fabrication as an
+        # empty <stem>.osm: a layer the folder says is present and
+        # Grasshopper reads as containing nothing, rather than a layer
+        # that is honestly absent. See OsmSource.merge for the full
+        # reasoning, which is one ruling applied in two places.
         outputs: list[Path] = []
+        merged_features = 0
         for overture_type, type_parts in sorted(by_type.items()):
             output = out_dir / f"{stem}_{overture_type}.geojson"
-            merge_geojson(type_parts, output)
+            count = merge_geojson(type_parts, output, write_when_empty=False)
+            merged_features += count
+            if count == 0:
+                output.unlink(missing_ok=True)
+                continue
             outputs.append(output)
+        self.merged_features = merged_features
         return outputs
 
     def possible_outputs(self, stem: str) -> list[str]:

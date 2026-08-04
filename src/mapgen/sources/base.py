@@ -21,6 +21,70 @@ class Estimate:
     seconds_estimate: float
 
 
+# Why a tile did not arrive, as a fixed vocabulary rather than a sentence
+# (Task 30).
+#
+# The sentence is for the owner and is carried separately, in TileFailure.
+# reason. This is the part code is allowed to branch on, and it exists
+# because package.py has to decide which failures a retry could plausibly
+# fix without reading English: matching on "timed out" or "503" in some
+# later, differently-worded message is the same textual-over-structural
+# mistake NodeCapExceededError's own docstring documents, one layer out.
+#
+# A source that cannot tell which of these applies says UNKNOWN and is
+# never retried. That is the safe direction: an unrecognised cause retried
+# blind is how a rate-limited public API gets hammered, and how an
+# authentication failure becomes four authentication failures.
+FAILURE_TIMEOUT = "timeout"
+FAILURE_UNREACHABLE = "unreachable"
+FAILURE_RATE_LIMITED = "rate_limited"
+FAILURE_SERVICE_ERROR = "service_error"
+FAILURE_NOT_AUTHORISED = "not_authorised"
+FAILURE_REFUSED = "refused"
+FAILURE_NODE_CAP = "node_cap"
+FAILURE_NO_OUTPUT = "no_output"
+FAILURE_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class TileFailure:
+    """One tile, one source, one reason it is not here.
+
+    Composed by the source that failed, because that is the only place
+    that knows what the service actually said, and read by package.py,
+    which knows nothing about any individual source. The pair of fields is
+    deliberate: `kind` is for code (see the retry policy in package.py),
+    `reason` is for the owner and must be a plain sentence they can act
+    on. A raw traceback is not a reason and neither is an HTTP status on
+    its own.
+
+    reason must never carry a URL. Not because a URL is unreadable, but
+    because a URL is where an API key lives: mapgen.sources.elevation
+    spent five review rounds learning that every path a request's own text
+    can take out of a source is a path a key can take with it. Composing
+    these sentences from a fixed vocabulary plus a status code, never from
+    str(exc) and never from the endpoint that was called, makes the leak
+    structurally impossible here rather than merely absent today.
+    """
+
+    source: str
+    tile_id: str
+    kind: str
+    reason: str
+
+    def to_record(self) -> dict[str, str]:
+        """The plain-dict form that reaches survey.json and the progress
+        event stream. One shape in both places, so a reader of the file
+        and a reader of the live event stream never have to learn two.
+        """
+        return {
+            "source": self.source,
+            "tile_id": self.tile_id,
+            "kind": self.kind,
+            "reason": self.reason,
+        }
+
+
 class UnknownSourceError(KeyError):
     """Raised when a source id is not in the registry."""
 
@@ -113,6 +177,24 @@ class LayerSource(Protocol):
     survey.json that never mentions it. The closed list is the safety
     property: a file the user dropped into the package folder can never
     match it, so the sweep cannot touch anything mapgen did not write.
+
+    tile_failures is the same convention again, for Task 30: a list of
+    TileFailure records describing the tiles THIS source's most recent
+    fetch() call attempted and could not deliver, reset at the top of
+    every fetch() so it always describes that call and never accumulates
+    across a retry. A source that keeps one sets it; a source that does
+    not simply never defines it, and package.py's getattr reads an empty
+    list, which means "this layer failed as a whole and cannot say which
+    tiles", the behaviour every source had before this existed.
+
+    Setting it does NOT mean fetch() stops raising. A tiled source should
+    continue past a failed tile, collect the failures, and raise once at
+    the end of the loop, so a direct Python caller still learns that
+    something went wrong rather than getting a short list back in
+    silence. What package.py does with the exception is different when
+    tile_failures is populated: it has an account it can retry from, so
+    it defers the decision until after the retry pass instead of ending
+    the layer on the first bad tile.
 
     fetch()'s own `cancel` parameter (Task 22) is different in kind from
     everything above: those are all optional EXTENSIONS, read defensively

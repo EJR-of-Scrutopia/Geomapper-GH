@@ -9,9 +9,11 @@ from mapgen.geo import BBox, build_tiles
 from mapgen.jobs import CancelToken, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
+    IncompleteSurveyError,
     SurveyRequest,
     UnbridgeablePackageError,
     bridge_package,
+    describe_tile_failures,
     estimate_geometry,
     estimate_survey,
     register_default_sources,
@@ -1557,6 +1559,16 @@ class _FakeOvertureRunner:
     the requested --output path: enough for OvertureSource.fetch's own
     rename-from-.part-on-success step and run_survey's merge step to
     both succeed, without ever shelling out to the real overturemaps CLI.
+
+    Minimal, but no longer EMPTY (Task 30). It used to write a
+    feature-less collection, which was a double more permissive than the
+    real thing in exactly the way this project keeps finding: a real
+    overturemaps download of a selected type over a real extent has
+    features in it, and a download that genuinely has none is now a
+    distinct, deliberately handled case (no merged file is written for
+    it, per the owner's no-fabricated-empty-output ruling). A double that
+    only ever produced the empty case would have every test that uses it
+    silently asserting against that case instead of the ordinary one.
     """
 
     def __init__(self):
@@ -1570,9 +1582,25 @@ class _FakeOvertureRunner:
     def __call__(self, command, **kwargs):
         with self.lock:
             self.commands.append(command)
+        overture_type = command[command.index("--type") + 1]
         output = Path(command[command.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
+        output.write_text(
+            json.dumps(
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "id": f"{overture_type}-1",
+                            "geometry": None,
+                            "properties": {},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         return type("FakeCompleted", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
 
@@ -3004,6 +3032,7 @@ def _package_on_disk(
     complete=True,
     stopped=False,
     bbox=BBOX,
+    tiles=None,
 ):
     """A finished package folder, written directly rather than surveyed.
 
@@ -3036,7 +3065,11 @@ def _package_on_disk(
         "tiling": {"tile_size_m": 600.0, "overlap_m": 50.0, "rows": 2, "cols": 2},
         "sources": [{"id": s, "licence": "CC0", "attribution": "nobody"} for s in source_ids],
         "categories": ["buildings"],
-        "tiles": [{"tile_id": "r00_c00", **{s: "ok" for s in source_ids}}],
+        "tiles": (
+            [{"tile_id": "r00_c00", **{s: "ok" for s in source_ids}}]
+            if tiles is None
+            else tiles
+        ),
         "complete": complete,
         "stopped": stopped,
         "bridge": (
@@ -3433,3 +3466,622 @@ def test_bridge_package_works_on_a_real_surveyed_package_with_an_osm_layer(tmp_p
         "ok": None,
         "error": None,
     }
+
+
+# --- Task 30: verify the run, retry what failed, and say why --------------
+#
+# The owner's ruling, in their words: "if a tile has no data then it has no
+# data, we should not add something random. we should be doing a verify at
+# the end of the run to confirm all tiles are there, then retry certain
+# tiles that failed, if nothing then it should say."
+#
+# These go through the REAL OsmSource against a fake HTTP session, not
+# through a stub source, because almost everything being asserted here is
+# a collaboration: the source classifies the failure, package.py decides
+# whether that kind is worth retrying, the source's own inner backoff runs
+# again underneath the retry, and the verify pass reads the disk both of
+# them wrote to. A stub in the middle of that would be asserting the test's
+# own idea of the contract rather than the contract.
+
+_EMPTY_OSM_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<osm version="0.6" generator="test">\n'
+    "</osm>\n"
+)
+
+
+def _osm_xml_for(tile_id):
+    """A one-node document stamped with the tile it came from, so a merged
+    output can be checked for the presence of a SPECIFIC tile's data rather
+    than merely for being non-empty."""
+    node_id = abs(hash(tile_id)) % 10_000_000
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<osm version="0.6" generator="test">\n'
+        f'  <node id="{node_id}" version="1" lat="51.38" lon="-3.29"/>\n'
+        "</osm>\n"
+    )
+
+
+class _FlakyOsmSession:
+    """A fake OSM map API that refuses NAMED tiles a fixed number of times
+    and then serves them.
+
+    The count is the whole point of it. A double that fails forever
+    exercises the give-up path and nothing else, and one that succeeds
+    immediately exercises neither; the brief for this task named that trap
+    directly. This one is told how many refusals each tile gets before it
+    starts working, so the same class covers "recovered by the retry"
+    (four, one whole inner budget) and "still failing after the retry"
+    (any number no budget reaches), and each test says which it means in
+    its own arguments.
+
+    It answers by TILE, which it recovers by looking the request's bbox up
+    in the plan build_tiles produces for the request under test. Nothing
+    here counts calls or knows anything about retrying: it only knows what
+    it has been asked for and how many times.
+    """
+
+    def __init__(self, failures_by_tile=(), status_code=503, text="unavailable",
+                 empty_tiles=(), bbox=BBOX, tile_size_m=600.0, overlap_m=50.0):
+        self.failures_left = dict(failures_by_tile)
+        self.status_code = status_code
+        self.text = text
+        self.empty_tiles = set(empty_tiles)
+        self.requests_by_tile: dict[str, int] = {}
+        self._by_query = {
+            tile.query_bbox.to_query_string(): tile.tile_id
+            for tile in build_tiles(bbox, tile_size_m, overlap_m)
+        }
+
+    def get(self, url, **kwargs):
+        tile_id = self._by_query[kwargs["params"]["bbox"]]
+        self.requests_by_tile[tile_id] = self.requests_by_tile.get(tile_id, 0) + 1
+        if self.failures_left.get(tile_id, 0) > 0:
+            self.failures_left[tile_id] -= 1
+            return _FakeOsmResponse(status_code=self.status_code, text=self.text)
+        if tile_id in self.empty_tiles:
+            return _FakeOsmResponse(text=_EMPTY_OSM_XML)
+        return _FakeOsmResponse(text=_osm_xml_for(tile_id))
+
+    def post(self, url, **kwargs):
+        raise AssertionError("expected the map API (GET) path")
+
+
+class _CancellingSink:
+    """An EventLog that presses Stop the first time it sees a named event.
+
+    The only way to land a stop at an exact point inside a run from
+    outside it. Used to interrupt the retry pass specifically.
+    """
+
+    def __init__(self, token, stop_on):
+        self.token = token
+        self.stop_on = stop_on
+        self.events: list[dict] = []
+
+    def emit(self, event, **fields):
+        self.events.append({"event": event, **fields})
+        if event == self.stop_on:
+            self.token.cancel()
+
+
+def _register_flaky_osm(session):
+    register(OsmSource(session=session, sleeper=lambda _s: None, min_interval_seconds=0.0))
+
+
+def _events_named(log, name):
+    return [event for event in log.events if event["event"] == name]
+
+
+def test_an_empty_but_successful_tile_is_ok_never_retried_and_not_a_problem(tmp_path):
+    # The distinction everything else in this task depends on. Sea,
+    # moorland and empty farmland legitimately return nothing, and if
+    # "empty" and "failed" ever collapse into one state the retry loop
+    # hammers empty countryside forever while the map paints correct
+    # results red.
+    session = _FlakyOsmSession(empty_tiles=("r00_c01",))
+    _register_flaky_osm(session)
+    log = EventLog()
+
+    result = run_survey(_osm_only_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    records = {r["tile_id"]: r["osm"] for r in result.survey["tiles"]}
+    assert records["r00_c01"] == "ok"
+    assert result.survey["tile_failures"] == []
+    assert session.requests_by_tile["r00_c01"] == 1, "an empty tile was asked for twice"
+    assert _events_named(log, "tile_retrying") == []
+    assert _events_named(log, "tile_failed") == []
+    # And the rest of the extent is unaffected: this is one thin tile in a
+    # package that is otherwise ordinary.
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+
+
+def test_a_tile_that_fails_its_whole_inner_budget_is_recovered_by_the_retry(tmp_path):
+    # Four refusals is exactly OsmSource's own max_retries, so this tile
+    # exhausts the inner backoff and comes back as a failure, and then
+    # succeeds on the first request of the retry pass. Five requests in
+    # total for it, which is also the arithmetic that says the two layers
+    # are not multiplying each other.
+    session = _FlakyOsmSession(failures_by_tile={"r00_c01": 4})
+    _register_flaky_osm(session)
+    log = EventLog()
+
+    result = run_survey(_osm_only_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert all(record["osm"] == "ok" for record in result.survey["tiles"])
+    assert result.survey["tile_failures"] == [], (
+        "a tile that was recovered is still being reported as a problem"
+    )
+    assert session.requests_by_tile["r00_c01"] == 5
+    retried = _events_named(log, "tile_retrying")
+    assert [event["tile_id"] for event in retried] == ["r00_c01"]
+    assert retried[0]["kind"] == "service_error"
+    assert "503" in retried[0]["reason"]
+    # The recovered tile's data really is in the package, not merely its
+    # status in the record.
+    merged = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    assert str(abs(hash("r00_c01")) % 10_000_000) in merged
+
+
+def test_a_permanent_failure_survives_the_budget_and_is_reported_everywhere(tmp_path):
+    # Two tiles that never recover, on a forced run. 4 attempts inside the
+    # first fetch plus 4 inside the retry pass is 8 requests each, and no
+    # more: the budget is one extra PASS, not one extra attempt and not an
+    # unbounded loop.
+    session = _FlakyOsmSession(failures_by_tile={"r00_c01": 99, "r01_c00": 99})
+    _register_flaky_osm(session)
+    log = EventLog()
+
+    result = run_survey(_osm_only_request(tmp_path, force=True), progress=log)
+
+    assert result.complete is False
+    assert session.requests_by_tile["r00_c01"] == 8
+    assert session.requests_by_tile["r01_c00"] == 8
+
+    # 1. survey.json, so the package explains itself later.
+    failures = result.survey["tile_failures"]
+    assert sorted(record["tile_id"] for record in failures) == ["r00_c01", "r01_c00"]
+    for record in failures:
+        assert record["source"] == "osm"
+        assert record["kind"] == "service_error"
+        assert "503" in record["reason"]
+        assert record["retried"] == 1
+    records = {r["tile_id"]: r["osm"] for r in result.survey["tiles"]}
+    assert records["r00_c01"] == "failed"
+    assert records["r00_c00"] == "ok"
+
+    # 2. the progress log, so the owner sees it while watching.
+    failed_events = _events_named(log, "tile_failed")
+    assert {event["tile_id"] for event in failed_events} == {"r00_c01", "r01_c00"}
+    assert all("503" in event["reason"] for event in failed_events)
+    verified = _events_named(log, "verify_done")
+    assert [event["phase"] for event in verified] == ["after_fetch", "after_retry"]
+    assert verified[-1]["failed"] == 2
+    assert verified[-1]["ok"] == 2
+
+    # 3. the command line summary: composed from these same records, and
+    # asserted through the real command in test_cli.py.
+    lines = describe_tile_failures(failures)
+    assert lines[0] == "2 tiles did not download:"
+    assert any("r00_c01" in line and "503" in line for line in lines)
+
+    # And every recoverable tile is still in the package, which is what
+    # collecting instead of aborting bought.
+    merged = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    assert str(abs(hash("r00_c00")) % 10_000_000) in merged
+
+
+def test_without_force_a_permanent_failure_still_raises_and_still_writes_the_record(tmp_path):
+    session = _FlakyOsmSession(failures_by_tile={"r01_c01": 99})
+    _register_flaky_osm(session)
+
+    with pytest.raises(IncompleteSurveyError) as excinfo:
+        run_survey(_osm_only_request(tmp_path))
+
+    assert "r01_c01" in str(excinfo.value)
+    assert "503" in str(excinfo.value)
+    assert "--force" in str(excinfo.value)
+
+    root = tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront"
+    payload = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    assert payload["complete"] is False
+    assert payload["stopped"] is False
+    assert [r["tile_id"] for r in payload["tile_failures"]] == ["r01_c01"]
+    # Unchanged from before this task: no merged output for a layer that
+    # is short on an unforced run, and the work directory is kept so the
+    # next run resumes rather than restarts.
+    assert not (root / "Barry-Waterfront_2026-08-01.osm").exists()
+    assert (root / "_work").is_dir()
+
+
+def test_a_forced_run_and_an_unforced_one_differ_only_in_raising(tmp_path):
+    # The same failure, twice, once each way. Both leave the same package
+    # state for the tiles that did land; only one of them raises.
+    session = _FlakyOsmSession(failures_by_tile={"r01_c01": 99})
+    _register_flaky_osm(session)
+    with pytest.raises(IncompleteSurveyError):
+        run_survey(_osm_only_request(tmp_path))
+
+    clear_registry()
+    second = _FlakyOsmSession(failures_by_tile={"r01_c01": 99})
+    _register_flaky_osm(second)
+    result = run_survey(_osm_only_request(tmp_path, force=True))
+
+    assert result.complete is False
+    records = {r["tile_id"]: r["osm"] for r in result.survey["tiles"]}
+    assert records["r01_c01"] == "failed"
+    assert records["r00_c00"] == "ok"
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+    # The second run resumed: the three tiles the first run got are not
+    # asked for again, so only the failing one is.
+    assert set(second.requests_by_tile) == {"r01_c01"}
+
+
+def test_a_tile_over_the_node_cap_subdivides_and_is_never_retried(tmp_path):
+    # Task 26's mechanism is separate from this task's and must stay
+    # separate. A tile that is still too dense after being split as far as
+    # splitting goes is a real failure with a real reason, but retrying it
+    # would ask an identical question and get an identical refusal, and
+    # would quietly turn a bounded subdivision into an unbounded re-ask.
+    session = _DenseTileOsmSession(max_span=0.0)
+    register(OsmSource(session=session, sleeper=lambda _s: None, min_interval_seconds=0.0))
+    log = EventLog()
+
+    result = run_survey(_osm_only_request(tmp_path, force=True), progress=log)
+
+    assert result.complete is False
+    assert _events_named(log, "tile_retrying") == [], "a node cap failure was retried"
+    # Three requests per tile and no more: the tile itself, its first
+    # quarter, and that quarter's first sixteenth, which is at the depth
+    # cap and raises rather than splitting again. Nothing asks a second
+    # time. A retry pass would show up here as another multiple of four
+    # before anything else in this test noticed.
+    assert len(session.bboxes) == 3 * 4
+    failures = result.survey["tile_failures"]
+    assert len(failures) == 4
+    assert {record["kind"] for record in failures} == {"node_cap"}
+    assert all("smaller extent" in record["reason"] for record in failures)
+    assert _events_named(log, "tile_subdivided") != []
+
+
+def test_a_stop_interrupts_the_retry_pass_as_promptly_as_the_first_attempt(tmp_path):
+    session = _FlakyOsmSession(failures_by_tile={"r01_c01": 99})
+    _register_flaky_osm(session)
+    token = CancelToken()
+    sink = _CancellingSink(token, stop_on="tile_retrying")
+
+    result = run_survey(_osm_only_request(tmp_path), progress=sink, cancel=token)
+
+    assert result.stopped is True
+    assert result.complete is False
+    # The retry was announced and then never made a request: 4 attempts
+    # from the first pass and nothing from the second.
+    assert session.requests_by_tile["r01_c01"] == 4
+    records = {r["tile_id"]: r["osm"] for r in result.survey["tiles"]}
+    # Failed, NOT pending. Task 22's rule is that a tile a stop never
+    # REACHED is pending; this one was reached, a whole pass ago, and it
+    # failed. Recording it pending because an optional second attempt did
+    # not happen would erase a failure the run genuinely observed.
+    assert records["r01_c01"] == "failed"
+    assert records["r00_c00"] == "ok"
+    # A stop is not an error, so this returned rather than raising even
+    # without --force, and what landed was merged rather than discarded.
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+
+
+def test_the_verify_pass_corrects_a_recorded_ok_with_no_file_behind_it(tmp_path):
+    # The belt to _record_tile_outcomes' braces, on the one thing that
+    # function cannot catch: it only ever looks at the tiles the fetch it
+    # follows was handed, and a tile recorded ok by an EARLIER run is
+    # never in that set. survey.json is the package's record of itself and
+    # the owner is expected to trust it, so a record claiming a file that
+    # is not there has to be found and corrected.
+    source = StubSource(fail_on=("r01_c01",))
+    register(source)
+    first = run_survey(_request(tmp_path, force=True))
+    assert first.complete is False
+
+    vanished = first.paths.work_dir / "raw" / "stub" / "r00_c00.txt"
+    assert vanished.is_file()
+    vanished.unlink()
+
+    source._fail_on.clear()
+    log = EventLog()
+    second = run_survey(_request(tmp_path, force=True), progress=log)
+
+    records = {r["tile_id"]: r["stub"] for r in second.survey["tiles"]}
+    assert records["r00_c00"] == "failed", (
+        "survey.json still claims a tile whose file is not on disk"
+    )
+    assert records["r01_c01"] == "ok"
+    assert second.complete is False
+    corrections = second.survey["verified"]["corrections"]
+    assert corrections == [
+        {"source": "stub", "tile_id": "r00_c00", "was": "ok", "now": "failed"}
+    ]
+    reasons = {r["tile_id"]: r["reason"] for r in second.survey["tile_failures"]}
+    assert "no file for it is on disk" in reasons["r00_c00"]
+    assert any(
+        event["tile_id"] == "r00_c00" for event in _events_named(log, "tile_failed")
+    )
+
+
+def test_the_verify_pass_counts_every_planned_tile_of_every_fetched_source(tmp_path):
+    register(StubSource())
+    result = run_survey(_request(tmp_path))
+    assert result.survey["verified"] == {
+        "checked": 4,
+        "ok": 4,
+        "failed": 0,
+        "pending": 0,
+        "corrections": [],
+    }
+
+
+def test_a_source_that_merged_nothing_writes_no_file_and_the_record_says_why(tmp_path):
+    # merge.py used to write the XML envelope unconditionally, so a run
+    # that merged nothing produced an 85-byte <osm></osm> in the package
+    # root, reported complete, and read in Grasshopper as a layer that is
+    # present and empty. The absence of a file now has to be explained by
+    # the record instead.
+    session = _FlakyOsmSession(empty_tiles=("r00_c00", "r00_c01", "r01_c00", "r01_c01"))
+    _register_flaky_osm(session)
+
+    result = run_survey(_osm_only_request(tmp_path))
+
+    assert result.complete is True
+    assert all(record["osm"] == "ok" for record in result.survey["tiles"])
+    assert not (result.paths.root / f"{result.paths.stem}.osm").exists()
+    entry = next(s for s in result.survey["sources"] if s["id"] == "osm")
+    assert entry["merged_files"] == []
+    assert entry["features_merged"] == 0
+    assert result.survey["tile_failures"] == [], (
+        "an empty extent is not a failure and must not be reported as one"
+    )
+
+
+def test_merged_nothing_not_selected_and_failed_are_three_different_readings(tmp_path):
+    # A reader of survey.json has to be able to tell them apart, and this
+    # is the run that puts all three in one file: osm answered and found
+    # nothing, elevation failed outright, overture was never asked for.
+    class _FailingElevation:
+        id = "elevation"
+        display_name = "Stub Elevation"
+        licence = "CC0"
+        attribution = "nobody"
+        requires_api_key = True
+
+        def estimate(self, bbox, tiles):
+            return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+
+        def fetch(self, bbox, tiles, work_dir, progress):
+            raise RuntimeError("Failed to download DEM: HTTP 401")
+
+        def merge(self, parts, out_dir, stem):
+            return []
+
+    session = _FlakyOsmSession(empty_tiles=("r00_c00", "r00_c01", "r01_c00", "r01_c01"))
+    _register_flaky_osm(session)
+    register(_FailingElevation())
+
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm", "elevation"), force=True)
+    )
+
+    entries = {entry["id"]: entry for entry in result.survey["sources"]}
+    assert set(entries) == {"osm", "elevation"}, "a source nobody asked for is recorded"
+
+    # Merged nothing: no file, a zero count, and no failure against its name.
+    assert entries["osm"]["merged_files"] == []
+    assert entries["osm"]["features_merged"] == 0
+    assert not any(r["source"] == "osm" for r in result.survey["tile_failures"])
+
+    # Failed: no file either, but every tile recorded failed and every one
+    # of them carrying the layer's own reason.
+    assert entries["elevation"]["merged_files"] == []
+    elevation_failures = [
+        r for r in result.survey["tile_failures"] if r["source"] == "elevation"
+    ]
+    assert len(elevation_failures) == 4
+    assert all("HTTP 401" in r["reason"] for r in elevation_failures)
+    assert all(r["elevation"] == "failed" for r in result.survey["tiles"])
+
+
+def test_an_authentication_failure_is_never_retried(tmp_path):
+    # The one keyed source's most likely failure, and the one a retry can
+    # only ever make worse. Asserted through the OSM path because it is
+    # the one that classifies statuses; the rule itself is package.py's.
+    session = _FlakyOsmSession(
+        failures_by_tile={"r00_c00": 99}, status_code=401, text="no key"
+    )
+    _register_flaky_osm(session)
+    log = EventLog()
+
+    result = run_survey(_osm_only_request(tmp_path, force=True), progress=log)
+
+    assert session.requests_by_tile["r00_c00"] == 4, "an unauthorised tile was retried"
+    assert _events_named(log, "tile_retrying") == []
+    failure = result.survey["tile_failures"][0]
+    assert failure["kind"] == "not_authorised"
+    assert failure["retried"] == 0
+
+
+def test_a_whole_layer_failing_without_force_still_raises_its_own_error(tmp_path):
+    # Unchanged behaviour, pinned because this task moved the OTHER kind
+    # of failure's raise to the end of the run. A source that fails as a
+    # whole and cannot say which tiles has nothing to retry and nothing
+    # finer to report, so it still ends the run immediately, with its own
+    # exception rather than IncompleteSurveyError.
+    register(StubSource(fail_on=("r00_c00",)))
+    with pytest.raises(RuntimeError, match="stub failure on r00_c00"):
+        run_survey(_request(tmp_path))
+
+
+# --- Task 30 section 6: bridging a package whose elevation layer failed ---
+#
+# Task 29's implementer flagged that `mapgen bridge` is stricter than
+# run_survey in exactly one case the owner will certainly hit, and
+# proposed the narrowing themselves. Elevation is the only keyed source,
+# so it fails whenever the key is missing, wrong, rate limited or the
+# service is down, and refusing there leaves the owner with a package they
+# can never produce Urbano files for without downloading it all again.
+
+
+def _all_tiles_failed_for(source_ids, elevation="failed"):
+    return [
+        {
+            "tile_id": tile_id,
+            **{s: ("ok" if s != "elevation" else elevation) for s in source_ids},
+        }
+        for tile_id in ("r00_c00", "r00_c01")
+    ]
+
+
+def test_bridge_package_proceeds_when_every_elevation_tile_is_recorded_failed(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(
+        tmp_path,
+        source_ids=("osm", "elevation"),
+        files=["Barry-Waterfront_2026-08-01.osm"],
+        complete=False,
+        tiles=_all_tiles_failed_for(("osm", "elevation")),
+    )
+    runner = FakeBridgeRunner(returncode=0)
+
+    bridge_package(root, bridge_runner=runner)
+
+    command = runner.calls[0]
+    assert "--skip-elevation" in command
+    assert "--elevation-tiff-path" not in command
+    # The rest of the package is bridged exactly as it would have been.
+    assert command[command.index("--osm-file-path") + 1] == str(
+        root / "Barry-Waterfront_2026-08-01.osm"
+    )
+    assert _bridge_block(root)["ok"] is True
+
+
+def test_bridge_package_still_refuses_when_only_some_elevation_tiles_failed(tmp_path):
+    # A DEM that half arrived and then vanished from the root is not
+    # explained by the record. This is the case the narrowing is narrow
+    # for: the file's absence has to be positively stated, not merely
+    # consistent with something.
+    register_default_sources()
+    mixed = _all_tiles_failed_for(("osm", "elevation"))
+    mixed[0]["elevation"] = "ok"
+    root = _package_on_disk(
+        tmp_path,
+        source_ids=("osm", "elevation"),
+        files=["Barry-Waterfront_2026-08-01.osm"],
+        complete=False,
+        tiles=mixed,
+    )
+    runner = FakeBridgeRunner(returncode=0)
+
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(root, bridge_runner=runner)
+
+    assert "elevation" in str(excinfo.value)
+    assert runner.calls == [], "a dotnet process was started at a package it refused"
+
+
+def test_bridge_package_still_refuses_when_elevation_tiles_are_merely_pending(tmp_path):
+    # Pending is "never attempted", which a stop produces in quantity. It
+    # is not the package saying the layer was tried and did not arrive.
+    register_default_sources()
+    root = _package_on_disk(
+        tmp_path,
+        source_ids=("osm", "elevation"),
+        files=["Barry-Waterfront_2026-08-01.osm"],
+        complete=False,
+        stopped=True,
+        tiles=_all_tiles_failed_for(("osm", "elevation"), elevation="pending"),
+    )
+    runner = FakeBridgeRunner(returncode=0)
+
+    with pytest.raises(UnbridgeablePackageError):
+        bridge_package(root, bridge_runner=runner)
+    assert runner.calls == []
+
+
+def test_bridge_package_still_refuses_a_record_with_no_tile_rows_at_all(tmp_path):
+    # "No evidence against" is not "positively stated". An empty tiles
+    # list says nothing, and a hand-edited or truncated record must not
+    # be read as permission.
+    register_default_sources()
+    root = _package_on_disk(
+        tmp_path,
+        source_ids=("osm", "elevation"),
+        files=["Barry-Waterfront_2026-08-01.osm"],
+        tiles=[],
+    )
+    runner = FakeBridgeRunner(returncode=0)
+
+    with pytest.raises(UnbridgeablePackageError):
+        bridge_package(root, bridge_runner=runner)
+    assert runner.calls == []
+
+
+def test_bridge_package_never_extends_the_same_leniency_to_a_missing_osm_file(tmp_path):
+    # A missing <stem>.osm has no benign reading, and nothing about a
+    # failed OSM layer makes the Urbano geometry worth producing without
+    # it. Same record shape as the elevation case, opposite answer.
+    register_default_sources()
+    root = _package_on_disk(
+        tmp_path,
+        source_ids=("osm",),
+        files=[],
+        complete=False,
+        tiles=[{"tile_id": "r00_c00", "osm": "failed"}],
+    )
+    runner = FakeBridgeRunner(returncode=0)
+
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(root, bridge_runner=runner)
+    assert "osm" in str(excinfo.value)
+    assert runner.calls == []
+
+
+def test_a_real_survey_whose_elevation_failed_can_be_bridged_afterwards(tmp_path):
+    # End to end on a package this project actually produces, rather than
+    # one written by hand: a forced run whose DEM 401s, then the command
+    # over the folder it left. This is the owner's real sequence.
+    class _FailingElevation:
+        id = "elevation"
+        display_name = "Stub Elevation"
+        licence = "CC0"
+        attribution = "nobody"
+        requires_api_key = True
+
+        def estimate(self, bbox, tiles):
+            return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+
+        def fetch(self, bbox, tiles, work_dir, progress):
+            raise RuntimeError("Failed to download DEM: HTTP 401")
+
+        def merge(self, parts, out_dir, stem):
+            return []
+
+        def possible_outputs(self, stem):
+            return [f"{stem}.tif"]
+
+    session = _FlakyOsmSession()
+    _register_flaky_osm(session)
+    register(_FailingElevation())
+
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm", "elevation"), force=True)
+    )
+    assert result.complete is False
+    assert not (result.paths.root / f"{result.paths.stem}.tif").exists()
+
+    runner = FakeBridgeRunner(returncode=0)
+    payload = bridge_package(result.paths.root, bridge_runner=runner)
+
+    assert "--skip-elevation" in runner.calls[0]
+    assert payload["bridge"]["ok"] is True
+    # The download's own record is untouched by the later command.
+    assert payload["complete"] is False
+    assert all(record["elevation"] == "failed" for record in payload["tiles"])

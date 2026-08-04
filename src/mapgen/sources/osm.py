@@ -56,7 +56,19 @@ from mapgen.fsutil import atomic_write_text
 from mapgen.geo import BBox, Tile, extent_metres, split_tile_into_quarters
 from mapgen.jobs import CancelToken
 from mapgen.merge import merge_osm_xml
-from mapgen.sources.base import Estimate, ProgressSink
+from mapgen.sources.base import (
+    FAILURE_NOT_AUTHORISED,
+    FAILURE_NODE_CAP,
+    FAILURE_RATE_LIMITED,
+    FAILURE_REFUSED,
+    FAILURE_SERVICE_ERROR,
+    FAILURE_TIMEOUT,
+    FAILURE_UNKNOWN,
+    FAILURE_UNREACHABLE,
+    Estimate,
+    ProgressSink,
+    TileFailure,
+)
 
 DEFAULT_OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
@@ -196,6 +208,72 @@ class NodeCapExceededError(OsmDownloadError):
         self.tile = tile
 
 
+class OsmTileFetchError(OsmDownloadError):
+    """A tile download that failed, carrying the per-tile account of why.
+
+    A subclass of OsmDownloadError and not a replacement for it: every
+    existing caller, cli.py's own exception tuple included, goes on
+    catching exactly what it always caught, and the message is the same
+    sentence this module has always raised. What is added is `failures`,
+    the structured record package.py needs in order to retry the right
+    tiles and to explain the wrong ones (Task 30).
+
+    Plural because fetch() raises one of these at the END of its loop for
+    however many tiles failed, in the same shape OvertureSource's
+    _combined_failure already established for its type pool: one failure
+    is re-raised exactly as it came out, so the ordinary single-tile
+    message and its chained per-attempt cause are unchanged character for
+    character, and only the genuinely new multi-tile case gets a new,
+    combined sentence.
+    """
+
+    def __init__(self, message: str, failures: Sequence[TileFailure]) -> None:
+        super().__init__(message)
+        self.failures = list(failures)
+
+
+def classify_transport_failure(exc: BaseException) -> tuple[str, str]:
+    """Why a request never produced a response at all, as (kind, phrase).
+
+    Classified by exception TYPE, never by the text of the exception, and
+    the phrase is composed here rather than taken from str(exc). Both of
+    those are the same decision: a requests exception's own message
+    embeds the URL it was called with, and a URL is where an API key
+    lives. OSM's endpoints carry no key today, but "today" is exactly the
+    assumption mapgen.sources.elevation's redaction history says not to
+    build on, and a reason assembled from a closed vocabulary cannot leak
+    one however this module is later reused.
+
+    An unrecognised exception contributes its class name and nothing
+    else. A class name is not a traceback and cannot carry a query
+    string, and "the request failed with ConnectionResetError" is at
+    least a fact the owner can quote at someone.
+    """
+    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)):
+        return FAILURE_TIMEOUT, "did not answer in time"
+    if isinstance(exc, (requests.exceptions.ConnectionError, ConnectionError, OSError)):
+        return FAILURE_UNREACHABLE, "could not be reached"
+    return FAILURE_UNKNOWN, f"failed with {type(exc).__name__}"
+
+
+def classify_status_failure(status_code: int) -> tuple[str, str]:
+    """Why a response was not usable, as (kind, phrase).
+
+    The split that matters is not 4xx against 5xx, it is "a retry could
+    plausibly fix this" against "a retry will get the same answer four
+    times". 429 sits on the 4xx side of the HTTP line and the retryable
+    side of this one, which is the whole reason this returns a kind
+    rather than letting package.py look at the number.
+    """
+    if status_code == 429:
+        return FAILURE_RATE_LIMITED, f"asked mapgen to slow down (HTTP {status_code})"
+    if status_code in (401, 403):
+        return FAILURE_NOT_AUTHORISED, f"refused the request as not allowed (HTTP {status_code})"
+    if status_code >= 500:
+        return FAILURE_SERVICE_ERROR, f"answered HTTP {status_code}"
+    return FAILURE_REFUSED, f"rejected the request (HTTP {status_code})"
+
+
 def build_overpass_query(
     bbox: BBox, timeout_seconds: int, categories: Sequence[str] | None = None
 ) -> str:
@@ -316,6 +394,20 @@ class OsmSource:
         # Endpoints actually contacted this run, deduplicated, first-seen
         # order. See the class docstring: a skipped tile records nothing.
         self.endpoints_used: list[str] = []
+        # The tiles the most recent fetch() call could not deliver, and
+        # why (Task 30). Reset at the top of every fetch(), so it always
+        # describes that one call: package.py calls fetch() again for a
+        # retry pass, and a list that accumulated would report the first
+        # attempt's failures as though they were still outstanding after
+        # the retry had cleared them. See sources/base.py for the
+        # convention and for why populating this does not stop fetch()
+        # raising.
+        self.tile_failures: list[TileFailure] = []
+        # How many OSM elements the last merge() actually wrote, so
+        # survey.json can say "this layer found nothing here" rather than
+        # leaving the absence of a file unexplained. None until merge()
+        # has run.
+        self.merged_features: int | None = None
 
     def configure(self, categories: Sequence[str] | None) -> "OsmSource":
         """Returns a fresh OsmSource sharing this instance's transport
@@ -454,7 +546,46 @@ class OsmSource:
         progress: ProgressSink,
         cancel: CancelToken | None = None,
     ) -> list[Path]:
+        """Every tile that could be downloaded, having tried all of them.
+
+        Task 30 changed one thing here and it is the change everything
+        else in that task rests on: a tile that fails no longer ends the
+        layer. It used to, and the consequence was not merely that the
+        remaining tiles went unfetched; it was that the run only ever
+        learned about ONE bad tile, so "retry the tiles that failed" had
+        nothing to retry from and "which tiles are missing and why" had
+        nothing to answer with. One tile of seventy-two timing out cost
+        the other seventy-one.
+
+        Each failure is recorded in self.tile_failures with a reason, the
+        loop continues, and the collected set is raised once at the end
+        (see _combined_tile_failure). Raising at the end rather than not
+        at all is deliberate: a direct Python caller, which the README
+        documents, must not get a short list back and no signal, and
+        cli.py's own exception tuple must go on turning this into one
+        plain line. package.py is the caller that does something new with
+        it, because it is the only one that can retry.
+
+        Three things this deliberately does NOT collect and continue past:
+
+          * Cancelled. A stop must stop, promptly, and a stop is not a
+            failure. It propagates untouched, exactly as before, and the
+            tiles it never reached stay pending rather than failed (Task
+            22, and package.py's _record_tile_outcomes for the half of
+            that which lives out there).
+          * A tile over the node cap that is still over it after being
+            split as far as splitting goes. It IS recorded as a failure,
+            with the sentence _fetch_tile composed for it, but its kind
+            says node_cap and package.py never retries that kind: the
+            same request would be refused for the same reason (Task 26).
+          * Anything that is not an OsmDownloadError at all, an OSError
+            from the filesystem say. mapgen has no per-tile reason for
+            those and inventing one would be fabricating an explanation,
+            so they end the layer exactly as they always have.
+        """
         paths: list[Path] = []
+        self.tile_failures = []
+        errors: list[OsmDownloadError] = []
         for tile in tiles:
             # Checked at the top of the loop, before this tile's own
             # request starts, not after: a tile already in flight is paid
@@ -469,10 +600,73 @@ class OsmSource:
                 progress.emit("tile_skipped", source=self.id, tile_id=tile.tile_id)
                 paths.append(output_path)
                 continue
-            self._fetch_tile(tile, output_path, work_dir, progress, cancel, depth=0)
+            try:
+                self._fetch_tile(tile, output_path, work_dir, progress, cancel, depth=0)
+            except OsmDownloadError as exc:
+                errors.append(exc)
+                self.tile_failures.extend(self._failures_from(tile, exc))
+                # No tile_failed event from here, on purpose. package.py's
+                # _record_tile_outcomes is the one place that decides a
+                # tile has failed, because it is the one place that
+                # reasons about what is genuinely on disk rather than
+                # about what an exception claimed, and two emitters of the
+                # same event is how a browser grid comes to show a state
+                # nothing recorded. The reason travels out through
+                # tile_failures and is attached to that event there.
+                continue
             progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
             paths.append(output_path)
+        if errors:
+            raise self._combined_tile_failure(errors)
         return paths
+
+    def _failures_from(self, tile: Tile, exc: OsmDownloadError) -> list[TileFailure]:
+        """The TileFailure records one raised OsmDownloadError stands for.
+
+        _download_tile attaches its own, already classified from the
+        response or the transport exception that produced it. A
+        NodeCapExceededError carries no failures of its own (it predates
+        this and its job is to signal a subdivision, not to explain a
+        run), so its record is composed here from the sentence _fetch_tile
+        already wrote for the owner, which names the piece that was too
+        dense and what to do about it.
+        """
+        attached = getattr(exc, "failures", None)
+        if attached:
+            return list(attached)
+        kind = FAILURE_NODE_CAP if isinstance(exc, NodeCapExceededError) else FAILURE_UNKNOWN
+        return [
+            TileFailure(source=self.id, tile_id=tile.tile_id, kind=kind, reason=str(exc))
+        ]
+
+    def _combined_tile_failure(self, errors: Sequence[OsmDownloadError]) -> OsmDownloadError:
+        """One exception for however many tiles failed in the same fetch.
+
+        Modelled on OvertureSource._combined_failure, for the same reason
+        and with the same rule: a single failure is re-raised exactly as
+        it came out. That keeps the ordinary case, one tile that ran out
+        of attempts, reporting the message this module has always
+        reported, with the per-attempt diagnostic still chained on as its
+        __cause__ naming the service actually contacted. Nothing that
+        matched on either changes.
+
+        More than one is the case this loop creates and the old
+        abort-on-first-failure never could. Every tile is named, since
+        three tiles failing and thirty failing are different situations
+        and a report that names only the first gives the owner no way to
+        tell them apart. The first is chained on, so the per-attempt
+        detail of at least one of them survives for anything that reads
+        __cause__.
+        """
+        if len(errors) == 1:
+            return errors[0]
+        tile_ids = ", ".join(failure.tile_id for failure in self.tile_failures)
+        combined = OsmTileFetchError(
+            f"Failed to download {len(errors)} OSM tiles ({tile_ids}).",
+            failures=self.tile_failures,
+        )
+        combined.__cause__ = errors[0]
+        return combined
 
     def _fetch_tile(
         self,
@@ -579,8 +773,24 @@ class OsmSource:
         # the code that already removes them along tile seams.
         merge_osm_xml(quarter_paths, output_path)
 
+    def _service_name(self) -> str:
+        """What to call the thing that failed, in a sentence for the
+        owner. Never the URL: see TileFailure's own docstring on why a
+        reason is composed rather than quoted.
+        """
+        return "Overpass" if self.use_overpass else "the OpenStreetMap map API"
+
     def _download_tile(self, tile: Tile, output_path: Path) -> None:
         last_error: Exception | None = None
+        # What the LAST attempt was told, which is what the reason
+        # reports. Not the first, and not a list of all of them: the
+        # owner needs one sentence they can act on, and after four
+        # attempts the standing answer is the current one. Seeded with
+        # UNKNOWN so a loop that somehow raised without setting these
+        # still produces a record, and produces the one kind package.py
+        # never retries.
+        last_kind = FAILURE_UNKNOWN
+        last_phrase = "did not answer"
 
         for attempt in range(1, self.max_retries + 1):
             overpass_candidate = self.overpass_urls[(attempt - 1) % len(self.overpass_urls)]
@@ -590,6 +800,7 @@ class OsmSource:
                 response = self._request(tile, overpass_candidate)
             except Exception as exc:
                 last_error = exc
+                last_kind, last_phrase = classify_transport_failure(exc)
                 self._sleeper(retry_delay_seconds(None, attempt))
                 continue
 
@@ -634,11 +845,24 @@ class OsmSource:
             last_error = OsmDownloadError(
                 f"HTTP {response.status_code} for tile {tile.tile_id} via {endpoint}"
             )
+            last_kind, last_phrase = classify_status_failure(response.status_code)
             self._sleeper(retry_delay_seconds(response.headers, attempt))
 
-        raise OsmDownloadError(
+        attempts = "attempt" if self.max_retries == 1 else "attempts"
+        raise OsmTileFetchError(
             f"Failed to download OSM tile {tile.tile_id} after "
-            f"{self.max_retries} attempts."
+            f"{self.max_retries} attempts.",
+            failures=[
+                TileFailure(
+                    source=self.id,
+                    tile_id=tile.tile_id,
+                    kind=last_kind,
+                    reason=(
+                        f"{self._service_name()} {last_phrase}, on all "
+                        f"{self.max_retries} {attempts}."
+                    ),
+                )
+            ],
         ) from last_error
 
     def _record_endpoint(self, endpoint: str) -> None:
@@ -663,11 +887,45 @@ class OsmSource:
         )
 
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
-        # Named after the package stem, not a bare "all.osm": this is the
-        # file Urbano needs to read, and the owner's original brief asked
-        # that its name say which survey it belongs to (Task 20 finding 2).
+        """The one .osm file for this package, or no file at all.
+
+        Named after the package stem, not a bare "all.osm": this is the
+        file Urbano needs to read, and the owner's original brief asked
+        that its name say which survey it belongs to (Task 20 finding 2).
+
+        No file when nothing was merged, which is Task 30's ruling and the
+        owner's own words: "if a tile has no data then it has no data, we
+        should not add something random". This used to write the XML
+        envelope unconditionally, so a run that merged nothing produced an
+        85-byte <osm version="0.6" generator="mapgen"></osm> in the
+        package root, reported complete, and read in Grasshopper as a
+        layer that is present and empty rather than as one that is not
+        there. Review finding N2 saw the same artefact from the other
+        direction: --category building, a typo, matched nothing and
+        produced exactly that file.
+
+        A stale copy is removed rather than left, the same decision
+        ElevationSource.merge had to make for the same reason (review
+        finding I8): package.py's stale-output sweep only runs on a
+        COMPLETE run, and the runs that merge nothing are usually the
+        incomplete ones, so leaving a previous attempt's real .osm beside
+        a survey.json that now says this layer found nothing is the
+        contradiction this whole ruling exists to remove. <stem>.osm is
+        the only name this method ever writes and possible_outputs below
+        says so, so this can never touch a file mapgen did not write.
+
+        This is NOT "an empty tile is a failure". A tile the API answered
+        with no features has a real file on disk and is recorded ok, here
+        and everywhere else; sea and empty farmland legitimately return
+        nothing and stay that way. What is refused is inventing a merged
+        artefact for data that was never there at all.
+        """
         output = out_dir / f"{stem}.osm"
-        merge_osm_xml(parts, output)
+        count = merge_osm_xml(parts, output, write_when_empty=False)
+        self.merged_features = count
+        if count == 0:
+            output.unlink(missing_ok=True)
+            return []
         return [output]
 
     def possible_outputs(self, stem: str) -> list[str]:

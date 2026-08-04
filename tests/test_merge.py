@@ -267,3 +267,50 @@ def test_merge_osm_xml_includes_relations(tmp_path):
     text = out.read_text(encoding="utf-8")
     assert '<relation id="100"' in text
     assert text.index("<way") < text.index("<relation")
+
+
+# --- Task 30: an empty merge can decline to write anything ----------------
+#
+# The switch, not the ruling. Which callers pass False, and why the source
+# layer also removes an earlier attempt's file, is in OsmSource.merge and
+# OvertureSource.merge; these two only hold the primitive to what it
+# promises, in both positions, because the default is load-bearing for the
+# subdivision recombine.
+
+
+def test_merge_osm_xml_writes_nothing_for_an_empty_merge_when_asked(tmp_path):
+    empty = _write(tmp_path, "a.osm", '<?xml version="1.0"?>\n<osm version="0.6"></osm>\n')
+    out = tmp_path / "merged.osm"
+    assert merge_osm_xml([empty], out, write_when_empty=False) == 0
+    assert not out.exists()
+
+
+def test_merge_osm_xml_still_writes_an_empty_file_by_default(tmp_path):
+    # The default is what OsmSource._fetch_tile relies on when it
+    # recombines the quarters of a subdivided tile: that file's presence
+    # is what package.py reads as "this tile arrived".
+    empty = _write(tmp_path, "a.osm", '<?xml version="1.0"?>\n<osm version="0.6"></osm>\n')
+    out = tmp_path / "merged.osm"
+    assert merge_osm_xml([empty], out) == 0
+    assert out.exists()
+
+
+def test_merge_osm_xml_writes_normally_when_there_is_something_to_write(tmp_path):
+    a = _write(tmp_path, "a.osm", TILE_A)
+    out = tmp_path / "merged.osm"
+    assert merge_osm_xml([a], out, write_when_empty=False) > 0
+    assert out.exists()
+
+
+def test_merge_geojson_writes_nothing_for_an_empty_merge_when_asked(tmp_path):
+    a = _write(tmp_path, "a.geojson", _collection())
+    out = tmp_path / "merged.geojson"
+    assert merge_geojson([a], out, write_when_empty=False) == 0
+    assert not out.exists()
+
+
+def test_merge_geojson_still_writes_an_empty_collection_by_default(tmp_path):
+    a = _write(tmp_path, "a.geojson", _collection())
+    out = tmp_path / "merged.geojson"
+    assert merge_geojson([a], out) == 0
+    assert out.exists()

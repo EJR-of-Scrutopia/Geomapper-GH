@@ -716,12 +716,34 @@ def test_fetch_re_downloads_a_zero_byte_existing_file(tmp_path):
     assert len(runner.commands) == 1
 
 
+def _one_feature(feature_id):
+    """A collection with something actually in it.
+
+    Task 30: the three merge tests below used to hand merge() empty
+    feature collections, because what they are about is naming and
+    grouping and the contents looked irrelevant. They stopped being
+    irrelevant: a type that merges to zero features now writes no file at
+    all (the owner's "if a tile has no data then it has no data" ruling),
+    so an empty fixture would leave these tests asserting the names of
+    files that are correctly not being written. Same claims, inputs that
+    can actually support them.
+    """
+    return json.dumps(
+        {
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "id": feature_id, "geometry": None, "properties": {}}
+            ],
+        }
+    )
+
+
 def test_merge_writes_one_file_per_type(tmp_path):
     work = tmp_path / "work"
     work.mkdir(parents=True)
     for overture_type in ("water", "building"):
         (work / f"{overture_type}.geojson").write_text(
-            '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+            _one_feature(f"{overture_type}-1"), encoding="utf-8"
         )
 
     source = OvertureSource(types=["water", "building"])
@@ -743,7 +765,7 @@ def test_merge_groups_by_the_file_stem_not_its_parent_directory(tmp_path):
     work.mkdir(parents=True)
     for overture_type in ("water", "building"):
         (work / f"{overture_type}.geojson").write_text(
-            '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+            _one_feature(f"{overture_type}-1"), encoding="utf-8"
         )
     source = OvertureSource(types=["water", "building"])
     outputs = source.merge(
@@ -764,9 +786,7 @@ def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
     # "water.geojson" if their outputs are ever copied into one place.
     work = tmp_path / "work"
     work.mkdir(parents=True)
-    (work / "water.geojson").write_text(
-        '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
-    )
+    (work / "water.geojson").write_text(_one_feature("water-1"), encoding="utf-8")
     source = OvertureSource(types=["water"])
     outputs = source.merge(
         [work / "water.geojson"], tmp_path / "out", "Cardiff-Bay_2026-09-01"

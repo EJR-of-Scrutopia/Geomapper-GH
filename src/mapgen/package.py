@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from mapgen import __version__
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
@@ -35,9 +35,16 @@ from mapgen.naming import (
     tiling_fingerprint,
 )
 from mapgen.sources.base import (
+    FAILURE_NO_OUTPUT,
+    FAILURE_RATE_LIMITED,
+    FAILURE_SERVICE_ERROR,
+    FAILURE_TIMEOUT,
+    FAILURE_UNKNOWN,
+    FAILURE_UNREACHABLE,
     EmptySourceSelectionError,
     NullProgress,
     ProgressSink,
+    TileFailure,
     UnknownSourceError,
     available_sources,
     get_source,
@@ -52,6 +59,94 @@ from mapgen.sources.overture import (
 )
 
 SCHEMA_VERSION = 1
+
+# How many extra passes over the tiles that failed one run is allowed to
+# make (Task 30). One.
+#
+# The number is small because it is the SECOND retry layer, not the first,
+# and the first one is already generous. OsmSource._download_tile makes
+# max_retries attempts, four by default, at every single tile, with
+# exponential backoff between them and Retry-After honoured when the
+# service sends one. By the time a tile reaches this constant it has
+# already been asked for four times over roughly fourteen seconds. Another
+# pass here is a fifth through eighth attempt, so the worst case for one
+# tile is 8 requests rather than the 4 it was. Two passes would make it 12
+# and three would make it 16, against a free public API this module
+# already spaces out on purpose, for a tile that has by then said no
+# eight times.
+#
+# What the extra pass buys that the inner four do not is TIME. The inner
+# backoff is seconds; this pass runs after every other tile in the run has
+# been fetched, which on the owner's own 72-tile Barry extent is about two
+# and a half minutes later. That is the gap a rate-limit window or a
+# service having a bad minute actually needs, and it is why this layer is
+# worth having at all rather than simply raising max_retries, which would
+# only ask the same question faster.
+RETRY_PASS_BUDGET = 1
+
+# Which causes a retry could plausibly fix. Everything else is asked once
+# and reported, because asking again is either useless or harmful.
+#
+# Retried:
+#   timeout        the service or the link was too slow this time; the
+#                  next request is a different roll of the dice
+#   unreachable    a dropped connection or a DNS blip, the same
+#   rate_limited   the service asked for less traffic, and the whole
+#                  point of this layer is that it comes back later
+#   service_error  a 5xx is the service saying the fault is its own
+#
+# Not retried, and each for its own reason:
+#   not_authorised a wrong, missing or expired key answers 401 every
+#                  time. Retrying it wastes the owner's time and, on a
+#                  keyed service, can count against them. This is
+#                  elevation's most common failure by a wide margin.
+#   refused        a 4xx that is not a rate limit means the request
+#                  itself was rejected. The same request will be
+#                  rejected again.
+#   node_cap       the tile is too dense, and OsmSource has already
+#                  split it as far as splitting goes (Task 26). The
+#                  answer is a smaller extent, not another identical
+#                  request. Retrying this would also quietly undo that
+#                  whole mechanism by turning a bounded subdivision into
+#                  an unbounded re-ask.
+#   no_output      the layer finished and left nothing, with no reason
+#                  given. mapgen does not know what to fix.
+#   unknown        by construction the kind a source uses when it cannot
+#                  say what happened. An unrecognised cause retried
+#                  blind is how a rate-limited API gets hammered.
+RETRYABLE_FAILURE_KINDS = frozenset(
+    {
+        FAILURE_TIMEOUT,
+        FAILURE_UNREACHABLE,
+        FAILURE_RATE_LIMITED,
+        FAILURE_SERVICE_ERROR,
+    }
+)
+
+
+class IncompleteSurveyError(RuntimeError):
+    """Raised when a run ends with tiles that never arrived and --force
+    was not given.
+
+    Task 30 moved WHEN this happens, not whether. Before it, the first
+    tile that failed raised out of the source's own fetch() and ended the
+    run there; now every tile is attempted, the failures are collected,
+    the recoverable ones are retried, and this is raised at the end if any
+    are still missing. The outcome for the owner is the same in the one
+    respect they were promised: without --force, a run that could not get
+    everything does not pretend otherwise, and it exits non-zero.
+
+    What changed is that survey.json has already been written by the time
+    this is raised, so the package explains itself rather than being a
+    folder of scratch files with no record. The message carries the same
+    account, composed by describe_tile_failures, so the terminal, the
+    progress log and the file all say the same thing.
+
+    A RuntimeError rather than a ValueError, unlike every refusal in this
+    module: those are all "your request cannot be honoured", decided
+    before any work starts. This one is "the work was done and the world
+    did not cooperate", which is not the owner's mistake to correct.
+    """
 
 
 def _fetch_accepts_cancel(source) -> bool:
@@ -438,6 +533,21 @@ def run_survey(
     ensure_dir(paths.work_dir)
 
     outputs_by_source: dict[str, list[Path]] = {}
+    # Task 30. Every source this run actually fetched, paired with the
+    # work directory its tiles live in, in the order they were fetched.
+    # The verify pass and the retry pass both walk this rather than
+    # `sources`: a source a stop caught before its turn has nothing on
+    # disk to reconcile against, and counting its tiles would report
+    # pending work as though it had been checked.
+    fetched: list[tuple[object, Path]] = []
+    # Sources whose merge waits until after the retry pass, because they
+    # came back with per-tile failures a retry might still clear. Merging
+    # one of these in the loop would write a package output that is short
+    # of a tile the run is about to recover, and would then have to be
+    # written a second time. A source that fetched cleanly, or that failed
+    # as a whole, merges in the loop exactly as it always has.
+    deferred_merges: list[tuple[object, Path]] = []
+    ledger = _FailureLedger()
     # Task 22: true once a Stop request has been noticed, at any of three
     # checkpoints (between sources, mid-fetch inside a source that accepts
     # `cancel`, or between the last source and the bridge). A stop is a
@@ -492,6 +602,7 @@ def run_survey(
                 if state.is_done(tile.tile_id, source.id):
                     sink.emit("tile_skipped", source=source.id, tile_id=tile.tile_id)
             fetch_succeeded = False
+            per_tile_failures = False
             fetch_kwargs = {"cancel": token} if _fetch_accepts_cancel(source) else {}
             try:
                 source.fetch(request.bbox, pending, source_work, sink, **fetch_kwargs)
@@ -520,15 +631,48 @@ def run_survey(
                 # far as splitting is allowed to go. That makes it an
                 # ordinary failure of one tile, handled by force exactly
                 # like any other.
-                if not request.force:
-                    # Record whatever genuinely landed before re-raising: a
-                    # batch call failing partway through must not blame tiles
-                    # that already succeeded, or the next resume would redo
-                    # work that was already done.
-                    _record_tile_outcomes(
-                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids, sink
-                    )
-                    raise
+                #
+                # Task 30 splits this in two, on whether the source came
+                # back with an ACCOUNT. A source that lists which tiles
+                # failed and why (see the tile_failures convention in
+                # sources/base.py) has given this run something it can act
+                # on, so the decision is deferred: the failures go in the
+                # ledger, the retry pass gets its turn, and only what is
+                # still missing afterwards decides whether this run
+                # raises. A source that failed as a whole and cannot say
+                # which tiles is unchanged in every respect, including
+                # re-raising immediately without --force: there is nothing
+                # to retry and nothing finer to report, so waiting would
+                # buy nothing and would only delay the news.
+                collected = list(getattr(source, "tile_failures", None) or ())
+                if collected:
+                    per_tile_failures = True
+                    ledger.add_tile_failures(collected)
+                else:
+                    ledger.set_source_error(source.id, str(exc))
+                    if not request.force:
+                        # Record whatever genuinely landed before re-raising: a
+                        # batch call failing partway through must not blame tiles
+                        # that already succeeded, or the next resume would redo
+                        # work that was already done.
+                        _record_tile_outcomes(
+                            state, source.id, pending, source_work, fetch_succeeded,
+                            current_tile_ids, sink, ledger,
+                        )
+                        raise
+
+            fetched.append((source, source_work))
+
+            if per_tile_failures:
+                # Recorded now, so the verify pass and the retry pass both
+                # start from a state.json that already reflects this
+                # fetch. The merge waits: see deferred_merges above.
+                _record_tile_outcomes(
+                    state, source.id, pending, source_work, fetch_succeeded,
+                    current_tile_ids, sink, ledger,
+                )
+                deferred_merges.append((source, source_work))
+                continue
 
             # merge() must see every output this source has ever produced for
             # this package, not just what fetch() returned from this call.
@@ -561,6 +705,7 @@ def run_survey(
                     fetch_succeeded,
                     current_tile_ids,
                     sink,
+                    ledger,
                     stopped=stopped,
                 )
             merged = source.merge(parts, paths.root, paths.stem)
@@ -578,6 +723,85 @@ def run_survey(
             # resolved the same way as every other stop rather than
             # raising past this point.
             stopped = True
+
+        # Task 30, sections 3 and 4, in the order the owner asked for
+        # them: confirm every tile really is there, retry the ones a
+        # retry could fix, confirm again.
+        #
+        # The retry is here, at the end of the run, rather than inline
+        # after each source's own fetch, and the reason is time. A tile
+        # that failed early is retried once every other tile has been
+        # fetched, which on a real extent is minutes later, and minutes
+        # are what a rate limit window or a service having a bad minute
+        # actually need. Retrying it immediately would ask the same
+        # question of the same unhappy service two seconds later. See
+        # RETRY_PASS_BUDGET for how this layer relates to the four
+        # attempts OsmSource already makes inside a single tile fetch.
+        verified = _verify_tiles(
+            state, fetched, tiles, current_tile_ids, ledger, sink, "after_fetch"
+        )
+        for retry_pass in range(1, RETRY_PASS_BUDGET + 1):
+            if stopped or token.is_cancelled():
+                # A stop skips the retry entirely. The tiles it leaves
+                # failed stay failed and are reported; they are not
+                # quietly downgraded to pending, because they were
+                # genuinely attempted and genuinely did not arrive.
+                stopped = True
+                break
+            retryable = [
+                record
+                for record in verified["failures"]
+                if record.get("kind") in RETRYABLE_FAILURE_KINDS
+            ]
+            if not retryable:
+                break
+            stopped = _retry_failed_tiles(
+                retryable, fetched, tiles, current_tile_ids, state, request,
+                token, sink, ledger, retry_pass,
+            ) or stopped
+            verified = _verify_tiles(
+                state, fetched, tiles, current_tile_ids, ledger, sink, "after_retry"
+            )
+
+        # Without --force, tiles still missing after all of that end the
+        # run, exactly as the first failing tile used to. What changed is
+        # everything before this line: every recoverable tile is now on
+        # disk, and survey.json (written below, before this is raised)
+        # carries the full account of what is not. The raise happens after
+        # the record is written, so an unforced failure leaves a package
+        # that explains itself rather than a folder of scratch files.
+        #
+        # Scoped to the sources that actually FAILED, deliberately, and
+        # not to every tile the verify pass found short. Those are not the
+        # same set, and the difference is a behaviour this task must not
+        # change: a source whose fetch() returns cleanly while writing
+        # nothing has always left its tiles recorded failed and the run
+        # recorded incomplete, WITHOUT raising, because nothing raised.
+        # (test_a_source_that_writes_nothing_is_marked_incomplete_not_ok
+        # pins exactly that.) Raising there would be this task inventing a
+        # new failure mode for an unforced run under cover of preserving
+        # an old one. What raises is what raised before: a layer that
+        # reported a failure, and is still short of tiles after the retry.
+        failed_layer_ids = {source.id for source, _ in deferred_merges}
+        unresolved = [
+            record
+            for record in verified["failures"]
+            if record.get("source") in failed_layer_ids
+        ]
+        unrecoverable = bool(unresolved) and not request.force and not stopped
+
+        for source, source_work in deferred_merges:
+            if unrecoverable:
+                # No merged output for a source whose tiles are still
+                # missing on an unforced run, which is what happened
+                # before this task too: the first failing tile raised out
+                # of fetch() and nothing was merged for that layer.
+                break
+            parts = _existing_output_files(source_work, current_tile_ids)
+            parts = assert_inputs_present(parts, force=request.force or stopped)
+            merged = source.merge(parts, paths.root, paths.stem)
+            outputs_by_source[source.id] = merged
+            sink.emit("source_done", source=source.id, outputs=[p.name for p in merged])
 
         # Review finding I1, and the handling both survey.json's own
         # `stopped` comment and README's schema table already claimed was
@@ -651,7 +875,14 @@ def run_survey(
         # matters, attempted=False, exactly as --skip-bridge does; running
         # the bridge anyway would be this function deciding a Stop means
         # something narrower than the owner pressed it to mean.
-        bridge_attempted = request.run_bridge_step and not stopped
+        #
+        # Never attempted on an unforced run that is ending short either
+        # (Task 30). That run is about to raise, exactly as it would have
+        # raised from inside the source loop before this task, and it
+        # never reached the bridge then. Starting an external process on
+        # data mapgen is in the middle of refusing to stand behind would
+        # be a new behaviour, not a preserved one.
+        bridge_attempted = request.run_bridge_step and not stopped and not unrecoverable
         bridge_ok: bool | None = None
         bridge_error: str | None = None
         if bridge_attempted:
@@ -678,6 +909,8 @@ def run_survey(
         bridge_ok,
         bridge_error,
         reported_stopped,
+        outputs_by_source,
+        verified,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -704,6 +937,24 @@ def run_survey(
     # would be on any other complete run.
     if state.complete and not request.keep_work:
         best_effort_rmtree(paths.work_dir.parent)
+
+    if unrecoverable:
+        # After survey.json and job_finished, never before: the record of
+        # what happened is part of what this run produced, and a caller
+        # that catches this needs the folder to already make sense. The
+        # message is the same account describe_tile_failures composed for
+        # the file and for the terminal.
+        raise IncompleteSurveyError(
+            "\n".join(
+                describe_tile_failures(survey["tile_failures"])
+                + [
+                    "Nothing was merged for the layers that are short. Run the "
+                    "survey again over the same extent to pick up where it "
+                    "stopped, or pass --force to package what did arrive and "
+                    "record the rest as missing."
+                ]
+            )
+        )
 
     return SurveyResult(
         paths=paths, complete=state.complete, survey=survey, stopped=reported_stopped
@@ -905,6 +1156,45 @@ def _survey_source_ids(payload: dict) -> list[str]:
     ]
 
 
+def _every_elevation_tile_failed(payload: dict) -> bool:
+    """Whether this package's own record positively states that its
+    elevation layer was attempted and did not arrive.
+
+    Task 30, section 6. `mapgen bridge` refuses a package that is short of
+    an input, which is right, and Task 29's implementer flagged that it is
+    therefore stricter than run_survey in one case the owner will
+    certainly hit: elevation is the only keyed source, so it fails
+    whenever the key is missing, wrong, rate limited or the service is
+    down, and run_survey bridges around that with skip_elevation while
+    this command used to refuse outright. Refusing leaves the owner with a
+    package they can never produce Urbano files for without downloading
+    the whole thing again, which is the exact problem this command exists
+    to solve.
+
+    The narrowing is Task 29's own proposal and it is the safe one: skip
+    elevation only when `tiles` records EVERY elevation tile as failed.
+    That is the package stating, in its own record, that the layer was
+    tried and did not arrive. A file the owner moved or deleted, or the
+    wrong folder passed, produces nothing of the kind, and those are still
+    refused. So is a mixture, where some tiles succeeded: a package whose
+    DEM half arrived and then vanished from the root is not explained by
+    its record, and guessing there is how a _project_setting.json that
+    reads as complete goes into Grasshopper missing a layer.
+
+    Deliberately requires at least one tile record. An empty or absent
+    `tiles` list says nothing at all, and "no evidence against" is not the
+    same as "positively stated", which is the whole standard this function
+    exists to apply.
+    """
+    records = payload.get("tiles")
+    if not isinstance(records, list) or not records:
+        return False
+    for record in records:
+        if not isinstance(record, dict) or record.get("elevation") != FAILED:
+            return False
+    return True
+
+
 def bridge_package(
     package_dir: Path | str,
     progress: ProgressSink | None = None,
@@ -962,6 +1252,17 @@ def bridge_package(
             continue
         path, names = _bridge_input_file(root, stem, source_id)
         if path is None:
+            if source_id == "elevation" and _every_elevation_tile_failed(payload):
+                # The package says this layer was attempted and did not
+                # arrive, so its absence is explained rather than
+                # suspicious. Bridged without it, exactly as run_survey
+                # does for the run that produced it (skip_elevation
+                # follows the file, in _run_bridge_step). Not extended to
+                # osm: a missing <stem>.osm has no benign reading, and
+                # nothing about a failed OSM layer makes the Urbano
+                # geometry worth producing without it.
+                sink.emit("bridge_skipping_elevation")
+                continue
             missing.append((source_id, names))
         else:
             found[source_id] = path
@@ -1127,6 +1428,381 @@ def _existing_output_files(source_work: Path, current_tile_ids: Sequence[str]) -
     return kept
 
 
+class _FailureLedger:
+    """Every reason this run has for a tile not being here, kept in one
+    place so the progress log, survey.json and the terminal cannot end up
+    telling the owner three different stories (Task 30, section 5).
+
+    Two kinds of reason go in, and they come from different places:
+
+      * A per-tile reason, composed by the source that failed, which is
+        the only thing that knows what the service actually said. These
+        arrive through the source's own tile_failures list.
+      * A source-level reason, for a layer that failed as a whole and
+        cannot say which tiles: str(exc) from its fetch(). Elevation is
+        the one that matters, because it is the only keyed source, so
+        "Failed to download DEM: HTTP 401" is the sentence the owner will
+        actually meet. It is already redacted by the time it gets here
+        (mapgen.sources.elevation does that at its own boundary, which is
+        the only place that has ever held the key), and nothing in this
+        module ever composes a reason out of a URL.
+
+    A tile with neither still gets a record. That is the point: the whole
+    task exists because a run that quietly produces less than asked for is
+    the failure mode to remove, so "no reason was given" is written down
+    as a reason rather than left as a gap.
+    """
+
+    def __init__(self) -> None:
+        self._tiles: dict[tuple[str, str], dict[str, object]] = {}
+        self._source_errors: dict[str, str] = {}
+        self._retries: dict[tuple[str, str], int] = {}
+
+    def add_tile_failures(self, failures: Sequence[TileFailure]) -> None:
+        for failure in failures:
+            self._tiles[(failure.source, failure.tile_id)] = failure.to_record()
+
+    def set_source_error(self, source_id: str, error: str) -> None:
+        self._source_errors[source_id] = error
+
+    def note_retry(self, source_id: str, tile_ids: Sequence[str]) -> None:
+        for tile_id in tile_ids:
+            key = (source_id, tile_id)
+            self._retries[key] = self._retries.get(key, 0) + 1
+
+    def forget(self, source_id: str, tile_id: str) -> None:
+        """Drop a tile's reason once it is genuinely on disk.
+
+        Called only by the verify pass, and only for a tile it has just
+        reconciled to ok. A retried tile that succeeded must not keep the
+        sentence explaining why it once did not, or a later reader would
+        find an explanation attached to something that is not a problem.
+        """
+        self._tiles.pop((source_id, tile_id), None)
+
+    def record_for(self, source_id: str, tile_id: str) -> dict[str, object]:
+        record = self._tiles.get((source_id, tile_id))
+        if record is None:
+            source_error = self._source_errors.get(source_id)
+            if source_error:
+                record = {
+                    "source": source_id,
+                    "tile_id": tile_id,
+                    "kind": FAILURE_UNKNOWN,
+                    "reason": source_error,
+                }
+            else:
+                record = {
+                    "source": source_id,
+                    "tile_id": tile_id,
+                    "kind": FAILURE_NO_OUTPUT,
+                    "reason": (
+                        "The layer finished without leaving a file for this tile, "
+                        "and gave no reason."
+                    ),
+                }
+        return {**record, "retried": self._retries.get((source_id, tile_id), 0)}
+
+
+def describe_tile_failures(records: Sequence[Mapping[str, object]]) -> list[str]:
+    """The account of what did not arrive, as plain lines.
+
+    One composer for all three places the owner can meet this (Task 30,
+    section 5): the terminal summary of a forced run, the message
+    IncompleteSurveyError carries out of an unforced one, and the browser,
+    which reads the same records out of survey.json. Three separately
+    written versions of this would drift, and the one thing they must
+    never do is disagree about which tiles are missing.
+
+    Sorted by source then tile id, so the same run always reads the same
+    way, rather than in whatever order the failures happened to land.
+    """
+    if not records:
+        return []
+    count = len(records)
+    noun = "tile" if count == 1 else "tiles"
+    lines = [f"{count} {noun} did not download:"]
+    for record in sorted(
+        records, key=lambda r: (str(r.get("source", "")), str(r.get("tile_id", "")))
+    ):
+        retried = record.get("retried") or 0
+        again = " Retried, and it failed again." if retried else ""
+        lines.append(
+            f"  {record.get('source')} {record.get('tile_id')}: "
+            f"{record.get('reason')}{again}"
+        )
+    return lines
+
+
+def _tile_has_output(
+    files: Sequence[Path], tile_stamped_dirs: set[Path], tile_id: str
+) -> bool | None:
+    """What the DISK says about one tile, as True, False, or "cannot say".
+
+    Extracted from _record_tile_outcomes (Task 30) so the verify pass
+    reaches exactly the same verdict from exactly the same code. Two
+    separately written answers to "is this tile actually here" is how a
+    belt and a braces end up disagreeing, and the verify pass exists
+    precisely to be a second opinion on the first one, which is worth
+    nothing if it is a different opinion for a different reason.
+
+    None, and not False, when a source keeps no tile-stamped files at all
+    (elevation's single whole-area TIFF, and Overture's one file per type
+    since Task 23): there is genuinely no per-tile fact on disk to read,
+    and inventing one would be fabricating a denominator. The caller
+    decides what to do with that; _record_tile_outcomes falls back on the
+    batch outcome, and the verify pass leaves such a tile exactly as it
+    found it.
+
+    False when this source does keep tile-stamped files and this tile has
+    none, or has one in only some of the directories it should be in.
+    """
+    if tile_stamped_dirs:
+        return all(
+            any(
+                path.parent == directory
+                and path.stem == tile_id
+                and path.stat().st_size > 0
+                for path in files
+            )
+            for directory in tile_stamped_dirs
+        )
+    if files:
+        return None
+    return False
+
+
+def _verify_tiles(
+    state: JobState,
+    fetched: Sequence[tuple[object, Path]],
+    tiles: Sequence[Tile],
+    current_tile_ids: Sequence[str],
+    ledger: _FailureLedger,
+    sink: ProgressSink,
+    phase: str,
+) -> dict[str, object]:
+    """Reconcile what this run RECORDED against what is genuinely on disk,
+    for every planned tile of every source it fetched, and say so.
+
+    Task 30, section 3, and the owner's own words: "we should be doing a
+    verify at the end of the run to confirm all tiles are there". It is
+    the belt to _record_tile_outcomes' braces. That function is called
+    once per source, from inside the fetch loop, and reasons about the
+    tiles that source was handed; this walks every planned tile of every
+    source afterwards, from a standing start, and believes only the
+    filesystem.
+
+    It CORRECTS rather than merely reports, because survey.json is the
+    package's record of itself and the owner is expected to trust it. A
+    record that says ok for a tile with no file is the file lying, and
+    leaving the lie in place while noting it elsewhere would be a worse
+    outcome than either fixing it or not noticing.
+
+    Three rules, and the third is the one that matters most:
+
+      * A file is there and the record does not say ok: the record is
+        raised to ok. This is how a tile whose retry succeeded gets its
+        state, and how a file written by a run that died before saving
+        state.json is recognised.
+      * The record says ok and no file is there: the record is lowered to
+        failed, and tile_failed is emitted for it. This is the belt.
+      * No file, and the record does NOT say ok: left exactly as it is. A
+        tile a stop never reached reads pending and stays pending; this
+        pass never invents a failure for work that was never attempted.
+        Task 22's ruling is a ruling about what "failed" means, and it
+        holds here for the same reason it holds there: red must mean a
+        real attempt came up short, or the owner stops believing it.
+
+    A source with no tile-stamped output at all (elevation, Overture) is
+    walked and left alone, per _tile_has_output's None: there is no
+    per-tile fact on disk to check against. Said plainly rather than
+    quietly skipped, because "verified" would otherwise imply more than
+    was actually done.
+    """
+    current = set(current_tile_ids)
+    counts = {OK: 0, FAILED: 0, PENDING: 0}
+    corrections: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+
+    for source, source_work in fetched:
+        source_id = source.id
+        files = _existing_output_files(source_work, current_tile_ids)
+        tile_stamped_dirs = {path.parent for path in files if path.stem in current}
+        for tile in tiles:
+            recorded = state.status(tile.tile_id, source_id)
+            present = _tile_has_output(files, tile_stamped_dirs, tile.tile_id)
+            resolved = recorded
+            if present is True and recorded != OK:
+                resolved = OK
+            elif present is False and recorded == OK:
+                resolved = FAILED
+            if resolved != recorded:
+                state.mark(tile.tile_id, source_id, resolved)
+                corrections.append(
+                    {
+                        "source": source_id,
+                        "tile_id": tile.tile_id,
+                        "was": recorded,
+                        "now": resolved,
+                    }
+                )
+                if resolved == FAILED:
+                    ledger.add_tile_failures(
+                        [
+                            TileFailure(
+                                source=source_id,
+                                tile_id=tile.tile_id,
+                                kind=FAILURE_NO_OUTPUT,
+                                reason=(
+                                    "This tile was recorded as downloaded, but no "
+                                    "file for it is on disk."
+                                ),
+                            )
+                        ]
+                    )
+                    sink.emit(
+                        "tile_failed",
+                        source=source_id,
+                        tile_id=tile.tile_id,
+                        **_failure_event_fields(ledger, source_id, tile.tile_id),
+                    )
+            if resolved == OK:
+                ledger.forget(source_id, tile.tile_id)
+            else:
+                if resolved == FAILED:
+                    failures.append(ledger.record_for(source_id, tile.tile_id))
+            counts[resolved] = counts.get(resolved, 0) + 1
+
+    report: dict[str, object] = {
+        "checked": counts[OK] + counts[FAILED] + counts[PENDING],
+        "ok": counts[OK],
+        "failed": counts[FAILED],
+        "pending": counts[PENDING],
+        "corrections": corrections,
+        "failures": failures,
+    }
+    sink.emit("verify_done", phase=phase, **report)
+    return report
+
+
+def _failure_event_fields(
+    ledger: _FailureLedger, source_id: str, tile_id: str
+) -> dict[str, object]:
+    """The reason fields every tile_failed event carries.
+
+    Always present, never conditional, so the browser can read
+    event.reason without first checking whether this particular failure
+    happened to have one. The ledger guarantees a record for any tile at
+    all, which is what makes that safe.
+    """
+    record = ledger.record_for(source_id, tile_id)
+    return {
+        "kind": record["kind"],
+        "reason": record["reason"],
+        "retried": record["retried"],
+    }
+
+
+def _retry_failed_tiles(
+    records: Sequence[Mapping[str, object]],
+    fetched: Sequence[tuple[object, Path]],
+    tiles: Sequence[Tile],
+    current_tile_ids: Sequence[str],
+    state: JobState,
+    request: SurveyRequest,
+    token: CancelToken,
+    sink: ProgressSink,
+    ledger: _FailureLedger,
+    retry_pass: int,
+) -> bool:
+    """One pass over the tiles a retry could plausibly fix. Returns True
+    if a stop landed during it.
+
+    Each source is asked again for exactly its own failed tiles, through
+    the same fetch() the first attempt used, so everything that call
+    already does keeps happening: the rate limiter still spaces requests,
+    _download_tile still makes its own four attempts with backoff, a tile
+    that is already on disk is still skipped, and a tile that turns out to
+    be over the node cap is still subdivided rather than retried. This
+    layer adds no backoff of its own, deliberately, because a second
+    competing delay on top of one that already honours Retry-After would
+    be slower for no benefit and impossible to reason about.
+
+    Cancellation interrupts this as promptly as it interrupts the first
+    attempt: checked before each source is asked, and threaded into
+    fetch() itself for the sources that accept it, so a stop lands between
+    tiles rather than after all of them.
+
+    A tile whose retry never happened because a stop landed first stays
+    FAILED, not pending, and that is deliberate. Task 22's rule is that a
+    tile a stop never REACHED is pending; this tile was reached, an entire
+    pass ago, and it failed. Recording it pending because a later,
+    optional second attempt did not happen would erase a failure the run
+    genuinely observed.
+    """
+    sources_by_id = {source.id: (source, work) for source, work in fetched}
+    tiles_by_id = {tile.tile_id: tile for tile in tiles}
+    by_source: dict[str, list[str]] = {}
+    for record in records:
+        by_source.setdefault(str(record["source"]), []).append(str(record["tile_id"]))
+
+    stopped = False
+    for source_id, tile_ids in by_source.items():
+        if token.is_cancelled():
+            return True
+        entry = sources_by_id.get(source_id)
+        if entry is None:
+            continue
+        source, source_work = entry
+        retry_tiles = [tiles_by_id[t] for t in tile_ids if t in tiles_by_id]
+        if not retry_tiles:
+            continue
+        for tile in retry_tiles:
+            record = ledger.record_for(source_id, tile.tile_id)
+            sink.emit(
+                "tile_retrying",
+                source=source_id,
+                tile_id=tile.tile_id,
+                pass_number=retry_pass,
+                of=RETRY_PASS_BUDGET,
+                kind=record["kind"],
+                reason=record["reason"],
+            )
+        ledger.note_retry(source_id, [tile.tile_id for tile in retry_tiles])
+
+        fetch_kwargs = {"cancel": token} if _fetch_accepts_cancel(source) else {}
+        fetch_succeeded = False
+        try:
+            source.fetch(request.bbox, retry_tiles, source_work, sink, **fetch_kwargs)
+            fetch_succeeded = True
+        except Cancelled:
+            stopped = True
+        except Exception as exc:
+            sink.emit("source_failed", source=source_id, error=str(exc))
+            collected = list(getattr(source, "tile_failures", None) or ())
+            if collected:
+                ledger.add_tile_failures(collected)
+            else:
+                ledger.set_source_error(source_id, str(exc))
+        # stopped is deliberately NOT passed through here: see this
+        # function's own docstring on why a tile the stop caught before
+        # its second attempt stays failed rather than reverting to
+        # pending.
+        _record_tile_outcomes(
+            state,
+            source_id,
+            retry_tiles,
+            source_work,
+            fetch_succeeded,
+            current_tile_ids,
+            sink,
+            ledger,
+        )
+        if stopped:
+            break
+    return stopped
+
+
 def _record_tile_outcomes(
     state: JobState,
     source_id: str,
@@ -1135,6 +1811,7 @@ def _record_tile_outcomes(
     fetch_succeeded: bool,
     current_tile_ids: Sequence[str],
     sink: ProgressSink,
+    ledger: "_FailureLedger",
     stopped: bool = False,
 ) -> None:
     """Mark each pending tile from what is actually on disk, not from
@@ -1142,10 +1819,24 @@ def _record_tile_outcomes(
 
     Also emits a tile_failed progress event for every tile this call
     resolves to FAILED (Task 22), never for one it resolves to PENDING.
-    This is deliberately the ONE place that decides a tile has failed,
-    since it is the one place that already has to reason about what is
-    genuinely on disk rather than trust a batch call's own return value;
-    the browser's tile grid reads this event to show a failed tile as
+    Since Task 30 that event carries WHY, read from the ledger: kind for
+    code, reason for the owner, and how many times the tile has been
+    retried. The fields are always present, so a browser can read
+    event.reason without checking first.
+
+    This is where a fetch decides a tile has failed, since it is the place
+    that already has to reason about what is genuinely on disk rather than
+    trust a batch call's own return value. It used to be the only such
+    place anywhere; _verify_tiles (Task 30) is now a second one, and the
+    division between them is exact rather than approximate. This one
+    resolves the tiles a fetch() call was just handed, from that call's
+    outcome plus the disk. That one re-reads every planned tile of every
+    source afterwards, from the disk alone, and only ever lowers a
+    recorded ok that has no file behind it. Both go through
+    _tile_has_output, so they cannot form different opinions about what
+    "on disk" means; what differs is which tiles they look at and when.
+
+    The browser's tile grid reads this event to show a failed tile as
     visibly distinct from one that is merely still pending, which matters
     more here than for the other three grid states, since it is the one
     the owner would want to know about before deciding they have enough.
@@ -1244,24 +1935,21 @@ def _record_tile_outcomes(
     not_attempted_status = PENDING if stopped else FAILED
 
     for tile in pending:
-        if tile_stamped_dirs:
-            has_output = all(
-                any(
-                    path.parent == directory
-                    and path.stem == tile.tile_id
-                    and path.stat().st_size > 0
-                    for path in files
-                )
-                for directory in tile_stamped_dirs
-            )
-            status = OK if has_output else not_attempted_status
-        elif files:
+        present = _tile_has_output(files, tile_stamped_dirs, tile.tile_id)
+        if present is None:
+            # No per-tile fact on disk to read, so the batch outcome is
+            # the finest signal there is. See _tile_has_output.
             status = OK if fetch_succeeded else not_attempted_status
         else:
-            status = not_attempted_status
+            status = OK if present else not_attempted_status
         state.mark(tile.tile_id, source_id, status)
         if status == FAILED:
-            sink.emit("tile_failed", source=source_id, tile_id=tile.tile_id)
+            sink.emit(
+                "tile_failed",
+                source=source_id,
+                tile_id=tile.tile_id,
+                **_failure_event_fields(ledger, source_id, tile.tile_id),
+            )
 
 
 def _write_layer_files(
@@ -1336,7 +2024,7 @@ def _sweep_stale_outputs(
             sink.emit("stale_output_removed", name=relative)
 
 
-def _source_provenance(source) -> dict[str, object]:
+def _source_provenance(source, merged_files: Sequence[Path] = ()) -> dict[str, object]:
     """One survey.json `sources` entry: the LayerSource protocol's own
     fields, plus endpoints_used, plus (Task 19) types and routing_note if
     this source exposes them, all read the same defensive way
@@ -1371,7 +2059,32 @@ def _source_provenance(source) -> dict[str, object]:
         "licence": source.licence,
         "attribution": source.attribution,
         "endpoints_used": list(getattr(source, "endpoints_used", [])),
+        # Task 30, and the half of the no-fabricated-empty-output ruling
+        # that lives in the record rather than in merge(). A source that
+        # merged nothing writes no file, so the folder is honest; without
+        # these two fields the absence would be a silent gap, and the
+        # ruling was explicit that it must be explained by the record.
+        #
+        # Three situations a reader has to be able to tell apart, and
+        # these are how:
+        #
+        #   not selected        no entry in `sources` at all
+        #   merged nothing      merged_files: [], features_merged: 0,
+        #                       and no entry for this source in
+        #                       tile_failures
+        #   failed              merged_files may be empty too, but
+        #                       tile_failures names the tiles and says
+        #                       why, and `tiles` records them failed
+        #
+        # features_merged is omitted rather than zeroed for a source that
+        # does not count features (elevation's DEM is a raster, not a
+        # feature collection), because a 0 there would read as "this DEM
+        # is empty" for a file that either exists or does not.
+        "merged_files": [path.name for path in merged_files],
     }
+    merged_features = getattr(source, "merged_features", None)
+    if merged_features is not None:
+        entry["features_merged"] = merged_features
     types = getattr(source, "fetched_types", None)
     if types is None:
         types = getattr(source, "types", None)
@@ -1413,8 +2126,15 @@ def _build_survey_json(
     bridge_ok,
     bridge_error,
     stopped,
+    outputs_by_source=None,
+    verified=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
+    outputs_by_source = outputs_by_source or {}
+    verified = verified or {
+        "checked": 0, "ok": 0, "failed": 0, "pending": 0,
+        "corrections": [], "failures": [],
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": __version__,
@@ -1437,7 +2157,10 @@ def _build_survey_json(
             "rows": max((t.row for t in tiles), default=0) + 1,
             "cols": max((t.col for t in tiles), default=0) + 1,
         },
-        "sources": [_source_provenance(source) for source in sources],
+        "sources": [
+            _source_provenance(source, outputs_by_source.get(source.id, ()))
+            for source in sources
+        ],
         # The resolved selection (never the possibly-None raw field:
         # every other audit-trail value here is a concrete, resolved
         # fact, not "whatever was asked for or a default"), so a package
@@ -1445,6 +2168,36 @@ def _build_survey_json(
         # know that None means everything.
         "categories": request.effective_categories,
         "tiles": state.as_tile_records(),
+        # Task 30, section 5: which tiles are missing, for which source,
+        # and why, in the package's own record, because "if nothing then
+        # it should say" was the owner's requirement and a folder that
+        # quietly holds less than was asked for is the failure this whole
+        # task exists to remove.
+        #
+        # A separate list rather than extra keys inside `tiles`, which
+        # stays exactly the shape it has always been: `tiles` is read by
+        # the browser, by `mapgen bridge` and by every package already on
+        # this machine, and one record per failure is also the shape a
+        # reader wants, since the ordinary run has none at all rather
+        # than one per tile. Empty on a clean run.
+        #
+        # `retried` says whether the run tried again before giving up,
+        # which is the difference between "the service was busy" and "the
+        # service is still saying no". Only kinds a retry could plausibly
+        # fix are ever retried; see RETRYABLE_FAILURE_KINDS.
+        "tile_failures": verified["failures"],
+        # What the end-of-run verify actually checked, and what it had to
+        # correct. corrections is normally empty, and when it is not, it
+        # is the interesting part: it means this run had recorded a tile
+        # as downloaded that had no file behind it, and the record has
+        # been put right rather than left to be believed.
+        "verified": {
+            "checked": verified["checked"],
+            "ok": verified["ok"],
+            "failed": verified["failed"],
+            "pending": verified["pending"],
+            "corrections": verified["corrections"],
+        },
         # complete reports the survey DATA alone: every requested source's
         # every tile downloaded and merged successfully. It intentionally
         # says nothing about the Urbano bridge, decided and recorded

@@ -1180,3 +1180,246 @@ def test_an_overpass_run_never_subdivides_even_on_a_node_cap_shaped_response(tmp
     assert not isinstance(excinfo.value, NodeCapExceededError)
     assert len(source.session.calls) == 4
     assert not (tmp_path / SPLIT_DIR_NAME).exists()
+
+
+# --- Task 30: a failed tile no longer ends the layer -----------------------
+#
+# The change these hold to account is small to describe and large in
+# consequence: fetch() used to raise out of its tile loop on the first
+# failure, so a run only ever learned about ONE bad tile. Everything the
+# task asked for after that (retry the tiles that failed, say which are
+# missing and why) had nothing to work from.
+
+
+EMPTY_OSM = """<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="test">
+</osm>
+"""
+
+
+def _three_tiles():
+    bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
+    return [
+        Tile(tile_id=f"r00_c0{index}", row=0, col=index, core_bbox=bbox, query_bbox=bbox)
+        for index in range(3)
+    ]
+
+
+def test_fetch_continues_past_a_failed_tile_and_gets_the_rest(tmp_path):
+    # Four refusals for the first tile (its whole inner budget), then a
+    # good answer for each of the other two. Before this, the run got one
+    # file and never asked for the third tile at all.
+    source = _source(
+        [FakeResponse(status_code=503, text="unavailable")] * 4
+        + [FakeResponse(), FakeResponse()],
+        max_retries=4,
+    )
+    with pytest.raises(OsmDownloadError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), _three_tiles(), tmp_path, NullProgress()
+        )
+    assert (tmp_path / "r00_c01.osm").exists()
+    assert (tmp_path / "r00_c02.osm").exists()
+    assert not (tmp_path / "r00_c00.osm").exists()
+
+
+def test_every_failed_tile_is_recorded_not_just_the_first(tmp_path):
+    source = _source(
+        [FakeResponse(status_code=503, text="unavailable")] * 4
+        + [FakeResponse()]
+        + [FakeResponse(status_code=503, text="unavailable")] * 4,
+        max_retries=4,
+    )
+    with pytest.raises(OsmDownloadError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), _three_tiles(), tmp_path, NullProgress()
+        )
+    assert [failure.tile_id for failure in source.tile_failures] == ["r00_c00", "r00_c02"]
+    assert {failure.source for failure in source.tile_failures} == {"osm"}
+
+
+def test_a_single_failed_tile_raises_exactly_what_it_always_raised(tmp_path):
+    # The one-failure case is re-raised as it came out, so the message and
+    # the chained per-attempt diagnostic are unchanged. Every caller that
+    # matched on either goes on matching.
+    source = _source([FakeResponse(status_code=504, text="gateway")] * 4, max_retries=4)
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert str(excinfo.value) == "Failed to download OSM tile r00_c00 after 4 attempts."
+    assert source.osm_api_url in str(excinfo.value.__cause__)
+
+
+def test_several_failed_tiles_are_named_in_one_message(tmp_path):
+    source = _source([FakeResponse(status_code=503, text="unavailable")] * 8, max_retries=4)
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"),
+            _three_tiles()[:2],
+            tmp_path,
+            NullProgress(),
+        )
+    assert "r00_c00" in str(excinfo.value)
+    assert "r00_c01" in str(excinfo.value)
+
+
+def test_tile_failures_are_reset_at_the_start_of_every_fetch(tmp_path):
+    # The retry pass calls fetch() again with just the failed tiles. A
+    # list that accumulated would report the first attempt's failures as
+    # still outstanding after the retry had cleared them, which is the
+    # whole point of the field being per call.
+    source = _source(
+        [FakeResponse(status_code=503, text="unavailable")] * 4 + [FakeResponse()],
+        max_retries=4,
+    )
+    with pytest.raises(OsmDownloadError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert len(source.tile_failures) == 1
+    source.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    assert source.tile_failures == []
+
+
+def test_a_stop_is_not_collected_as_a_tile_failure(tmp_path):
+    # Cancellation is not a failure, and must not be swallowed by the new
+    # collect-and-continue path (Task 22's ruling, held here at the point
+    # most likely to break it).
+    token = CancelToken()
+    token.cancel()
+    source = _source([FakeResponse()] * 3)
+    with pytest.raises(Cancelled):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"),
+            _three_tiles(),
+            tmp_path,
+            NullProgress(),
+            cancel=token,
+        )
+    assert source.tile_failures == []
+
+
+def test_a_reason_names_the_cause_and_carries_no_url(tmp_path):
+    # A URL is where an API key lives. OSM's carry none today, and the
+    # reason is composed from a fixed vocabulary rather than from str(exc)
+    # or the endpoint so that stays true however this is later reused.
+    source = _source([FakeResponse(status_code=503, text="unavailable")] * 4, max_retries=4)
+    with pytest.raises(OsmDownloadError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    failure = source.tile_failures[0]
+    assert failure.kind == "service_error"
+    assert "503" in failure.reason
+    assert "4 attempts" in failure.reason
+    assert "://" not in failure.reason
+    assert source.osm_api_url not in failure.reason
+    assert not any(url in failure.reason for url in source.overpass_urls)
+    assert "Traceback" not in failure.reason
+
+
+@pytest.mark.parametrize(
+    "status_code,expected_kind",
+    [
+        (429, "rate_limited"),
+        (503, "service_error"),
+        (401, "not_authorised"),
+        (400, "refused"),
+    ],
+)
+def test_a_status_is_classified_by_what_a_retry_could_fix(
+    tmp_path, status_code, expected_kind
+):
+    source = _source(
+        [FakeResponse(status_code=status_code, text="no")] * 4, max_retries=4
+    )
+    with pytest.raises(OsmDownloadError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert source.tile_failures[0].kind == expected_kind
+
+
+def test_a_transport_timeout_is_classified_as_a_timeout(tmp_path):
+    source = _source([TimeoutError("timed out")] * 4, max_retries=4)
+    with pytest.raises(OsmDownloadError):
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    assert source.tile_failures[0].kind == "timeout"
+    assert "timed out" not in source.tile_failures[0].reason
+
+
+def test_a_tile_still_over_the_cap_at_the_depth_limit_is_a_node_cap_failure(tmp_path):
+    # Recorded as a failure like any other, so the run can report it, but
+    # kinded node_cap so package.py never retries it: the same request
+    # would be refused for the same reason (Task 26).
+    source = _source(
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 21,
+        max_retries=4,
+    )
+    with pytest.raises(NodeCapExceededError):
+        source.fetch(
+            BBox.parse("-3.30,51.37,-3.27,51.40"), [_split_tile()], tmp_path, NullProgress()
+        )
+    assert [failure.kind for failure in source.tile_failures] == ["node_cap"]
+    assert "smaller extent" in source.tile_failures[0].reason
+
+
+def test_merge_writes_no_file_at_all_when_nothing_was_merged(tmp_path):
+    # The owner's ruling: "if a tile has no data then it has no data, we
+    # should not add something random". This used to write an 85-byte
+    # osm envelope, which reads in Grasshopper as a layer that is present
+    # and empty rather than one that is honestly absent.
+    part = tmp_path / "r00_c00.osm"
+    part.write_text(EMPTY_OSM, encoding="utf-8")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    source = OsmSource()
+    assert source.merge([part], out_dir, "Barry-Waterfront_2026-08-01") == []
+    assert list(out_dir.iterdir()) == []
+    assert source.merged_features == 0
+
+
+def test_merge_removes_an_earlier_attempts_file_when_nothing_is_merged(tmp_path):
+    # The stale-output sweep only runs on a COMPLETE run, and the runs
+    # that merge nothing are usually the incomplete ones, so leaving a
+    # previous attempt's real .osm here would contradict the survey.json
+    # beside it. Same decision ElevationSource.merge had to make (I8).
+    part = tmp_path / "r00_c00.osm"
+    part.write_text(EMPTY_OSM, encoding="utf-8")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stale = out_dir / "Barry-Waterfront_2026-08-01.osm"
+    stale.write_text(OSM_XML, encoding="utf-8")
+    assert OsmSource().merge([part], out_dir, "Barry-Waterfront_2026-08-01") == []
+    assert not stale.exists()
+
+
+def test_a_tile_that_came_back_empty_still_gets_its_own_file(tmp_path):
+    # An empty tile is not a failed tile. The API answered, there is
+    # genuinely nothing on this ground, and the file's presence is what
+    # package.py reads as "this tile arrived".
+    source = _source([FakeResponse(text=EMPTY_OSM)])
+    paths = source.fetch(
+        BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+    )
+    assert paths[0].exists()
+    assert paths[0].stat().st_size > 0
+    assert source.tile_failures == []
+
+
+def test_recombining_quarters_always_writes_the_tile_file(tmp_path):
+    # The write_when_empty default that OsmSource.merge overrides must NOT
+    # be overridden here: a recombine that silently wrote nothing would
+    # turn a successful subdivision into a failed tile.
+    from mapgen.merge import merge_osm_xml
+
+    quarter = tmp_path / "q.osm"
+    quarter.write_text(EMPTY_OSM, encoding="utf-8")
+    output = tmp_path / "r00_c00.osm"
+    assert merge_osm_xml([quarter], output) == 0
+    assert output.exists()
