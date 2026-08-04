@@ -140,6 +140,23 @@
           <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
         </label>
 
+        <!--
+          Task 28. The options are filled in by app.js from GET
+          /api/sources, not written here, so this markup cannot drift from
+          the vocabulary mapgen.elevation_models owns. The whole label is
+          hidden until a source actually offers a choice.
+
+          The copy below is the point of the setting, and it is
+          deliberately blunt about what this does not do. The task was
+          originally justified as unlocking higher resolution; it does not,
+          and an owner left hunting for a sharper DEM in here would be
+          hunting for something that is not there.
+        -->
+        <label id="demtype-field">Elevation model
+          <select id="demtype"></select>
+          <span class="hint">Nothing in this list is higher resolution than the COP30 default. OpenTopography's global service serves 30 m at best, anywhere, and a paid OpenTopography plan buys high resolution LiDAR for North America rather than sharper data over Wales. What changes is the kind of model. COP30, COP90, SRTMGL1, SRTMGL3, NASADEM and AW3D30 measure the surface, so roofs and tree canopy are in the heights. EU_DTM is bare earth terrain at the same 30 m, which is usually what a site section or a ground plane wants. Genuine 1 m ground for a Welsh site is NRW LiDAR through DataMapWales, which this tool cannot fetch yet.</span>
+        </label>
+
         <fieldset>
           <legend>API keys</legend>
           <div id="api-keys"></div>

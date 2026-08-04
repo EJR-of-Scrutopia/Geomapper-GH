@@ -888,7 +888,7 @@ async function suggestNames() {
 // --- estimate --------------------------------------------------------
 
 function payload() {
-  return {
+  const request = {
     bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
     region: $("region").value.trim(),
     site: $("site").value.trim(),
@@ -909,6 +909,19 @@ function payload() {
     // a job's request payload, and from there never in survey.json or the
     // job log the payload's fields could otherwise end up echoed into.
   };
+  // The elevation model, unlike the key above, DOES belong in the
+  // payload: it is a per-request choice the CLI can also make with
+  // --demtype, and SurveyRequest is where the two meet and where an
+  // unknown one is refused. Added here rather than in the literal above,
+  // and only when the select actually holds a model, never as an empty
+  // string: the server reads an ABSENT key as "the default, COP30" and a
+  // present-but-empty one as a malformed request, and that distinction is
+  // worth preserving from this side too. Absent is what a page whose
+  // /api/sources reply carried no choices sends, and such a page works
+  // exactly as it did before this setting existed.
+  const demtype = $("demtype").value;
+  if (demtype) request.elevation_demtype = demtype;
+  return request;
 }
 
 // Task 21: unticking every category checkbox used to be accepted right
@@ -1347,6 +1360,80 @@ function maybePersistFieldSettings() {
   $(id).addEventListener("change", maybePersistFieldSettings)
 );
 
+// --- elevation model -----------------------------------------------------
+//
+// Task 28. The options are not written into index.html: they come from
+// GET /api/sources, where the elevation source declares them, the same
+// registry-driven convention the API key fields already use. A second
+// hand-maintained copy of a vocabulary in markup is exactly the drift
+// mapgen.categories' own docstring warns about.
+//
+// The whole control hides itself when no source offers a choice. That is
+// not defensive habit: it is what makes this page keep working against a
+// server that predates the setting, and what stops an empty select
+// sending an empty model on the next estimate.
+
+function hideElevationModel() {
+  // Set here rather than left to a `hidden` attribute in index.html, the
+  // same reasoning closeSettingsPanel and hideProgress already document:
+  // a real browser honours the markup before any script runs, but the
+  // Node harness's synthetic elements only ever see what a script sets.
+  $("demtype-field").hidden = true;
+  $("demtype").innerHTML = "";
+}
+hideElevationModel();
+
+function elevationModelChoices(sources) {
+  const source = (sources || []).find(
+    (s) => Array.isArray(s.demtype_choices) && s.demtype_choices.length
+  );
+  return source ? source.demtype_choices : [];
+}
+
+// saved is whatever the config file actually holds, which is not
+// guaranteed to be one of the offered models: it can be a value set by
+// hand, or one this page's own server offers and a later one does not.
+// A <select> handed a value none of its options carry silently reports
+// "" instead, and payload() would then send an empty model and be
+// refused. Keeping the saved value as an option of its own is the same
+// answer applyTileSizeBounds gives for a tile size outside the slider's
+// range: widen to fit the setting rather than quietly rewrite it, and
+// say on screen that it is being kept.
+function renderElevationModel(sources, saved) {
+  const choices = elevationModelChoices(sources);
+  if (!choices.length) {
+    hideElevationModel();
+    return;
+  }
+  const current = typeof saved === "string" ? saved : "";
+  const offered = choices.some((choice) => choice.id === current);
+  const options = choices.map(
+    (choice) =>
+      `<option value="${escapeHtml(choice.id)}">${escapeHtml(choice.label)}</option>`
+  );
+  if (current && !offered) {
+    options.push(
+      `<option value="${escapeHtml(current)}">` +
+        `${escapeHtml(current)}, saved earlier and kept</option>`
+    );
+  }
+  $("demtype").innerHTML = options.join("");
+  $("demtype").value = current || choices[0].id;
+  $("demtype-field").hidden = false;
+}
+
+// Persisted immediately and unconditionally, like the theme and the API
+// key fields, because there is no "value the estimate just rejected"
+// case to defer past the way output-root/tile-size/overlap have. Not
+// awaited before refreshing, unlike the key fields: the model travels in
+// the estimate's own payload (see payload()), so the estimate does not
+// depend on the save having landed first, and the two are genuinely
+// independent here.
+$("demtype").addEventListener("change", () => {
+  persistConfig({ elevation_demtype: $("demtype").value });
+  refreshEstimate();
+});
+
 // The theme setting persists immediately, unconditionally, like an API
 // key field: there is nothing here an estimate could reject, so there is
 // no "value the estimate just rejected" case to defer past the way
@@ -1770,6 +1857,7 @@ function renderApiKeys(sources, config) {
     currentSources = sources;
     renderSources(sources);
     renderApiKeys(sources, config);
+    renderElevationModel(sources, config.elevation_demtype);
     $("sources").addEventListener("change", refreshEstimate);
 
     const categories = await api("/api/categories");

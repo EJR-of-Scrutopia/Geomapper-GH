@@ -91,6 +91,21 @@ function _parseInputs(html) {
 
 function makeElement(id) {
   let html = "";
+  // Task 28. A <select>'s value is not an ordinary property: a browser
+  // accepts an assignment only when one of its own <option>s carries that
+  // value, and quietly reports "" otherwise. A plain property here would
+  // be more permissive than any browser, and would pass code that
+  // assigns the value BEFORE rendering the options, or that assigns a
+  // model none of the options carry. Either reaches the owner as a
+  // settings panel that looks right and then sends an empty model, which
+  // the server refuses with a 400.
+  //
+  // Only an element that has actually been given <option> markup gets
+  // this behaviour, so every plain input here is unaffected, as is the
+  // theme select, whose options live in index.html and are never
+  // rendered through innerHTML.
+  let optionValues = [];
+  let value = "";
   // Attributes set through setAttribute, kept apart from the plain
   // properties above because they are not the same thing: app.js's
   // progress bar (Task 27) writes aria-valuenow here, which no property
@@ -100,7 +115,16 @@ function makeElement(id) {
   const attributes = {};
   const element = {
     id,
-    value: "",
+    get value() {
+      return value;
+    },
+    set value(next) {
+      if (optionValues.length && !optionValues.includes(String(next))) {
+        value = "";
+        return;
+      }
+      value = String(next);
+    },
     checked: false,
     disabled: false,
     hidden: false,
@@ -129,9 +153,22 @@ function makeElement(id) {
     get innerHTML() {
       return html;
     },
-    set innerHTML(value) {
-      html = value;
-      this._inputs = _parseInputs(value);
+    set innerHTML(markup) {
+      html = markup;
+      this._inputs = _parseInputs(markup);
+      optionValues = Array.from(
+        String(markup).matchAll(/<option\b[^>]*\bvalue="([^"]*)"/g),
+        (match) => match[1]
+      );
+      // Rendering a select's options in a browser sets its value to the
+      // first of them, since none of the options app.js writes carries
+      // `selected`. Whatever was assigned before is gone: a select with
+      // no options ignores an assignment outright, and rendering options
+      // afterwards does not bring it back. That is what makes writing
+      // the value BEFORE the options a real bug rather than a harmless
+      // ordering preference, and it is the reason this line exists
+      // rather than a gentler "keep it if it still matches".
+      if (optionValues.length) value = optionValues[0];
     },
     // A real element supports multiple listeners per event type; this
     // stored a single handler per type and let a later addEventListener
@@ -3789,6 +3826,160 @@ function ok(condition, message) {
       /draw or paste an extent/i.test(sandbox.document.getElementById("tile-size-cost").textContent),
       sandbox.document.getElementById("tile-size-cost").textContent
     );
+  });
+
+  // =======================================================================
+  // Task 28: the elevation model select.
+  //
+  // The options come from GET /api/sources, not from index.html, so a
+  // server that offers none must leave the page working exactly as it did
+  // before this setting existed, and a saved model the server no longer
+  // offers must not silently become an empty one on the next estimate.
+  // Both are checked below, because both send a request the server
+  // refuses with a 400 if this goes wrong.
+  // =======================================================================
+
+  const MODEL_SOURCE_ENTRY = {
+    id: "elevation",
+    display_name: "Elevation (OpenTopography)",
+    licence: "Copernicus DEM",
+    requires_api_key: true,
+    api_key_config_field: "opentopography_api_key",
+    demtype_choices: [
+      { id: "COP30", label: "COP30, Copernicus surface model, 30 m (default)" },
+      { id: "EU_DTM", label: "EU_DTM, bare earth terrain, 30 m, Europe" },
+      { id: "COP90", label: "COP90, Copernicus surface model, 90 m" },
+    ],
+  };
+
+  const MODEL_ESTIMATE = {
+    tiles: 1,
+    rows: 1,
+    cols: 1,
+    extent_km: { width: 1, height: 1 },
+    bytes_estimate: 1000,
+    seconds_estimate: 60,
+    sources: [],
+    warnings: [],
+    folder: "C:\\Surveys\\South-Wales\\2026-08-04_Barry",
+    tile_grid: [],
+  };
+
+  async function bootedWithModels(configOverrides = {}, sources = [MODEL_SOURCE_ENTRY]) {
+    return bootedSandbox(async (url, options) => {
+      if (url.pathname === "/api/config") {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, ...configOverrides });
+      }
+      if (url.pathname === "/api/sources") return jsonResponse(200, sources);
+      if (url.pathname === "/api/estimate") return jsonResponse(200, MODEL_ESTIMATE);
+      return null;
+    });
+  }
+
+  async function lastEstimateBody(sandbox, fetchCalls) {
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    const call = [...fetchCalls].reverse().find((c) => c.url.pathname === "/api/estimate");
+    ok(call, "expected an /api/estimate call");
+    return JSON.parse(call.options.body);
+  }
+
+  await test("the model select is filled from /api/sources, not from the markup", async () => {
+    const { sandbox } = await bootedWithModels();
+    const html = sandbox.document.getElementById("demtype").innerHTML;
+    for (const choice of MODEL_SOURCE_ENTRY.demtype_choices) {
+      ok(html.includes(`value="${choice.id}"`), `expected an option for ${choice.id}, got: ${html}`);
+      ok(html.includes(choice.label), `expected the label for ${choice.id}, got: ${html}`);
+    }
+    ok(sandbox.document.getElementById("demtype-field").hidden === false);
+  });
+
+  await test("the saved model is what the select starts on", async () => {
+    const { sandbox } = await bootedWithModels({ elevation_demtype: "EU_DTM" });
+    const value = sandbox.document.getElementById("demtype").value;
+    ok(value === "EU_DTM", `expected the saved model selected, got: ${value}`);
+  });
+
+  await test("a saved model the server no longer offers is kept, not silently dropped", async () => {
+    // A select handed a value none of its options carry reports "" in a
+    // real browser, and payload() would then send an empty model, which
+    // the server refuses outright. Keeping it as an option of its own is
+    // the same answer applyTileSizeBounds gives a tile size outside the
+    // slider's range.
+    const { sandbox } = await bootedWithModels({ elevation_demtype: "GEDTM30" });
+    const html = sandbox.document.getElementById("demtype").innerHTML;
+    ok(html.includes('value="GEDTM30"'), `expected the saved model kept as an option, got: ${html}`);
+    ok(/saved earlier and kept/.test(html), `expected the page to say it is being kept, got: ${html}`);
+    ok(sandbox.document.getElementById("demtype").value === "GEDTM30");
+  });
+
+  await test("a server that offers no models hides the control entirely", async () => {
+    const { sandbox } = await bootedWithModels({}, DEFAULT_SOURCES);
+    ok(sandbox.document.getElementById("demtype-field").hidden === true);
+    ok(sandbox.document.getElementById("demtype").innerHTML === "");
+    // And boot() got past it rather than throwing on an empty list: the
+    // control being hidden is worth nothing if reaching that state broke
+    // the rest of the page, which renders after this.
+    ok(
+      sandbox.document.getElementById("categories").innerHTML.includes("Buildings"),
+      "boot() did not reach the categories, so it threw on the way there"
+    );
+  });
+
+  await test("the chosen model travels in the estimate payload", async () => {
+    const { sandbox, fetchCalls } = await bootedWithModels({ elevation_demtype: "EU_DTM" });
+    const body = await lastEstimateBody(sandbox, fetchCalls);
+    ok(
+      body.elevation_demtype === "EU_DTM",
+      `expected the model in the payload, got: ${JSON.stringify(body)}`
+    );
+  });
+
+  await test("a page with no model offered sends no model key at all", async () => {
+    // Absent means "the default, COP30" server-side; an empty string is a
+    // malformed request that comes back 400. This is what an older server
+    // produces, and it has to keep working.
+    const { sandbox, fetchCalls } = await bootedWithModels({}, DEFAULT_SOURCES);
+    const body = await lastEstimateBody(sandbox, fetchCalls);
+    ok(!("elevation_demtype" in body), `expected no model key at all, got: ${JSON.stringify(body)}`);
+  });
+
+  await test("changing the model saves it and asks for a fresh estimate", async () => {
+    const { sandbox, fetchCalls } = await bootedWithModels();
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    fetchCalls.length = 0;
+
+    const select = sandbox.document.getElementById("demtype");
+    select.value = "COP90";
+    select.fire("change");
+    await flush(10);
+
+    const put = fetchCalls.find(
+      (c) => c.url.pathname === "/api/config" && (c.options.method || "").toUpperCase() === "PUT"
+    );
+    ok(put, "expected the model to be saved immediately");
+    ok(
+      JSON.parse(put.options.body).elevation_demtype === "COP90",
+      `unexpected PUT body: ${put.options.body}`
+    );
+
+    const estimate = fetchCalls.find((c) => c.url.pathname === "/api/estimate");
+    ok(estimate, "expected a fresh estimate after changing the model");
+    ok(JSON.parse(estimate.options.body).elevation_demtype === "COP90");
+  });
+
+  await test("model labels from the server are HTML-escaped", async () => {
+    const { sandbox } = await bootedWithModels({}, [
+      { ...MODEL_SOURCE_ENTRY, demtype_choices: [{ id: "COP30", label: "<b>COP30</b>" }] },
+    ]);
+    const html = sandbox.document.getElementById("demtype").innerHTML;
+    ok(!html.includes("<b>COP30</b>"), `expected the label's tag escaped, got: ${html}`);
+    ok(html.includes("&lt;b&gt;"), `expected an escaped label, got: ${html}`);
   });
 
   console.log(
