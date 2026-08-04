@@ -3,8 +3,14 @@
 Requested for the whole study bbox in one call rather than per tile, because the
 API already handles arbitrary extents and stitching tiled DEMs is needless work.
 
+Which DEM is fetched is a choice as of Task 28, not the fixed COP30 this
+module was written around. The vocabulary of models, and an honest account
+of what choosing between them actually buys (a surface model or bare earth
+terrain, never a finer resolution), lives in mapgen.elevation_models.
+
 Phase 2 note: NRW LiDAR at 1 m will be a sibling module here, and is a far better
-source than COP30 for anywhere in Wales.
+source than any of them for anywhere in Wales. Nothing OpenTopography's
+global API serves is finer than 30 m.
 """
 
 from __future__ import annotations
@@ -19,6 +25,12 @@ from urllib.parse import quote, quote_plus
 import requests
 
 from mapgen.config import load_config
+from mapgen.elevation_models import (
+    DEFAULT_DEMTYPE,
+    model_for,
+    offered_choices,
+    work_file_name,
+)
 from mapgen.fsutil import atomic_write_bytes
 from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.jobs import CancelToken, Cancelled
@@ -26,7 +38,6 @@ from mapgen.sources.base import Estimate, ProgressSink
 
 DEFAULT_OPENTOPOGRAPHY_URL = "https://portal.opentopography.org/API/globaldem"
 USER_AGENT = "mapgen/1.0 (architectural survey tool)"
-OUTPUT_NAME = "elevation.tif"
 
 # Measured 2026-08-04 (Task 25) through ElevationSource.fetch against the
 # live OpenTopography API, three Welsh extents, two samples each:
@@ -49,7 +60,10 @@ OUTPUT_NAME = "elevation.tif"
 # "one machine on one day", not as a property of the service.
 SECONDS_FLOOR = 11.0
 
-# 4 bytes per pixel, not 2 with a fudge for overhead. COP30 comes back as
+# 4 bytes per pixel, not 2 with a fudge for overhead. Measured against
+# COP30 and applied to every model since Task 28 made the model a choice,
+# which errs in the honest direction: a model that comes back as Int16
+# instead is overstated by this, never understated. COP30 comes back as
 # Float32 and the arithmetic says so: 42,943 pixels at 38.63 sq km
 # against 254,479 bytes measured is 5.9 bytes per pixel with the header
 # in it, and 288,384 pixels at 259.60 sq km against 1,005,162 bytes is
@@ -372,10 +386,32 @@ def _redact_response_urls(response: object, secret: str) -> None:
 
 class ElevationSource:
     id = "elevation"
-    display_name = "Elevation (OpenTopography COP30)"
+    # Names no model, on purpose. This is the attribute GET /api/sources
+    # and `mapgen sources` read off the ONE instance
+    # register_default_sources() builds at startup, and that instance's own
+    # demtype is not what any particular request will use: the request's
+    # is (see configure below). "Elevation (OpenTopography COP30)", which
+    # this said before Task 28, would therefore go on claiming COP30 in
+    # the layer checklist while the settings panel beside it showed
+    # EU_DTM. A configured, request-scoped copy overrides this with the
+    # model that request actually asked for, which is the one place naming
+    # a model is true rather than merely plausible.
+    display_name = "Elevation (OpenTopography)"
+    # Class-level defaults matching DEFAULT_DEMTYPE, so the LayerSource
+    # protocol's attributes exist on the class exactly as they always
+    # have. __init__ replaces both with the chosen model's own terms: a
+    # package that downloaded EU_DTM must not record Copernicus'
+    # copyright line in its survey.json, and one that downloaded SRTMGL1
+    # must not claim a licence OpenTopography does not state for it.
     licence = "Copernicus DEM, free for any use with attribution"
     attribution = "(c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH"
     requires_api_key = True
+    # Task 28: the settings panel's model select is built from this rather
+    # than from a hardcoded list in index.html, the same registry-driven
+    # convention api_key_config_field established for the key fields (see
+    # sources/base.py). GET /api/sources reads it the same defensive way;
+    # a source with no models to choose between does not define it at all.
+    demtype_choices = offered_choices()
     # Task 19: the settings panel is driven from the source registry
     # rather than one hard-coded field per key, so a source that needs a
     # key must say which mapgen.config.Config field holds it. Not
@@ -392,7 +428,7 @@ class ElevationSource:
     def __init__(
         self,
         api_key: str | None = None,
-        demtype: str = "COP30",
+        demtype: str = DEFAULT_DEMTYPE,
         session: object | None = None,
         url: str = DEFAULT_OPENTOPOGRAPHY_URL,
         timeout_seconds: int = 600,
@@ -400,10 +436,61 @@ class ElevationSource:
     ) -> None:
         self._api_key = api_key
         self.demtype = demtype
+        # Never raises for a demtype this project has no record of: see
+        # model_for's own docstring. Validation of a person's chosen model
+        # happens once, at SurveyRequest construction (mapgen.package),
+        # which is where the CLI's --demtype and the browser's select
+        # meet, matching what Task 21 established for categories. A
+        # constructor is not a second validation site.
+        model = model_for(demtype)
+        self.licence = model.licence
+        self.attribution = model.attribution
+        self._resolution_m = model.resolution_m
         self.session = session if session is not None else requests.Session()
         self.url = url
         self.timeout_seconds = timeout_seconds
         self._environ = environ
+
+    def configure(self, demtype: str) -> "ElevationSource":
+        """Returns a fresh ElevationSource scoped to this request's chosen
+        model, sharing this instance's transport configuration and never
+        mutating self.
+
+        The same optional LayerSource extension OvertureSource.configure
+        and OsmSource.configure already implement, for the same reason its
+        docstring gives at length: register_default_sources() builds ONE
+        instance and registers it process-wide, /api/estimate has no
+        busy-guard so it can be polled while a job using a different
+        selection is mid-fetch, and mutating shared state underneath a
+        running job is the kind of race that would be very hard to
+        reproduce afterwards.
+
+        This is also the one place a request is genuinely in view, so it is
+        the one place display_name is allowed to name a model. The
+        registered instance keeps the model-free class attribute, so the
+        layer checklist never claims a model the next download may not
+        use; the copy package.py actually estimates and fetches with says
+        exactly which one it is, which is what `mapgen estimate` prints
+        beside the licence.
+        """
+        configured = ElevationSource(
+            api_key=self._api_key,
+            demtype=demtype,
+            session=self.session,
+            url=self.url,
+            timeout_seconds=self.timeout_seconds,
+            environ=self._environ,
+        )
+        configured.display_name = f"Elevation (OpenTopography {demtype})"
+        return configured
+
+    def output_name(self) -> str:
+        """The file this source downloads to inside its work directory.
+
+        Carries the model's own name; see elevation_models.work_file_name
+        for why that is what keeps a resumed run's survey.json honest.
+        """
+        return work_file_name(self.demtype)
 
     def _configured_key(self) -> str | None:
         """The key saved via the interface's settings field, if any.
@@ -441,13 +528,22 @@ class ElevationSource:
 
         Both constants were refitted from measurement in Task 25; see
         their definitions for the runs behind them and for how thin the
-        evidence is. The shape is unchanged: pixels at COP30's 30 m
-        resolution, and a time that is a floor until the file gets big
-        enough for transfer to matter, which nothing the owner has drawn
-        comes close to.
+        evidence is. The shape is unchanged: pixels at the chosen model's
+        own ground sample distance, and a time that is a floor until the
+        file gets big enough for transfer to matter, which nothing the
+        owner has drawn comes close to.
+
+        The 30 m this used to hardcode was COP30's resolution, and Task 28
+        made the model a choice, so it reads the model's own figure now.
+        Picking COP90 really is a ninth of the pixels, and an estimate
+        that went on quoting COP30's size for it would overstate the
+        download by nine times. The TIME is unaffected in practice either
+        way: SECONDS_FLOOR dominates for anything the owner draws, because
+        what is being paid for is the service's turnaround, not the
+        transfer.
         """
         width_m, height_m = extent_metres(bbox)
-        pixel_count = (width_m / 30.0) * (height_m / 30.0)
+        pixel_count = (width_m / self._resolution_m) * (height_m / self._resolution_m)
         bytes_estimate = max(
             int(pixel_count * BYTES_PER_PIXEL), SMALLEST_OBSERVED_BYTES
         )
@@ -473,7 +569,11 @@ class ElevationSource:
         # merely next in line should not start a slow DEM download at all.
         if cancel is not None:
             cancel.raise_if_cancelled()
-        output_path = work_dir / OUTPUT_NAME
+        # Named after the model, so "already downloaded" means "already
+        # downloaded THIS model" rather than "some DEM is sitting here".
+        # See elevation_models.work_file_name for the exact run that used
+        # to record a model in survey.json which was never the one on disk.
+        output_path = work_dir / self.output_name()
         if output_path.exists() and output_path.stat().st_size > 0:
             progress.emit("tile_skipped", source=self.id, tile_id="whole-area")
             return [output_path]
@@ -658,23 +758,40 @@ class ElevationSource:
         return [output_path]
 
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
-        """Copies the single whole-area DEM into out_dir under the package
+        """Copies THIS model's whole-area DEM into out_dir under the package
         stem, for example Barry-Waterfront_2026-08-03.tif.
 
         There is nothing to combine (fetch() always produces exactly one
         whole-area file, never one per tile), so earlier versions of this
         method just returned parts unchanged, still sitting under work_dir
-        as the fixed, unidentified name OUTPUT_NAME. That had two problems,
+        as a fixed, unidentified "elevation.tif". That had two problems,
         not one: Task 20 finding 2's unidentified-filename issue, the same
         as OsmSource's and OvertureSource's, AND the file never actually
         reached the finished package, since a complete run deletes work_dir
         (see run_survey). Copying rather than moving, because parts may
         still be read again on a subsequent run's resume/skip check.
+
+        parts[0] is no longer good enough, and that is Task 28's doing. A
+        resumed run whose model changed since the last attempt has BOTH
+        files in its work directory, and package.py hands over everything
+        it finds there (see _existing_output_files); parts[0] would take
+        whichever sorted first, which for a run that just downloaded
+        EU_DTM beside a leftover COP30 is the leftover. Matching on this
+        instance's own output name is what makes the file that leaves with
+        the package the file this run actually fetched.
+
+        Returning nothing when no part matches is deliberate, and it is
+        only reachable on a forced run whose elevation fetch failed while
+        an older model's file happened to be lying about. A package with
+        no DEM, and a survey.json that says so, is a better outcome there
+        than one holding a DEM of a model it does not name.
         """
-        if not parts:
+        wanted = self.output_name()
+        chosen = next((part for part in parts if part.name == wanted), None)
+        if chosen is None:
             return []
         output = out_dir / f"{stem}.tif"
-        atomic_write_bytes(output, parts[0].read_bytes())
+        atomic_write_bytes(output, chosen.read_bytes())
         return [output]
 
     def possible_outputs(self, stem: str) -> list[str]:

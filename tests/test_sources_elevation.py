@@ -132,7 +132,9 @@ def test_fetch_writes_a_single_tiff(tmp_path):
     source = ElevationSource(api_key="k", session=session)
     paths = source.fetch(BBOX, [], tmp_path, NullProgress())
     assert len(paths) == 1
-    assert paths[0].name == "elevation.tif"
+    # Task 28 put the model's own name into the file's name; see
+    # elevation_models.work_file_name for the resume this keeps honest.
+    assert paths[0].name == "elevation_COP30.tif"
     assert paths[0].read_bytes() == TIFF_LITTLE_ENDIAN
 
 
@@ -151,7 +153,7 @@ def test_fetch_sends_the_bbox_and_key_as_parameters(tmp_path):
 
 
 def test_fetch_reuses_an_existing_tiff(tmp_path):
-    (tmp_path / "elevation.tif").write_bytes(TIFF_LITTLE_ENDIAN)
+    (tmp_path / "elevation_COP30.tif").write_bytes(TIFF_LITTLE_ENDIAN)
     session = FakeSession(FakeStreamResponse([]))
     ElevationSource(api_key="k", session=session).fetch(BBOX, [], tmp_path, NullProgress())
     assert session.calls == []
@@ -195,7 +197,10 @@ def test_fetch_rejects_a_non_tiff_response_and_leaves_no_file(tmp_path):
     source = ElevationSource(api_key="k", session=session)
     with pytest.raises(ElevationError, match="did not return a TIFF"):
         source.fetch(BBOX, [], tmp_path, NullProgress())
-    assert not (tmp_path / "elevation.tif").exists()
+    assert not (tmp_path / "elevation_COP30.tif").exists()
+    # Nothing at all, under any name: a check for one specific filename
+    # would pass for free if the name ever changed again.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_fetch_without_a_key_fails_before_any_request(tmp_path, monkeypatch):
@@ -554,11 +559,11 @@ def test_readiness_problem_never_raises_even_though_resolve_api_key_does(monkeyp
 
 def test_merge_copies_the_tiff_into_out_dir_named_after_the_stem(tmp_path):
     # Task 20 finding 2: merge() used to return parts unchanged, so the DEM
-    # kept OUTPUT_NAME's fixed, unidentified "elevation.tif" and never left
-    # work_dir, which a complete run then deletes (see run_survey). Now it
-    # is copied into the finished package under the package stem, the same
-    # fix applied consistently to OsmSource and OvertureSource.
-    part = tmp_path / "elevation.tif"
+    # kept a fixed, unidentified "elevation.tif" and never left work_dir,
+    # which a complete run then deletes (see run_survey). Now it is copied
+    # into the finished package under the package stem, the same fix
+    # applied consistently to OsmSource and OvertureSource.
+    part = tmp_path / "elevation_COP30.tif"
     part.write_bytes(TIFF_LITTLE_ENDIAN)
     out_dir = tmp_path / "out"
     outputs = ElevationSource(api_key="k").merge([part], out_dir, "Barry-Waterfront_2026-08-01")
@@ -569,6 +574,149 @@ def test_merge_copies_the_tiff_into_out_dir_named_after_the_stem(tmp_path):
 
 def test_merge_of_no_parts_produces_no_output(tmp_path):
     assert ElevationSource(api_key="k").merge([], tmp_path / "out", "Barry-Waterfront_2026-08-01") == []
+
+
+# --- Task 28: the model is a choice, and the package must say which -----
+
+
+def test_fetch_sends_the_chosen_model_as_the_demtype_parameter(tmp_path):
+    session = FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    ElevationSource(api_key="k", demtype="EU_DTM", session=session).fetch(
+        BBOX, [], tmp_path, NullProgress()
+    )
+    assert session.calls[0][1]["params"]["demtype"] == "EU_DTM"
+
+
+def test_fetch_writes_each_model_under_its_own_name(tmp_path):
+    session = FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    paths = ElevationSource(api_key="k", demtype="EU_DTM", session=session).fetch(
+        BBOX, [], tmp_path, NullProgress()
+    )
+    assert paths[0].name == "elevation_EU_DTM.tif"
+
+
+def test_fetch_does_not_reuse_a_different_models_download(tmp_path):
+    # The exact resume this naming exists to stop being a lie: a stopped
+    # COP30 run, the model changed in Settings, then Download again over
+    # the same extent at the same tiling. work_dir is fingerprinted by
+    # TILING, not by model, so the earlier file really is sitting there. A
+    # fixed "elevation.tif" made that a skip, and survey.json would then
+    # have recorded EU_DTM for a Copernicus surface model on disk.
+    (tmp_path / "elevation_COP30.tif").write_bytes(TIFF_LITTLE_ENDIAN)
+    session = FakeSession(FakeStreamResponse([TIFF_BIG_ENDIAN]))
+    paths = ElevationSource(api_key="k", demtype="EU_DTM", session=session).fetch(
+        BBOX, [], tmp_path, NullProgress()
+    )
+    assert len(session.calls) == 1, "the other model's file was treated as this one's"
+    assert paths[0].name == "elevation_EU_DTM.tif"
+    assert paths[0].read_bytes() == TIFF_BIG_ENDIAN
+    # And the earlier model's file is left exactly as it was, so a run
+    # that goes back to COP30 still resumes rather than refetching.
+    assert (tmp_path / "elevation_COP30.tif").read_bytes() == TIFF_LITTLE_ENDIAN
+
+
+def test_merge_takes_this_models_part_and_never_a_leftover(tmp_path):
+    # package.py hands merge() everything it finds in the source's work
+    # directory (see _existing_output_files), which on the resume above is
+    # both files. parts[0] would sort to the leftover COP30 one.
+    leftover = tmp_path / "elevation_COP30.tif"
+    leftover.write_bytes(TIFF_LITTLE_ENDIAN)
+    current = tmp_path / "elevation_EU_DTM.tif"
+    current.write_bytes(TIFF_BIG_ENDIAN)
+    out_dir = tmp_path / "out"
+
+    outputs = ElevationSource(api_key="k", demtype="EU_DTM").merge(
+        [leftover, current], out_dir, "Barry-Waterfront_2026-08-01"
+    )
+
+    assert [p.name for p in outputs] == ["Barry-Waterfront_2026-08-01.tif"]
+    assert outputs[0].read_bytes() == TIFF_BIG_ENDIAN
+
+
+def test_merge_produces_nothing_when_only_another_models_part_is_present(tmp_path):
+    # Reachable only on a forced run whose own elevation fetch failed with
+    # an older model's file lying about. A package with no DEM and a
+    # survey.json that says so beats one holding a DEM it does not name.
+    leftover = tmp_path / "elevation_COP30.tif"
+    leftover.write_bytes(TIFF_LITTLE_ENDIAN)
+    outputs = ElevationSource(api_key="k", demtype="EU_DTM").merge(
+        [leftover], tmp_path / "out", "Barry-Waterfront_2026-08-01"
+    )
+    assert outputs == []
+
+
+def test_the_registered_source_names_no_model_at_all():
+    # GET /api/sources and `mapgen sources` read this off the one instance
+    # registered at startup, whose own demtype is not what any request
+    # will use. Naming COP30 here would contradict a settings panel
+    # showing EU_DTM, in the layer checklist, permanently.
+    assert ElevationSource.display_name == "Elevation (OpenTopography)"
+    assert "COP30" not in ElevationSource().display_name
+
+
+def test_configure_names_the_model_the_request_actually_asked_for():
+    configured = ElevationSource(api_key="k").configure("EU_DTM")
+    assert configured.demtype == "EU_DTM"
+    assert configured.display_name == "Elevation (OpenTopography EU_DTM)"
+
+
+def test_configure_never_mutates_the_registered_instance():
+    # The reason OvertureSource.configure exists at all: /api/estimate has
+    # no busy-guard, so it can be polled while a job using a different
+    # selection is mid-fetch.
+    registered = ElevationSource(api_key="k")
+    registered.configure("SRTMGL1")
+    assert registered.demtype == "COP30"
+    assert registered.display_name == "Elevation (OpenTopography)"
+
+
+def test_configure_shares_the_transport_rather_than_building_a_new_one():
+    session = FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    registered = ElevationSource(
+        api_key="k", session=session, url="http://example.invalid/dem", timeout_seconds=42
+    )
+    configured = registered.configure("NASADEM")
+    assert configured.session is session
+    assert configured.url == "http://example.invalid/dem"
+    assert configured.timeout_seconds == 42
+
+
+def test_licence_and_attribution_follow_the_chosen_model():
+    # survey.json records both per source (see package._source_provenance).
+    # A package that downloaded a JAXA or an OpenGeoHub product must not
+    # claim Copernicus' copyright line.
+    copernicus = ElevationSource(api_key="k", demtype="COP30")
+    assert "Copernicus" in copernicus.licence
+    assert "Airbus" in copernicus.attribution
+
+    european = ElevationSource(api_key="k", demtype="EU_DTM")
+    assert european.licence == "CC BY 4.0"
+    assert "Hengl" in european.attribution
+    assert "Airbus" not in european.attribution
+
+
+def test_a_model_with_no_stated_licence_claims_none():
+    srtm = ElevationSource(api_key="k", demtype="SRTMGL1")
+    assert "No licence stated" in srtm.licence
+    assert "Shuttle Radar" in srtm.attribution
+
+
+def test_an_unrecognised_model_constructs_without_raising_and_claims_nothing():
+    # Not a second validation site: SurveyRequest is where a person's
+    # chosen model is refused (see mapgen.elevation_models).
+    source = ElevationSource(api_key="k", demtype="SOMETHING_NEW")
+    assert source.demtype == "SOMETHING_NEW"
+    assert "Not established by mapgen" in source.licence
+
+
+def test_estimate_sizes_the_download_by_the_models_own_resolution():
+    # A large extent, well clear of SMALLEST_OBSERVED_BYTES, so the floor
+    # is not what this is measuring. COP90 is three times the ground
+    # sample distance of COP30, so a ninth of the pixels.
+    big = BBox.parse("-4.0,51.0,-3.0,52.0")
+    fine = ElevationSource(api_key="k", demtype="COP30").estimate(big, []).bytes_estimate
+    coarse = ElevationSource(api_key="k", demtype="COP90").estimate(big, []).bytes_estimate
+    assert coarse == pytest.approx(fine / 9.0, rel=0.01)
 
 
 def test_estimate_scales_with_bbox_area():

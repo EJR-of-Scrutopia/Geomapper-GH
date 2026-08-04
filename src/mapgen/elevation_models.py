@@ -59,6 +59,7 @@ nothing here has established one for them.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 DEFAULT_DEMTYPE = "COP30"
@@ -300,6 +301,41 @@ def model_for(demtype: str) -> ElevationModel:
         licence=UNSTATED_LICENCE,
         attribution=UNSTATED_ATTRIBUTION,
     )
+
+
+_UNSAFE_IN_A_FILENAME = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def work_file_name(demtype: str) -> str:
+    """The name ElevationSource writes its downloaded DEM under, inside the
+    job's work directory.
+
+    The demtype is in the name on purpose, and it is the whole reason this
+    function exists rather than a fixed "elevation.tif" constant. A DEM is
+    fetched once for the whole extent and skipped on a later run if the
+    file is already there (see ElevationSource.fetch), and work_dir is
+    fingerprinted by TILING, which the elevation model is deliberately not
+    part of: it is not a tiling property, and folding it in would orphan
+    every in-progress work directory on the owner's machine for no reason.
+
+    That left one way to record a lie in a package. Stop a run, change the
+    model in Settings, download again over the same extent at the same
+    tiling: the previous model's file is sitting there, fetch skips the
+    download, and survey.json records the model that was SELECTED rather
+    than the one actually on disk. Putting the model in the file's own
+    name makes the skip self-verifying: a file for a different model
+    simply is not the file this run is looking for, so it downloads, and
+    the record stays true. It is the same principle package.py's
+    _existing_output_files already applies to a stale tiling's tile ids.
+
+    Sanitised rather than interpolated raw, even though every demtype that
+    reaches a real run has already been through validate_demtype and is
+    plain alphanumerics: this composes a filesystem path, and a function
+    that composes a path from a string should not depend on a check made
+    somewhere else for its safety.
+    """
+    safe = _UNSAFE_IN_A_FILENAME.sub("", str(demtype)) or "model"
+    return f"elevation_{safe}.tif"
 
 
 def offered_choices() -> list[dict[str, str]]:

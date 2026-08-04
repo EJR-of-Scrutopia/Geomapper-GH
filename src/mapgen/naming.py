@@ -11,6 +11,8 @@ from datetime import date
 from pathlib import Path
 from typing import Sequence
 
+from mapgen.elevation_models import DEFAULT_DEMTYPE, work_file_name
+
 MAX_COMPONENT_LENGTH = 40
 DEFAULT_PATH_LIMIT = 240
 FINGERPRINT_LENGTH = 8
@@ -187,6 +189,7 @@ def check_path_length(
     overture_types: Sequence[str],
     source_ids: Sequence[str] | None = None,
     limit: int = DEFAULT_PATH_LIMIT,
+    elevation_demtype: str = DEFAULT_DEMTYPE,
 ) -> None:
     """Raises PathTooLongError if this job's worst-case path would be too long.
 
@@ -208,6 +211,15 @@ def check_path_length(
     conservative still names a path in its error message, and naming a path
     the tool can no longer produce sends the owner looking for a file that
     will never exist.
+
+    elevation_demtype is here for the same "measure the real shape" reason
+    (Task 28). Elevation's raw file used to be a fixed "elevation.tif";
+    it now carries the chosen model's name, so the path this job can
+    actually produce is up to sixteen characters longer than the one this
+    guard used to measure, and a guard that under counts is a guard that
+    admits a job Windows will refuse. Defaulted rather than required, so
+    every existing caller and test keeps working and only gets a longer
+    candidate when it actually says the job asked for a longer one.
 
     project_setting is always a candidate: it exists for a package
     regardless of which sources it contains, since naming.py builds it
@@ -235,7 +247,9 @@ def check_path_length(
         candidates.append((_length(osm_path), osm_path))
 
     if selected is None or "elevation" in selected:
-        elevation_path = paths.work_dir / "raw" / "elevation" / "elevation.tif"
+        elevation_path = (
+            paths.work_dir / "raw" / "elevation" / work_file_name(elevation_demtype)
+        )
         candidates.append((_length(elevation_path), elevation_path))
 
     length, longest_candidate = candidates[0]

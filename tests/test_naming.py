@@ -460,6 +460,38 @@ def test_check_path_length_still_checks_osms_own_path_when_it_is_selected(tmp_pa
     check_path_length(paths, [], source_ids=["stub"], limit=osm_length - 1)
 
 
+# --- Task 28: elevation's raw file now carries the model's name ------------
+
+
+def test_check_path_length_measures_the_chosen_elevation_models_own_filename(tmp_path):
+    # The raw DEM used to be a fixed "elevation.tif". It is
+    # "elevation_<model>.tif" now, which for the longest model in the
+    # vocabulary is sixteen characters more, and a guard measuring the old
+    # name would admit a job Windows then refuses.
+    paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
+    default_path = paths.work_dir / "raw" / "elevation" / "elevation_COP30.tif"
+    longest_path = paths.work_dir / "raw" / "elevation" / "elevation_GEBCOSubIceTopo.tif"
+    limit = len(str(default_path))
+
+    assert len(str(longest_path)) > limit, "test setup: the longer model must be longer"
+
+    # Exactly at the limit for the default model, so this isolates the
+    # filename itself rather than anything else about the path.
+    check_path_length(paths, [], source_ids=["elevation"], limit=limit)
+
+    with pytest.raises(PathTooLongError) as excinfo:
+        check_path_length(
+            paths,
+            [],
+            source_ids=["elevation"],
+            limit=limit,
+            elevation_demtype="GEBCOSubIceTopo",
+        )
+    # And it names the path that would actually be created, not the one
+    # the guard used to assume.
+    assert str(longest_path) in str(excinfo.value)
+
+
 # --- what the 240 character limit does and does not cover ------------------
 #
 # check_path_length measures OSM at raw/osm/r00_c00.osm, and Task 26 gave a
