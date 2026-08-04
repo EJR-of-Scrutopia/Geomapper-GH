@@ -5248,6 +5248,38 @@ def test_mapgen_bridge_converts_the_dem_of_a_package_already_on_disk(tmp_path):
     assert payload["elevation_grid"]["nodes"] == 12432
 
 
+def test_mapgen_bridge_names_the_egrid_it_just_wrote_in_the_project_setting(tmp_path):
+    """The same ordering run_survey's copy is pinned for, on the one command
+    whose entire purpose is retrofitting terrain onto a package that has none.
+
+    resolve_data_files reads the layer list off the disk, so the .egrid has
+    to be there before the setting is composed. Transposed, this command
+    writes a perfectly good .egrid and then a setting saying the package has
+    no terrain, and survey.json records the omission without flagging it:
+    the owner points Urbano at the folder and gets no ground, with the file
+    it wanted sitting beside the file it read.
+    """
+    register(RealDemStubSource())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+    root, stem = result.paths.root, result.paths.stem
+    # The shape of a package the owner already has: the DEM, and neither of
+    # the two files this command exists to produce.
+    (root / f"{stem}.egrid").unlink()
+    (root / f"{stem}_project_setting.json").unlink()
+
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    setting = json.loads(
+        (root / f"{stem}_project_setting.json").read_text(encoding="utf-8")
+    )
+    assert setting["ElevationFilePath"] == str(root / f"{stem}.egrid")
+    assert "elevation" in setting["Layers"]
+    # And survey.json agrees with the file, rather than recording a layer
+    # the setting does not name.
+    assert payload["project_setting"]["layers"] == setting["Layers"]
+    assert payload["elevation_grid"]["written"] is True
+
+
 def test_the_egrid_is_written_before_the_project_setting(tmp_path):
     """The ordering, pinned through the events rather than by reading the
     source, so reversing the two calls fails here.
