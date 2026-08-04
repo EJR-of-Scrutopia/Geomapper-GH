@@ -703,6 +703,37 @@ button.armed {
    beside a map that is flex: 1. Without it the log would share out the
    leftover height with the map instead of holding the height it has been
    given, which is the height item 4 lets the owner set. */
+/* Task 38, item 4: the line the owner drags to give the log more room.
+   It carries the border that separated the log from the map's furniture
+   (item 3 put it on .log itself, and two lines a few pixels apart is one
+   line too many), plus a short grip so it reads as something to take
+   hold of rather than a rule. row-resize is the cursor a horizontal
+   splitter has everywhere else, which is the whole of the affordance
+   before it is touched.
+
+   height and the grip are deliberately small: this sits between two
+   things that both want the space, and a fat bar would be spending the
+   height it exists to hand out. */
+.log-resizer {
+  flex: none;
+  height: 7px;
+  position: relative;
+  cursor: row-resize;
+  background: var(--paper);
+  border-top: 1px solid var(--line);
+}
+
+.log-resizer::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 3px;
+  width: 36px;
+  margin-left: -18px;
+  height: 1px;
+  background: var(--line);
+}
+
 .log {
   flex: none;
   height: 120px;
@@ -710,7 +741,6 @@ button.armed {
   padding: 8px 20px;
   font: 12px/1.5 Consolas, monospace;
   background: var(--surface);
-  border-top: 1px solid var(--line);
 }
 
 .log .fail { color: var(--warn); }

@@ -2740,6 +2740,147 @@ function log(message, failed = false) {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
+// --- how much of the column the log gets ---------------------------------
+//
+// Task 38, item 4. "allow for a height adjustment to the bottom of the
+// viewport to allow me to drag it up and down, this is in aid of allowing
+// more visibility of the log".
+//
+// The log and the map share one flex column (item 3). The map is flex: 1
+// and the log holds whatever height it is given, so setting the log's
+// height is the whole of the split: everything the log takes the map
+// gives up, and nothing else on the page moves.
+//
+// Two floors, and neither is arbitrary. The log is worth having only if a
+// line or two of it is readable, and a map under about 160px is not one
+// an extent can be drawn on. Both are enforced against the height the two
+// of them actually share, measured when the drag starts, so the pair can
+// never be asked for more than the column has.
+//
+// Leaflet has to be told. A map whose container has changed size and has
+// not been told keeps the tile layout it had, which shows as tiles
+// missing from the newly revealed strip and a centre that is no longer
+// the centre. map.invalidateSize() is the vendored build's own answer
+// (Map.invalidateSize, 1.9.4), and it is called on every step of the drag
+// rather than once at the end: that is what Leaflet itself does for a
+// window resize, one call per animation frame, and a mousemove cannot
+// arrive more often than that.
+const LOG_MIN_PX = 60;
+const MAP_MIN_PX = 160;
+const LOG_DEFAULT_PX = 120;
+
+// Kept in localStorage, and this is the only setting in this file that
+// lives anywhere but config.json, so the reason belongs here rather than
+// being left to be discovered.
+//
+// PUT /api/config ignores any key that is not a declared field of
+// mapgen.config.Config (server.py: `if key in
+// current.__dataclass_fields__`), and GET /api/config only ever returns
+// that dataclass. A browser-invented key is therefore accepted with a
+// 200, silently dropped, and gone by the next launch. Keeping the split
+// there needs a Config field, which is a Python change this task was
+// scoped out of; the report says what the one line is.
+//
+// What this does instead survives what the brief asked it to survive, a
+// reload of the page. What it does not survive is a relaunch: serve()
+// binds port 0, an ephemeral port per launch, and localStorage is keyed
+// by origin including the port, so the next launch reads a different
+// store. That gap is real, it is named in the report, and it closes the
+// moment the field exists.
+const LOG_HEIGHT_KEY = "mapgen.log-height-px";
+
+// { startY, logHeight } for as long as the divider is being dragged.
+let logResize = null;
+
+function elementHeight(id) {
+  const measured = Number($(id).offsetHeight);
+  return Number.isFinite(measured) && measured > 0 ? measured : 0;
+}
+
+// The log's height as it is now: what this file last set, or what the
+// stylesheet gave it, or the stylesheet's own number when neither can be
+// read, which is what a page whose layout has not happened yet has.
+function logHeight() {
+  const styled = parseFloat(String($("log").style.height || ""));
+  if (Number.isFinite(styled) && styled > 0) return styled;
+  return elementHeight("log") || LOG_DEFAULT_PX;
+}
+
+// The height the map and the log share, read fresh on every call rather
+// than captured when a drag starts. Capturing it looks like the careful
+// thing to do and is not: the previous step of the drag has already been
+// applied by the time this runs, so the log's height and the map's add up
+// to the same column either way, and the captured version is a second
+// copy of a number that has to be kept true. It would also be saving a
+// forced layout read that is not being saved, since map.invalidateSize()
+// four lines below reads the container's size in the same breath.
+function setLogHeight(px) {
+  const shared = logHeight() + elementHeight("map");
+  // max() rather than a bare subtraction: on a window too short for both
+  // minimums the log's own floor wins and the map keeps whatever is left,
+  // which is what happened before this control existed.
+  const most = Math.max(LOG_MIN_PX, shared - MAP_MIN_PX);
+  const next = Math.min(Math.max(px, LOG_MIN_PX), most);
+  $("log").style.height = `${Math.round(next)}px`;
+  map.invalidateSize();
+  return next;
+}
+
+function storedLogHeight() {
+  try {
+    const raw = window.localStorage && window.localStorage.getItem(LOG_HEIGHT_KEY);
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch (error) {
+    // Storage can be disabled or full, and neither is a reason for the
+    // page not to open. The stylesheet's own height is a fine answer.
+    return 0;
+  }
+}
+
+function storeLogHeight(px) {
+  try {
+    if (window.localStorage) window.localStorage.setItem(LOG_HEIGHT_KEY, String(Math.round(px)));
+  } catch (error) {
+    // A failed save costs the next reload its remembered split and
+    // nothing else, the same way a failed PUT /api/config costs the next
+    // launch its settings, and it stays quiet for the same reason.
+  }
+}
+
+$("log-resizer").addEventListener("mousedown", (event) => {
+  logResize = { startY: Number(event.clientY), logHeight: logHeight() };
+  // Or the drag selects the log's text on its way past.
+  if (event.preventDefault) event.preventDefault();
+});
+
+// Bound on the document rather than on the divider: a 7px target is easy
+// to leave behind mid-gesture, and a drag that stopped following the
+// cursor the moment it left the line would be unusable. Leaflet's own
+// Draggable binds its move and up the same way and for the same reason.
+document.addEventListener("mousemove", (event) => {
+  if (!logResize) return;
+  // Up the screen is a SMALLER clientY and a TALLER log, which is why
+  // this is the start minus now rather than the other way round.
+  setLogHeight(logResize.logHeight + (logResize.startY - Number(event.clientY)));
+});
+
+document.addEventListener("mouseup", () => {
+  if (!logResize) return;
+  logResize = null;
+  // Saved once, at the end. This is one setting the owner chose, not the
+  // sixty positions they passed through on the way to it.
+  storeLogHeight(logHeight());
+});
+
+// The remembered split, put through the same clamp a live drag goes
+// through, so a height saved on a taller window does not come back on a
+// shorter one and leave no map.
+(function restoreLogHeight() {
+  const saved = storedLogHeight();
+  if (saved) setLogHeight(saved);
+})();
+
 // The sources this specific job was started with, for classifyTiles: read
 // from the same payload() the job start request itself sent, never
 // re-read from the checklist afterwards, since the owner is free to

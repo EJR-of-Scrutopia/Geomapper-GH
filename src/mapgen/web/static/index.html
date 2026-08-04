@@ -92,6 +92,21 @@
         </div>
 
         <!--
+          Task 38, item 4. "allow for a height adjustment to the bottom of
+          the viewport to allow me to drag it up and down, this is in aid
+          of allowing more visibility of the log".
+
+          The line between the map's furniture and the log, and the thing
+          that is dragged. Dragging it up gives the log the height and the
+          map loses it; down is the reverse. app.js keeps neither from
+          being crushed to nothing and tells Leaflet its box has changed,
+          which is what stops the tiles going stale.
+        -->
+        <div id="log-resizer" class="log-resizer" role="separator"
+             aria-orientation="horizontal"
+             title="Drag up for more log, down for more map"></div>
+
+        <!--
           Task 38, item 3. "can we put the scripting part only below the
           viewport part, and leave the entire right tab running all the
           way down, just looks cleaner".

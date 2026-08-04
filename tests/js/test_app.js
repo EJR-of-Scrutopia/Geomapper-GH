@@ -226,6 +226,13 @@ function makeElement(id) {
     className: "",
     textContent: "",
     style: {},
+    // Task 38, item 4. A real element reports its laid-out height here
+    // and this harness cannot lay anything out, so it starts at 0 and a
+    // test that cares supplies the two numbers the split is worked out
+    // from (the map's height and the log's). 0 rather than undefined
+    // because that is what a real element not in the document reports,
+    // and app.js has to survive being asked before layout either way.
+    offsetHeight: 0,
     scrollHeight: 0,
     scrollTop: 0,
     children: [],
@@ -451,6 +458,24 @@ function makeWindow() {
     _setPrefersDark(value) {
       prefersDark = value;
     },
+    // Task 38, item 4: where the log's height is remembered. The real
+    // Storage API's own shape in the two respects app.js depends on:
+    // getItem returns null for a key that was never set (not undefined),
+    // and setItem stores strings, so a number goes in and a string comes
+    // back out. A stub that handed back the number would let a version
+    // that never coerced it pass here and fail in a browser.
+    localStorage: {
+      _items: new Map(),
+      getItem(key) {
+        return this._items.has(key) ? this._items.get(key) : null;
+      },
+      setItem(key, value) {
+        this._items.set(key, String(value));
+      },
+      removeItem(key) {
+        this._items.delete(key);
+      },
+    },
   };
 }
 
@@ -517,6 +542,17 @@ function makeLeaflet() {
     },
     getContainer: () => ({ style: {} }),
     fitBounds() {},
+    // Task 38, item 4. The real method (Map.invalidateSize, 1.9.4), which
+    // a map whose container has changed size has to be told about or its
+    // tiles stay laid out for the box it used to have. Counted rather
+    // than accepted silently: "the divider moved the boxes" and "the
+    // divider moved the boxes and the map now knows" are different
+    // claims, and only the second one leaves usable tiles.
+    _invalidateSizeCalls: 0,
+    invalidateSize() {
+      this._invalidateSizeCalls += 1;
+      return this;
+    },
     removeLayer(layer) {
       if (layer) layer.removed = true;
     },
@@ -838,7 +874,12 @@ function bootRoutes(extra) {
   };
 }
 
-function buildSandbox({ fetch, token = DEFAULT_TOKEN }) {
+// beforeRun runs against the built sandbox before app.js is evaluated in
+// it, which is the only moment some things can be arranged: what
+// localStorage already holds from a previous session, and what the page's
+// layout would have measured, since app.js reads both while it is being
+// evaluated rather than later. Added for Task 38, item 4.
+function buildSandbox({ fetch, token = DEFAULT_TOKEN, beforeRun }) {
   const document = makeDocument();
   const windowObject = makeWindow();
   const navigator = makeNavigator();
@@ -876,6 +917,7 @@ function buildSandbox({ fetch, token = DEFAULT_TOKEN }) {
     Object,
   };
   vm.createContext(sandbox);
+  if (beforeRun) beforeRun(sandbox);
   vm.runInContext(SOURCE, sandbox, { filename: "app.js" });
   return sandbox;
 }
@@ -884,9 +926,9 @@ function flush(ms = 0) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function bootedSandbox(extraRoutes, token) {
+async function bootedSandbox(extraRoutes, token, beforeRun) {
   const stub = makeFetchStub(bootRoutes(extraRoutes));
-  const sandbox = buildSandbox({ fetch: stub.fetch, token });
+  const sandbox = buildSandbox({ fetch: stub.fetch, token, beforeRun });
   await flush(10); // let boot()'s three sequential awaits (config, sources, categories) settle
   return { sandbox, fetchCalls: stub.calls };
 }
@@ -6966,6 +7008,145 @@ function ok(condition, message) {
     const lines = sandbox.document.getElementById("log").children.map((line) => line.textContent);
     ok(lines.length > 0, "expected the run's events in the log");
     ok(lines.some((line) => line.startsWith("tile_done")), `got ${JSON.stringify(lines)}`);
+  });
+
+  // =======================================================================
+  // Task 38, item 4: a draggable divider between the map and the log.
+  //
+  // The split is the log's height: the map beside it is flex: 1, so
+  // whatever the log takes the map gives up. Nothing here can lay a page
+  // out, so the two heights the arithmetic works from are supplied the
+  // way a browser would have measured them, and what is checked is the
+  // arithmetic, the floors, the call that keeps Leaflet's tiles honest,
+  // and what is remembered.
+  // =======================================================================
+
+  const LOG_HEIGHT_KEY = "mapgen.log-height-px";
+
+  // A page whose layout has happened: a 400px map above a 120px log, so
+  // the two of them share 520px.
+  function layOutColumn(sandbox, { map = 400, log = 120 } = {}) {
+    sandbox.document.getElementById("map").offsetHeight = map;
+    sandbox.document.getElementById("log").offsetHeight = log;
+  }
+
+  function dragDivider(sandbox, fromY, toY, { release = true } = {}) {
+    sandbox.document.getElementById("log-resizer").fire("mousedown", { clientY: fromY });
+    sandbox.document.fire("mousemove", { clientY: toY });
+    if (release) sandbox.document.fire("mouseup", {});
+  }
+
+  function logStyleHeight(sandbox) {
+    return parseFloat(String(sandbox.document.getElementById("log").style.height || ""));
+  }
+
+  await test("the divider sits between the map's furniture and the log", () => {
+    const tools = MAP_PANE_MARKUP.indexOf('class="map-tools"');
+    const resizer = MAP_PANE_MARKUP.indexOf('id="log-resizer"');
+    const log = MAP_PANE_MARKUP.indexOf('id="log"');
+    ok(resizer !== -1, "expected the divider in the map pane");
+    ok(tools < resizer && resizer < log, "expected the divider directly above the log");
+    const resizers = INDEX_HTML_MARKUP.match(/id="log-resizer"/g) || [];
+    ok(resizers.length === 1, `expected exactly one divider, found ${resizers.length}`);
+    const rule = cssRule(".log-resizer");
+    ok(/cursor:\s*row-resize/.test(rule), `expected the splitter cursor: ${rule}`);
+    ok(/flex:\s*none/.test(rule), `expected the divider to hold its own height: ${rule}`);
+  });
+
+  await test("dragging the divider up gives the log the height the map loses", async () => {
+    const { sandbox } = await bootedSandbox();
+    layOutColumn(sandbox);
+    const before = sandbox.L._mapObject._invalidateSizeCalls;
+    dragDivider(sandbox, 500, 400); // 100px up the screen
+    ok(logStyleHeight(sandbox) === 220, `expected 120 + 100, got ${logStyleHeight(sandbox)}`);
+    ok(
+      sandbox.L._mapObject._invalidateSizeCalls > before,
+      "Leaflet was never told its box changed: the tiles would be laid out for the old height"
+    );
+  });
+
+  await test("dragging the divider down gives it back", async () => {
+    const { sandbox } = await bootedSandbox();
+    layOutColumn(sandbox);
+    dragDivider(sandbox, 500, 540); // 40px down the screen
+    ok(logStyleHeight(sandbox) === 80, `expected 120 - 40, got ${logStyleHeight(sandbox)}`);
+  });
+
+  await test("neither the log nor the map can be crushed to nothing", async () => {
+    const { sandbox } = await bootedSandbox();
+    layOutColumn(sandbox);
+    // All the way up: the map keeps its own floor out of the 520 they
+    // share, so the log stops at 360 rather than taking the lot.
+    dragDivider(sandbox, 500, -2000);
+    ok(logStyleHeight(sandbox) === 360, `expected the map's 160px floor kept, got ${logStyleHeight(sandbox)}`);
+    // And all the way down, where the log's own floor holds.
+    layOutColumn(sandbox, { map: 40, log: 360 });
+    dragDivider(sandbox, 500, 3000);
+    ok(logStyleHeight(sandbox) === 60, `expected the log's own floor, got ${logStyleHeight(sandbox)}`);
+  });
+
+  await test("the split is remembered when the drag ends, and not before", async () => {
+    const { sandbox } = await bootedSandbox();
+    layOutColumn(sandbox);
+    dragDivider(sandbox, 500, 420, { release: false });
+    ok(
+      sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === null,
+      "expected nothing saved from the middle of a drag"
+    );
+    sandbox.document.fire("mouseup", {});
+    ok(
+      sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === "200",
+      `expected the chosen split saved, got ${sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY)}`
+    );
+  });
+
+  await test("a remembered split is applied before anything is drawn", async () => {
+    // The reload case: the page opens with the height it was left at,
+    // rather than the stylesheet's default and a jump afterwards.
+    const { sandbox } = await bootedSandbox(null, undefined, (built) => {
+      built.window.localStorage.setItem(LOG_HEIGHT_KEY, "240");
+      built.document.getElementById("map").offsetHeight = 400;
+      built.document.getElementById("log").offsetHeight = 120;
+    });
+    ok(logStyleHeight(sandbox) === 240, `expected the remembered split, got ${logStyleHeight(sandbox)}`);
+  });
+
+  await test("a remembered split too tall for this window is cut down to fit it", async () => {
+    // Saved on a big monitor, opened on a laptop. The map keeps its floor
+    // rather than the page opening with no map at all.
+    const { sandbox } = await bootedSandbox(null, undefined, (built) => {
+      built.window.localStorage.setItem(LOG_HEIGHT_KEY, "5000");
+      built.document.getElementById("map").offsetHeight = 400;
+      built.document.getElementById("log").offsetHeight = 120;
+    });
+    ok(logStyleHeight(sandbox) === 360, `expected it clamped to fit, got ${logStyleHeight(sandbox)}`);
+  });
+
+  await test("a page with nothing remembered is left exactly as the stylesheet drew it", async () => {
+    const { sandbox } = await bootedSandbox();
+    ok(
+      !sandbox.document.getElementById("log").style.height,
+      `expected no height forced on a first visit, got ${sandbox.document.getElementById("log").style.height}`
+    );
+    ok(
+      sandbox.L._mapObject._invalidateSizeCalls === 0,
+      "expected no resize reported for a page that was never resized"
+    );
+  });
+
+  await test("a mouse moving with no drag in progress moves nothing", async () => {
+    const { sandbox } = await bootedSandbox();
+    layOutColumn(sandbox);
+    sandbox.document.fire("mousemove", { clientY: 10 });
+    sandbox.document.fire("mouseup", {});
+    ok(
+      !sandbox.document.getElementById("log").style.height,
+      `expected the log untouched by an ordinary mouse move, got ${sandbox.document.getElementById("log").style.height}`
+    );
+    ok(
+      sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === null,
+      "expected an ordinary mouseup to save nothing"
+    );
   });
 
   console.log(
