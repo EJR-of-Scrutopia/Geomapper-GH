@@ -8,8 +8,13 @@ keeps working offline and cannot break because a CDN changed or went down.
 | `leaflet.js` | 1.9.4 | `https://unpkg.com/leaflet@1.9.4/dist/leaflet.js` | `db49d009c841f5ca34a888c96511ae936fd9f5533e90d8b2c4d57596f4e5641a` |
 | `leaflet.css` | 1.9.4 | `https://unpkg.com/leaflet@1.9.4/dist/leaflet.css` | `a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6` |
 
-Leaflet's marker icon PNGs are not vendored because this interface draws only
-a rectangle and never places a marker.
+Leaflet's marker icon PNGs are not vendored, and the interface is written so
+that it never needs them. It draws rectangles, and the four handles on the
+drawn extent are markers with a DIV icon (`L.divIcon`), which is a styled
+element rather than an image. Anything added here that used the default
+`L.Icon` would request `marker-icon.png` from this folder and get a 404, so a
+new marker needs either its own div icon or those files vendored alongside
+these two.
 
 ## Verifying
 
