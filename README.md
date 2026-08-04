@@ -244,6 +244,15 @@ the URL, so nothing else on the machine can drive it. On the page:
   dashed outline over whatever state it is in, and its tooltip says into
   how many pieces it was split, so a square that has gone quiet explains
   itself rather than looking stuck.
+- That grid belongs to the run for as long as the run lasts. Changing the
+  tile size, the overlap or the layer selection while a download is going
+  still re-estimates, and the panel above Download still answers with what
+  the new tiling would cost, but the rectangles on the map are left
+  reporting on the download in progress rather than being redrawn for a
+  tiling nothing is fetching. The new tiling is drawn the next time you
+  ask for an estimate after the run ends. Download itself stays out of
+  reach until then, since starting a second run is what would clear the
+  log of the first.
 - A red tile says why it is red. Hover one, or tap it on a touchscreen, and
   the reason the run actually recorded appears on the tile: the service
   timed out, or answered 429, or answered 503 four times over, and whether

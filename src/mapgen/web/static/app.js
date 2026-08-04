@@ -361,7 +361,42 @@ function selectFailedTile(tileId) {
 // refreshEstimate): a fresh tile_grid always means a fresh set of
 // rectangles, never a resize of the previous ones, since a changed
 // tiling can add, remove or move tiles rather than just reshape them.
+//
+// --- and never while a job is running, Task 38's third fix round -------
+//
+// This is the second half of the same claim the extent lock makes. That
+// one protects the geometry a job was STARTED with; this protects the
+// grid keyed to that geometry, and the two together are what make "a
+// running job's display cannot be destroyed from the form" true by
+// construction rather than by guarding each control that might reach it.
+//
+// What the damage was. refreshEstimate is bound to a change on the
+// region, the site, the tile size, the overlap, the output root, the
+// layer checklist and the category checklist. Any of them mid-run
+// reaches here with a different tiling, and this function tears down
+// every rectangle and builds new ones keyed by new tile ids. The poll
+// loop then summarises the job against [...tileRectangles.keys()], which
+// the job's own events do not name, so every tile reads pending, the bar
+// falls to 0% and the grid stays blank for the rest of a run that is
+// going perfectly well. Moving the tile-size slider while waiting for a
+// download is an ordinary thing to do and it looked like the run had
+// died.
+//
+// The estimate itself is deliberately NOT refused. Asking what a
+// different tiling would cost harms nothing, so the panel, the folder
+// preview and the slider's own readout all still update mid-run; only
+// the rectangles that describe the run in flight are held. The cost of
+// that choice, and it is a real one: between such an estimate and the
+// end of the run, the panel can be describing a tiling the map is not
+// showing. The grid is the one of the two that is reporting on
+// something happening now, so it wins, and the next estimate after the
+// run ends redraws it.
+//
+// Released on exactly the line that releases the extent: jobRunning goes
+// false at both ends of the poll loop, so a stopped or failed run frees
+// the grid at the same instant it frees the extent controls.
 function renderTileGrid(tileGrid) {
+  if (jobRunning) return;
   clearTileGrid();
   for (const tile of tileGrid || []) {
     tileState.set(tile.tile_id, "pending");
@@ -1188,6 +1223,15 @@ function remainingLabel({
 // browser honours the markup's own attribute before any script runs, but
 // the Node test harness's synthetic elements have no knowledge of the
 // real markup's attributes at all, only of whatever a script sets.
+//
+// The one call to clearTileGrid that is deliberately NOT routed through
+// renderTileGrid([]) the way the two in refreshEstimate and
+// showEstimateError now are. This line runs while the module is still
+// being evaluated, and renderTileGrid reads jobRunning, which is a `let`
+// declared further down: reading it from here would be a temporal dead
+// zone error that blanks the whole page. There is nothing to guard
+// against at this point anyway, since no job can be running before the
+// script that starts jobs has finished loading.
 clearTileGrid();
 
 // --- API -------------------------------------------------------------
@@ -2260,7 +2304,15 @@ function showEstimateError(message) {
   // A tiling or extent problem invalidates whatever grid was last drawn:
   // showing rectangles for a configuration that just failed would
   // mislead rather than help.
-  clearTileGrid();
+  //
+  // Through renderTileGrid rather than clearTileGrid directly, so that
+  // this is not a second way to tear the grid down: an estimate that
+  // FAILS mid-run (an absurd tiling from the slider, an output root the
+  // server rejects, a network hiccup) is exactly as much the running
+  // job's business as one that succeeds, and there is one sink for both
+  // (see renderTileGrid). An empty grid is what it has always drawn
+  // here; the only thing that has changed is which function draws it.
+  renderTileGrid([]);
   // And it invalidates the tile count and time beside the slider for
   // exactly the same reason: an absurd tiling is one of the things the
   // slider itself can cause, so the numbers next to it must not go on
@@ -2282,7 +2334,10 @@ async function refreshEstimate() {
     $("estimate").textContent = missing;
     $("download").disabled = true;
     hideFolderPreview();
-    clearTileGrid();
+    // The same one sink, for the same reason, although this branch is
+    // unreachable while a job runs: there is no bbox here, and a job
+    // cannot start without one.
+    renderTileGrid([]);
     lastSizing = null;
     renderTileSize();
     return;
@@ -2340,7 +2395,15 @@ async function refreshEstimate() {
       html += `<span class="estimate-warning">${data.warnings.map(escapeHtml).join("<br />")}</span>`;
     }
     $("estimate").innerHTML = html;
-    $("download").disabled = false;
+    // Not while a job is running, and this is the third thing the form
+    // could destroy a run's display with rather than a fourth guard on
+    // the same class. Download's own handler opens with
+    // $("log").innerHTML = "", so a button re-enabled by a mid-run
+    // estimate is one press away from wiping the log of the run in
+    // progress; the POST that follows is refused by the server with a
+    // clean 409, by which time the log has already gone. The button
+    // stays exactly as the Download handler left it until the run ends.
+    $("download").disabled = jobRunning;
     renderTileGrid(data.tile_grid);
     // The exact path naming.build_package_paths composed for this request,
     // not a guess assembled here: this is read straight into Grasshopper,
@@ -3106,6 +3169,13 @@ function renderProgress(summary, job, elapsedSeconds) {
 }
 
 $("download").addEventListener("click", async () => {
+  // The guard beside the disabled attribute, the same pair the extent
+  // controls use: a browser does not deliver a click to a disabled
+  // button, but this covers one already on its way when the job started,
+  // and it is what the harness exercises, since firing a listener there
+  // does not consult `disabled`. It has to come before the line below,
+  // which is the one that would wipe the running job's log.
+  if (jobRunning) return;
   $("log").innerHTML = "";
   try {
     const requestPayload = payload();

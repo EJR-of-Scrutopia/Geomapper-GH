@@ -271,6 +271,15 @@ function makeElement(id) {
       // ordering preference, and it is the reason this line exists
       // rather than a gentler "keep it if it still matches".
       if (optionValues.length) value = optionValues[0];
+      // And assigning innerHTML REPLACES an element's children, which
+      // this stub used to leave standing. That is not a detail: the log
+      // is built with appendChild and cleared with innerHTML = "", so a
+      // press of Download that wipes the running job's log looked from
+      // here like a press that left it alone, and the mutation which
+      // removes the guard against exactly that survived a full run. A
+      // stub more forgiving than a browser is the one thing this file
+      // exists to not be.
+      this.children = [];
     },
     // A real element supports multiple listeners per event type; this
     // stored a single handler per type and let a later addEventListener
@@ -7194,6 +7203,242 @@ function ok(condition, message) {
         `expected #${id} live again once nothing is watching the job`
       );
     }
+  });
+
+  // --- and the grid keyed to that geometry -------------------------------
+  //
+  // The second half of the same claim. The extent lock above protects the
+  // geometry a job was started with; this protects the rectangles keyed
+  // to it. refreshEstimate is bound to a change on seven other controls,
+  // and any of them mid-run used to reach renderTileGrid with a different
+  // tiling, which threw away the running job's rectangles and built new
+  // ones keyed by tile ids that job's events do not name: every tile read
+  // pending and the bar fell to 0% for the rest of a healthy run.
+
+  // A job sandbox whose estimate answers differently the second time, so
+  // a test can tell "the grid was left alone" from "the grid was redrawn
+  // with the same thing".
+  async function midRunEstimateSandbox({ polls }) {
+    const tileIds = tileIdsUpTo(4);
+    const later = {
+      tiles: 9,
+      rows: 3,
+      cols: 3,
+      extent_km: { width: 3, height: 3 },
+      bytes_estimate: 9000,
+      seconds_estimate: 400,
+      warnings: [],
+      folder: "C:\\out",
+      tile_grid: gridFor(tileIdsUpTo(9)),
+      sources: [{ id: "osm", seconds_estimate: 144 }],
+    };
+    let estimates = 0;
+    let pollIndex = 0;
+    const { sandbox } = await bootedSandbox(async (url, options) => {
+      const method = (options.method || "GET").toUpperCase();
+      if (url.pathname === "/api/sources") return jsonResponse(200, [TWO_SOURCES[0]]);
+      if (url.pathname === "/api/config" && method === "PUT") return jsonResponse(200, DEFAULT_CONFIG);
+      if (url.pathname === "/api/estimate") {
+        estimates += 1;
+        if (estimates > 1) return jsonResponse(200, later);
+        return jsonResponse(200, {
+          tiles: 4,
+          rows: 1,
+          cols: 4,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 175,
+          warnings: [],
+          folder: "C:\\out",
+          tile_grid: gridFor(tileIds),
+          sources: [{ id: "osm", seconds_estimate: 144 }],
+        });
+      }
+      if (url.pathname === "/api/jobs" && method === "POST") return jsonResponse(202, { id: "job1" });
+      if (url.pathname === "/api/jobs/job1") {
+        const reply = polls[Math.min(pollIndex, polls.length - 1)];
+        pollIndex += 1;
+        return jsonResponse(200, { id: "job1", error: null, result_root: "C:\\out", ...reply });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    await flush(20);
+    return { sandbox, tileIds };
+  }
+
+  const RUNNING_FIRST_TILE = {
+    state: "running",
+    events: [{ event: "tile_done", source: "osm", tile_id: "r00_c00" }],
+  };
+
+  await test("a re-estimate mid-run leaves the running job's grid exactly as it is", async () => {
+    const { sandbox, tileIds } = await midRunEstimateSandbox({ polls: [RUNNING_FIRST_TILE] });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const painted = gridRectangles(sandbox, tileIds);
+    ok(painted[0].options.fillColor === "#2f5d4f", "expected the run's first tile green before the estimate");
+    const rectanglesBefore = sandbox.L._rectangles.length;
+
+    // The ordinary thing to do while waiting for a download.
+    setField(sandbox, "overlap", "250");
+    await flush(20);
+
+    ok(
+      sandbox.L._rectangles.length === rectanglesBefore,
+      `expected no rectangle rebuilt mid-run, ${sandbox.L._rectangles.length - rectanglesBefore} were`
+    );
+    const after = gridRectangles(sandbox, tileIds);
+    ok(after.length === 4, `expected the job's own four tiles still on the map, got ${after.length}`);
+    ok(
+      after[0].options.fillColor === "#2f5d4f",
+      `expected the finished tile still green, got ${after[0].options.fillColor}`
+    );
+    ok(after.every((rect) => !rect.removed), "expected none of the job's rectangles taken off the map");
+  });
+
+  await test("the estimate itself still runs mid-job, and still answers", async () => {
+    // Asking what a different tiling would cost harms nothing, so the
+    // panel updates. Only the rectangles describing the run in flight are
+    // held back.
+    const { sandbox } = await midRunEstimateSandbox({ polls: [RUNNING_FIRST_TILE] });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    setField(sandbox, "overlap", "250");
+    await flush(20);
+    const shown = sandbox.document.getElementById("estimate").innerHTML;
+    ok(/9 tiles/.test(shown), `expected the panel to answer with the new tiling, got ${shown}`);
+    ok(!/error/.test(sandbox.document.getElementById("estimate").className), "and not as an error");
+  });
+
+  await test("an estimate that fails mid-run does not clear the grid either", async () => {
+    // The other way in, and the reason showEstimateError goes through the
+    // same one sink: a failed estimate is exactly as much the running
+    // job's business as a successful one.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [RUNNING_FIRST_TILE],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(gridRectangles(sandbox, tileIds).length === 4, "expected the job's grid up");
+    sandbox.showEstimateError("Something the server refused.");
+    ok(
+      gridRectangles(sandbox, tileIds).length === 4,
+      "expected the running job's grid to survive an estimate failure"
+    );
+    ok(
+      /refused/.test(sandbox.document.getElementById("estimate").textContent),
+      "expected the failure still reported in the panel"
+    );
+  });
+
+  await test("the grid is free again the moment the run ends, like the extent", async () => {
+    const { sandbox, tileIds } = await midRunEstimateSandbox({
+      polls: [
+        RUNNING_FIRST_TILE,
+        {
+          state: "done",
+          events: [
+            ...tileIdsUpTo(4).map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(1600);
+    ok(gridRectangles(sandbox, tileIds).length === 4, "expected the finished run's grid still up");
+    setField(sandbox, "overlap", "250");
+    await flush(20);
+    // Nine now, not four: the same estimate that was held back mid-run
+    // redraws the moment the run is over.
+    const redrawn = gridRectangles(sandbox, tileIdsUpTo(9));
+    ok(redrawn.length === 9, `expected the new tiling drawn once the run ended, got ${redrawn.length}`);
+  });
+
+  await test("a stopped run frees the grid at the same instant it frees the extent", async () => {
+    const { sandbox, tileIds } = await midRunEstimateSandbox({
+      polls: [RUNNING_FIRST_TILE, { state: "stopped", events: [] }],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(1600);
+    ok(
+      sandbox.document.getElementById("draw").disabled === false,
+      "expected the extent controls handed back by a stopped run"
+    );
+    // The stopped run's own rectangles, held onto before the estimate
+    // that replaces them: "the grid was freed" means these come OFF the
+    // map, which counting the new ones cannot say on its own.
+    const stoppedRunGrid = gridRectangles(sandbox, tileIds);
+    setField(sandbox, "overlap", "250");
+    await flush(20);
+    ok(
+      gridRectangles(sandbox, tileIdsUpTo(9)).length === 9,
+      "expected the grid handed back by the same stop"
+    );
+    ok(
+      stoppedRunGrid.every((rect) => rect.removed),
+      "expected the stopped run's own rectangles taken off the map by the new tiling"
+    );
+  });
+
+  await test("Download cannot be pressed mid-run, so the log cannot be wiped", async () => {
+    // A mid-run estimate used to re-enable it, and the handler's own
+    // first line is $("log").innerHTML = "". One press would have thrown
+    // away the log of the run in progress and then been refused by the
+    // server with a 409.
+    const { sandbox } = await midRunEstimateSandbox({ polls: [RUNNING_FIRST_TILE] });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const lines = sandbox.document.getElementById("log").children.length;
+    ok(lines > 0, "expected the run's events in the log");
+    setField(sandbox, "overlap", "250");
+    await flush(20);
+    ok(
+      sandbox.document.getElementById("download").disabled === true,
+      "a mid-run estimate must not hand the button back"
+    );
+    sandbox.document.getElementById("download").fire("click");
+    ok(
+      sandbox.document.getElementById("log").children.length >= lines,
+      "the running job's log must survive a press on a button that should be dead"
+    );
+  });
+
+  await test("a download that IS allowed still starts with an empty log", async () => {
+    // The other half of the check above, and the reason it is not passing
+    // for the wrong reason: a press that goes through clears the log, so
+    // "the log survived" says the press was refused rather than saying
+    // that pressing Download never clears anything.
+    const { sandbox, tileIds } = await midRunEstimateSandbox({
+      polls: [
+        {
+          state: "done",
+          events: [
+            ...tileIdsUpTo(4).map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const first = sandbox.document.getElementById("log").children.map((line) => line.textContent);
+    ok(first.length > 0, "expected the first run's events in the log");
+    ok(tileIds.length === 4, "fixture check");
+
+    sandbox.document.getElementById("download").fire("click");
+    ok(
+      sandbox.document.getElementById("log").children.length === 0,
+      `expected a fresh run to start from an empty log, got ${sandbox.document.getElementById("log").children.length} lines`
+    );
   });
 
   await test("an armed draw tool takes the handles off the old rectangle", async () => {
