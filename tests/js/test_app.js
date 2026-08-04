@@ -2745,6 +2745,109 @@ function ok(condition, message) {
   );
 
   // =======================================================================
+  // Task 26: a tile too dense for one request is split into quarters and
+  // recombined. The browser is told, and a subdivided tile still settles
+  // to done: it is not a failure and must not be shown as one.
+  // =======================================================================
+
+  await test("classifyTiles: a tile_subdivided event does not disturb the grid", async () => {
+    // The event carries a tile_id, so it reaches classifyTiles' own
+    // tile_id branch, and it must fall straight through: subdivision is
+    // something happening TO a tile that is still being fetched, not a
+    // state of its own. Checked rather than assumed, because an unknown
+    // event arriving with a KNOWN tile_id is exactly the shape that
+    // would quietly repaint a rectangle if that branch were written
+    // loosely.
+    const { sandbox } = await bootedSandbox();
+    const result = sandbox.classifyTiles(
+      ["r00_c00", "r00_c01"],
+      ["osm"],
+      [{ event: "tile_subdivided", source: "osm", tile_id: "r00_c00", pieces: 4, depth: 1 }],
+      true
+    );
+    ok(
+      result.get("r00_c00") === "pending",
+      `expected the subdivided tile still pending mid-fetch, got ${result.get("r00_c00")}`
+    );
+    ok(result.get("r00_c01") === "pending");
+  });
+
+  await test("classifyTiles: a subdivided tile still settles to done when it lands", async () => {
+    const { sandbox } = await bootedSandbox();
+    const events = [
+      { event: "tile_subdivided", source: "osm", tile_id: "r00_c00", pieces: 4, depth: 1 },
+      // A quarter reports under its own id, which is not a tile of the
+      // plan at all, so the grid must ignore it rather than growing an
+      // entry for it.
+      { event: "tile_skipped", source: "osm", tile_id: "r00_c00_q00" },
+      { event: "tile_done", source: "osm", tile_id: "r00_c00" },
+      { event: "source_done", source: "osm", outputs: ["Barry_2026-08-01.osm"] },
+    ];
+    const result = sandbox.classifyTiles(["r00_c00"], ["osm"], events, true);
+    ok(
+      result.get("r00_c00") === "done",
+      `expected a subdivided tile to finish done, got ${result.get("r00_c00")}`
+    );
+    ok(result.size === 1, "a quarter id must not become a tile of its own");
+  });
+
+  await test("a tile_subdivided event is logged plainly, with its parent and piece count", async () => {
+    // app.js formats no event by name: every one is logged as its name
+    // plus its fields. That is what makes a new event safe to add from
+    // the Python side, and it is worth pinning here, because the whole
+    // point of this event is that the log says why a run has gone quiet
+    // on one tile.
+    const { sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: 1,
+          rows: 1,
+          cols: 1,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 60,
+          warnings: [],
+          folder: "C:\\Surveys\\R\\2026-08-02_S",
+        });
+      }
+      if (url.pathname === "/api/jobs" && (options.method || "").toUpperCase() === "POST") {
+        return jsonResponse(202, { id: "job1" });
+      }
+      if (url.pathname === "/api/jobs/job1") {
+        return jsonResponse(200, {
+          id: "job1",
+          state: "done",
+          events: [
+            { event: "tile_subdivided", source: "osm", tile_id: "r00_c00", pieces: 4, depth: 1 },
+          ],
+          error: null,
+          result_root: "C:\\out",
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    await flush(10);
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+
+    const logLines = sandbox.document.getElementById("log").children;
+    const line = logLines.find((l) => l.textContent.startsWith("tile_subdivided"));
+    ok(
+      line,
+      `expected a tile_subdivided log line, got: ${logLines.map((l) => l.textContent).join(" | ")}`
+    );
+    ok(
+      line.textContent.includes("tile_id=r00_c00") && line.textContent.includes("pieces=4"),
+      `expected the parent tile and the piece count in the line, got: ${line.textContent}`
+    );
+    ok(line.className !== "fail", "a split is not a failure and must not be styled as one");
+  });
+
+  // =======================================================================
   // Task 22: Stop keeps the data, so a stopped job is a normal, successful
   // outcome in the interface, never styled or worded like a failure.
   // =======================================================================

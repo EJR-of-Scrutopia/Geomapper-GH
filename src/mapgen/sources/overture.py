@@ -16,8 +16,10 @@ survey. Overture is a read of cloud-hosted parquet with no such etiquette
 problem, which is why it and not OSM got this.
 
 Not tiled, unlike OsmSource (Task 23). OSM is tiled because the OSM map API
-has a hard 50,000-node cap per request, and the whole node-cap retry ladder
-in package.py exists to service that cap. Overture is a bbox-filtered read of
+has a hard 50,000-node cap per request, and the subdivision machinery in
+osm.py exists to service that cap when a tile hits it even so (Task 26,
+which replaced package.py's whole-run retry at a smaller tile size).
+Overture is a bbox-filtered read of
 cloud-hosted parquet with no equivalent cap; it only ever inherited OSM's
 constraint because it was added alongside it. Measured on this machine over
 the same extent, same type, 16 tiles at 600 m with 20 m overlap, in two

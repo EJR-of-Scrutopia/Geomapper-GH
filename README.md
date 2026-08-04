@@ -357,7 +357,7 @@ Fields, as actually written:
 | `urbano_stem` | The file stem used for every named output in this package. |
 | `bbox` | The requested extent, `west`/`south`/`east`/`north`. |
 | `extent_km` | Width and height of that bbox in kilometres. |
-| `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. On a node-cap retry (see "Limits worth knowing about") this is the size the retry settled on, which can be smaller than what was requested. |
+| `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. Always the tiling that was requested: a tile too dense for one request is split inside its own tile (see "Limits worth knowing about") and the plan itself never changes. |
 | `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
 | `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), and, for Overture, `types` (the actual Overture types fetched). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
 | `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"`/`"pending"` status per source. `"pending"` means the source never got a turn on that tile at all, most often because a Stop request landed first; it is a different, more honest claim than `"failed"`, which means a real attempt came up short. |
@@ -407,24 +407,33 @@ not a substitute for reading either.
 **The OSM node cap.** The OSM map API refuses any single request over 50000
 nodes. This is the map API's own limit; Overpass has no equivalent, so it
 only applies to a run that is actually using the map API, which is the
-default whenever every category is selected. A tile that dense
-automatically retries the *whole run* at the next smaller size in a fixed
-ladder, 2000, then 1500, then 1000 m, matching the old superseded script's
-own behaviour, restored by owner ruling: dense city centres are exactly
-where surveys happen, and a run that stops to wait for a manual
-`--tile-size-m` retry has to be babysat. The whole run retries, not just
-the failing tile, because the fingerprinted work folder makes that safe by
-construction: a different tile size hashes to a different `_work/`
-subfolder, so a retry cannot mix its tiles with the failed attempt's. Each
-retry is announced through the progress log (`[tile_size_retry]
-previous_tile_size_m=... next_tile_size_m=...`), and `survey.json`'s
-`tiling.tile_size_m` records whichever size was actually used, which may be
-smaller than what you asked for. If the smallest size in the ladder still
-fails, or you were already at or below 1000 m, mapgen fails once, clearly,
-with the same message as before, and leaves a further manual retry to you.
-A run already on Overpass, whether because a category filter put it there
-or because `use_overpass=True` was set directly, never enters this retry
-at all: there is no node cap on that path for a smaller tile to fix.
+default whenever every category is selected. A tile that dense is split
+into four quarters and downloaded in pieces, and a quarter that is still
+too dense is split again, twice at most: a 2000 m tile becomes at most
+sixteen 500 m pieces. The pieces are merged back into that tile's own
+file, so the rest of the run carries on exactly as if the tile had
+arrived in one request, `survey.json` records it as an ordinary `ok`
+tile, and the map shows it finishing green. Each split is announced
+through the progress log (`[tile_subdivided] source=osm tile_id=r03_c04
+pieces=4 depth=1`).
+
+Only the dense tile pays. The tiling itself never changes, so the work
+folder, the resume state and every tile and Overture download that has
+already succeeded are all untouched: a split costs at most that one
+tile's own pieces, about 40 seconds at the map API's rate limit, not
+another run. (Until Task 26 the whole run restarted at 1500 m and then
+1000 m instead, which meant refetching everything that had already
+worked; on a 72-tile extent that turned a three minute download into
+fifteen.) The quarters are kept in a `_split/` folder under `_work/`
+until the package completes, so a run interrupted mid-split resumes into
+it rather than starting it again.
+
+Ground still over 50000 nodes in a sixteenth of a tile fails, and mapgen
+says which piece it was and how large that piece is, so "draw a smaller
+extent" is a decision you make with the number in front of you. A run
+already on Overpass, whether because a category filter put it there or
+because `use_overpass=True` was set directly, never splits at all: there
+is no node cap on that path for a smaller piece to fix.
 
 **Overpass is a second, separate shared public service.** Once any category
 is deselected, OpenStreetMap downloads switch from the map API to Overpass

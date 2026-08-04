@@ -104,7 +104,7 @@
         <div class="row">
           <label>Tile size (m)
             <input id="tile-size" type="number" min="500" step="100" value="2000" />
-            <span class="hint">Cuts the extent into tiles this many metres across. The OSM map API refuses any request over 50000 nodes; a tile that dense retries automatically at smaller sizes, down to 1000 m, rather than failing outright. 2000 m suits most sites; dense city centres may want to start at 1500 or 1000 m. Below 1000 m there is no smaller size left to retry at, so a tile that is still too dense there fails outright instead.</span>
+            <span class="hint">Cuts the extent into tiles this many metres across. The OSM map API refuses any request over 50000 nodes; a tile that dense is split into four and fetched in pieces, twice over if it needs it, rather than failing outright. The rest of the run is unaffected and nothing already downloaded is fetched again, so the whole download just takes a little longer. 2000 m suits most sites. Only ground still over the cap at a sixteenth of a tile fails, and the log says which piece and how large it was.</span>
           </label>
           <label>Overlap (m)
             <input id="overlap" type="number" min="0" step="10" value="100" />
