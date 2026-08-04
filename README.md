@@ -79,6 +79,50 @@ label next to it says which is actually true, and updates the moment you
 save a new key or clear the field. It never shows the key itself, only
 whether one is on disk.
 
+### Which elevation model
+
+The DEM is a choice, in Settings or with `--demtype`, and it defaults to
+COP30 exactly as it always was. Be clear about what the choice is for,
+because it is not what it sounds like:
+
+**Nothing in the list is higher resolution than COP30.** OpenTopography's
+global DEM API serves 30 m at best, anywhere, Wales included, and a paid
+OpenTopography plan (OT+) buys high resolution LiDAR for North America
+rather than sharper data anywhere else. If you came here looking for a
+finer DEM for a Welsh site, it is not in this setting; it is NRW LiDAR
+through DataMapWales, which is phase 2 work (see the roadmap).
+
+What the choice actually changes is the kind of model:
+
+| Model | Resolution | What it measures |
+| --- | --- | --- |
+| `COP30` (default) | 30 m | Surface: roofs and tree canopy are in the heights |
+| `EU_DTM` | 30 m | Bare earth terrain, Europe including the UK |
+| `AW3D30` | 30 m | Surface (JAXA ALOS) |
+| `NASADEM` | 30 m | Surface (reprocessed SRTM) |
+| `SRTMGL1` | 30 m | Surface (SRTM) |
+| `COP90` | 90 m | Surface, coarser and quicker |
+| `SRTMGL3` | 90 m | Surface, coarser |
+
+For a site section or a ground plane, `EU_DTM` is often the more useful of
+these, because a 30 m surface model puts trees and roofs into the terrain.
+That, and not sharpness, is the reason this setting exists.
+
+Every other `demtype` OpenTopography's API accepts is still valid on
+`--demtype` (the ellipsoidal variants `SRTMGL1_E` and `AW3D30_E`, the
+bathymetry grids, `GEDTM30`, and the Canada and South America products),
+and none of them is offered in the interface: the ellipsoidal ones differ
+from their ordinary siblings by tens of metres vertically with nothing on
+screen to say so, the bathymetry grids and `GEDI_L3` are 500 m and 1 km,
+and the regional ones do not cover Wales. `survey.json` records the model
+each package actually holds, along with that model's own licence and
+citation rather than Copernicus' regardless of what was downloaded.
+
+An unrecognised model is refused before anything is downloaded, by the
+same construction-time check an unrecognised `--category` goes through, so
+the browser and the command line both get "Unknown elevation model" and
+the list of valid ones rather than a download that fails halfway.
+
 ## Running it
 
 ### Browser
@@ -121,8 +165,20 @@ the URL, so nothing else on the machine can drive it. On the page:
   there per data source that needs one (OpenTopography's, for the
   elevation layer), driven by the same source registry the layer list
   comes from, so a second or third keyed source in a later phase needs no
-  new panel. An Appearance setting there too: Match system (the default),
-  Light or Dark, applied to the whole page and to the tile grid below.
+  new panel. The elevation model select is built from that same registry
+  (see "Which elevation model"), and it says on the page that nothing in
+  it is sharper than the default. An Appearance setting there too: Match
+  system (the default), Light or Dark, applied to the whole page and to
+  the tile grid below.
+- Output root has a Browse button beside it that opens a real Windows
+  folder dialog and writes the chosen path into the field. A browser
+  cannot hand a page a filesystem path, so the dialog is opened by the
+  local server, in a short-lived child process; the text field is
+  unchanged and still does the whole job on its own. Cancelling, a
+  dialog left open for two minutes, and a machine with no picker at all
+  each leave the field exactly as it was and say so underneath it. If
+  the dialog does not appear, look behind the browser window: it is a
+  native window and can open behind a maximised one.
 - Tile size is a slider, and it says what each size costs for the extent
   currently drawn: the tile count and the estimated time, re-estimated
   from the server a moment after you stop moving it rather than on every
@@ -352,8 +408,10 @@ Each file:
   without knowing which Overture type produced them. Only these three are
   copied here; every other requested type is still available as the
   `<stem>_<type>.geojson` file above.
-- **`<stem>.tif`**: the whole-area Copernicus DEM GeoTIFF, if an elevation
-  source was selected and an OpenTopography key was available.
+- **`<stem>.tif`**: the whole-area DEM GeoTIFF, if an elevation source was
+  selected and an OpenTopography key was available. Which model it is comes
+  from the `--demtype` setting (COP30 by default) and is recorded in
+  `survey.json`.
 - **`<stem>_project_setting.json`**: written by the Urbano bridge, only when
   the bridge succeeds. This is the single file to point Urbano 2 at.
 - **`survey.json`**: see below.
@@ -385,7 +443,7 @@ Fields, as actually written:
 | `extent_km` | Width and height of that bbox in kilometres. |
 | `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. Always the tiling that was requested: a tile too dense for one request is split inside its own tile (see "Limits worth knowing about") and the plan itself never changes. |
 | `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
-| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), and, for Overture, `types` (the actual Overture types fetched). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
+| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), for Overture `types` (the actual Overture types fetched), and for elevation `demtype` (the DEM model the package actually holds, with `licence` and `attribution` beside it being that model's own). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
 | `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"`/`"pending"` status per source. `"pending"` means the source never got a turn on that tile at all, most often because a Stop request landed first; it is a different, more honest claim than `"failed"`, which means a real attempt came up short. |
 | `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
 | `stopped` | `true` only when a Stop request is the reason `complete` is `false`, never for an ordinary tile failure. Distinguishes the two ways a package can be short: `complete: false, stopped: true` is exactly as far as you asked it to go and is safe to hand to Grasshopper as is; `complete: false, stopped: false` means something failed. Re-running the same extent resumes either way. |

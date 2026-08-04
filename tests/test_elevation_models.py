@@ -177,7 +177,10 @@ def test_the_labels_say_which_models_are_surface_and_which_are_bare_earth():
 def test_no_label_or_licence_uses_an_em_dash():
     # A project-wide rule, checked where new prose is most likely to
     # arrive: this module is a table of copy that reaches both a dropdown
-    # and a package's own survey.json.
+    # and a package's own survey.json. Written as an escape rather than
+    # the character itself so a plain grep for one over this repository
+    # still comes back empty, including from this file.
+    em_dash = chr(8212)
     for model in DEMTYPES.values():
         for text in (model.label, model.licence, model.attribution):
-            assert "—" not in text
+            assert em_dash not in text
