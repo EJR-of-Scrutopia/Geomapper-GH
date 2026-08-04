@@ -3336,19 +3336,62 @@ function ok(condition, message) {
     ok(Math.abs(summary.fractionDone - 0.5) < 1e-9, `expected 50%, got ${summary.fractionDone}`);
   });
 
-  await test("progress: subdivisions are counted from the events, once each", async () => {
+  await test("progress: one tile split twice is one tile, not two", async () => {
+    // Review finding I5. This check was named "subdivisions are counted
+    // from the events, once each", fed exactly the two events one
+    // doubly-split plan tile produces, and asserted 2. It constructed the
+    // wrong answer and pinned it: the countdown then told the owner "2
+    // tiles were too dense" about one tile, and at MAX_SUBDIVISION_DEPTH
+    // a single plan tile can produce five events and would have read "5
+    // tiles were".
+    //
+    // The fixture's second id is r00_c00_q10, a real quarter id: quarters
+    // are _q00, _q01, _q10 and _q11 (see geo.split_tile_into_quarters),
+    // and the old fixture's r00_c00_q02 was an id that function cannot
+    // produce.
     const { sandbox } = await bootedSandbox();
-    const summary = sandbox.summariseJob(
+    const oneTileTwice = sandbox.summariseJob(
       ["r00_c00", "r00_c01"],
       ["osm"],
       [
         { event: "tile_subdivided", source: "osm", tile_id: "r00_c00", pieces: 4, depth: 1 },
-        { event: "tile_subdivided", source: "osm", tile_id: "r00_c00_q02", pieces: 4, depth: 2 },
+        { event: "tile_subdivided", source: "osm", tile_id: "r00_c00_q10", pieces: 4, depth: 2 },
       ],
       true,
       BARRY_SECONDS
     );
-    ok(summary.subdivisions === 2, `expected 2 subdivisions, got ${summary.subdivisions}`);
+    ok(
+      oneTileTwice.subdivisions === 1,
+      `one tile split twice is one tile, got ${oneTileTwice.subdivisions}`
+    );
+
+    // And two genuinely different plan tiles are still two, so this
+    // counts rather than merely capping at one.
+    const twoTiles = sandbox.summariseJob(
+      ["r00_c00", "r00_c01"],
+      ["osm"],
+      [
+        { event: "tile_subdivided", source: "osm", tile_id: "r00_c00", pieces: 4, depth: 1 },
+        { event: "tile_subdivided", source: "osm", tile_id: "r00_c01", pieces: 4, depth: 1 },
+      ],
+      true,
+      BARRY_SECONDS
+    );
+    ok(twoTiles.subdivisions === 2, `expected 2 tiles, got ${twoTiles.subdivisions}`);
+
+    // The sentence the owner actually reads, through remainingLabel, is
+    // what this finding was about: the count above only matters because
+    // it is rendered as a count of tiles.
+    const note = sandbox.remainingLabel({
+      fractionDone: 0,
+      fractionFetched: 0,
+      fractionSkipped: 0,
+      elapsedSeconds: 10,
+      staticSeconds: 175,
+      subdivisions: oneTileTwice.subdivisions,
+    }).note;
+    ok(/one tile was/i.test(note), `expected the singular reading, got: ${note}`);
+    ok(!/2 tiles/.test(note), `expected no claim of two tiles, got: ${note}`);
   });
 
   // --- the countdown's own arithmetic ------------------------------------

@@ -245,7 +245,7 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const finishedSources = new Set();
   const fetchedTiles = new Map(); // source id -> Set of plan tile ids
   const skippedTiles = new Map(); // source id -> Set of plan tile ids
-  let subdivisions = 0;
+  const subdividedTiles = new Set(); // plan tile ids that needed splitting
 
   const setFor = (bucket, source) => {
     if (!bucket.has(source)) bucket.set(source, new Set());
@@ -279,8 +279,18 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     if (event.event === "source_done" && event.source) {
       finishedSources.add(event.source);
     }
-    if (event.event === "tile_subdivided") {
-      subdivisions += 1;
+    // Counted per TILE OF THE PLAN, and this sat outside the
+    // state.has(event.tile_id) guard above, incrementing per EVENT, until
+    // review finding I5. OsmSource emits one tile_subdivided per SPLIT,
+    // and a quarter that is itself over the cap emits another under
+    // tile_id "<parent>_q10", which is not a tile of the plan at all. One
+    // dense tile split twice therefore read as "2 tiles were too dense",
+    // and at the depth cap a single plan tile can produce five events, so
+    // the note would have said "5 tiles were". A Set for the same reason
+    // every other per-tile figure here uses one: the note claims a number
+    // of TILES, so counting one twice is the single thing it must not do.
+    if (event.event === "tile_subdivided" && state.has(event.tile_id)) {
+      subdividedTiles.add(event.tile_id);
     }
   }
 
@@ -334,7 +344,7 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     fractionDone,
     fractionSkipped,
     fractionFetched: Math.max(0, fractionDone - fractionSkipped),
-    subdivisions,
+    subdivisions: subdividedTiles.size,
   };
 }
 
