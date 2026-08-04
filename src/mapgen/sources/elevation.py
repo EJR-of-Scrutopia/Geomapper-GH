@@ -34,7 +34,16 @@ from mapgen.elevation_models import (
 from mapgen.fsutil import atomic_write_bytes
 from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.jobs import CancelToken, Cancelled
-from mapgen.sources.base import Estimate, ProgressSink
+from mapgen.sources.base import (
+    FAILURE_NOT_AUTHORISED,
+    FAILURE_UNKNOWN,
+    Estimate,
+    ProgressSink,
+    TileFailure,
+    classify_status_failure,
+    classify_transport_failure,
+    parse_retry_after,
+)
 
 DEFAULT_OPENTOPOGRAPHY_URL = "https://portal.opentopography.org/API/globaldem"
 USER_AGENT = "mapgen/1.0 (architectural survey tool)"
@@ -450,6 +459,20 @@ class ElevationSource:
         self.url = url
         self.timeout_seconds = timeout_seconds
         self._environ = environ
+        # The per-tile account of the most recent fetch(), for package.py's
+        # retry pass (Task 32). The optional LayerSource extension
+        # sources/base.py documents: reset at the top of every fetch(), so
+        # it always describes THAT call and never accumulates across a
+        # retry, and read by package.py through a defensive getattr.
+        #
+        # Elevation has no tiles of its own (one whole-area request, see
+        # the module docstring), so a failure here is recorded against
+        # every tile the caller handed in. That is not a fabricated
+        # per-tile fact: one whole-extent download that did not arrive
+        # did not arrive for every tile equally, which is the same
+        # reasoning package.py's _record_tile_outcomes already applies to
+        # this source.
+        self.tile_failures: list[TileFailure] = []
 
     def configure(self, demtype: str) -> "ElevationSource":
         """Returns a fresh ElevationSource scoped to this request's chosen
@@ -552,6 +575,49 @@ class ElevationSource:
         )
         return Estimate(bytes_estimate=bytes_estimate, seconds_estimate=seconds_estimate)
 
+    def _record_tile_failures(
+        self,
+        tiles: Sequence[Tile],
+        kind: str,
+        reason: str,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        """Record why this fetch() could not deliver, once per tile.
+
+        `reason` is composed by the caller from the shared failure
+        vocabulary and nothing else. Never from str(exc), never from the
+        response body, never from a URL, and this is the rule that binds
+        every future edit to this file rather than a convention that
+        happens to hold today.
+
+        The reason is that this module is the one place in mapgen where a
+        secret is in scope at all. Everything the redaction work in this
+        file defends (see _redact, _scrub_exception_chain,
+        _redact_response_urls) is a path by which the API key can reach
+        text, and every one of those four rounds found a path nobody had
+        thought of. A reason assembled from a closed vocabulary plus an
+        HTTP status is not a redaction that has to be right; it is a
+        sentence the key was never in. That is the difference between
+        "no leak has been found" and "there is nothing to find", and it
+        is the standard TileFailure's own docstring sets.
+
+        The full, redacted message still reaches the owner: it is what
+        this method's callers raise, and package.py emits it as
+        source_failed. What is deliberately narrower is the text that
+        lands in survey.json and in the tile_failed event, which are
+        files and streams that outlive the run.
+        """
+        self.tile_failures = [
+            TileFailure(
+                source=self.id,
+                tile_id=tile.tile_id,
+                kind=kind,
+                reason=reason,
+                retry_after_seconds=retry_after_seconds,
+            )
+            for tile in tiles
+        ]
+
     def fetch(
         self,
         bbox: BBox,
@@ -560,6 +626,11 @@ class ElevationSource:
         progress: ProgressSink,
         cancel: CancelToken | None = None,
     ) -> list[Path]:
+        # Reset before anything else, including the cancellation check, so
+        # this list always describes THIS call. A stop leaves it empty,
+        # which is right: a stop is not a failure and must never be
+        # reported as one (Task 22).
+        self.tile_failures = []
         # Elevation has no per-tile loop to check between iterations of
         # (see the module docstring: one whole-area request, not one per
         # tile), so the only meaningful checkpoint is before that single
@@ -578,7 +649,22 @@ class ElevationSource:
             progress.emit("tile_skipped", source=self.id, tile_id="whole-area")
             return [output_path]
 
-        api_key = resolve_api_key(self._api_key, self._environ, self._configured_key())
+        try:
+            api_key = resolve_api_key(self._api_key, self._environ, self._configured_key())
+        except MissingApiKeyError:
+            # Recorded, then re-raised untouched. not_authorised is the
+            # vocabulary's own term for "a wrong, missing or expired key",
+            # and it is deliberately not retryable: no number of attempts
+            # conjures a key. The sentence is a fixed string with nothing
+            # interpolated into it, so there is no value here for a
+            # redaction to have to catch.
+            self._record_tile_failures(
+                tiles,
+                FAILURE_NOT_AUTHORISED,
+                "Failed to download DEM: no OpenTopography API key is "
+                "configured. Keys are free from portal.opentopography.org.",
+            )
+            raise
         params = {
             "demtype": self.demtype,
             "south": f"{bbox.south:.7f}",
@@ -634,6 +720,27 @@ class ElevationSource:
                 timeout=self.timeout_seconds,
             ) as response:
                 status_code = response.status_code
+                # Read inside the `with`, beside the status, not at the
+                # raise site below: headers are the service's own
+                # instruction about when to come back, and reading them
+                # off a closed response is a detail of requests' own
+                # internals that this module should not have to depend
+                # on. A plain float or None, which survives the block;
+                # nothing here holds a URL.
+                #
+                # Only on a bad status, and defensively. The happy path
+                # must not touch a single attribute it did not touch
+                # before this task: an AttributeError raised while
+                # reading a header would be caught by the except clause
+                # below and turned into a download failure, on a request
+                # that actually succeeded. A response that cannot say
+                # when to come back is treated exactly like one that did
+                # not say.
+                retry_after_seconds = (
+                    parse_retry_after(getattr(response, "headers", None))
+                    if status_code >= 400
+                    else None
+                )
                 payload = (
                     b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)
                     if status_code < 400
@@ -681,6 +788,15 @@ class ElevationSource:
             # directly, bypassing that suppression, finds it already clean.
             _scrub_exception_chain(exc, api_key)
             message = f"Failed to download DEM: {_redact(str(exc), api_key)}"
+            # Classified by the exception's TYPE, never its message. A
+            # timeout and a dropped connection are both retryable, and
+            # anything this classifier does not recognise comes back
+            # unknown, which package.py never retries. Recorded here
+            # rather than after the raise, because there is no after.
+            kind, phrase = classify_transport_failure(exc)
+            self._record_tile_failures(
+                tiles, kind, f"Failed to download DEM: OpenTopography {phrase}."
+            )
             # Cleared before the raise, not after: a frame that is still
             # on the stack when an exception propagates through it stays
             # inspectable exactly as it was at that point, to
@@ -717,6 +833,22 @@ class ElevationSource:
             # on every attempt, which is exactly what made this the
             # finding worth catching before a fifth round had to.
             _redact_response_urls(response, api_key)
+            # The one branch this whole section of Task 32 exists for.
+            # 401 and 403 are elevation's dominant failure by a wide
+            # margin, and classify_status_failure puts them outside
+            # RETRYABLE_FAILURE_KINDS: a rejected key is rejected
+            # identically every time, it costs the owner their own quota
+            # to find that out again, and it delays the honest error. A
+            # 429, a 500 and a 503 are retried, and a 429's Retry-After
+            # is carried through so package.py waits the period the
+            # service actually asked for instead of coming straight back.
+            kind, phrase = classify_status_failure(status_code)
+            self._record_tile_failures(
+                tiles,
+                kind,
+                f"Failed to download DEM: OpenTopography {phrase}.",
+                retry_after_seconds=retry_after_seconds,
+            )
             del api_key, params
             raise ElevationError(f"Failed to download DEM: HTTP {status_code}")
 
@@ -741,6 +873,25 @@ class ElevationSource:
             # so it is scrubbed in place directly, the same way the
             # status-check branch above it does.
             _redact_response_urls(response, api_key)
+            # Never retried, and unknown is the honest kind for it. A 200
+            # carrying something that is not a TIFF is how OpenTopography
+            # reports a demtype it does not have and how it serves a
+            # maintenance or error page, and mapgen cannot tell those
+            # apart from here. The first is permanent, so retrying is the
+            # wrong default, and the vocabulary's own rule is that an
+            # unrecognised cause is never retried blind.
+            #
+            # `preview` is deliberately NOT the reason. It is redacted,
+            # and it is still the raw response body: this is the one
+            # sentence in this module composed from something the service
+            # sent, and survey.json is a file that outlives the run. The
+            # preview reaches the owner through the raised exception and
+            # the source_failed event, which is where it belongs.
+            self._record_tile_failures(
+                tiles,
+                FAILURE_UNKNOWN,
+                "Failed to download DEM: OpenTopography did not return a TIFF.",
+            )
             # api_key and params for the same reason as the except
             # branch above; payload and decoded because both are the
             # raw, un-redacted response body, which can itself echo the

@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 import pytest
 import requests
 
-from mapgen.geo import BBox
+from mapgen.geo import BBox, Tile
 from mapgen.jobs import Cancelled
 from mapgen.sources.base import NullProgress
 from mapgen.sources.elevation import (
@@ -1326,3 +1326,297 @@ def test_fetch_does_not_leave_the_raw_key_in_any_frame_local_on_the_cancelled_pa
 def test_possible_outputs_names_exactly_the_stem_tif_file():
     source = ElevationSource(api_key="k")
     assert source.possible_outputs("Stem_2026-08-01") == ["Stem_2026-08-01.tif"]
+
+
+# --- Task 32: elevation says WHY it failed, so a transient one can be
+# retried and a rejected key never is ---------------------------------------
+#
+# Before this, elevation failed as a whole layer with no per-tile cause,
+# and package.py never retries a failure with no kind. So the one keyed
+# source, whose service really does time out and really does rate limit,
+# got exactly one attempt at everything, while its most common failure by
+# a wide margin (a wrong or missing key) was indistinguishable from a
+# service having a bad minute.
+#
+# Every test here asserts against the RECORDED failure, not against the
+# raised exception, because the record is the thing that is new and it is
+# the thing that reaches survey.json and the browser.
+
+def _tile(tile_id, row=0, col=0):
+    return Tile(tile_id=tile_id, row=row, col=col, core_bbox=BBOX, query_bbox=BBOX)
+
+
+_TILES = [_tile("r00_c00")]
+
+
+class HeaderedResponse(FakeStreamResponse):
+    """A response that carries headers, which FakeStreamResponse does not.
+
+    Deliberately a separate double rather than a header dict added to the
+    existing one. Every test above was written against a response with no
+    headers at all, and that is a real shape this module has to survive:
+    it is what proves the happy path never reads a header it does not
+    need. Retry-After needs the opposite, so it gets its own double and
+    both shapes stay covered.
+    """
+
+    def __init__(self, chunks, status_code=200, headers=None):
+        super().__init__(chunks, status_code=status_code)
+        self.headers = dict(headers or {})
+
+
+def test_a_successful_fetch_records_no_failure_at_all(tmp_path):
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    )
+    source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures == []
+
+
+def test_a_rejected_key_is_recorded_as_not_authorised_and_never_retryable(tmp_path):
+    from mapgen.package import RETRYABLE_FAILURE_KINDS
+
+    source = ElevationSource(
+        api_key=SECRET, session=FakeSession(FakeStreamResponse([], status_code=401))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+
+    failure = source.tile_failures[0]
+    assert failure.source == "elevation"
+    assert failure.tile_id == "r00_c00"
+    assert failure.kind == "not_authorised"
+    assert failure.kind not in RETRYABLE_FAILURE_KINDS
+    assert "401" in failure.reason
+
+
+def test_a_forbidden_response_is_also_never_retryable(tmp_path):
+    from mapgen.package import RETRYABLE_FAILURE_KINDS
+
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([], status_code=403))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures[0].kind not in RETRYABLE_FAILURE_KINDS
+
+
+def test_a_service_error_and_a_timeout_are_both_retryable(tmp_path):
+    from mapgen.package import RETRYABLE_FAILURE_KINDS
+
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([], status_code=503))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures[0].kind == "service_error"
+    assert source.tile_failures[0].kind in RETRYABLE_FAILURE_KINDS
+
+    timing_out = ElevationSource(
+        api_key="k", session=ConnectFailureSession(requests.exceptions.ReadTimeout)
+    )
+    with pytest.raises(ElevationError):
+        timing_out.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert timing_out.tile_failures[0].kind == "timeout"
+    assert timing_out.tile_failures[0].kind in RETRYABLE_FAILURE_KINDS
+
+
+def test_a_rate_limit_carries_the_period_the_service_asked_for(tmp_path):
+    source = ElevationSource(
+        api_key="k",
+        session=FakeSession(
+            HeaderedResponse([], status_code=429, headers={"Retry-After": "30"})
+        ),
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+
+    failure = source.tile_failures[0]
+    assert failure.kind == "rate_limited"
+    assert failure.retry_after_seconds == pytest.approx(30.0)
+
+
+def test_a_rate_limit_with_no_retry_after_header_carries_none(tmp_path):
+    # The ordinary case, and the one that must not become a zero-second
+    # wait dressed up as an instruction the service never gave.
+    source = ElevationSource(
+        api_key="k", session=FakeSession(HeaderedResponse([], status_code=429))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures[0].kind == "rate_limited"
+    assert source.tile_failures[0].retry_after_seconds is None
+
+
+def test_a_missing_key_is_recorded_rather_than_left_unexplained(tmp_path, monkeypatch):
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+    source = ElevationSource(api_key=None, environ={})
+    with pytest.raises(MissingApiKeyError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+
+    failure = source.tile_failures[0]
+    assert failure.kind == "not_authorised"
+    assert "portal.opentopography.org" in failure.reason
+
+
+def test_a_non_tiff_response_is_recorded_as_unknown_and_never_retried(tmp_path):
+    from mapgen.package import RETRYABLE_FAILURE_KINDS
+
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([b"<html>nope</html>"]))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures[0].kind == "unknown"
+    assert source.tile_failures[0].kind not in RETRYABLE_FAILURE_KINDS
+
+
+def test_a_stop_records_no_failure_because_a_stop_is_not_a_failure(tmp_path):
+    from mapgen.jobs import CancelToken
+
+    token = CancelToken()
+    token.cancel()
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    )
+    with pytest.raises(Cancelled):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress(), cancel=token)
+    assert source.tile_failures == []
+
+
+def test_the_record_is_reset_by_the_next_fetch_and_never_accumulates(tmp_path):
+    # The convention sources/base.py documents. A retry that succeeds must
+    # not leave the previous attempt's reason attached to a layer that is
+    # now on disk.
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([], status_code=503))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert len(source.tile_failures) == 1
+
+    source.session = FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures == []
+
+
+def test_one_failure_is_recorded_against_every_tile_it_covers(tmp_path):
+    # Elevation makes one whole-area request, so a failure is a failure
+    # for every tile equally. This is what lets package.py's retry pass,
+    # which is written in tiles, reach a source that has none.
+    tiles = [
+        _tile(f"r{r:02d}_c{c:02d}", row=r, col=c) for r in range(2) for c in range(2)
+    ]
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([], status_code=503))
+    )
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, tiles, tmp_path, NullProgress())
+
+    assert [f.tile_id for f in source.tile_failures] == [
+        "r00_c00", "r00_c01", "r01_c00", "r01_c01"
+    ]
+    assert len({f.reason for f in source.tile_failures}) == 1
+
+
+# --- The proof the brief asks for: a key cannot reach a recorded failure ---
+#
+# The redaction work in this module took four rounds and four adversarial
+# reviews, and every round closed a path nobody had thought of, including
+# one through an exception chain and one through requests encoding a space
+# as "+". A recorded failure is a NEW path out of this module: it goes to
+# survey.json, which is a file that outlives the run, and to the tile_failed
+# event, which goes to the browser.
+#
+# It is closed structurally rather than by redaction. The reason is
+# composed from the shared failure vocabulary plus an HTTP status and
+# nothing else, so there is no value in it for a redaction to have to
+# catch. These tests hold that line: every failure path, with a key that
+# is deliberately present in the URL, in the exception text and in the
+# response body.
+
+
+class BodyEchoesTheKeySession:
+    """A service that quotes the key back inside its own error body, which
+    is the shape _redact's value-matching backstop exists for. If a reason
+    were ever composed from the response, this is what would land in
+    survey.json."""
+
+    def __init__(self, status_code=200):
+        self._status_code = status_code
+
+    def get(self, url, **kwargs):
+        body = f"<html>Bad key: {SECRET} for {LEAKY_URL}</html>".encode("utf-8")
+        return HeaderedResponse([body], status_code=self._status_code)
+
+
+@pytest.mark.parametrize(
+    "session_factory",
+    [
+        pytest.param(
+            lambda: ConnectFailureSession(requests.exceptions.ConnectionError),
+            id="connect_failure",
+        ),
+        pytest.param(
+            lambda: ConnectFailureSession(requests.exceptions.ReadTimeout),
+            id="read_timeout",
+        ),
+        pytest.param(lambda: FakeSession(MidStreamDropResponse()), id="mid_stream_drop"),
+        pytest.param(
+            lambda: FakeSession(
+                HeaderedResponse([], status_code=401, headers={"Retry-After": "5"})
+            ),
+            id="unauthorised",
+        ),
+        pytest.param(
+            lambda: FakeSession(HeaderedResponse([], status_code=500)), id="server_error"
+        ),
+        pytest.param(lambda: BodyEchoesTheKeySession(), id="non_tiff_body_echoes_key"),
+        pytest.param(
+            lambda: BodyEchoesTheKeySession(status_code=400), id="bad_request_echoes_key"
+        ),
+    ],
+)
+def test_no_recorded_failure_can_ever_contain_the_key(session_factory, tmp_path):
+    source = ElevationSource(api_key=SECRET, session=session_factory())
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+
+    assert source.tile_failures, "the failure path recorded nothing to check"
+    for failure in source.tile_failures:
+        # The key itself, in every encoding _redact has ever had to learn.
+        assert SECRET not in failure.reason
+        assert quote_plus(SECRET) not in failure.reason
+        assert SECRET.replace("-", "%2D") not in failure.reason
+        # And the two things a key travels inside: a URL and a parameter
+        # name. Neither belongs in a reason at all, which is what makes
+        # the first three assertions structurally guaranteed rather than
+        # merely observed.
+        assert "API_Key" not in failure.reason
+        assert "://" not in failure.reason
+        # No query string can exist without one of these, whatever the
+        # parameter happens to be called next year.
+        assert "=" not in failure.reason
+        assert "&" not in failure.reason
+        # Not vacuous: the reason really does say something.
+        assert failure.reason.startswith("Failed to download DEM: ")
+        assert len(failure.reason) > len("Failed to download DEM: ")
+
+
+def test_the_key_reaches_the_recorded_failure_by_no_route_at_all(tmp_path):
+    # The paranoid version of the test above, and the one that would catch
+    # a future edit composing a reason out of str(exc). Walks the WHOLE
+    # record, not just the reason: every field of it, stringified.
+    source = ElevationSource(api_key=SECRET, session=BodyEchoesTheKeySession())
+    with pytest.raises(ElevationError):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+
+    for failure in source.tile_failures:
+        record = failure.to_record()
+        blob = repr(record) + repr(failure)
+        assert SECRET not in blob
+        assert quote_plus(SECRET) not in blob
+        # REDACTION_PLACEHOLDER present would mean a redaction had to run,
+        # which would mean the reason had been composed from text that
+        # held the key. It must never have to.
+        assert REDACTION_PLACEHOLDER not in blob
