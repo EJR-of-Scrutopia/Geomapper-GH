@@ -178,6 +178,24 @@ def _absolute(path: Path) -> Path:
     return path if path.is_absolute() else path.resolve()
 
 
+def project_zone(bbox: BBox) -> str:
+    """The one UTM zone a package is measured in.
+
+    The bottom right corner's, which is the one Urbano's own `WorldOrigin`
+    keeps after assigning `Utm` twice; see `world_origin` below for why that
+    matters and why mapgen projects both corners into it.
+
+    A function rather than a line inside `world_origin` because the
+    elevation grid has to be built in exactly this zone and nothing else.
+    Urbano projects every piece of downstream geometry with
+    `CoordinateReference.Utm` and samples the grid with the result, so a grid
+    built in a neighbouring zone would be sampled hundreds of kilometres from
+    where it is. Two separate opinions about "which zone" is the shape that
+    failure would take, so there is one.
+    """
+    return utm_zone(bbox.south, bbox.east)
+
+
 def world_origin(bbox: BBox) -> dict[str, object]:
     """Urbano's `CoordinateReference`: a zone string and the two bottom
     corners of the extent, projected.
@@ -206,7 +224,7 @@ def world_origin(bbox: BBox) -> dict[str, object]:
     to differ, and the report for task 35 records it as a difference rather
     than leaving it to be discovered.
     """
-    zone = utm_zone(bbox.south, bbox.east)
+    zone = project_zone(bbox)
     left_easting, left_northing = project(bbox.south, bbox.west, zone)
     right_easting, right_northing = project(bbox.south, bbox.east, zone)
     return {
