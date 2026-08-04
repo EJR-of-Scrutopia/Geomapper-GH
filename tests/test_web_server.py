@@ -26,6 +26,7 @@ from mapgen.web.server import (
     JobBusyError,
     JobManager,
     JobRecord,
+    _survey_request,
     _watch_heartbeat,
     build_server,
     make_handler,
@@ -853,6 +854,71 @@ def test_an_empty_category_selection_is_refused_by_estimate_too(server, tmp_path
             },
         )
     assert excinfo.value.code == 400
+
+
+def test_an_empty_layer_selection_is_refused_rather_than_downloading_everything(
+    server, tmp_path
+):
+    # Review finding C1, reproduced exactly as the reviewer did: the
+    # payload app.js sends when every layer checkbox is unticked. This
+    # used to be coalesced back into ("osm", "overture") by
+    # `payload.get("sources") or (...)`, three lines above the comment in
+    # the same function explaining why `or` is wrong for the sibling
+    # categories field, and the owner got a full OpenStreetMap plus
+    # Overture download of data they had just switched off.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/jobs",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "South Wales",
+                "site": "Barry",
+                "output_root": str(tmp_path),
+                "sources": [],
+                "run_bridge": False,
+            },
+        )
+    assert excinfo.value.code == 400
+    message = json.loads(excinfo.value.read().decode("utf-8"))["error"].lower()
+    assert "no layers are selected" in message
+    assert "at least one layer" in message
+    # Nothing was started, so nothing was downloaded and no package exists.
+    assert not any((tmp_path / "South-Wales").glob("**/survey.json"))
+
+
+def test_an_empty_layer_selection_is_refused_by_estimate_too(server, tmp_path):
+    # The estimate call is what enables or disables Download, so it has to
+    # refuse the same selection /api/jobs does, for the same reason the
+    # empty-category case directly above needs both.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/estimate",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "South Wales",
+                "site": "Barry",
+                "output_root": str(tmp_path),
+                "sources": [],
+            },
+        )
+    assert excinfo.value.code == 400
+
+
+def test_a_missing_layer_selection_still_means_the_default_pair(server, tmp_path):
+    # The other half of C1, and the half that must NOT change: an absent
+    # "sources" key (an older client, or the CLI without --source) still
+    # means the default set. Only a present, empty list is refused.
+    request = _survey_request(
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+        }
+    )
+    assert request.source_ids == ("osm", "overture")
 
 
 def test_a_missing_category_selection_defaults_to_every_category(server, tmp_path):

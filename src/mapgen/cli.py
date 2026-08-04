@@ -36,7 +36,11 @@ from mapgen.package import (
     register_default_sources,
     run_survey,
 )
-from mapgen.sources.base import UnknownSourceError, available_sources
+from mapgen.sources.base import (
+    EmptySourceSelectionError,
+    UnknownSourceError,
+    available_sources,
+)
 from mapgen.sources.elevation import ElevationError
 from mapgen.sources.osm import OsmDownloadError
 from mapgen.sources.overture import OvertureError
@@ -144,7 +148,16 @@ def _request_from_args(args: argparse.Namespace) -> SurveyRequest:
         output_root=Path(output_root),
         tile_size_m=args.tile_size_m,
         overlap_m=args.overlap_m,
-        source_ids=tuple(args.sources or ("osm", "overture")),
+        # `or` is safe here and unsafe in server.py's own version of this
+        # line (see C1 there): argparse's append action leaves this None
+        # when --source is never given and a non-empty list otherwise, so
+        # there is no way to type an empty selection at a terminal. Kept
+        # in the same explicit shape anyway, so the two entry points read
+        # alike and nobody has to re-derive which of them can produce an
+        # empty list.
+        source_ids=(
+            tuple(args.sources) if args.sources is not None else ("osm", "overture")
+        ),
         overture_types=tuple(args.overture_types) if args.overture_types else None,
         categories=tuple(args.categories) if args.categories else None,
         # The flag wins over the saved setting, and neither one is
@@ -415,6 +428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         TilingError,
         UnknownCategoryError,
         EmptyCategorySelectionError,
+        EmptySourceSelectionError,
         UnknownDemTypeError,
         OsmDownloadError,
         OvertureError,
@@ -440,7 +454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # catching ValueError itself, so it needs the same one-line
         # addition here that every new request-validation error has.
         # UnknownDemTypeError (Task 28) is the next one along, added the
-        # same way for the same reason.
+        # same way for the same reason, and EmptySourceSelectionError
+        # (review finding C1) the one after that.
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

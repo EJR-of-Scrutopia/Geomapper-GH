@@ -1758,6 +1758,21 @@ def test_survey_request_rejects_an_empty_category_selection_at_construction(tmp_
     _request(tmp_path, categories=None)
 
 
+def test_survey_request_rejects_an_empty_layer_selection_at_construction(tmp_path):
+    # Review finding C1, and the exact counterpart of the empty-category
+    # case above. server.py built source_ids with
+    # `payload.get("sources") or ("osm", "overture")`, so a browser that
+    # sent sources: [] got the full default set downloaded: 72 rate-
+    # limited OSM tiles and eight whole-extent Overture downloads of the
+    # data the owner had just switched off. Refused at construction, the
+    # one place --source and the browser's checklist meet, so neither
+    # entry point can grow a way round it.
+    from mapgen.sources.base import EmptySourceSelectionError
+
+    with pytest.raises(EmptySourceSelectionError, match="layer is needed"):
+        _request(tmp_path, source_ids=())
+
+
 def test_effective_overture_types_prefers_an_explicit_overture_type_over_categories(tmp_path):
     # Two different ways of choosing the same thing must not both apply
     # at once: the CLI's own original, lower-level --overture-type wins

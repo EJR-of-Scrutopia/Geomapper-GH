@@ -1697,6 +1697,73 @@ function ok(condition, message) {
     }
   );
 
+  await test(
+    "unticking every LAYER checkbox disables Download with a visible reason",
+    async () => {
+      // Review finding C1. The layer checklist had no client-side guard
+      // at all: missingFieldsMessage() checked the extent, the names and
+      // the categories and never the layers, so Download stayed enabled,
+      // the page sent sources: [], and the server coalesced that back
+      // into the full default pair and downloaded both.
+      let allowEstimate = true;
+      const { fetchCalls, sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/extent") {
+          return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
+        }
+        if (url.pathname === "/api/estimate") {
+          // Answered only for the fully-ticked estimate below, for the
+          // same reason the category test above does it: reaching this
+          // route with no layer selected is the guard failing, and an
+          // unhandled-fetch error is the right way for that to fail.
+          if (!allowEstimate) return null;
+          return jsonResponse(200, {
+            tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 },
+            bytes_estimate: 1000, seconds_estimate: 60, warnings: [], folder: "C:\\out",
+          });
+        }
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      setField(sandbox, "region", "R");
+      setField(sandbox, "site", "S");
+      await flush(10);
+      ok(sandbox.document.getElementById("download").disabled === false, "expected a valid estimate first");
+
+      allowEstimate = false;
+      fetchCalls.length = 0;
+      const boxes = sandbox.document.querySelectorAll("#sources input");
+      ok(boxes.length > 0, "expected the layer checklist to have rendered");
+      boxes.forEach((box) => {
+        box.checked = false;
+      });
+      sandbox.document.getElementById("sources").fire("change");
+      await flush(10);
+
+      ok(
+        sandbox.document.getElementById("download").disabled === true,
+        "expected Download disabled once every layer is unticked"
+      );
+      const message = sandbox.document.getElementById("estimate").textContent
+        || sandbox.document.getElementById("estimate").innerHTML;
+      ok(/layer/i.test(message), `expected the reason to mention layers, got: ${message}`);
+      ok(
+        !fetchCalls.some((c) => c.url.pathname === "/api/estimate"),
+        "expected no /api/estimate call while no layer is selected"
+      );
+
+      // And back: re-ticking one layer re-enables Download, so the guard
+      // is a guard rather than a one-way trap.
+      allowEstimate = true;
+      boxes[0].checked = true;
+      sandbox.document.getElementById("sources").fire("change");
+      await flush(10);
+      ok(
+        sandbox.document.getElementById("download").disabled === false,
+        "expected Download re-enabled once a layer is ticked again"
+      );
+    }
+  );
+
   // =======================================================================
   // Task 19, item 2: the settings panel. API key fields are rendered from
   // the source registry (GET /api/sources' api_key_config_field), one per

@@ -255,7 +255,22 @@ def _survey_request(payload: dict) -> SurveyRequest:
         output_root=Path(payload["output_root"]),
         tile_size_m=float(payload.get("tile_size_m", 2000.0)),
         overlap_m=float(payload.get("overlap_m", 100.0)),
-        source_ids=tuple(payload.get("sources") or ("osm", "overture")),
+        # C1. This read `payload.get("sources") or ("osm", "overture")`,
+        # which is the exact pattern the comment below condemns for the
+        # sibling field, three lines away from it. app.js sends the ticked
+        # boxes, so an empty checklist genuinely arrives as [], and `or`
+        # turned "I want none of these layers" into the full default set:
+        # 72 rate-limited OSM tiles and eight whole-extent Overture
+        # downloads of data the owner had just switched off. Absent still
+        # means the default (an older client, or the CLI without
+        # --source); present-and-empty now survives as an empty tuple and
+        # is refused by SurveyRequest.__post_init__, which is where the
+        # identical category case is already refused.
+        source_ids=(
+            tuple(payload["sources"])
+            if payload.get("sources") is not None
+            else ("osm", "overture")
+        ),
         # Absent entirely (an older client, or the CLI without --category)
         # means None, "every category". A present-but-empty list is a
         # genuine, deliberate "nothing selected" and must not be coalesced

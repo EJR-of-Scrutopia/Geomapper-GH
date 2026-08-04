@@ -29,6 +29,39 @@ class DuplicateSourceError(ValueError):
     """Raised when two sources try to register the same id."""
 
 
+class EmptySourceSelectionError(ValueError):
+    """Raised for an explicitly empty layer selection.
+
+    The exact counterpart of mapgen.categories.EmptyCategorySelectionError,
+    and open for the same reason it was: server.py built source_ids with
+    `payload.get("sources") or ("osm", "overture")`, three lines above its
+    own comment explaining why `or` is wrong for the sibling field. A
+    browser that sends sources: [] (which app.js does, since it maps the
+    ticked boxes and an empty checklist maps to an empty array) therefore
+    got the full default set back. Unticking every layer downloaded both
+    of them: on the owner's Barry extent that is 72 rate-limited OSM tiles
+    plus eight whole-extent Overture downloads of data they had just
+    switched off.
+
+    Refused rather than honoured, matching the category ruling exactly:
+    there is no workflow this tool serves where "survey no layers at all"
+    is a useful, intentional request, and the owner reaches this state by
+    accident. A survey with no sources would write a package holding
+    nothing but a survey.json, reported complete: true.
+
+    A ValueError subclass so server.py's _REQUEST_VALUE_ERRORS already
+    turns it into the same plain 400 an unknown category gets, and
+    cli.py's own exception tuple needs the same one-line addition
+    UnknownCategoryError and EmptyCategorySelectionError each needed.
+
+    Absent is not this, exactly as it is not for categories: a request
+    that never mentions sources at all (an older client, or the CLI
+    without --source) means "the default set", and only a present,
+    empty list means "none". server.py and cli.py are what keep those
+    two apart before a SurveyRequest is ever built.
+    """
+
+
 @runtime_checkable
 class ProgressSink(Protocol):
     def emit(self, event: str, **fields: object) -> None: ...

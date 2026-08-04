@@ -35,6 +35,7 @@ from mapgen.naming import (
     tiling_fingerprint,
 )
 from mapgen.sources.base import (
+    EmptySourceSelectionError,
     NullProgress,
     ProgressSink,
     available_sources,
@@ -121,6 +122,18 @@ class SurveyRequest:
         # by this too, on the next estimate, because that is also a
         # SurveyRequest.
         validate_demtype(self.elevation_demtype)
+        # C1, and the same ruling as validate_categories above: an
+        # explicitly empty layer selection is an accident, not a request
+        # for an empty package. Checked here, at the one place the CLI's
+        # --source and the browser's checklist both already meet, rather
+        # than in server.py alone, so neither entry point can grow a way
+        # round it. len() rather than a truth test: source_ids is a
+        # Sequence, and the point of this whole finding is that an empty
+        # sequence must stay distinguishable from a missing one.
+        if len(self.source_ids) == 0:
+            raise EmptySourceSelectionError(
+                "No layers are selected. At least one layer is needed."
+            )
 
     @property
     def effective_date(self) -> date:

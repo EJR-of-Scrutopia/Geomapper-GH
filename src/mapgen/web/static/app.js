@@ -946,11 +946,28 @@ function noCategorySelected() {
   return boxes.length > 0 && boxes.every((box) => !box.checked);
 }
 
+// The same check for the layer checklist, added by review finding C1.
+// Unticking every layer used to send sources: [], which the server
+// coalesced back into the full default set, so the owner got an
+// OpenStreetMap and Overture download of exactly the data they had just
+// switched off. The server now refuses an empty list (see
+// mapgen.sources.base.EmptySourceSelectionError), and this is what keeps
+// the owner from ever reaching a refusal: Download sits disabled with the
+// same missing-fields sentence a blank site name already produces.
+//
+// Empty reads as "nothing to say yet" for the same reason it does above:
+// boot() renders this checklist with every box ticked, so zero boxes only
+// ever means GET /api/sources has not landed yet.
+function noLayerSelected() {
+  const boxes = [...document.querySelectorAll("#sources input")];
+  return boxes.length > 0 && boxes.every((box) => !box.checked);
+}
+
 // Names the field or fields actually missing, rather than a fixed message
 // regardless of which ones are empty: a region already filled by the
 // reverse lookup must not be told to "enter a region" alongside a genuinely
-// empty site. Returns null once bbox, region, site and at least one
-// category are all present.
+// empty site. Returns null once bbox, region, site, at least one layer and
+// at least one category are all present.
 function missingFieldsMessage() {
   const clauses = [];
   if (!bbox) clauses.push("draw or paste an extent");
@@ -958,6 +975,7 @@ function missingFieldsMessage() {
   if (!$("region").value.trim()) namesMissing.push("region");
   if (!$("site").value.trim()) namesMissing.push("site");
   if (namesMissing.length) clauses.push(`enter a ${namesMissing.join(" and ")}`);
+  if (noLayerSelected()) clauses.push("select at least one layer");
   if (noCategorySelected()) clauses.push("select at least one category");
   if (!clauses.length) return null;
   const sentence = `${clauses.join(" and ")} to see an estimate.`;
