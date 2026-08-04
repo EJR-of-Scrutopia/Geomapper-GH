@@ -10,6 +10,8 @@ from mapgen.jobs import CancelToken, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
     SurveyRequest,
+    UnbridgeablePackageError,
+    bridge_package,
     estimate_geometry,
     estimate_survey,
     register_default_sources,
@@ -1324,8 +1326,10 @@ def test_coordinate_stem_option_uses_the_coordinate_form(tmp_path):
 
 
 class FakeCompletedProcess:
-    def __init__(self, returncode=0):
+    def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class FakeBridgeRunner:
@@ -1334,15 +1338,27 @@ class FakeBridgeRunner:
     tools/UrbanoBridge/UrbanoBridge.csproj (it genuinely exists in this
     repo), so run_bridge reaches this runner exactly as it would reach the
     real dotnet executable in production.
+
+    It fails the way the real one fails, which is the point of it: a
+    non-zero returncode and nothing else. run_bridge's own returncode
+    check, its inspection of the output for a missing Urbano install, and
+    the BridgeError it raises are all the real code, exercised here. A
+    double that raised BridgeError itself would skip every one of them and
+    would pass whatever run_bridge did.
+
+    stderr is carried so a test can hand it UrbanoBridge's own real output
+    (see REAL_MISSING_URBANO_OUTPUT in tests/test_bridge.py), which is what
+    the owner's machine produces on every run.
     """
 
-    def __init__(self, returncode=0):
+    def __init__(self, returncode=0, stderr=""):
         self.returncode = returncode
+        self.stderr = stderr
         self.calls = []
 
     def __call__(self, command, **kwargs):
         self.calls.append(command)
-        return FakeCompletedProcess(self.returncode)
+        return FakeCompletedProcess(self.returncode, stderr=self.stderr)
 
 
 _MINIMAL_OSM_XML = (
@@ -2965,3 +2981,455 @@ def test_the_estimate_names_the_model_this_request_will_use(tmp_path):
     # While the registered instance, which is what the layer checklist
     # reads, still claims no model at all.
     assert get_source("elevation").display_name == "Elevation (OpenTopography)"
+
+
+# --- Task 29: `mapgen bridge <package-dir>`, the inverse of --skip-bridge.
+# Two live situations, neither of them exotic. The owner has no Urbano
+# install, so the bridge has failed on every run they have ever made and
+# every package they own is missing its _project_setting.json. And review
+# finding I1's deliberate residual: a Stop landing after the last tile
+# leaves complete: true with bridge.attempted: false, in a folder that is
+# never reused, so the Urbano files were previously unreachable without
+# downloading the whole extent again. ------------------------------------
+
+
+def _package_on_disk(
+    tmp_path,
+    *,
+    name="2026-08-01_Barry-Waterfront",
+    stem="Barry-Waterfront_2026-08-01",
+    source_ids=("osm",),
+    files=None,
+    bridge=None,
+    complete=True,
+    stopped=False,
+    bbox=BBOX,
+):
+    """A finished package folder, written directly rather than surveyed.
+
+    Used for the refusals and for the survey.json shapes, which are about
+    packages a run either could not produce or produced long ago. The
+    happy paths below go through run_survey instead, so nothing here is
+    the only evidence that this works on a real package.
+
+    files defaults to exactly the merged output each named source writes,
+    so a test that wants one missing removes it by name rather than by
+    knowing the whole set.
+    """
+    root = tmp_path / "South-Wales" / name
+    root.mkdir(parents=True, exist_ok=True)
+    default_files = {"osm": f"{stem}.osm", "elevation": f"{stem}.tif"}
+    if files is None:
+        files = [default_files[s] for s in source_ids if s in default_files]
+    for filename in files:
+        (root / filename).write_text("merged", encoding="utf-8")
+    payload = {
+        "schema_version": 1,
+        "tool_version": "0.0.0-test",
+        "site": "Barry Waterfront",
+        "region": "South Wales",
+        "slug": {"site": "Barry-Waterfront", "region": "South-Wales"},
+        "date": "2026-08-01",
+        "urbano_stem": stem,
+        "bbox": bbox.to_dict(),
+        "extent_km": {"width": 0.7, "height": 1.11},
+        "tiling": {"tile_size_m": 600.0, "overlap_m": 50.0, "rows": 2, "cols": 2},
+        "sources": [{"id": s, "licence": "CC0", "attribution": "nobody"} for s in source_ids],
+        "categories": ["buildings"],
+        "tiles": [{"tile_id": "r00_c00", **{s: "ok" for s in source_ids}}],
+        "complete": complete,
+        "stopped": stopped,
+        "bridge": (
+            {"attempted": True, "ok": False, "error": "Urbano is not installed"}
+            if bridge is None
+            else bridge
+        ),
+        "started_at": "2026-08-01T09:00:00Z",
+        "finished_at": "2026-08-01T09:05:00Z",
+    }
+    (root / "survey.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return root
+
+
+def _bridge_block(root):
+    return json.loads((root / "survey.json").read_text(encoding="utf-8"))["bridge"]
+
+
+def test_bridge_package_refuses_a_folder_that_is_not_there(tmp_path):
+    register_default_sources()
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(tmp_path / "nothing-here")
+    message = str(excinfo.value)
+    assert "no folder" in message
+    assert "nothing-here" in message
+    # One plain line, the way every other refusal in cli.py's tuple is.
+    assert "\n" not in message
+
+
+def test_bridge_package_refuses_a_package_with_no_survey_json_and_says_to_resume(tmp_path):
+    register_default_sources()
+    root = tmp_path / "half-done"
+    root.mkdir()
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(root)
+    message = str(excinfo.value)
+    assert "survey.json" in message
+    # The brief's requirement, and the only useful thing to say: an
+    # unfinished package needs the survey running again, not this.
+    assert "resume" in message
+    assert "\n" not in message
+
+
+def test_bridge_package_refuses_a_survey_json_it_cannot_read(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+    (root / "survey.json").write_text("{not json at all", encoding="utf-8")
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(root)
+    # Told apart from the missing case deliberately: a resume does not fix
+    # a damaged record of a package that may be entirely intact.
+    assert "could not be read" in str(excinfo.value)
+    assert "resume" not in str(excinfo.value)
+
+
+def test_bridge_package_names_the_input_missing_from_the_package_root(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("osm",), files=[])
+    runner = FakeBridgeRunner(returncode=0)
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(root, bridge_runner=runner)
+    message = str(excinfo.value)
+    assert "Barry-Waterfront_2026-08-01.osm" in message
+    assert "osm layer" in message
+    # Refused BEFORE anything is started, not after a bridge has run and
+    # produced a project setting missing a layer the record names.
+    assert runner.calls == []
+    assert _bridge_block(root) == {
+        "attempted": True,
+        "ok": False,
+        "error": "Urbano is not installed",
+    }, "a refusal must not rewrite the package's own record of its download"
+
+
+def test_bridge_package_names_every_missing_input_not_only_the_first(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("osm", "elevation"), files=[])
+    with pytest.raises(UnbridgeablePackageError) as excinfo:
+        bridge_package(root)
+    message = str(excinfo.value)
+    assert "Barry-Waterfront_2026-08-01.osm" in message
+    assert "Barry-Waterfront_2026-08-01.tif" in message
+
+
+def test_bridge_package_refuses_a_record_with_no_bbox(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+    payload = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    del payload["bbox"]
+    (root / "survey.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(UnbridgeablePackageError, match="bbox"):
+        bridge_package(root)
+
+
+def test_bridge_package_refuses_a_record_with_no_urbano_stem(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+    payload = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    del payload["urbano_stem"]
+    (root / "survey.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(UnbridgeablePackageError, match="urbano_stem"):
+        bridge_package(root)
+
+
+def test_bridge_package_refuses_a_layer_that_does_not_declare_its_outputs(tmp_path):
+    # possible_outputs is an optional LayerSource extension, so this is
+    # reachable, and it must refuse rather than quietly hand the bridge no
+    # OSM file at all: that would be the exact "test passes for the wrong
+    # reason" failure, a bridge that ran and produced nothing useful.
+    class NoDeclaredOutputsSource(StubSource):
+        pass
+
+    source = NoDeclaredOutputsSource(source_id="osm")
+    register(source)
+    root = _package_on_disk(tmp_path, source_ids=("osm",))
+    with pytest.raises(UnbridgeablePackageError, match="does not declare"):
+        bridge_package(root)
+
+
+def test_bridge_package_hands_the_bridge_the_package_and_its_merged_osm_file(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("osm",))
+    runner = FakeBridgeRunner(returncode=0)
+
+    bridge_package(root, bridge_runner=runner)
+
+    command = runner.calls[0]
+    assert command[command.index("--output-folder") + 1] == str(root)
+    assert command[command.index("--file-name-stem") + 1] == "Barry-Waterfront_2026-08-01"
+    assert command[command.index("--osm-file-path") + 1] == str(
+        root / "Barry-Waterfront_2026-08-01.osm"
+    )
+    # The extent comes from the record, never from the folder name, which
+    # carries a site and a date and no coordinates at all.
+    assert command[command.index("--bbox") + 1] == BBOX.to_query_string()
+
+
+def test_bridge_package_hands_over_the_elevation_tiff_when_the_package_holds_one(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("osm", "elevation"))
+    runner = FakeBridgeRunner(returncode=0)
+
+    bridge_package(root, bridge_runner=runner)
+
+    command = runner.calls[0]
+    assert command[command.index("--elevation-tiff-path") + 1] == str(
+        root / "Barry-Waterfront_2026-08-01.tif"
+    )
+    assert "--skip-elevation" not in command
+
+
+def test_bridge_package_skips_elevation_for_a_package_that_holds_none(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("osm",))
+    runner = FakeBridgeRunner(returncode=0)
+
+    bridge_package(root, bridge_runner=runner)
+
+    command = runner.calls[0]
+    assert "--skip-elevation" in command
+    assert "--elevation-tiff-path" not in command
+
+
+def test_bridge_package_bridges_a_package_that_holds_no_osm_layer(tmp_path):
+    # An overture-only package is a real selection, and the bridge fetches
+    # its own buildings geoparquet, so there is nothing to refuse here.
+    register_default_sources()
+    root = _package_on_disk(tmp_path, source_ids=("overture",))
+    runner = FakeBridgeRunner(returncode=0)
+
+    payload = bridge_package(root, bridge_runner=runner)
+
+    assert "--osm-file-path" not in runner.calls[0]
+    assert payload["bridge"]["ok"] is True
+
+
+def test_bridge_package_records_a_success_and_when_it_happened(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    block = payload["bridge"]
+    assert block["attempted"] is True
+    assert block["ok"] is True
+    assert block["error"] is None
+    # A timestamp is what tells a reader this did not happen during the
+    # download. Its shape is the one every other timestamp in this file
+    # uses, so nothing has to learn a second format.
+    assert block["ran_at"].endswith("Z")
+    assert len(block["ran_at"]) == len("2026-08-01T09:00:00Z")
+    assert _bridge_block(root) == block, "the record on disk must say the same thing"
+
+
+def test_bridge_package_records_a_failure_in_plain_language_and_never_raises(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+
+    # Task 20's ruling applies here too: a bridge that ran and failed is
+    # recorded, never propagated over the package that already exists.
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=1))
+
+    block = payload["bridge"]
+    assert block["attempted"] is True
+    assert block["ok"] is False
+    assert "exit code 1" in block["error"]
+    assert "Traceback" not in block["error"]
+
+
+def test_bridge_package_records_the_owner_s_real_missing_urbano_message(tmp_path):
+    # The case the owner actually hits, on every single run: the bridge
+    # process starts, loads nothing, and exits non-zero with UrbanoBridge's
+    # own DirectoryNotFoundException and C# stack trace on stderr. What
+    # reaches survey.json must be the one plain sentence, not the trace.
+    from tests.test_bridge import REAL_MISSING_URBANO_OUTPUT
+
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+
+    payload = bridge_package(
+        root,
+        bridge_runner=FakeBridgeRunner(returncode=1, stderr=REAL_MISSING_URBANO_OUTPUT),
+    )
+
+    error = payload["bridge"]["error"]
+    assert "Urbano is not installed" in error
+    assert "DirectoryNotFoundException" not in error
+    assert "Program.cs" not in error
+
+
+def test_a_later_success_keeps_the_download_s_own_failed_attempt(tmp_path):
+    # The brief's headline case, and the one the owner reaches the day
+    # they install Urbano: a package whose bridge failed at download time,
+    # bridged successfully weeks later. survey.json must not end up
+    # claiming the bridge succeeded during a run where it did not.
+    register_default_sources()
+    root = _package_on_disk(
+        tmp_path,
+        bridge={
+            "attempted": True,
+            "ok": False,
+            "error": "Urbano is not installed: no Urbano.Core.dll ...",
+        },
+    )
+
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    block = payload["bridge"]
+    assert block["ok"] is True, "the package has its Urbano files now"
+    assert block["during_download"] == {
+        "attempted": True,
+        "ok": False,
+        "error": "Urbano is not installed: no Urbano.Core.dll ...",
+    }, "and the download's own failure is still on the record, untouched"
+    assert block["ran_at"] != payload["finished_at"]
+
+
+def test_a_second_bridge_run_still_reports_the_download_not_the_previous_one(tmp_path):
+    # during_download is the ORIGINAL, not the previous. Two runs of this
+    # command must not walk the record forward one attempt at a time until
+    # the download's own result has been shifted out of it entirely.
+    register_default_sources()
+    root = _package_on_disk(
+        tmp_path,
+        bridge={"attempted": False, "ok": None, "error": None},
+    )
+
+    bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=1))
+    first_attempt = _bridge_block(root)
+    payload = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    assert first_attempt["ok"] is False
+    assert payload["bridge"]["ok"] is True
+    assert payload["bridge"]["during_download"] == {
+        "attempted": False,
+        "ok": None,
+        "error": None,
+    }
+
+
+def test_a_bridge_run_changes_nothing_in_survey_json_but_the_bridge_block(tmp_path):
+    # survey.json is the package's record of ITSELF, and this command was
+    # not there for the download. complete and stopped describe that
+    # download and nothing else; so do tiles, sources and both timestamps.
+    register_default_sources()
+    root = _package_on_disk(tmp_path, complete=False, stopped=True)
+    before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+
+    bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    after = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    assert after["complete"] is False
+    assert after["stopped"] is True
+    del before["bridge"]
+    del after["bridge"]
+    assert after == before
+    assert list(after) == list(before), "field order is part of a file a person reads"
+
+
+def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+    log = EventLog()
+
+    bridge_package(root, progress=log, bridge_runner=FakeBridgeRunner(returncode=1))
+
+    assert [e["event"] for e in log.events] == ["bridge_started", "bridge_failed"]
+    assert "exit code 1" in log.events[1]["error"]
+
+
+def test_a_stop_that_landed_at_the_very_end_can_have_its_urbano_files_afterwards(tmp_path):
+    """Review finding I1's residual, end to end and through run_survey.
+
+    A stop noticed only after every tile has genuinely finished leaves
+    complete: true, stopped: false and bridge.attempted: false, and
+    naming._survey_reports_complete means that folder is never opened by a
+    survey again. Before this command that package could never get its
+    Urbano files. Task 22's ruling that a stop starts no further external
+    process is untouched: the bridge still does not run during that survey.
+    """
+    token = CancelToken()
+    register(LegacyNoCancelStubSource(token))
+    result = run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        cancel=token,
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+    assert result.complete is True
+    assert result.stopped is False
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["bridge"]["attempted"] is False, "the stop skipped the bridge, as ruled"
+
+    after = bridge_package(result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    assert after["bridge"]["ok"] is True
+    assert after["bridge"]["during_download"] == {
+        "attempted": False,
+        "ok": None,
+        "error": None,
+    }
+    assert after["complete"] is True
+    assert after["stopped"] is False
+
+
+def test_bridge_package_and_run_survey_hand_the_bridge_the_same_command(tmp_path):
+    """The brief's "one path, not two" made checkable rather than asserted.
+
+    Same package, same files, same stem: if the two callers ever start
+    composing different BridgeRequests, this is what says so, and it fails
+    on the argument that differs rather than on a count.
+    """
+    source = OsmSource(
+        session=_FakeOsmSession([_FakeOsmResponse() for _ in range(4)]),
+        sleeper=lambda _seconds: None,
+        min_interval_seconds=0.0,
+    )
+    register(source)
+    during_download = FakeBridgeRunner(returncode=0)
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm",), run_bridge_step=True),
+        bridge_runner=during_download,
+    )
+    assert result.complete is True
+
+    afterwards = FakeBridgeRunner(returncode=0)
+    bridge_package(result.paths.root, bridge_runner=afterwards)
+
+    assert afterwards.calls[0] == during_download.calls[0]
+
+
+def test_bridge_package_works_on_a_real_surveyed_package_with_an_osm_layer(tmp_path):
+    # The same package the previous test compares commands over, checked
+    # from the other end: the file the bridge is pointed at is the merged
+    # OSM output actually sitting in the folder, not a name composed here.
+    source = OsmSource(
+        session=_FakeOsmSession([_FakeOsmResponse() for _ in range(4)]),
+        sleeper=lambda _seconds: None,
+        min_interval_seconds=0.0,
+    )
+    register(source)
+    result = run_survey(
+        _request(tmp_path, source_ids=("osm",), run_bridge_step=False)
+    )
+    runner = FakeBridgeRunner(returncode=0)
+
+    payload = bridge_package(result.paths.root, bridge_runner=runner)
+
+    merged = result.paths.root / f"{result.paths.stem}.osm"
+    assert merged.is_file()
+    assert runner.calls[0][runner.calls[0].index("--osm-file-path") + 1] == str(merged)
+    assert payload["bridge"]["ok"] is True
+    assert payload["bridge"]["during_download"] == {
+        "attempted": False,
+        "ok": None,
+        "error": None,
+    }

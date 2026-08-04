@@ -38,6 +38,7 @@ from mapgen.sources.base import (
     EmptySourceSelectionError,
     NullProgress,
     ProgressSink,
+    UnknownSourceError,
     available_sources,
     get_source,
     register,
@@ -764,6 +765,308 @@ def _run_bridge_step(
         return False, error
     sink.emit("bridge_done")
     return True, None
+
+
+class UnbridgeablePackageError(ValueError):
+    """Raised when `mapgen bridge` is pointed at something it must refuse.
+
+    A ValueError subclass for the same reason every other refusal in this
+    project is one (see EmptySourceSelectionError): cli.py names its
+    exceptions explicitly and prints str(exc) as one plain line, and
+    server.py's _REQUEST_VALUE_ERRORS already turns a ValueError into a
+    clean 400 if this ever reaches a route, which today it does not.
+
+    Every message this carries names the folder it is talking about and
+    what to do next, because the two situations it exists for are exactly
+    the two an owner reaches by accident: pointing it at the region folder
+    rather than the package inside it, and pointing it at a package a run
+    never finished.
+    """
+
+
+# The two survey.json source ids whose merged output the bridge takes as a
+# FILE input. Overture is deliberately not among them: the bridge fetches
+# its own buildings geoparquet on its own account (see README, "Using the
+# output in Grasshopper"), so a package's <stem>_building.geojson is not
+# something it is ever handed, and requiring one would refuse packages the
+# bridge can process perfectly well.
+_BRIDGE_FILE_INPUT_IDS = ("osm", "elevation")
+
+
+def _bridge_input_file(root: Path, stem: str, source_id: str) -> tuple[Path | None, list[str]]:
+    """The merged file this source left in the package root, or, if none of
+    them is there, the names it could have had.
+
+    Names come from the source's own possible_outputs(stem), the same
+    closed list the stale-output sweep uses, rather than from a second copy
+    of "osm writes <stem>.osm" kept here. package.py already knows the
+    source IDS it has to reason about; what it must not start knowing
+    separately is their filenames, because two copies of that fact drift
+    and the failure when they do is a bridge quietly handed nothing.
+    """
+    try:
+        source = get_source(source_id)
+    except UnknownSourceError:
+        raise UnbridgeablePackageError(
+            f"This package's survey.json names the {source_id} layer, which this "
+            f"version of mapgen does not have, so the file the Urbano bridge needs "
+            f"from it cannot be identified."
+        ) from None
+    possible = getattr(source, "possible_outputs", None)
+    if not callable(possible):
+        raise UnbridgeablePackageError(
+            f"The {source_id} layer does not declare which files it writes, so the "
+            f"file the Urbano bridge needs from it cannot be identified."
+        )
+    names = [str(name) for name in possible(stem)]
+    for name in names:
+        candidate = root / name
+        if candidate.is_file():
+            return candidate, []
+    return None, names
+
+
+def _survey_payload(survey_json: Path) -> dict:
+    """survey.json as a dict, or a refusal saying which of the three ways
+    it was unusable.
+
+    A missing file and a corrupt one are told apart deliberately, unlike in
+    naming._survey_reports_complete, which collapses both to "not
+    complete": that function only has to decide whether a folder is safe to
+    reuse, and both answers are the same there. Here they mean different
+    things to the owner. Missing means the run never got far enough to
+    write one, and a resume is the answer. Corrupt means the record of a
+    package that may be entirely intact has been damaged, and no amount of
+    resuming fixes that by itself.
+    """
+    if not survey_json.is_file():
+        raise UnbridgeablePackageError(
+            f"There is no survey.json in {survey_json.parent}, so no survey ever "
+            f"finished there. Run the survey again over the same extent: an "
+            f"unfinished package needs a resume, which picks up whatever is "
+            f"already on disk, not this command."
+        )
+    try:
+        payload = json.loads(survey_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UnbridgeablePackageError(
+            f"{survey_json} could not be read as a survey record: {exc}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise UnbridgeablePackageError(
+            f"{survey_json} does not contain a survey record."
+        )
+    return payload
+
+
+def _survey_bbox(payload: dict, survey_json: Path) -> BBox:
+    """The extent this package was surveyed over, read from its own record.
+
+    The bridge needs a bbox and nothing else in survey.json implies one:
+    Urbano's world origin is built from it (see UrbanoBridge's Program.cs),
+    so a wrong one here is a package whose Urbano geometry sits in the
+    wrong place, which is the failure that would be hardest to notice.
+    Never re-derived from the folder name, which carries a site and a date
+    and no coordinates at all.
+    """
+    raw = payload.get("bbox")
+    if not isinstance(raw, dict):
+        raise UnbridgeablePackageError(
+            f"{survey_json} records no bbox, so the extent the Urbano bridge "
+            f"needs cannot be recovered from it."
+        )
+    try:
+        return BBox(
+            west=float(raw["west"]),
+            south=float(raw["south"]),
+            east=float(raw["east"]),
+            north=float(raw["north"]),
+        ).validated()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnbridgeablePackageError(
+            f"{survey_json} records an unusable bbox: {exc}"
+        ) from None
+
+
+def _survey_source_ids(payload: dict) -> list[str]:
+    """The source ids this package's own record says it holds.
+
+    Read from `sources` rather than from what is lying in the folder: the
+    folder is what a stale file from an earlier, wider attempt also lives
+    in, and survey.json is the record of what this package actually is.
+    """
+    entries = payload.get("sources")
+    if not isinstance(entries, list):
+        return []
+    return [
+        entry["id"]
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    ]
+
+
+def bridge_package(
+    package_dir: Path | str,
+    progress: ProgressSink | None = None,
+    bridge_runner=None,
+) -> dict:
+    """Run the Urbano bridge, and only the bridge, over a package that
+    already exists on disk. Returns that package's updated survey.json.
+
+    Task 29. Two situations share this one command, and both are ordinary
+    rather than exotic:
+
+      * The owner has no Urbano install, so the bridge has failed on every
+        run they have ever made and every package they own is missing its
+        _project_setting.json. Without this, installing Urbano would mean
+        downloading every one of those packages again.
+      * A Stop that lands after the last tile has finished leaves a package
+        with complete: true and bridge.attempted: false (Task 22's ruling
+        that a stop starts no further external process, kept deliberately
+        by review finding I1). A complete folder is never reused, so
+        surveying the same site and date again produces an _02 and refetches
+        everything. This is what makes that ruling affordable.
+
+    What it will not do is decide anything about the download. `complete`,
+    `stopped`, `tiles` and `sources` describe a run that happened at some
+    point in the past and this command was not there; they are read and
+    never written. The only key it changes is `bridge`.
+    """
+    sink = progress if progress is not None else NullProgress()
+    root = Path(package_dir)
+    if not root.is_dir():
+        raise UnbridgeablePackageError(
+            f"There is no folder at {root}. Point mapgen bridge at a survey "
+            f"package folder, the one holding survey.json, not at the region "
+            f"folder above it."
+        )
+
+    survey_json = root / "survey.json"
+    payload = _survey_payload(survey_json)
+    stem = payload.get("urbano_stem")
+    if not isinstance(stem, str) or not stem:
+        raise UnbridgeablePackageError(
+            f"{survey_json} records no urbano_stem, so the names of the files in "
+            f"this package cannot be recovered from it."
+        )
+    bbox = _survey_bbox(payload, survey_json)
+    source_ids = _survey_source_ids(payload)
+
+    # Each file input resolved before the bridge is started, never during,
+    # so a package that is short of one is refused without a dotnet process
+    # ever being launched at it.
+    found: dict[str, Path] = {}
+    missing: list[tuple[str, list[str]]] = []
+    for source_id in _BRIDGE_FILE_INPUT_IDS:
+        if source_id not in source_ids:
+            continue
+        path, names = _bridge_input_file(root, stem, source_id)
+        if path is None:
+            missing.append((source_id, names))
+        else:
+            found[source_id] = path
+    if missing:
+        # Refused rather than quietly bridged without it. run_survey does
+        # go ahead in this shape, and it is right to: it has just watched
+        # that source fail in this same run and knows the file is absent
+        # because it never arrived. This command knows nothing of the kind.
+        # An absent file here is equally a package whose layer failed, a
+        # file the owner moved, and a folder that is not the one they
+        # meant, and the difference between them is not recoverable from
+        # the folder. Guessing produces a _project_setting.json that reads
+        # as complete, goes straight into Grasshopper, and is silently
+        # missing a layer the package's own survey.json says it holds.
+        layers = " and ".join(source_id for source_id, _ in missing)
+        files = " and ".join(
+            " or ".join(names) if names else "its merged output"
+            for _, names in missing
+        )
+        layer_word = "layer" if len(missing) == 1 else "layers"
+        file_word = "is" if len(missing) == 1 else "are"
+        raise UnbridgeablePackageError(
+            f"Cannot run the Urbano bridge over {root}: survey.json names the "
+            f"{layers} {layer_word}, but {files} {file_word} not in the package. "
+            f"Run the survey again over the same extent to fetch what is missing, "
+            f"then run this again."
+        )
+
+    ok, error = _run_bridge_step(
+        bbox=bbox,
+        root=root,
+        # The package's own recorded stem, always, so every file the bridge
+        # writes carries the same name as everything already in the folder
+        # and as naming.PackagePaths.project_setting predicts. run_survey
+        # passes None instead for a --coordinate-stem run, letting
+        # UrbanoBridge derive the same coordinate string itself; the two
+        # agree for every package that flag can produce except a suffixed
+        # one, where run_survey's own bridge output is already named
+        # differently from the project_setting path mapgen goes on to
+        # report (see the task 29 report). Reading the record is the
+        # honest half of that disagreement.
+        file_name_stem=stem,
+        osm_file=found.get("osm"),
+        elevation_file=found.get("elevation"),
+        sink=sink,
+        bridge_runner=bridge_runner,
+    )
+
+    payload["bridge"] = _rebridged_block(payload.get("bridge"), ok, error, _now())
+    atomic_write_text(survey_json, json.dumps(payload, indent=2))
+    return payload
+
+
+def _rebridged_block(
+    existing: object, ok: bool, error: str | None, ran_at: str
+) -> dict[str, object]:
+    """The `bridge` block after a `mapgen bridge` run, keeping the download's
+    own record of the same field intact.
+
+    attempted, ok and error stay exactly where a reader already looks for
+    them and go on meaning the same thing: whether this package has Urbano
+    files, and why not if it has none. That is the question survey.json is
+    read for, and the freshest answer is the true one.
+
+    What would have been a lie is leaving it there alone. Before this
+    command existed the block could only ever describe the download itself,
+    and every sentence written about it, in this file and in README, said
+    so. A later success written over an earlier failure would have made the
+    file claim the bridge succeeded during a run where it demonstrably did
+    not, on a machine that at the time had no Urbano on it at all.
+
+    So two fields carry what the three cannot:
+
+      * ran_at, the UTC time of the attempt attempted/ok/error describe.
+        Its ABSENCE is the signal, and it is why nothing was added to
+        run_survey's own block: no ran_at means the block describes the
+        download, which is what every package written before this task
+        already means and what every ordinary run still means.
+      * during_download, the untouched attempted/ok/error the download
+        itself wrote. Copied verbatim, including a null, and never
+        rewritten by a second `mapgen bridge` run: it is the ORIGINAL that
+        must survive, not the previous one.
+
+    None if the package's record had no usable bridge block at all, which
+    is not the same as false: it says nothing was recorded, rather than
+    claiming a run that nothing witnessed.
+    """
+    block = existing if isinstance(existing, dict) else {}
+    if "during_download" in block:
+        during_download = block["during_download"]
+    elif block:
+        during_download = {
+            "attempted": block.get("attempted"),
+            "ok": block.get("ok"),
+            "error": block.get("error"),
+        }
+    else:
+        during_download = None
+    return {
+        "attempted": True,
+        "ok": ok,
+        "error": error,
+        "ran_at": ran_at,
+        "during_download": during_download,
+    }
 
 
 _TILE_ID_SHAPE = re.compile(r"^r\d+_c\d+$")
