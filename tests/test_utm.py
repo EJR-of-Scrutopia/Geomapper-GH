@@ -390,12 +390,19 @@ def test_the_inverse_is_urbanos_own_inverse(
 
     A nanometre stated as an angle would be meaningless, so the tolerance is
     converted: one degree of latitude is about 111,320 m, and the check is
-    that the disagreement is under a millionth of a metre on the ground. The
-    measured worst case over this table is 3.2e-9 m.
+    that the disagreement is under a ten millionth of a metre on the ground.
+    The measured worst case over this table is 3.2e-9 m, thirty times inside
+    it.
+
+    A ten millionth and not a millionth, because a tolerance has to be tight
+    enough to be doing work. The smallest term in the longitude series moves
+    the answer by 6.4e-7 m at the London fixture, which is 200 km from its
+    central meridian, and a millionth would have let a wrong coefficient
+    through unnoticed.
     """
     got_latitude, got_longitude = unproject(easting, northing, zone)
-    assert abs(got_latitude - latitude) * 111_320.0 < 1e-6
-    assert abs(got_longitude - longitude) * 111_320.0 < 1e-6
+    assert abs(got_latitude - latitude) * 111_320.0 < 1e-7
+    assert abs(got_longitude - longitude) * 111_320.0 < 1e-7
 
 
 @pytest.mark.parametrize(

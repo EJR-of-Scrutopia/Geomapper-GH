@@ -585,3 +585,56 @@ def test_a_raster_larger_than_the_limit_is_refused_before_it_is_read(tmp_path):
     path.write_bytes(body)
     with pytest.raises(GeoTiffError, match="pixel limit"):
         read_dem(path)
+
+
+def test_a_tie_point_that_is_not_at_pixel_zero_moves_the_whole_raster(tmp_path):
+    """GeoTIFF's tie point names a PIXEL and the place it sits at, and both
+    real DEMs happen to name pixel (0,0), so the term that subtracts the
+    pixel column is multiplied by zero on every real file. A raster tied at
+    any other pixel would be placed two pixels out with that term dropped,
+    which is 60 m of COP30.
+    """
+    at_origin = read_dem(
+        write(tmp_path, "a.tif", values=RAMP, tiepoint=(0.0, 0.0, 0.0, -3.0, 51.5, 0.0))
+    )
+    tied_inside = read_dem(
+        write(tmp_path, "b.tif", values=RAMP, tiepoint=(2.0, 1.0, 0.0, -3.0, 51.5, 0.0))
+    )
+    assert at_origin.transform[0] == pytest.approx(-3.0)
+    assert at_origin.transform[3] == pytest.approx(51.5)
+    # Pixel (2,1) is at (-3.0, 51.5), so pixel (0,0) is two columns west and
+    # one row north of it.
+    assert tied_inside.transform[0] == pytest.approx(-3.002)
+    assert tied_inside.transform[3] == pytest.approx(51.501)
+    # And the point the tie point names really is pixel (2,1) of it.
+    column, row = tied_inside.pixel_at(51.5, -3.0)
+    assert column == pytest.approx(2.0)
+    assert row == pytest.approx(1.0)
+    assert at_origin.pixel_at(51.5, -3.0) == pytest.approx((0.0, 0.0))
+
+
+def test_a_latitude_or_longitude_that_is_not_a_real_number_cannot_be_sampled(tmp_path):
+    """None rather than an exception, and neither a height nor a crash. The
+    grid builder asks this question for every node it has, and a NaN two
+    frames down would take a whole survey's terrain with it.
+    """
+    dem = read_dem(write(tmp_path, values=RAMP))
+    for latitude, longitude in (
+        (float("nan"), -3.0), (51.5, float("nan")), (float("inf"), -3.0)
+    ):
+        assert dem.has_coverage(latitude, longitude) is False
+        assert dem.sample(latitude, longitude) is None
+
+
+def test_a_raster_whose_two_pixel_scales_differ_keeps_both(tmp_path):
+    """Both real DEMs are square pixels, a thirtieth of an arc minute each
+    way, so a reader that used the easting scale for both would be right on
+    every file this tool has ever downloaded and wrong on the first one that
+    was not.
+    """
+    dem = read_dem(write(tmp_path, values=RAMP, scale=(0.002, 0.001)))
+    assert dem.transform[1] == pytest.approx(0.002)
+    assert dem.transform[5] == pytest.approx(-0.001)
+    # Two pixels east is 0.004 degrees; two pixels south is 0.002.
+    assert dem.pixel_at(51.5, -3.0 + 0.004) == pytest.approx((2.0, 0.0))
+    assert dem.pixel_at(51.5 - 0.002, -3.0) == pytest.approx((0.0, 2.0))

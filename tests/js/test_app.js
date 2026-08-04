@@ -4374,7 +4374,19 @@ function ok(condition, message) {
     });
     ok(label.branch === "measured", `expected the projection branch, got ${label.branch}`);
     ok(label.text.includes("about 1 min"), `expected about 1 min, got ${label.text}`);
-    ok(label.text.includes("from the rate so far"), `expected the copy to name the branch, got ${label.text}`);
+    ok(label.text === "about 1 min left", `expected the time and nothing after it, got ${label.text}`);
+    // The two branches are still told apart by everything except the
+    // copy, which is what makes dropping the suffix a change of wording
+    // rather than of behaviour: the same numbers on the estimate branch
+    // would read differently.
+    const fromEstimate = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      fractionDone: 0.5,
+      fractionFetched: 0.05,
+      elapsedSeconds: 60,
+    });
+    ok(fromEstimate.branch === "estimate", `expected the other branch, got ${fromEstimate.branch}`);
+    ok(fromEstimate.text !== label.text, "expected the two branches to still produce different times");
   });
 
   await test("countdown: a run that stalls reports a growing wait, not a frozen one", async () => {
@@ -4436,6 +4448,11 @@ function ok(condition, message) {
       /taking longer/i.test(label.text) && !/\b0\b/.test(label.text),
       `expected an honest overrun line with no zero countdown, got ${label.text}`
     );
+    // Task 38, item 5 shortened this one too, and the brief is explicit
+    // that it had to survive in some short form: it is the only thing the
+    // countdown can honestly say once the estimate has been passed.
+    ok(label.text === "Taking longer than the estimate.", `got ${label.text}`);
+    ok(!/left/.test(label.text), `an overrun has no time left to promise, got ${label.text}`);
   });
 
   await test("countdown: once every source has reported, it stops counting down", async () => {
@@ -4625,8 +4642,13 @@ function ok(condition, message) {
       `expected a screen reader to be told the same 50, got ${progress.getAttribute("aria-valuenow")}`
     );
     const text = sandbox.document.getElementById("progress-text").textContent;
-    ok(text.includes("50% done"), `expected the percentage in the copy, got ${text}`);
     ok(/left/.test(text), `expected a countdown, got ${text}`);
+    // Task 38, item 5. The percentage is drawn, not written: the bar
+    // immediately to the left of this copy is 140px of exactly that
+    // number, and aria-valuenow above carries the same 50 to a screen
+    // reader. Saying it a third time in words is what the owner asked to
+    // have off this line.
+    ok(!/%/.test(text), `expected no percentage repeated in the copy, got ${text}`);
   });
 
   await test("the bar reaches a complete, plainly finished state on a finished job", async () => {
@@ -5016,7 +5038,10 @@ function ok(condition, message) {
     );
   });
 
-  await test("the status line says what is happening now, by the layer's own name", async () => {
+  await test("the status line says which tile is being worked, and which package", async () => {
+    // Task 38, item 5 rewrote this expectation. It used to read
+    // "Downloading OpenStreetMap"; the owner asked for "which tile its
+    // doing and what package its downloading".
     const tileIds = tileIdsUpTo(4);
     const { sandbox } = await jobSandbox({
       tileIds,
@@ -5033,9 +5058,69 @@ function ok(condition, message) {
     sandbox.document.getElementById("download").fire("click");
     await flush(900);
     ok(
-      sandbox.document.getElementById("progress-status").textContent === "Downloading OpenStreetMap",
-      `expected the display name from /api/sources, got ${sandbox.document.getElementById("progress-status").textContent}`
+      sandbox.document.getElementById("progress-status").textContent === "osm r00_c00 · out",
+      `expected the tile then the package, got ${sandbox.document.getElementById("progress-status").textContent}`
     );
+  });
+
+  await test("a layer with no tile of its own is named instead, and the package stays", async () => {
+    // Overture downloads the whole extent per type and reports it across
+    // the plan's tiles, one event per type, so naming a tile would say
+    // the run is on one square when it is on all of them. The layer's own
+    // display name is the true thing to say there, which is what the
+    // brief asked for during a whole-extent layer.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      polls: [
+        {
+          state: "running",
+          events: [
+            { event: "job_started", tiles: 4, root: "C:\\out" },
+            {
+              event: "tile_done",
+              source: "overture",
+              tile_id: tileIds[0],
+              overture_type: "building",
+            },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("progress-status").textContent === "Downloading Overture · out",
+      `expected the layer name, got ${sandbox.document.getElementById("progress-status").textContent}`
+    );
+  });
+
+  await test("the package is named by its own folder, not the whole path to it", async () => {
+    // <output root>/<region>/<date>_<site>: everything before the last
+    // segment is the same for every run the owner makes, and this line
+    // has one row of a shared strip to work in.
+    const { sandbox } = await bootedSandbox();
+    ok(
+      sandbox.packageStem("C:\\Users\\Param\\Surveys\\south-wales\\2026-08-04_barry") ===
+        "2026-08-04_barry",
+      sandbox.packageStem("C:\\Users\\Param\\Surveys\\south-wales\\2026-08-04_barry")
+    );
+    // Composed server-side by pathlib, so it arrives with the separators
+    // of whichever platform the server is on.
+    ok(sandbox.packageStem("/home/param/surveys/wales/2026-08-04_barry") === "2026-08-04_barry");
+    ok(sandbox.packageStem("C:\\out\\2026-08-04_barry\\") === "2026-08-04_barry", "a trailing slash");
+    ok(sandbox.packageStem("") === "", "nothing known yet is nothing said");
+    ok(sandbox.packageStem(null) === "", "and the same for a folder the server did not send");
+  });
+
+  await test("no estimate yet means no package name, and no stray separator", async () => {
+    // A job cannot start without an estimate, but the line still has to
+    // be composable from half of what it wants: the moment between the
+    // job starting and its first event has a phase and, on a page whose
+    // estimate never returned a folder, no package.
+    const { sandbox } = await bootedSandbox();
+    const line = sandbox.progressStatusLine({ kind: "checking", source: "" }, { result_root: null });
+    ok(line === "Checking the files", `expected no dangling separator, got ${JSON.stringify(line)}`);
   });
 
   await test("the status line follows the run through its phases", async () => {
@@ -5068,11 +5153,17 @@ function ok(condition, message) {
       await flush(800);
       seen.push(sandbox.document.getElementById("progress-status").textContent);
     }
-    ok(seen[0] === "Starting", `got ${JSON.stringify(seen)}`);
-    ok(seen[1] === "Downloading Overture", `got ${JSON.stringify(seen)}`);
-    ok(seen[2] === "Finished Overture", `got ${JSON.stringify(seen)}`);
-    ok(seen[3] === "Checking the files", `got ${JSON.stringify(seen)}`);
-    ok(seen[4] === "Writing the Urbano bridge", `got ${JSON.stringify(seen)}`);
+    // The package's own name rides along on every one of them, since it
+    // is what the run is building throughout (Task 38, item 5). The
+    // second is a tile: that fixture's Overture event carries no
+    // overture_type, which per Task 36's own rule is a claim about the
+    // whole of that source's work for the tile, exactly like the skips a
+    // resume emits.
+    ok(seen[0] === "Starting · out", `got ${JSON.stringify(seen)}`);
+    ok(seen[1] === "overture r00_c00 · out", `got ${JSON.stringify(seen)}`);
+    ok(seen[2] === "Finished Overture · out", `got ${JSON.stringify(seen)}`);
+    ok(seen[3] === "Checking the files · out", `got ${JSON.stringify(seen)}`);
+    ok(seen[4] === "Writing the Urbano bridge · out", `got ${JSON.stringify(seen)}`);
   });
 
   await test("an event this page has never heard of leaves the status line alone", async () => {
@@ -5090,7 +5181,8 @@ function ok(condition, message) {
       true
     );
     ok(summary.phase.kind === "downloading", `got ${JSON.stringify(summary.phase)}`);
-    ok(sandbox.phaseLabel(summary.phase) === "Downloading OpenStreetMap", sandbox.phaseLabel(summary.phase));
+    ok(summary.phase.tile === "r00_c00", `got ${JSON.stringify(summary.phase)}`);
+    ok(sandbox.phaseLabel(summary.phase) === "osm r00_c00", sandbox.phaseLabel(summary.phase));
   });
 
   await test("a run that has ended leaves the status to the line that already says so", async () => {
@@ -5135,7 +5227,7 @@ function ok(condition, message) {
     sandbox.document.getElementById("download").fire("click");
     await flush(800);
     ok(
-      sandbox.document.getElementById("progress-status").textContent === "Downloading OpenStreetMap",
+      sandbox.document.getElementById("progress-status").textContent === "osm r00_c00 · out",
       sandbox.document.getElementById("progress-status").textContent
     );
     await flush(800);
@@ -7150,6 +7242,86 @@ function ok(condition, message) {
     ok(
       sandbox.window.localStorage.getItem(LOG_HEIGHT_KEY) === null,
       "expected an ordinary mouseup to save nothing"
+    );
+  });
+
+  // =======================================================================
+  // Task 38, item 5: shorter, more concrete progress text.
+  //
+  // The rest of it is checked where the lines it replaced were checked,
+  // beside the bar and the countdown above. What is left here is the
+  // shape of the tile half of the line and the one thing that could go
+  // wrong quietly: the package name being read from wherever the page has
+  // got to rather than from the run that is actually going.
+  // =======================================================================
+
+  await test("a layer with no tile of the plan at all never names one", async () => {
+    // Elevation downloads the whole extent and reports it under
+    // "whole-area", which is not a tile of the plan. It has to reach the
+    // status line as the layer's name, and it must not reach it as a
+    // tile id the grid has never heard of.
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00", "r00_c01"],
+      ["elevation"],
+      [{ event: "tile_done", source: "elevation", tile_id: "whole-area" }],
+      true
+    );
+    ok(summary.phase.kind === "downloading", JSON.stringify(summary.phase));
+    ok(summary.phase.tile === "", `expected no tile named, got ${JSON.stringify(summary.phase)}`);
+    ok(
+      sandbox.phaseLabel(summary.phase) === "Downloading elevation",
+      sandbox.phaseLabel(summary.phase)
+    );
+  });
+
+  await test("a retry names the tile it has gone back for", async () => {
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00", "r00_c01"],
+      ["osm"],
+      [
+        { event: "tile_failed", source: "osm", tile_id: "r00_c01", kind: "timeout", reason: "x" },
+        { event: "tile_retrying", source: "osm", tile_id: "r00_c01", pass_number: 1, of: 2 },
+      ],
+      true
+    );
+    ok(sandbox.phaseLabel(summary.phase) === "Retrying osm r00_c01", sandbox.phaseLabel(summary.phase));
+  });
+
+  await test("the package named is the one this run is building, not the one the page is on", async () => {
+    // The owner is free to start drawing the next survey while this one
+    // downloads. The name on the line is snapshotted when Download is
+    // pressed, for the same reason the estimate the bar weighs itself by
+    // is: it describes the job in flight, not the form.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [{ state: "running", events: [{ event: "tile_done", source: "osm", tile_id: tileIds[0] }] }],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("progress-status").textContent === "osm r00_c00 · out",
+      sandbox.document.getElementById("progress-status").textContent
+    );
+    // The page loses the folder it knew: a degenerate extent is refused,
+    // which clears the preview and everything derived from it.
+    setField(sandbox, "bbox", "10,20,10,25");
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("folder-preview").hidden === true,
+      "expected the preview cleared by the rejected extent"
+    );
+    ok(
+      sandbox.progressStatusLine({ kind: "checking", source: "" }, { result_root: null }) ===
+        "Checking the files · out",
+      `expected the running job's own package still named, got ${sandbox.progressStatusLine(
+        { kind: "checking", source: "" },
+        { result_root: null }
+      )}`
     );
   });
 

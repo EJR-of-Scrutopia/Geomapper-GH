@@ -1179,7 +1179,7 @@ function remainingLabel({
     // fact twice on a strip with room for neither.
     return { text: "Taking longer than the estimate.", note, branch: "overrun" };
   }
-  return { text: `${formatRemaining(remaining)} left`, note, branch: "estimate" };
+  return { text: `${formatRemaining(remaining)} left, from the estimate`, note, branch: "estimate" };
 }
 
 // Starts with no grid and the legend hidden. Set explicitly here rather

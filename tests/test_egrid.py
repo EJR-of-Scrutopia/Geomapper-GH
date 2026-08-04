@@ -575,3 +575,152 @@ def test_the_file_goes_beside_the_dem_under_the_same_stem(tmp_path):
     path = elevation_grid_path(tmp_path, "Barry-Full_2026-08-04")
     assert path == tmp_path / "Barry-Full_2026-08-04.egrid"
     assert ELEVATION_GRID_SUFFIX == ".egrid"
+
+
+# --------------------------------------------------------------------------
+# The cell size arithmetic, exercised where the real extents do not reach it.
+#
+# Every test below exists because a mutant survived without it. With the 200 m
+# pad on, a real survey's first guess at a cell count always lands inside its
+# tier and always well above the minimum, so three whole branches of Urbano's
+# own helper are unreachable from a real bbox. They are still Urbano's
+# behaviour, and a grid that disagreed with it on a small or a long thin
+# extent would be as wrong as one that disagreed on Barry.
+# --------------------------------------------------------------------------
+
+
+def test_the_tier_options_are_urbanos_own_defaults():
+    """`ElevationExtensions.AutoTierOptions`, constructed with no arguments,
+    which is what `BuildElevationGridFromTiff` uses when it is passed none.
+    Read off the decompiled class (task 39) and pinned here because they are
+    the contract, not a preference: they decide how big a cell is, and a
+    disagreement makes a grid Urbano's own mesh generation was not sized for.
+    """
+    from mapgen import egrid
+
+    assert egrid.PAD_METRES == 200.0
+    assert egrid.SMALL_MAX_METRES == 2000.0
+    assert egrid.MEDIUM_MAX_METRES == 10000.0
+    assert egrid.FINE_CELL_METRES == (5.0, 15.0)
+    assert egrid.MEDIUM_CELL_METRES == (15.0, 50.0)
+    assert egrid.COARSE_CELL_METRES == (50.0, 200.0)
+    assert egrid.MIN_COUNT_PER_SIDE == 8
+    assert egrid.MAX_COUNT_PER_SIDE == 4000
+    assert egrid.PREFER_SQUARE_CELLS is True
+    assert egrid.SAMPLE_AT_CENTRES is False
+
+
+def test_a_side_too_short_for_the_tier_still_gets_urbanos_minimum_count():
+    """The clamp at eight nodes a side. Unreachable with the pad on, since
+    400 m of padding alone is forty six fine cells, so it is exercised with
+    the pad off. Urbano clamps first and recomputes the cell size from the
+    clamped count, which is what makes a tiny extent a usable grid rather
+    than one cell.
+    """
+    tiny = BBox(west=-3.27010, south=51.39310, east=-3.27000, north=51.39320)
+    nx, ny, _x0, _y0, dx, dy = grid_geometry(tiny, project_zone(tiny), pad_metres=0.0)
+    assert nx == 9 and ny == 9
+    assert dx < 5.0 and dy < 5.0  # below the tier's own minimum, as Urbano does
+
+
+def test_the_two_recomputation_branches_are_transcribed_and_cannot_bite():
+    """Urbano's helper redoes the count from the tier's floor when the first
+    guess comes out too fine, and from its ceiling when it comes out too
+    coarse. Both branches are here, and neither can change an answer, for
+    any of the three tiers Urbano defines. That is worth saying rather than
+    leaving as an untested pair of lines.
+
+    The argument, for the floor branch: the first guess is the length over
+    the geometric mean of the tier, so it only comes out below the tier's
+    minimum when the count has been clamped up to eight, and the branch then
+    clamps to eight again and divides by the same number. For the ceiling
+    branch: it only comes out above the tier's maximum when the count has
+    been clamped down to four thousand, and the branch clamps to four
+    thousand again. The clamp wins either way, which is Urbano's behaviour
+    and is why a tiny extent gets cells finer than its tier and an enormous
+    one gets cells coarser.
+
+    Both are exercised below, so the transcription is at least run.
+    """
+    from mapgen.egrid import (
+        FINE_CELL_METRES, MAX_COUNT_PER_SIDE, MIN_COUNT_PER_SIDE, _cell_count
+    )
+
+    # Through the floor: thirty metres in fine tier.
+    count, size = _cell_count(30.0, *FINE_CELL_METRES)
+    assert count == MIN_COUNT_PER_SIDE
+    assert size == pytest.approx(30.0 / MIN_COUNT_PER_SIDE)
+    assert size < FINE_CELL_METRES[0]
+
+    # Through the ceiling: a hundred kilometres in fine tier.
+    count, size = _cell_count(100_000.0, *FINE_CELL_METRES)
+    assert count == MAX_COUNT_PER_SIDE
+    assert size == pytest.approx(100_000.0 / MAX_COUNT_PER_SIDE)
+    assert size > FINE_CELL_METRES[1]
+
+    # And in between, where neither branch fires, the cell is the geometric
+    # mean of the tier to within the rounding of one count.
+    count, size = _cell_count(1000.0, *FINE_CELL_METRES)
+    assert FINE_CELL_METRES[0] <= size <= FINE_CELL_METRES[1]
+    assert size == pytest.approx(math.sqrt(5.0 * 15.0), rel=0.01)
+
+
+def test_the_tier_is_picked_off_the_longer_side_of_the_extent():
+    """`Math.Max(num5, num6)` in Urbano's own code. A long thin extent takes
+    the tier its LENGTH earns, not the one its width does, so the two sides
+    are divided by the same rule and the cells stay square. Picking the
+    shorter side would give a 12 km by 500 m survey fine 5 to 15 m cells
+    along its length: 1600 nodes across, four times the file and four times
+    the mesh.
+    """
+    thin = BBox(west=-3.35, south=51.3930, east=-3.18, north=51.3975)
+    zone = project_zone(thin)
+    nx, ny, _x0, _y0, dx, dy = grid_geometry(thin, zone)
+    assert dx > 50.0, "an extent this long is coarse tier on its longer side"
+    assert dy > 50.0, "and both sides take the same tier"
+    assert nx < 400
+
+
+def test_square_cells_are_preferred_the_way_urbano_prefers_them():
+    """`PreferSquareCells`: once the easting step is fixed, the northing
+    count is retried as the height divided by the EASTING step, and taken if
+    the result is still inside the tier. Without it the two steps are picked
+    independently and the cells come out visibly rectangular.
+
+    On this extent the preference moves the northing count by one node and
+    brings the two steps from 0.29 m apart to 0.01 m. Both real surveys land
+    on the same answer either way, which is exactly why this needs an extent
+    of its own: measured over 81 extents, 28 of them are changed by it.
+    """
+    from mapgen import egrid
+
+    oblong = BBox(west=-3.30, south=51.3930, east=-3.295, north=51.4130)
+    zone = project_zone(oblong)
+    _nx, ny, _x0, _y0, dx, dy = grid_geometry(oblong, zone)
+
+    original = egrid.PREFER_SQUARE_CELLS
+    try:
+        egrid.PREFER_SQUARE_CELLS = False
+        _nx2, ny2, _x02, _y02, dx2, dy2 = grid_geometry(oblong, zone)
+    finally:
+        egrid.PREFER_SQUARE_CELLS = original
+
+    assert dx == dx2, "the easting step is picked first and is not affected"
+    assert ny != ny2, (
+        "this extent has to be one the preference changes, or the test below "
+        "is not testing anything"
+    )
+    assert abs(dx - dy) < abs(dx2 - dy2) / 10.0
+
+
+def test_a_height_no_float_can_hold_is_written_at_full_precision():
+    """`Z1D` is a `double[]`, and encode writes doubles. Heights that come
+    out of the DEM have already been through single precision, so a writer
+    that quietly rounded again would be invisible on a real grid; a caller
+    handing this a full precision height would silently lose it.
+    """
+    exact = 0.1  # not representable in single precision
+    grid = ElevationGrid(
+        nx=1, ny=1, x0=1.0, y0=2.0, dx=3.0, dy=4.0, heights=[exact]
+    )
+    assert struct.unpack("<d", encode(grid)[-8:])[0] == exact

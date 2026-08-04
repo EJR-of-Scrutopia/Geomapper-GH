@@ -5291,3 +5291,26 @@ def test_the_egrid_a_run_writes_is_the_grid_it_says_it_is(tmp_path):
     assert len(grid.heights) == 12432
     assert 400_000 < grid.x0 < 500_000
     assert 5_600_000 < grid.y0 < 5_800_000
+
+
+def test_a_failed_conversion_is_announced_and_not_only_written_down(tmp_path):
+    """The browser reads the events, not survey.json, while a run is going.
+    A failure recorded in the file but never emitted is one the owner does
+    not see until they go looking, and the whole point of reporting it is
+    that the folder otherwise looks complete.
+    """
+
+    class BadDemStub(UrbanoReadableStubSource):
+        def merge(self, parts, out_dir, stem):
+            outputs = super().merge(parts, out_dir, stem)
+            (out_dir / f"{stem}.tif").write_bytes(b"not a tiff")
+            return outputs + [out_dir / f"{stem}.tif"]
+
+    register(BadDemStub())
+    log = EventLog()
+    run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False), progress=log)
+
+    failed = [e for e in log.snapshot() if e["event"] == "elevation_grid_failed"]
+    assert len(failed) == 1
+    assert "byte order mark" in failed[0]["error"]
+    assert not any(e["event"] == "elevation_grid_written" for e in log.snapshot())
