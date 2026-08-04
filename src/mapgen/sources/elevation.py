@@ -28,6 +28,49 @@ DEFAULT_OPENTOPOGRAPHY_URL = "https://portal.opentopography.org/API/globaldem"
 USER_AGENT = "mapgen/1.0 (architectural survey tool)"
 OUTPUT_NAME = "elevation.tif"
 
+# Measured 2026-08-04 (Task 25) through ElevationSource.fetch against the
+# live OpenTopography API, three Welsh extents, two samples each:
+#
+#      4.17 sq km    10.94s, 11.16s      29,606 bytes
+#     38.63 sq km    11.26s, 11.30s     254,479 bytes
+#    259.60 sq km    11.58s, 11.60s   1,005,162 bytes
+#
+# Sixty-two times the area for 1.04x the time. What is being paid for is
+# the service's own turnaround on a request, not a transfer: even the
+# largest of these is a megabyte, which is nothing on this link. The
+# estimate said 5.0s for all three, understating by 2.2x, and it was the
+# only source in the panel understating rather than overstating. That
+# matters more than the six seconds do, because a countdown built on an
+# under-estimate runs out while the work is still going.
+#
+# Two significant figures, from six samples over one afternoon against
+# one API. The spread within an extent is hundredths of a second, which
+# is suspiciously tight for a network measurement and should be read as
+# "one machine on one day", not as a property of the service.
+SECONDS_FLOOR = 11.0
+
+# 4 bytes per pixel, not 2 with a fudge for overhead. COP30 comes back as
+# Float32 and the arithmetic says so: 42,943 pixels at 38.63 sq km
+# against 254,479 bytes measured is 5.9 bytes per pixel with the header
+# in it, and 288,384 pixels at 259.60 sq km against 1,005,162 bytes is
+# 3.5, either side of 4 as compression starts paying for itself on the
+# larger file. The old 2 bytes plus 20% was a 16-bit assumption and read
+# 0.40x at the middle extent.
+BYTES_PER_PIXEL = 4.0
+
+# The floor is the smallest real file this has ever been seen to return,
+# rounded down: 29,606 bytes over 4.17 sq km, where the GeoTIFF header
+# and tiling structure cost more than the 4,629 pixels inside it. The
+# 100,000 it replaces was 3.4x that.
+SMALLEST_OBSERVED_BYTES = 29_000
+
+# Never observed to bind. The largest DEM measured is a megabyte, which
+# this rate would put at 2s, well under SECONDS_FLOOR. It is kept for an
+# extent far larger than anything the owner has drawn, where transfer
+# would eventually dominate the service's turnaround, and it is honest to
+# say that no measurement supports the particular value.
+BYTES_PER_SECOND_ESTIMATE = 500_000.0
+
 
 class ElevationError(RuntimeError):
     """Raised when the DEM could not be downloaded or was not a TIFF."""
@@ -394,15 +437,23 @@ class ElevationSource:
         return None
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
-        # Estimate based on bbox area. COP30 resolution is 30 m per pixel.
-        # Model: pixel_count * 2 bytes per pixel (16-bit elevation) * 1.2 for
-        # GeoTIFF overhead. Time estimate scales with data size with a sensible floor.
+        """One whole-area request, so nothing here counts tiles.
+
+        Both constants were refitted from measurement in Task 25; see
+        their definitions for the runs behind them and for how thin the
+        evidence is. The shape is unchanged: pixels at COP30's 30 m
+        resolution, and a time that is a floor until the file gets big
+        enough for transfer to matter, which nothing the owner has drawn
+        comes close to.
+        """
         width_m, height_m = extent_metres(bbox)
         pixel_count = (width_m / 30.0) * (height_m / 30.0)
-        # 2 bytes per pixel + 20% GeoTIFF/compression overhead
-        bytes_estimate = max(int(pixel_count * 2 * 1.2), 100_000)
-        # Rough model: 500 KB/second download rate, minimum 5 seconds
-        seconds_estimate = max(bytes_estimate / 500_000.0, 5.0)
+        bytes_estimate = max(
+            int(pixel_count * BYTES_PER_PIXEL), SMALLEST_OBSERVED_BYTES
+        )
+        seconds_estimate = max(
+            bytes_estimate / BYTES_PER_SECOND_ESTIMATE, SECONDS_FLOOR
+        )
         return Estimate(bytes_estimate=bytes_estimate, seconds_estimate=seconds_estimate)
 
     def fetch(

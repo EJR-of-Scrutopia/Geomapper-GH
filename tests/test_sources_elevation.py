@@ -592,6 +592,61 @@ def test_estimate_returns_positive_for_tiny_bbox():
     assert est.seconds_estimate > 0
 
 
+# --- Task 25: both constants refitted from live measurement ------------
+
+
+def test_the_time_estimate_matches_the_measured_floor():
+    # Measured 2026-08-04 through ElevationSource.fetch against the live
+    # OpenTopography API: 10.94s and 11.16s over 4.17 sq km, 11.26s and
+    # 11.30s over 38.63, 11.58s and 11.60s over 259.60. Sixty-two times
+    # the area for 1.04x the time, because what is being paid for is the
+    # service's turnaround, not a transfer of at most a megabyte.
+    #
+    # The 5.0s this replaces was the only understatement in the whole
+    # estimate panel. Every other source overstated. That asymmetry is
+    # the reason it was worth fixing a six second error: a countdown
+    # built on an under-estimate runs out while the download is still
+    # going, which reads as a hang.
+    source = ElevationSource(api_key="k")
+    for spec in (
+        "-3.2830,51.4000,-3.2530,51.4180",
+        "-3.32,51.40,-3.22,51.45",
+        "-3.3400,51.3600,-3.1000,51.5000",
+    ):
+        seconds = source.estimate(BBox.parse(spec), []).seconds_estimate
+        assert 10.9 <= seconds <= 12.0, (
+            f"every measured extent took 10.94s to 11.60s whatever its size; "
+            f"{spec} is estimated at {seconds:.1f}s"
+        )
+
+
+def test_the_byte_estimate_matches_three_measured_downloads():
+    # COP30 comes back as Float32, so 4 bytes per pixel, not the 16-bit
+    # 2 bytes plus 20% that was here before and read 0.40x at the middle
+    # extent. Measured file sizes, identical on both samples of each:
+    #
+    #      4.17 sq km      29,606 bytes
+    #     38.63 sq km     254,479 bytes
+    #    259.60 sq km   1,005,162 bytes
+    #
+    # The bands are wide because three points are three points, and
+    # because compression against header overhead pulls in opposite
+    # directions as the file grows: the smallest file is nearly all
+    # header and the largest is nearly all data.
+    source = ElevationSource(api_key="k")
+    measured = {
+        "-3.2830,51.4000,-3.2530,51.4180": 29_606,
+        "-3.32,51.40,-3.22,51.45": 254_479,
+        "-3.3400,51.3600,-3.1000,51.5000": 1_005_162,
+    }
+    for spec, actual in measured.items():
+        estimate = source.estimate(BBox.parse(spec), []).bytes_estimate
+        assert 0.6 <= estimate / actual <= 1.4, (
+            f"{spec} downloaded {actual:,} bytes; the estimate says "
+            f"{estimate:,}, which is {estimate / actual:.2f}x"
+        )
+
+
 # --- Review round 3: a third independent reviewer got the key out again,
 # through a bare space in the key that requests encodes as "+" (quote_plus
 # semantics), which the previous candidate list, quote() only, encoded as
