@@ -2812,6 +2812,92 @@ def test_a_resumed_run_that_changed_model_downloads_rather_than_relabelling(tmp_
     assert entry["demtype"] == "EU_DTM"
 
 
+class _FailingDemSession(_FakeDemSession):
+    """Answers the first request with a real TIFF and every one after it
+    with a 401, which is what OpenTopography returns for a key that has
+    been revoked or has run out of quota."""
+
+    def __init__(self, payload=b"II*\x00COP30-COPERNICUS-DATA"):
+        super().__init__(payload=payload)
+        self.fail_from = 1
+
+    def get(self, url, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) > self.fail_from:
+            response = _FakeDemResponse(b"Unauthorized")
+            response.status_code = 401
+            return response
+        return _FakeDemResponse(self._payload)
+
+
+def test_a_forced_run_whose_dem_fails_does_not_leave_the_previous_models_tif(tmp_path):
+    # Review finding I8, reproduced as the reviewer described it. An
+    # incomplete package holds a COP30 DEM; the owner changes the model to
+    # EU_DTM in Settings and re-runs with --force; OpenTopography answers
+    # 401. merge() returns [] when no part matches this run's model, and
+    # justified that as "a package with no DEM, and a survey.json that
+    # says so, is a better outcome than one holding a DEM of a model it
+    # does not name". Nothing produced that outcome: returning []
+    # deleted nothing, and the stale-output sweep never runs on an
+    # incomplete package, so the previous model's <stem>.tif stayed in
+    # the root while _source_provenance recorded the CONFIGURED model and
+    # __init__ had already swapped in that model's licence and citation.
+    # The result was a licence statement about the wrong dataset.
+    from mapgen.sources.elevation import ElevationSource
+
+    # A second, always-failing source keeps the package INCOMPLETE, which
+    # is what the finding is about: a complete package is never reused, so
+    # a second run would land on _02 and never see the first one's DEM.
+    # This is the owner's own situation, an attempt that did not finish
+    # being re-run with --force.
+    session = _FailingDemSession()
+    register(ElevationSource(api_key="test-key", session=session))
+    register(SucceedsButWritesNothingSource())
+    first_request = _request(
+        tmp_path, source_ids=("elevation", "stub"), keep_work=True, force=True
+    )
+    first = run_survey(first_request)
+    assert first.complete is False
+    stale = first.paths.root / f"{first.paths.stem}.tif"
+    assert stale.is_file(), "expected the first run to have produced a COP30 DEM"
+    assert stale.read_bytes().endswith(b"COP30-COPERNICUS-DATA")
+
+    clear_registry()
+    register(ElevationSource(api_key="test-key", session=session))
+    register(SucceedsButWritesNothingSource())
+    second = run_survey(
+        _request(
+            tmp_path,
+            source_ids=("elevation", "stub"),
+            elevation_demtype="EU_DTM",
+            keep_work=True,
+            force=True,
+        )
+    )
+
+    assert second.paths.root == first.paths.root
+    assert second.complete is False, "the DEM download failed, so this run is short"
+    entry = next(s for s in second.survey["sources"] if s["id"] == "elevation")
+    assert entry["demtype"] == "EU_DTM"
+    # The whole finding in one line: the record names EU_DTM, so a COP30
+    # TIFF must not be sitting beside it under the licence and citation
+    # of a dataset it is not.
+    assert not stale.exists(), (
+        "the previous model's DEM is still in the package while survey.json "
+        f"records {entry['demtype']} and its terms"
+    )
+    assert not any(second.paths.root.glob("*.tif"))
+
+
+def test_a_run_whose_dem_lands_still_gets_its_tif(tmp_path):
+    # The other side of the removal above: a successful run must not have
+    # its own DEM swept out from under it, and a second successful run
+    # over the same package replaces rather than deletes.
+    _register_fake_elevation()
+    result = run_survey(_request(tmp_path, source_ids=("elevation",)))
+    assert (result.paths.root / f"{result.paths.stem}.tif").is_file()
+
+
 def test_the_estimate_names_the_model_this_request_will_use(tmp_path):
     _register_fake_elevation()
 

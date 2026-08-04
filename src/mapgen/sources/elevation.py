@@ -785,12 +785,36 @@ class ElevationSource:
         an older model's file happened to be lying about. A package with
         no DEM, and a survey.json that says so, is a better outcome there
         than one holding a DEM of a model it does not name.
+
+        Review finding I8: that last paragraph described an outcome
+        nothing produced. Returning [] removed nothing, and package.py's
+        stale-output sweep never runs on an incomplete package, so a
+        PREVIOUS model's <stem>.tif stayed in the root while
+        _source_provenance recorded this run's configured model and
+        __init__ had already replaced licence and attribution with that
+        model's terms. The owner's reproducible case: an incomplete
+        package holding a COP30 DEM, the model changed to EU_DTM in
+        Settings, --force, and OpenTopography answers 401. The folder
+        then held a Copernicus surface model while survey.json recorded
+        demtype EU_DTM, CC BY 4.0 and the Hengl et al. citation. That is
+        a licence statement about the wrong dataset, in the record
+        elevation_models.py's own docstring says the owner may one day
+        have to stand behind.
+
+        So the stale copy is removed here, which is what makes the
+        paragraph above true. This is the same closed-list rule
+        package.py's sweep applies (<stem>.tif is the one and only name
+        this method ever writes, and possible_outputs below says so), and
+        it is applied at the one moment that sweep cannot run. A file the
+        owner dropped in themselves can never match it, and a run whose
+        DEM did land is untouched, since that takes the branch below.
         """
         wanted = self.output_name()
         chosen = next((part for part in parts if part.name == wanted), None)
-        if chosen is None:
-            return []
         output = out_dir / f"{stem}.tif"
+        if chosen is None:
+            output.unlink(missing_ok=True)
+            return []
         atomic_write_bytes(output, chosen.read_bytes())
         return [output]
 
