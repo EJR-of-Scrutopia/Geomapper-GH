@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -83,6 +84,8 @@ def test_parser_exposes_every_expected_subcommand():
         "download",
         "merge",
         "urbano-package",
+        # Task 29, the inverse of --skip-bridge.
+        "bridge",
     }
 
 
@@ -1039,3 +1042,85 @@ def test_the_demtype_help_does_not_promise_higher_resolution():
     action = next(a for a in survey._actions if "--demtype" in a.option_strings)
     assert "higher resolution than COP30" in action.help
     assert "COP30" in action.help
+
+
+# --- Task 29: `mapgen bridge <package-dir>`. The refusals go through the
+# real bridge_package, because a refusal never starts a process and is
+# exactly what must not arrive as a traceback. The two summary tests fake
+# bridge_package the way the survey summary tests above fake run_survey,
+# so they exercise command_bridge's own branching without needing dotnet
+# or Urbano to be present. ------------------------------------------------
+
+
+def test_bridge_takes_a_package_directory_and_nothing_else():
+    parser = build_parser()
+    args = parser.parse_args(["bridge", r"C:\Surveys\South-Wales\2026-08-01_Barry"])
+    assert args.package_dir == Path(r"C:\Surveys\South-Wales\2026-08-01_Barry")
+    assert args.func is cli.command_bridge
+
+
+def test_bridge_needs_a_package_directory():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["bridge"])
+
+
+def test_bridge_reports_a_folder_that_is_not_there_without_a_traceback(tmp_path, capsys):
+    exit_code = main(["bridge", str(tmp_path / "not-a-package")])
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert "not-a-package" in err
+    assert "Traceback" not in err
+    assert err.strip().count("\n") == 0, "a refusal is one plain line"
+
+
+def test_bridge_reports_a_package_with_no_survey_json_without_a_traceback(tmp_path, capsys):
+    root = tmp_path / "2026-08-01_Barry"
+    root.mkdir()
+    exit_code = main(["bridge", str(root)])
+    err = capsys.readouterr().err
+    assert exit_code == 1
+    assert "survey.json" in err
+    assert "resume" in err
+    assert "Traceback" not in err
+
+
+def test_bridge_names_the_project_setting_when_it_succeeds(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "mapgen.cli.bridge_package",
+        lambda *a, **k: {
+            "urbano_stem": "Barry-Waterfront_2026-08-01",
+            "bridge": {"attempted": True, "ok": True, "error": None, "ran_at": "2026-08-04T10:00:00Z"},
+        },
+    )
+    exit_code = main(["bridge", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Urbano project setting: Barry-Waterfront_2026-08-01_project_setting.json" in captured.out
+    assert captured.err == ""
+
+
+def test_bridge_exits_1_and_says_why_when_the_bridge_ran_and_failed(tmp_path, capsys, monkeypatch):
+    # The owner's normal case today, and the reason this exits 1 where
+    # `mapgen survey` exits 0 for the same failure: a survey that cannot
+    # bridge still delivered its data, and this command was asked for
+    # nothing else.
+    error = (
+        "Urbano is not installed: no Urbano.Core.dll or ProjectSetup.dll was found "
+        "under C:\\Users\\Param\\AppData\\Roaming\\McNeel\\Rhinoceros\\packages\\8.0\\Urbano2. "
+        "Urbano is optional; the rest of the package does not need it."
+    )
+    monkeypatch.setattr(
+        "mapgen.cli.bridge_package",
+        lambda *a, **k: {
+            "urbano_stem": "Barry-Waterfront_2026-08-01",
+            "bridge": {"attempted": True, "ok": False, "error": error, "ran_at": "2026-08-04T10:00:00Z"},
+        },
+    )
+    exit_code = main(["bridge", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "not produced" in captured.out
+    assert "Barry-Waterfront_2026-08-01_project_setting.json" not in captured.out
+    assert error in captured.err
+    assert "Traceback" not in captured.err

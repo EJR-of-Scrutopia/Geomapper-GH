@@ -32,6 +32,8 @@ from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
     SurveyRequest,
+    UnbridgeablePackageError,
+    bridge_package,
     estimate_survey,
     register_default_sources,
     run_survey,
@@ -237,6 +239,33 @@ def command_survey(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_bridge(args: argparse.Namespace) -> int:
+    """`mapgen bridge <package-dir>`: the Urbano files for a package that
+    already exists, without downloading it again.
+
+    Exits 1 on a bridge that ran and failed, where `mapgen survey` exits 0
+    for the same failure. That is not an inconsistency. A survey whose
+    bridge fails still delivered the OSM, Overture and elevation data it
+    was asked for, which is most of what it was for; this command was asked
+    for exactly one thing, so a failure here is the whole of it. The
+    package is unharmed either way, and survey.json says what happened.
+    """
+    payload = bridge_package(args.package_dir, progress=ConsoleProgress())
+    bridge = payload.get("bridge") or {}
+    print(f"\nPackage: {args.package_dir}")
+    if bridge.get("ok"):
+        # Named from the package's own recorded stem, which is what was
+        # handed to the bridge as --file-name-stem, so this is the file
+        # that was actually just written rather than a prediction.
+        print(f"Urbano project setting: {payload.get('urbano_stem')}_project_setting.json")
+        return 0
+    # A plain sentence, already produced by bridge.py, never a stack trace:
+    # the survey data in the folder is untouched by this failure.
+    print("Urbano project setting: not produced, the Urbano bridge step failed.")
+    print(f"Urbano bridge step failed: {bridge.get('error')}", file=sys.stderr)
+    return 1
+
+
 def _install_windowless_safety() -> bool:
     """Redirects sys.stdout/sys.stderr to WINDOWLESS_LOG_PATH when there
     is no console attached, returning True if it actually did so.
@@ -387,6 +416,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ui.set_defaults(func=command_ui)
 
+    # The inverse of --skip-bridge, which has existed since the bridge did.
+    # Deliberately a command line only thing: the browser is for choosing an
+    # extent and downloading it, and this operates on a folder that is
+    # already finished.
+    bridge = subparsers.add_parser(
+        "bridge",
+        help="Run the Urbano bridge over a survey package that already exists.",
+    )
+    bridge.add_argument(
+        "package_dir", type=Path,
+        help="The survey package folder, the one holding survey.json. Its own "
+             "record says which layers it holds and over what extent; nothing "
+             "is re-derived from the folder name.",
+    )
+    bridge.set_defaults(func=command_bridge)
+
     sources = subparsers.add_parser("sources", help="List available data sources.")
     sources.set_defaults(func=command_sources)
 
@@ -430,6 +475,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         EmptyCategorySelectionError,
         EmptySourceSelectionError,
         UnknownDemTypeError,
+        UnbridgeablePackageError,
         OsmDownloadError,
         OvertureError,
         ElevationError,
@@ -456,6 +502,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # UnknownDemTypeError (Task 28) is the next one along, added the
         # same way for the same reason, and EmptySourceSelectionError
         # (review finding C1) the one after that.
+        # UnbridgeablePackageError (Task 29) is every refusal `mapgen
+        # bridge` can make: a folder that is not there, a folder with no
+        # survey.json, a survey.json that cannot be read, and a package
+        # short of a file the bridge needs. Each is already one plain
+        # sentence naming the folder and what to do next, which is the
+        # whole reason they are exceptions rather than return codes.
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
