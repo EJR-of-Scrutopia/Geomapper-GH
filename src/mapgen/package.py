@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -41,7 +41,7 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.elevation import ElevationSource
-from mapgen.sources.osm import NodeCapExceededError, OsmSource
+from mapgen.sources.osm import OsmSource
 from mapgen.sources.overture import (
     DEFAULT_OVERTURE_TYPES,
     LAYER_FILENAMES,
@@ -49,37 +49,6 @@ from mapgen.sources.overture import (
 )
 
 SCHEMA_VERSION = 1
-
-# The old, superseded script's own fixed ladder (Task 17's audit found it
-# in build_tiled_osm_fallback: 2000, then 1500, then 1000 metres), restored
-# by owner ruling after Task 17 recorded it as a dropped capability: dense
-# city centres are exactly where the owner surveys, and a run that stops an
-# hour in to wait for a manual --tile-size-m retry has to be babysat. Only
-# candidates SMALLER than whatever size just failed are ever tried (see
-# _next_smaller_node_cap_tile_size), so a job already at or below 1000 m
-# has nowhere smaller to fall back to and fails immediately, exactly as it
-# does today.
-NODE_CAP_RETRY_TILE_SIZES_M: tuple[float, ...] = (2000.0, 1500.0, 1000.0)
-
-
-def _next_smaller_node_cap_tile_size(current_tile_size_m: float) -> float | None:
-    smaller = [size for size in NODE_CAP_RETRY_TILE_SIZES_M if size < current_tile_size_m]
-    return max(smaller) if smaller else None
-
-
-class _RetryAtSmallerTileSize(RuntimeError):
-    """Internal signal only: raised by _run_survey_once when an OSM tile
-    exceeded the node cap AND a smaller size remains in the retry ladder,
-    caught by run_survey's own loop to actually perform the retry. Never
-    raised when no smaller size remains, which is what lets _run_survey_
-    once fall through to its ordinary (non-retryable) failure handling,
-    respecting request.force exactly as it always has, at the final rung
-    and for every other kind of failure at every rung.
-    """
-
-    def __init__(self, original: BaseException) -> None:
-        super().__init__(str(original))
-        self.original = original
 
 
 def _fetch_accepts_cancel(source) -> bool:
@@ -387,59 +356,25 @@ def run_survey(
     cancel: CancelToken | None = None,
     bridge_runner=None,
 ) -> SurveyResult:
-    """Runs a survey, automatically retrying the WHOLE run at the next
-    smaller tile size in NODE_CAP_RETRY_TILE_SIZES_M whenever an OSM tile
-    exceeds the 50000-node cap and a smaller size remains untried.
+    """Runs a survey once, at the tiling it was asked for.
 
-    The whole run, not just the failing tile: the owner considered and
-    rejected subdividing only the offending tile, in favour of this
-    simpler, uniform retry. This is safe by construction, not merely by
-    convention: a different tile_size_m hashes to a different
-    tiling_fingerprint (see _plan), so a retry gets its own, entirely
-    separate work_dir and cannot read or mix in anything the failed
-    attempt at the larger size wrote. Confirmed directly, not merely
-    assumed, by test_package.py's own retry tests.
+    Task 19 wrapped this in a retry loop that restarted the WHOLE run at
+    the next smaller size in a fixed ladder whenever an OSM tile exceeded
+    the map API's 50000-node cap. Task 26 removed it by owner ruling: a
+    restart changed tile_size_m, tile_size_m is part of tiling_fingerprint
+    (see _plan), and a different fingerprint is a different work_dir, so
+    every tile that had already succeeded and every Overture type was
+    refetched from scratch. A single dense tile in a 72-tile extent cost
+    the run three times over. Density is now handled where it arises, one
+    tile deep, inside OsmSource.fetch: the offending tile is split into
+    quarters and recombined into its own file, so this function sees an
+    ordinary tile that took longer, the fingerprint never changes, and
+    nothing already downloaded is thrown away.
 
-    Stops once NODE_CAP_RETRY_TILE_SIZES_M is exhausted (nothing smaller
-    remains to try) and fails with the same message _run_survey_once has
-    always raised, honouring request.force at that final attempt exactly
-    as it always has: this function never overrides force itself, it only
-    decides whether another attempt happens at all, at a smaller size,
-    before force's own "continue past a failure" or "stop and raise"
-    behaviour gets to run at that attempt.
+    One function again, not the run_survey/_run_survey_once pair Task 19
+    split it into: the only reason for the inner function was that the
+    outer one could call it more than once.
     """
-    sink = progress if progress is not None else NullProgress()
-    current_request = request
-    while True:
-        try:
-            return _run_survey_once(current_request, sink, cancel, bridge_runner)
-        except _RetryAtSmallerTileSize as retry_signal:
-            next_size = _next_smaller_node_cap_tile_size(current_request.tile_size_m)
-            # _run_survey_once only ever raises this when a smaller size
-            # genuinely exists (see its own comment at the raise site), so
-            # next_size is never None here; asserted rather than silently
-            # trusted, since a future change to that condition breaking
-            # this invariant should fail loudly, not retry into a
-            # TypeError from max() on an empty sequence three lines away.
-            assert next_size is not None
-            next_overlap = min(current_request.overlap_m, max(50.0, next_size / 10.0))
-            sink.emit(
-                "tile_size_retry",
-                previous_tile_size_m=current_request.tile_size_m,
-                next_tile_size_m=next_size,
-                reason=str(retry_signal),
-            )
-            current_request = replace(
-                current_request, tile_size_m=next_size, overlap_m=next_overlap
-            )
-
-
-def _run_survey_once(
-    request: SurveyRequest,
-    progress: ProgressSink | None = None,
-    cancel: CancelToken | None = None,
-    bridge_runner=None,
-) -> SurveyResult:
     sink = progress if progress is not None else NullProgress()
     token = cancel if cancel is not None else CancelToken()
 
@@ -507,26 +442,15 @@ def _run_survey_once(
                 stopped = True
             except Exception as exc:
                 sink.emit("source_failed", source=source.id, error=str(exc))
-                # A node-cap failure with a smaller size still to try is
-                # ALWAYS retried by run_survey's own wrapper, regardless of
-                # request.force: force's job is "tolerate a failure and
-                # mark the package incomplete rather than stop", which is
-                # not the same decision as "this specific, structural
-                # failure has a smaller-tile-size fix available, try it
-                # first". Checked before the request.force branch below,
-                # not folded into it, so force's existing behaviour for
-                # every OTHER kind of failure, and for a node-cap failure
-                # once this ladder is exhausted, is completely unchanged:
-                # this raises only in the one case _run_survey_once itself
-                # would not otherwise have handled differently.
-                if (
-                    isinstance(exc, NodeCapExceededError)
-                    and _next_smaller_node_cap_tile_size(request.tile_size_m) is not None
-                ):
-                    _record_tile_outcomes(
-                        state, source.id, pending, source_work, fetch_succeeded, current_tile_ids, sink
-                    )
-                    raise _RetryAtSmallerTileSize(exc) from exc
+                # No special case for a node-cap failure any more (Task
+                # 26). It used to be caught here and turned into a
+                # whole-run restart at a smaller tile size, ahead of and
+                # regardless of request.force; OsmSource now subdivides
+                # the offending tile itself, and a NodeCapExceededError
+                # that still reaches this far has already been split as
+                # far as splitting is allowed to go. That makes it an
+                # ordinary failure of one tile, handled by force exactly
+                # like any other.
                 if not request.force:
                     # Record whatever genuinely landed before re-raising: a
                     # batch call failing partway through must not blame tiles
@@ -749,7 +673,7 @@ def _record_tile_outcomes(
 
     stopped tells this apart from an ordinary failure: it is true only
     when THIS call is the one running because this source's own fetch()
-    raised Cancelled just now (see _run_survey_once's own local `stopped`
+    raised Cancelled just now (see run_survey's own local `stopped`
     flag, passed straight through), never for a genuine per-tile error or
     a plain, complete success. Cancelled and any other exception cannot
     both come out of the same fetch() call (Python raises one exception

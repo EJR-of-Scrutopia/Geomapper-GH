@@ -254,9 +254,10 @@ class _RaisesOsmDownloadErrorSource:
 
 class _RaisesNodeCapExceededErrorSource:
     """NodeCapExceededError specifically, not just its OsmDownloadError
-    parent: this is the one main() would actually meet in practice (a
-    dense tile at the smallest rung of the retry ladder), so it gets its
-    own test rather than trusting the inheritance relationship alone.
+    parent: this is the one main() would actually meet in practice (a tile
+    still over the node cap after being split as far as splitting goes),
+    so it gets its own test rather than trusting the inheritance
+    relationship alone.
     """
 
     id = "raises-node-cap-error"
@@ -336,9 +337,9 @@ def test_survey_reports_an_osm_download_error_without_a_traceback(tmp_path, caps
 
 
 def test_survey_reports_a_node_cap_exceeded_error_without_a_traceback(tmp_path, capsys):
-    # The realistic case: a node-cap failure with no smaller tile size
-    # left to retry (the ladder in package.py only retries automatically;
-    # once it is exhausted, this is what main() actually has to catch).
+    # The realistic case: a tile still over the cap after OsmSource has
+    # split it as far as it is allowed to, which is the one way this
+    # error reaches main() at all.
     register(_RaisesNodeCapExceededErrorSource())
     exit_code = main(_survey_error_case_args(tmp_path, "raises-node-cap-error", tile_size_m=1000))
     assert exit_code == 1
