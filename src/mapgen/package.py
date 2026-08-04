@@ -630,11 +630,35 @@ def _existing_output_files(source_work: Path, current_tile_ids: Sequence[str]) -
     current_tile_ids is passed in by the caller, which already knows the
     current plan, rather than inferred here, so this stays correct
     regardless of what older runs left on disk.
+
+    A subdirectory whose name starts with an underscore is a source's own
+    private scratch, not output, and everything under it is excluded
+    whatever it is named (Task 26). OsmSource keeps the quarters of a
+    subdivided tile in one, and they are exactly the kind of file this
+    function must not hand on: they are real .osm data, but they are
+    PARTS of a tile whose own file may not exist yet, and merging them
+    into the package would put a half-fetched tile's ground into the
+    finished output with nothing recording that it is partial. They are
+    also not shaped like a tile id (see geo.split_tile_into_quarters:
+    r00_c00_q10, never r00_c00), so the tile-id rule above would have
+    admitted them rather than rejected them, which is why this needs a
+    rule of its own.
+
+    That rule, and NOT a change to _TILE_ID_SHAPE, deliberately: the regex
+    is a safety mechanism against stale tilings, and every change to it
+    either lets more through, which is the failure it exists to prevent,
+    or excludes more real output. The underscore rule can only ever
+    exclude, it excludes nothing any source writes today (osm writes
+    rNN_cNN.osm flat, overture <type>.geojson flat, elevation one TIFF),
+    and it leaves the stale-tiling property exactly as it was: a file that
+    would have been rejected for its name is still rejected for its name.
     """
     current_ids = set(current_tile_ids)
     kept: list[Path] = []
     for path in sorted(source_work.rglob("*")):
         if not path.is_file() or path.suffix == ".part":
+            continue
+        if any(part.startswith("_") for part in path.relative_to(source_work).parts[:-1]):
             continue
         if _TILE_ID_SHAPE.match(path.stem) and path.stem not in current_ids:
             continue

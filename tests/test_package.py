@@ -2320,6 +2320,201 @@ def test_resume_replicates_the_owners_real_interrupted_package_and_completes(tmp
     )
 
 
+# --- Task 26: a subdivided tile is an ordinary tile from out here ----------
+#
+# The point of putting subdivision inside OsmSource.fetch is that nothing
+# in this file has to know about it. These are the tests that hold that
+# claim to account through the real orchestration: the tile is recorded
+# ok, the quarters never reach merge(), and a stop landing mid-split
+# leaves the tile pending rather than failed or half-finished.
+
+
+class _DenseTileOsmSession:
+    """An OSM map API that refuses any request wider than max_span degrees
+    with the real "too many nodes" 400, and answers anything smaller with
+    a node stamped with the bbox it came from.
+
+    Density by area, which is what actually drives the node cap: a tile
+    fails and its quarters do not, without the session having to count
+    calls or know anything about subdivision.
+    """
+
+    def __init__(self, max_span=0.006):
+        # 0.006 degrees sits between the tile these tests use (about
+        # 0.0094 degrees of longitude across, including its overlap) and
+        # its quarters (about 0.0050), so every tile splits exactly once
+        # and no quarter splits again. One level is enough to prove the
+        # orchestration; the recursion itself is covered in
+        # test_sources_osm.py against a model of the ground.
+        self.max_span = max_span
+        self.bboxes = []
+
+    def get(self, url, **kwargs):
+        west, south, east, north = (
+            float(value) for value in kwargs["params"]["bbox"].split(",")
+        )
+        self.bboxes.append((west, south, east, north))
+        if (east - west) > self.max_span:
+            return _FakeOsmResponse(status_code=400, text="You requested too many nodes")
+        node_id = abs(hash((round(west, 7), round(south, 7)))) % 10_000_000
+        return _FakeOsmResponse(
+            text=(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<osm version="0.6" generator="test">\n'
+                f'  <node id="{node_id}" version="1" lat="{south}" lon="{west}"/>\n'
+                "</osm>\n"
+            )
+        )
+
+    def post(self, url, **kwargs):
+        raise AssertionError("expected the map API (GET) path")
+
+
+def _osm_only_request(tmp_path, **overrides):
+    defaults = dict(
+        source_ids=("osm",),
+        tile_size_m=600.0,
+        overlap_m=50.0,
+        run_bridge_step=False,
+    )
+    defaults.update(overrides)
+    return _request(tmp_path, **defaults)
+
+
+def test_a_subdivided_tile_is_recorded_ok_like_any_other_tile(tmp_path):
+    session = _DenseTileOsmSession()
+    register(OsmSource(session=session, sleeper=lambda _s: None, min_interval_seconds=0.0))
+
+    result = run_survey(_osm_only_request(tmp_path))
+
+    assert result.complete is True
+    assert all(record["osm"] == "ok" for record in result.survey["tiles"]), (
+        f"a subdivided tile was not recorded ok: {result.survey['tiles']}"
+    )
+    # The tiling in survey.json is the one that was asked for. The old
+    # ladder used to rewrite it, so a package could say 1000 m when the
+    # owner asked for 2000; subdivision leaves the plan alone.
+    assert result.survey["tiling"]["tile_size_m"] == 600.0
+    assert result.survey["tiling"]["overlap_m"] == 50.0
+    # And every tile really did have to split, so this is not passing by
+    # never exercising the path.
+    assert any(
+        (east - west) > session.max_span for west, _s, east, _n in session.bboxes
+    )
+
+
+def test_the_quarters_of_a_subdivided_tile_never_reach_the_package(tmp_path):
+    # _existing_output_files feeds both merge() and the per-tile outcome
+    # check. A quarter is real .osm data sitting in the source's work
+    # directory, so without the scratch-directory rule it would be merged
+    # into the finished package as though it were a tile's own output.
+    session = _DenseTileOsmSession()
+    register(OsmSource(session=session, sleeper=lambda _s: None, min_interval_seconds=0.0))
+
+    result = run_survey(_osm_only_request(tmp_path, keep_work=True))
+
+    from mapgen.package import _existing_output_files
+    from mapgen.sources.osm import SPLIT_DIR_NAME
+
+    source_work = result.paths.work_dir / "raw" / "osm"
+    split_dir = source_work / SPLIT_DIR_NAME
+    assert split_dir.is_dir(), "the quarters should still be on disk for a resume"
+    assert list(split_dir.iterdir()), "the quarters should not have been deleted"
+
+    tile_ids = [record["tile_id"] for record in result.survey["tiles"]]
+    offered = _existing_output_files(source_work, tile_ids)
+    assert offered, "the tiles themselves must still be offered to merge"
+    assert all(path.parent == source_work for path in offered), (
+        f"a scratch file was offered to merge as though it were tile output: {offered}"
+    )
+    assert sorted(p.stem for p in offered) == sorted(tile_ids)
+
+
+def test_a_stop_mid_subdivision_leaves_the_tile_pending_not_failed(tmp_path):
+    # Task 22's rule, one level further in than it was written: a tile a
+    # stop never finished is pending, never failed, and the quarters it
+    # did fetch must not be recombined into a tile file that would then
+    # read as complete.
+    token = CancelToken()
+
+    class _StopsAfterOneQuarter(_DenseTileOsmSession):
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if len(self.bboxes) == 2:  # the tile, then its first quarter
+                token.cancel()
+            return response
+
+    session = _StopsAfterOneQuarter()
+    register(OsmSource(session=session, sleeper=lambda _s: None, min_interval_seconds=0.0))
+
+    result = run_survey(_osm_only_request(tmp_path, keep_work=True), cancel=token)
+
+    assert result.stopped is True
+    assert result.complete is False
+    statuses = {record["tile_id"]: record["osm"] for record in result.survey["tiles"]}
+    assert "failed" not in statuses.values(), (
+        f"a stop mid-subdivision marked a tile failed: {statuses}"
+    )
+    assert "pending" in statuses.values()
+
+    from mapgen.sources.osm import SPLIT_DIR_NAME
+
+    source_work = result.paths.work_dir / "raw" / "osm"
+    interrupted = [
+        tile_id for tile_id, status in statuses.items() if status == "pending"
+    ]
+    for tile_id in interrupted:
+        assert not (source_work / f"{tile_id}.osm").exists(), (
+            "a half-fetched set of quarters was recombined into a tile file"
+        )
+    # The quarter that was paid for is kept, so the resume starts from it.
+    assert list((source_work / SPLIT_DIR_NAME).iterdir())
+
+
+def test_a_run_resumed_after_a_stop_mid_subdivision_completes(tmp_path):
+    token = CancelToken()
+
+    class _StopsAfterOneQuarter(_DenseTileOsmSession):
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if len(self.bboxes) == 2:
+                token.cancel()
+            return response
+
+    stopped_session = _StopsAfterOneQuarter()
+    register(
+        OsmSource(
+            session=stopped_session, sleeper=lambda _s: None, min_interval_seconds=0.0
+        )
+    )
+    stopped = run_survey(_osm_only_request(tmp_path, keep_work=True), cancel=token)
+    assert stopped.complete is False
+    # The tile's own request, then the one quarter that landed before the
+    # stop: that quarter's bbox is what must not be asked for twice.
+    assert len(stopped_session.bboxes) == 2
+    already_paid_for = stopped_session.bboxes[1]
+
+    clear_registry()
+    resumed_session = _DenseTileOsmSession()
+    register(
+        OsmSource(session=resumed_session, sleeper=lambda _s: None, min_interval_seconds=0.0)
+    )
+    resumed = run_survey(_osm_only_request(tmp_path, keep_work=True))
+
+    assert resumed.complete is True
+    assert resumed.paths.root == stopped.paths.root, "the resume must reuse the same folder"
+    assert all(record["osm"] == "ok" for record in resumed.survey["tiles"])
+    # Resumed INTO the subdivision, not restarted: the quarter already on
+    # disk is never asked for again, while its three siblings are.
+    assert already_paid_for not in resumed_session.bboxes, (
+        "the resumed run refetched a quarter that was already on disk"
+    )
+    assert sum(1 for box in resumed_session.bboxes if box[0] == already_paid_for[0]) >= 1, (
+        "the resumed run should still have fetched the tile and the "
+        "remaining quarters that share this westing"
+    )
+
+
 # --- the stale-output sweep (final review residual, HANDOFF item 4) ---------
 #
 # The fingerprinted work directory isolates each selection's RAW tiles, but

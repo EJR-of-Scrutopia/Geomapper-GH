@@ -1,9 +1,13 @@
+import xml.etree.ElementTree as ET
+
 import pytest
 
-from mapgen.geo import BBox, Tile
+from mapgen.geo import BBox, Tile, extent_metres
 from mapgen.jobs import CancelToken, Cancelled
 from mapgen.sources.base import NullProgress
 from mapgen.sources.osm import (
+    MAX_SUBDIVISION_DEPTH,
+    SPLIT_DIR_NAME,
     NodeCapExceededError,
     OsmDownloadError,
     OsmSource,
@@ -236,31 +240,33 @@ def test_failure_message_names_the_overpass_url_when_use_overpass_is_true(tmp_pa
     assert source.overpass_urls[1] in str(exc_info.value.__cause__)
 
 
-def test_node_limit_failure_is_reported_immediately_without_retrying(tmp_path):
+def test_node_limit_failure_is_recognised_immediately_without_retrying(tmp_path):
+    # One request per attempt, not max_retries of them: a node cap is not
+    # a transient failure and retrying the identical request cannot clear
+    # it. The three requests here are the tile, the first quarter, and the
+    # first sixteenth, each recognised on its first response.
     source = _source(
-        [FakeResponse(status_code=400, text="You requested too many nodes")], max_retries=4
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 3,
+        max_retries=4,
     )
     with pytest.raises(OsmDownloadError, match="50000"):
         source.fetch(
             BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
         )
-    assert len(source.session.calls) == 1
+    assert len(source.session.calls) == 3
 
 
-def test_node_limit_message_does_not_suggest_a_specific_tile_size(tmp_path):
+def test_node_limit_message_does_not_suggest_a_tile_size_it_cannot_verify(tmp_path):
     # A coordinator review's Honesty finding 1: this used to say "reduce
-    # to 1500 or 2000 metres", which is wrong exactly when the message
-    # actually reaches a person, since run_survey's own retry ladder
-    # (package.py's NODE_CAP_RETRY_TILE_SIZES_M) already tries both of
-    # those, among others, before ever letting this propagate that far,
-    # and is also wrong for a run that started at or below the ladder's
-    # smallest rung, which the ladder never touches. osm.py cannot import
-    # that ladder to check against without a circular import (package.py
-    # imports this module already), so the fix is a message with no
-    # specific size claim to be wrong about, checked here by name so a
-    # future edit cannot casually reintroduce one.
+    # to 1500 or 2000 metres", sizes osm.py has no way to check anything
+    # against, since a Tile carries a bbox and no tile_size_m at all. The
+    # figures the message may state are the ones it measured for itself,
+    # the size of the piece that actually failed, and those come from the
+    # tile in hand rather than from a guess about the setting that
+    # produced it.
     source = _source(
-        [FakeResponse(status_code=400, text="You requested too many nodes")], max_retries=4
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 3,
+        max_retries=4,
     )
     with pytest.raises(NodeCapExceededError) as excinfo:
         source.fetch(
@@ -269,20 +275,42 @@ def test_node_limit_message_does_not_suggest_a_specific_tile_size(tmp_path):
     message = str(excinfo.value)
     assert "1500" not in message
     assert "2000" not in message
+    # The measured size of the piece that failed IS present, and it is the
+    # sixteenth's own ground, about 174 by 278 metres, not the tile's.
+    width_m, height_m = extent_metres(_tile().query_bbox)
+    assert f"{width_m / 4:.0f} by {height_m / 4:.0f} metres" in message
 
 
 def test_node_limit_failure_is_specifically_a_node_cap_exceeded_error(tmp_path):
-    # Task 19: mapgen.package's whole-run retry needs to tell this failure
-    # apart from any other kind of download failure by TYPE, not by
-    # matching on message text (the same structural-over-textual lesson
-    # the elevation API key redaction work had to learn the hard way).
+    # The subdivision handler needs to tell this failure apart from any
+    # other kind of download failure by TYPE, not by matching on message
+    # text (the same structural-over-textual lesson the elevation API key
+    # redaction work had to learn the hard way).
     source = _source(
-        [FakeResponse(status_code=400, text="You requested too many nodes")], max_retries=4
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 3,
+        max_retries=4,
     )
     with pytest.raises(NodeCapExceededError):
         source.fetch(
             BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
         )
+
+
+def test_a_node_cap_error_carries_the_tile_that_was_too_dense(tmp_path):
+    # Structural, not textual: the handler that has to split the tile must
+    # be able to read which tile it is, not parse it out of a sentence.
+    source = _source(
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 3,
+        max_retries=4,
+    )
+    with pytest.raises(NodeCapExceededError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.29,51.38,-3.28,51.39"), [_tile()], tmp_path, NullProgress()
+        )
+    # The piece that actually failed, two levels down, and its id names
+    # the tile of the plan it came from and where in it.
+    assert excinfo.value.tile.tile_id == "r00_c00_q00_q00"
+    assert excinfo.value.tile.query_bbox.west == _tile().query_bbox.west
 
 
 def test_a_different_400_is_not_a_node_cap_exceeded_error(tmp_path):
@@ -685,3 +713,429 @@ def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
 
 def test_possible_outputs_names_exactly_the_stem_osm_file():
     assert OsmSource().possible_outputs("Stem_2026-08-01") == ["Stem_2026-08-01.osm"]
+
+
+# =======================================================================
+# Task 26: a tile over the node cap is split into quarters and recombined,
+# instead of the whole run restarting at a smaller tile size.
+# =======================================================================
+#
+# Every test below runs against GroundSession rather than a queue of
+# canned responses. A queue answers in call order and knows nothing about
+# what was asked for, which is exactly the stub that is more permissive
+# than the real thing: it cannot tell a quarter from its parent, so it
+# cannot show that splitting actually helped, and a queue that always
+# answers "too many nodes" recurses to the depth cap and proves nothing
+# about the success path.
+#
+# GroundSession models the ground instead. It holds nodes at known
+# coordinates and ways over them, answers each request from the bbox that
+# was actually asked for, and refuses with the map API's own "too many
+# nodes" 400 when more than node_cap nodes fall inside it. Density is
+# then a property of where the nodes are, so "dense in one corner, fine
+# everywhere else", which is what a real city centre in a rural extent
+# looks like, is something the test can simply state.
+
+
+class GroundSession:
+    """A fake OSM map API answering from a model of the ground.
+
+    Reproduces the three parts of the real map API's contract that this
+    feature depends on: every node inside the bbox, every way with at
+    least one node inside it, and those ways' remaining nodes even where
+    they fall outside. The last one is why a way lying across a seam
+    comes back whole from whichever piece holds one of its nodes, and
+    therefore why a split cannot clip anything.
+    """
+
+    def __init__(self, nodes, ways=None, node_cap=50):
+        self.nodes = dict(nodes)
+        self.ways = dict(ways or {})
+        self.node_cap = node_cap
+        self.calls = []
+        self.bboxes = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        west, south, east, north = (
+            float(value) for value in kwargs["params"]["bbox"].split(",")
+        )
+        self.bboxes.append((west, south, east, north))
+        inside = {
+            node_id
+            for node_id, (lon, lat) in self.nodes.items()
+            if west <= lon <= east and south <= lat <= north
+        }
+        if len(inside) > self.node_cap:
+            return FakeResponse(status_code=400, text="You requested too many nodes")
+
+        way_ids = sorted(
+            way_id
+            for way_id, refs in self.ways.items()
+            if any(ref in inside for ref in refs)
+        )
+        returned_nodes = set(inside)
+        for way_id in way_ids:
+            returned_nodes.update(self.ways[way_id])
+        return FakeResponse(text=self._document(sorted(returned_nodes), way_ids))
+
+    def post(self, url, **kwargs):
+        raise AssertionError("the node cap belongs to the map API, not Overpass")
+
+    def _document(self, node_ids, way_ids):
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<osm version="0.6">']
+        for node_id in node_ids:
+            lon, lat = self.nodes[node_id]
+            lines.append(f'  <node id="{node_id}" version="1" lat="{lat}" lon="{lon}"/>')
+        for way_id in way_ids:
+            refs = "".join(f'<nd ref="{ref}"/>' for ref in self.ways[way_id])
+            lines.append(f'  <way id="{way_id}" version="1">{refs}</way>')
+        lines.append("</osm>")
+        return "\n".join(lines) + "\n"
+
+
+def _element_keys(path):
+    """Every element in an .osm file as type/id strings, IN FILE ORDER and
+    with repeats kept, so a duplicate is visible rather than collapsed."""
+    root = ET.parse(path).getroot()
+    return [f"{el.tag}/{el.get('id')}" for el in root if el.tag in ("node", "way")]
+
+
+def _split_tile():
+    """A tile with a real overlap margin, the shape build_tiles produces
+    for anything that is not on the edge of the extent."""
+    return Tile(
+        tile_id="r03_c04",
+        row=3,
+        col=4,
+        core_bbox=BBox(-3.290, 51.380, -3.280, 51.390),
+        query_bbox=BBox(-3.291, 51.379, -3.279, 51.391),
+    )
+
+
+def _spread(count, west, south, east, north, first_id=1):
+    """count nodes spread evenly over a rectangle, on a square-ish grid."""
+    import math
+
+    per_side = math.ceil(math.sqrt(count))
+    nodes = {}
+    for index in range(count):
+        row, col = divmod(index, per_side)
+        lon = west + (east - west) * (col + 0.5) / per_side
+        lat = south + (north - south) * (row + 0.5) / per_side
+        nodes[first_id + index] = (lon, lat)
+    return nodes
+
+
+def _ground_source(session, **kwargs):
+    kwargs.setdefault("sleeper", lambda _seconds: None)
+    kwargs.setdefault("min_interval_seconds", 0.0)
+    return OsmSource(session=session, **kwargs)
+
+
+class Recorder:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, **fields):
+        self.events.append({"event": event, **fields})
+
+
+def test_a_tile_over_the_node_cap_is_split_into_four_and_recombined(tmp_path):
+    # 200 nodes over the whole tile, a cap of 120: the tile fails, and
+    # each quarter holds about 50, which does not.
+    tile = _split_tile()
+    session = GroundSession(_spread(200, -3.291, 51.379, -3.279, 51.391), node_cap=120)
+    source = _ground_source(session)
+
+    paths = source.fetch(BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], tmp_path, NullProgress())
+
+    # The pipeline outside this module sees one ordinary tile file, named
+    # after the tile of the plan, exactly as if it had never been split.
+    assert paths == [tmp_path / "r03_c04.osm"]
+    assert paths[0].exists()
+    # One failed request for the tile, then four that worked.
+    assert len(session.calls) == 5
+    keys = _element_keys(paths[0])
+    assert len(keys) == 200, "every node the ground holds should be in the recombined tile"
+
+
+def test_a_subdivided_tile_says_so_through_the_progress_sink(tmp_path):
+    tile = _split_tile()
+    session = GroundSession(_spread(200, -3.291, 51.379, -3.279, 51.391), node_cap=120)
+    progress = Recorder()
+
+    _ground_source(session).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], tmp_path, progress
+    )
+
+    subdivided = [e for e in progress.events if e["event"] == "tile_subdivided"]
+    assert len(subdivided) == 1
+    assert subdivided[0]["source"] == "osm"
+    assert subdivided[0]["tile_id"] == "r03_c04", "the parent tile, by the id the plan knows"
+    assert subdivided[0]["pieces"] == 4
+    # And it still finishes as an ordinary done tile: a subdivided tile is
+    # not a failure and must not be shown as one.
+    assert {"event": "tile_done", "source": "osm", "tile_id": "r03_c04"} in progress.events
+    assert not any(e["event"] == "tile_failed" for e in progress.events)
+
+
+def test_the_recombined_tile_holds_exactly_what_an_unsplit_fetch_would_have(tmp_path):
+    # The seam question, answered by comparison rather than assertion: the
+    # same ground, fetched once whole and once in quarters, must produce
+    # the same set of elements. The ways here run straight across both
+    # seams, so a clipped feature or a duplicated one would show up as a
+    # difference.
+    nodes = _spread(200, -3.291, 51.379, -3.279, 51.391)
+    ways = {
+        # Left edge to right edge, across the vertical seam.
+        900: [1, 100, 200],
+        # And a short one sitting right on the crossing of both seams.
+        901: [95, 96, 105, 106],
+    }
+    tile = _split_tile()
+
+    whole_session = GroundSession(nodes, ways, node_cap=10_000)
+    whole_dir = tmp_path / "whole"
+    whole_dir.mkdir()
+    _ground_source(whole_session).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], whole_dir, NullProgress()
+    )
+    assert len(whole_session.calls) == 1, "this half of the comparison must not split"
+
+    split_session = GroundSession(nodes, ways, node_cap=120)
+    split_dir = tmp_path / "split"
+    split_dir.mkdir()
+    _ground_source(split_session).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], split_dir, NullProgress()
+    )
+    assert len(split_session.calls) == 5, "this half of the comparison must split"
+
+    whole_keys = _element_keys(whole_dir / "r03_c04.osm")
+    split_keys = _element_keys(split_dir / "r03_c04.osm")
+
+    assert set(split_keys) == set(whole_keys), "the split fetch covered different ground"
+    assert len(split_keys) == len(set(split_keys)), "a seam duplicate survived the merge"
+    assert len(split_keys) == len(whole_keys)
+    assert "way/900" in set(split_keys) and "way/901" in set(split_keys)
+
+
+def test_a_quarter_that_is_still_too_dense_is_split_again(tmp_path):
+    # The realistic shape: one dense corner and three quiet ones, not
+    # uniform density. The south-west quarter needs a second round; the
+    # other three are answered first time.
+    dense_corner = _spread(200, -3.2905, 51.3795, -3.2845, 51.3855, first_id=1)
+    sparse = _spread(30, -3.2845, 51.3855, -3.2795, 51.3905, first_id=1000)
+    session = GroundSession({**dense_corner, **sparse}, node_cap=120)
+    tile = _split_tile()
+    progress = Recorder()
+
+    _ground_source(session).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], tmp_path, progress
+    )
+
+    subdivided = [e for e in progress.events if e["event"] == "tile_subdivided"]
+    assert [e["tile_id"] for e in subdivided] == ["r03_c04", "r03_c04_q00"], (
+        "expected the tile split once and its dense quarter split again, "
+        f"got {[e['tile_id'] for e in subdivided]}"
+    )
+    assert [e["depth"] for e in subdivided] == [1, 2]
+    # The tile, its dense quarter, that quarter's four sixteenths, and the
+    # three quarters that were fine first time: nine requests, depth
+    # first, none of them repeated.
+    assert len(session.calls) == 9
+    keys = _element_keys(tmp_path / "r03_c04.osm")
+    assert len(keys) == len(set(keys)) == 230
+
+
+def test_a_piece_still_over_the_cap_at_the_depth_cap_fails_and_says_what_was_tried(tmp_path):
+    # Every node in one tiny spot, so no amount of quartering thins it
+    # out: the depth cap is what stops this, not the arithmetic.
+    session = GroundSession(_spread(200, -3.2901, 51.3801, -3.2900, 51.3802), node_cap=120)
+    source = _ground_source(session)
+
+    with pytest.raises(NodeCapExceededError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.30,51.37,-3.27,51.40"), [_split_tile()], tmp_path, NullProgress()
+        )
+
+    message = str(excinfo.value)
+    assert "50000-node" in message
+    assert f"quarters {MAX_SUBDIVISION_DEPTH} times" in message
+    assert "metres" in message, "the size of the piece that failed should be stated"
+    assert "Draw a smaller extent" in message
+    # It never loops: the tile, one quarter, one sixteenth, then it stops.
+    assert len(session.calls) == 1 + MAX_SUBDIVISION_DEPTH
+
+
+def test_a_failed_subdivision_leaves_no_tile_file_behind(tmp_path):
+    # The half-fetched set of quarters must not be recombined into a
+    # parent file, which package.py would then read as a finished tile.
+    session = GroundSession(_spread(200, -3.2901, 51.3801, -3.2900, 51.3802), node_cap=120)
+    with pytest.raises(NodeCapExceededError):
+        _ground_source(session).fetch(
+            BBox.parse("-3.30,51.37,-3.27,51.40"), [_split_tile()], tmp_path, NullProgress()
+        )
+    assert not (tmp_path / "r03_c04.osm").exists()
+
+
+def test_the_quarters_are_kept_on_disk_in_a_scratch_subdirectory(tmp_path):
+    session = GroundSession(_spread(200, -3.291, 51.379, -3.279, 51.391), node_cap=120)
+    _ground_source(session).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [_split_tile()], tmp_path, NullProgress()
+    )
+
+    split_dir = tmp_path / SPLIT_DIR_NAME
+    assert sorted(p.name for p in split_dir.iterdir()) == [
+        "r03_c04_q00.osm",
+        "r03_c04_q01.osm",
+        "r03_c04_q10.osm",
+        "r03_c04_q11.osm",
+    ]
+    # Not loose in the source's work directory beside the real tiles, and
+    # not named like one either.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [SPLIT_DIR_NAME, "r03_c04.osm"]
+
+
+def test_a_resumed_run_reuses_the_quarters_already_on_disk(tmp_path):
+    # An interrupted run resumes INTO the subdivision. Two quarters are
+    # already on disk; the resume must pay for the other two and no more.
+    nodes = _spread(200, -3.291, 51.379, -3.279, 51.391)
+    tile = _split_tile()
+
+    first = GroundSession(nodes, node_cap=120)
+    _ground_source(first).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], tmp_path, NullProgress()
+    )
+    (tmp_path / "r03_c04.osm").unlink()  # as if the run died before recombining
+    (tmp_path / SPLIT_DIR_NAME / "r03_c04_q10.osm").unlink()
+    (tmp_path / SPLIT_DIR_NAME / "r03_c04_q11.osm").unlink()
+
+    second = GroundSession(nodes, node_cap=120)
+    progress = Recorder()
+    _ground_source(second).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [tile], tmp_path, progress
+    )
+
+    # One request for the tile itself (still too dense, still true) plus
+    # the two missing quarters. The two that survived are not refetched.
+    assert len(second.calls) == 3
+    skipped = [e["tile_id"] for e in progress.events if e["event"] == "tile_skipped"]
+    assert skipped == ["r03_c04_q00", "r03_c04_q01"]
+    keys = _element_keys(tmp_path / "r03_c04.osm")
+    assert len(keys) == len(set(keys)) == 200, "the resumed tile must still be whole"
+
+
+def test_a_stop_landing_mid_subdivision_keeps_the_quarters_and_writes_no_tile(tmp_path):
+    # Task 22's contract, one level further in: a stop is allowed to
+    # interrupt between quarters, never during one, and what it leaves
+    # behind must not read as a finished tile.
+    token = CancelToken()
+    nodes = _spread(200, -3.291, 51.379, -3.279, 51.391)
+
+    class StoppingSession(GroundSession):
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if len(self.calls) == 3:  # the tile, one quarter, then stop
+                token.cancel()
+            return response
+
+    session = StoppingSession(nodes, node_cap=120)
+    with pytest.raises(Cancelled):
+        _ground_source(session).fetch(
+            BBox.parse("-3.30,51.37,-3.27,51.40"),
+            [_split_tile()],
+            tmp_path,
+            NullProgress(),
+            cancel=token,
+        )
+
+    # No recombined tile: package.py finds nothing for this tile and, on a
+    # stopped run, records it pending rather than failed or ok.
+    assert not (tmp_path / "r03_c04.osm").exists()
+    # The quarters that landed are kept, including the one that was in
+    # flight when the stop arrived: it was paid for.
+    assert sorted(p.name for p in (tmp_path / SPLIT_DIR_NAME).iterdir()) == [
+        "r03_c04_q00.osm",
+        "r03_c04_q01.osm",
+    ]
+    assert len(session.calls) == 3, "the stop must not start the third quarter"
+
+
+def test_a_run_resumed_after_a_stop_mid_subdivision_finishes_the_tile(tmp_path):
+    # The other half of the same story, tested rather than reasoned: the
+    # resume picks up the two quarters the stop left and completes the
+    # tile, and the tile it produces is whole.
+    token = CancelToken()
+    nodes = _spread(200, -3.291, 51.379, -3.279, 51.391)
+
+    class StoppingSession(GroundSession):
+        def get(self, url, **kwargs):
+            response = super().get(url, **kwargs)
+            if len(self.calls) == 3:
+                token.cancel()
+            return response
+
+    with pytest.raises(Cancelled):
+        _ground_source(StoppingSession(nodes, node_cap=120)).fetch(
+            BBox.parse("-3.30,51.37,-3.27,51.40"),
+            [_split_tile()],
+            tmp_path,
+            NullProgress(),
+            cancel=token,
+        )
+
+    resumed = GroundSession(nodes, node_cap=120)
+    _ground_source(resumed).fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"),
+        [_split_tile()],
+        tmp_path,
+        NullProgress(),
+        cancel=CancelToken(),
+    )
+
+    assert len(resumed.calls) == 3, "the tile, and only the two missing quarters"
+    keys = _element_keys(tmp_path / "r03_c04.osm")
+    assert len(keys) == len(set(keys)) == 200
+
+
+def test_the_quarters_are_rate_limited_like_any_other_request(tmp_path):
+    # The quarters go through _download_tile, so they are spaced by the
+    # same RateLimiter every other request is, and they go one at a time.
+    # A tile that just failed for being too dense is not the place to
+    # start making concurrent requests against a free public service.
+    slept = []
+    clock_values = iter([float(tick) for tick in range(0, 40)])
+    session = GroundSession(_spread(200, -3.291, 51.379, -3.279, 51.391), node_cap=120)
+    source = _ground_source(
+        session,
+        min_interval_seconds=2.0,
+        sleeper=slept.append,
+        clock=lambda: next(clock_values),
+    )
+    source.fetch(
+        BBox.parse("-3.30,51.37,-3.27,51.40"), [_split_tile()], tmp_path, NullProgress()
+    )
+    # Five requests, so four gaps, every one of them waited on: the clock
+    # advances 1s per reading against a 2s minimum interval.
+    assert slept == [pytest.approx(1.0)] * 4
+
+
+def test_an_overpass_run_never_subdivides_even_on_a_node_cap_shaped_response(tmp_path):
+    # A category-filtered run goes to Overpass, Overpass has no node cap,
+    # and subdivision answers that cap specifically. Even a response
+    # SHAPED like the map API's own refusal must therefore be an ordinary
+    # retried-then-reported failure here, with no quarters fetched: four
+    # attempts at the one tile, and no scratch directory at all.
+    source = _source(
+        [FakeResponse(status_code=400, text="You requested too many nodes")] * 4,
+        use_overpass=True,
+        max_retries=4,
+    )
+    with pytest.raises(OsmDownloadError) as excinfo:
+        source.fetch(
+            BBox.parse("-3.30,51.37,-3.27,51.40"), [_split_tile()], tmp_path, NullProgress()
+        )
+    assert not isinstance(excinfo.value, NodeCapExceededError)
+    assert len(source.session.calls) == 4
+    assert not (tmp_path / SPLIT_DIR_NAME).exists()

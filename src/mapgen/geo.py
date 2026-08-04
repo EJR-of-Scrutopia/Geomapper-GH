@@ -162,11 +162,24 @@ def split_tile_into_quarters(tile: Tile) -> list[Tile]:
     - No quarter ever reaches OUTSIDE the parent's query_bbox, so a split
       cannot quietly pull in ground the plan never asked for.
 
-    The interior seams overlap by the parent's own overlap on both sides,
-    which is what stops a feature sitting on a seam being seen only in
-    part. Duplicates along those seams are not a concern here: the
-    recombine goes through mapgen.merge.merge_osm_xml, which keys elements
-    on type and id exactly as the whole-tile merge already does.
+    The interior seams then overlap by the parent's own overlap on both
+    sides. Worth being exact about what that does and does not buy, since
+    it is easy to assume the seams depend on it. They do not: it is the
+    exact cover above that leaves no gap, and it is mapgen.merge.
+    merge_osm_xml, which keys elements on type and id exactly as the
+    whole-tile merge already does, that leaves no duplicate. Measured
+    directly by removing the overlap here and rerunning
+    test_the_recombined_tile_holds_exactly_what_an_unsplit_fetch_would_
+    have in test_sources_osm.py, which still passes: the OSM map API
+    returns every way whole, including its nodes outside the requested
+    box, so a way lying across a seam comes back complete from whichever
+    piece holds one of its nodes.
+
+    The overlap is kept anyway, for the same reason build_tiles has one:
+    it is this project's one convention about seams, and it costs a ring
+    of ground that is deduplicated away rather than a correctness
+    argument that has to hold for a service to be relied on to return
+    features whole.
 
     Every value is a plain degree, no projection: build_tiles works in
     local metres, but both of its conversions (see lonlat_to_local_metres)

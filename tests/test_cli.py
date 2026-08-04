@@ -270,7 +270,13 @@ class _RaisesNodeCapExceededErrorSource:
         return Estimate(bytes_estimate=100, seconds_estimate=1.0)
 
     def fetch(self, bbox, tiles, work_dir, progress):
-        raise NodeCapExceededError("a distinctive NodeCapExceededError from a test source")
+        # Constructed the way the real raise sites construct it, tile and
+        # all: NodeCapExceededError has no tile-less form, so a stub that
+        # could omit it would be a more permissive thing than the code it
+        # stands in for.
+        raise NodeCapExceededError(
+            "a distinctive NodeCapExceededError from a test source", tile=tiles[0]
+        )
 
     def merge(self, parts, out_dir, stem):
         return []

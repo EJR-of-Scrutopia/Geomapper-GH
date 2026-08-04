@@ -22,17 +22,23 @@ that correction still holds; it is a different claim from configure()'s
 own whole-request routing decision above it. Both endpoints are free
 public services, so requests are spaced out and back off on failure.
 
-Task 19 restored a different kind of retry the superseded script had and
-mapgen initially dropped: on a NodeCapExceededError, mapgen.package's
-run_survey retries the WHOLE run at the next smaller size in a fixed
-ladder (2000, then 1500, then 1000 metres) before giving up. That is
-orchestration, not this module's concern: this module only ever raises
-the one exception type that makes the retry decision possible elsewhere,
-it does not loop or know about tile sizes other than the one it was
-asked to fetch. Because NodeCapExceededError is never raised on the
-Overpass path (there is no cap there to except), a run that configure()
-routed to Overpass for its category filter is never a candidate for this
-retry either, which is the coherence a coordinator review asked to have
+A tile that does hit the cap is answered here, one tile deep, rather
+than anywhere further out (Task 26, replacing Task 19's whole-run retry
+at a smaller tile size, by owner ruling): fetch() splits that tile into
+a 2x2 grid of quarters, downloads those in its place, and merges them
+back into the single <tile_id>.osm file the rest of the pipeline already
+expects, so nothing outside this module needs to know a split happened.
+The tiling itself never changes, which is the whole point: tile_size_m
+is hashed into naming.tiling_fingerprint, so the old ladder's smaller
+retry landed in a different _work/ directory and refetched every tile
+and every Overture type that had already succeeded, while this leaves
+the work directory, the plan and the resume state exactly where they
+were and pays only for the tile that was actually too dense.
+
+Because NodeCapExceededError is never raised on the Overpass path
+(there is no cap there to except), a run that configure() routed to
+Overpass for its category filter is never a candidate for subdivision
+either, which is the coherence a coordinator review asked to have
 confirmed rather than assumed: a limit that does not apply on a given
 path cannot trigger a response written for the path where it does.
 """
@@ -47,7 +53,7 @@ import requests
 
 from mapgen.categories import osm_tag_clauses
 from mapgen.fsutil import atomic_write_text
-from mapgen.geo import BBox, Tile
+from mapgen.geo import BBox, Tile, extent_metres, split_tile_into_quarters
 from mapgen.jobs import CancelToken
 from mapgen.merge import merge_osm_xml
 from mapgen.sources.base import Estimate, ProgressSink
@@ -112,6 +118,36 @@ MAP_API_SECONDS_PER_TILE = 2.0
 # as much per tile.
 OVERPASS_SECONDS_PER_TILE = 19.0
 
+# How many times a tile may be cut into quarters before mapgen gives up
+# and says so (see OsmSource.fetch). Two, so a 2000 m tile becomes at
+# most sixteen 500 m pieces, finer than the old whole-run ladder's 1000 m
+# floor ever reached, and a 500 m tile (the interface's own minimum)
+# becomes 125 m pieces.
+#
+# Not user-configurable, and two rather than three or more, because each
+# level costs four times the requests for the same ground: a tile that
+# needs both levels everywhere is 1 + 4 + 16 = 21 rate-limited requests
+# where the estimate quoted one, about 42 seconds. A third level would be
+# 85. Ground that is still over 50000 nodes in a 500 m square is over
+# 200000 nodes per sq km, denser than anything in the reference material
+# by an order of magnitude, and the honest answer there is to tell the
+# owner rather than to keep quartering in silence: they can draw a
+# smaller extent knowing why, which no amount of further splitting
+# decides for them.
+MAX_SUBDIVISION_DEPTH = 2
+
+# Where the quarters live: a subdirectory of the source's own work
+# directory, kept rather than deleted so an interrupted run resumes INTO
+# a subdivision instead of restarting it.
+#
+# The leading underscore is load-bearing. package.py's
+# _existing_output_files skips any subdirectory of a source's work
+# directory whose name begins with one, so quarter files are never
+# offered to merge() and never counted as tile output; see its own
+# docstring for why that rule, and not a change to _TILE_ID_SHAPE, is
+# what keeps them out.
+SPLIT_DIR_NAME = "_split"
+
 
 class OsmDownloadError(RuntimeError):
     """Raised when a tile could not be downloaded."""
@@ -121,17 +157,27 @@ class NodeCapExceededError(OsmDownloadError):
     """Raised specifically when a tile exceeded the OSM API's 50000-node
     limit, as distinct from any other download failure.
 
-    A subclass, not a message-text convention: mapgen.package's whole-run
-    retry-at-a-smaller-tile-size logic (Task 19) needs to tell "this tile
-    was too dense, a smaller tile size might clear it" apart from "this
-    tile failed for some other reason a smaller tile size would not fix"
-    (a timeout, a 500, an exhausted retry budget), and matching on
-    isinstance() here is exactly the structural-over-textual discipline
+    A subclass, not a message-text convention: the handler needs to tell
+    "this tile was too dense, a smaller piece of it might clear it" apart
+    from "this tile failed for some other reason a smaller piece would
+    not fix" (a timeout, a 500, an exhausted retry budget), and matching
+    on isinstance() here is exactly the structural-over-textual discipline
     the API key redaction work in mapgen.sources.elevation had to learn
     the hard way: a string match on "50000" or "too many nodes" in some
     later, differently-worded message is a future regression waiting to
     happen, in a way a type check is not.
+
+    The same argument applies to WHICH tile was too dense, which is why
+    tile is a required attribute and not merely a name inside the
+    sentence (Task 26): a handler that has to split the offending tile
+    must not have to parse a sentence to learn what to split, and there
+    is no such thing as a node-cap failure without a tile to attach it
+    to, so there is no default to fall back on.
     """
+
+    def __init__(self, message: str, tile: Tile) -> None:
+        super().__init__(message)
+        self.tile = tile
 
 
 def build_overpass_query(
@@ -349,16 +395,32 @@ class OsmSource:
         about ten times as much per tile, being quoted the unfiltered
         price.
 
-        Deliberately NOT modelling the node-cap retry ladder, which is a
-        real and unquoted cost: a dense extent requested at 2000 m fails
-        part way through and package.py restarts the whole run at 1500 m
-        and then at 1000 m, four times the tiles, having already paid for
-        the tiles it got. Whether that happens depends on how dense the
-        ground is, which is precisely what cannot be known before
-        downloading it. An estimate that guessed would be inventing, and
-        an estimate that assumed the worst would overstate every rural
-        survey by 4x. Named here so the next person knows it is missing
-        on purpose.
+        Still NOT modelling what a tile over the node cap costs, but the
+        size of what is unmodelled has changed, and it is now bounded.
+        Task 25 recorded the old whole-run retry ladder here as a real and
+        unquoted cost: a dense extent requested at 2000 m failed part way
+        through, and package.py restarted the entire run at 1500 m and
+        then at 1000 m, four times the tiles, having already paid for the
+        tiles it got, so the true cost of one dense tile was another
+        whole run and then another.
+
+        Task 26 replaced that with subdivision inside fetch(), and a
+        subdivided tile now costs at most its own quarters. The worst
+        case is one tile needing both levels of splitting everywhere:
+        1 failed request + 4 quarters + 16 sixteenths = 21 rate-limited
+        requests, about 42 seconds at MAP_API_SECONDS_PER_TILE, in place
+        of the 2 seconds quoted for that one tile. Nothing else in the run
+        is affected, nothing already downloaded is refetched, and every
+        other tile costs exactly what it says here.
+
+        Still not added to the model, for the same reason as before: how
+        many tiles subdivide depends on how dense the ground is, which is
+        precisely what cannot be known before downloading it. Assuming
+        none is right for almost every extent; assuming the worst would
+        overstate a rural survey twentyfold. The difference is that the
+        error is now at most 40 seconds per dense tile rather than an
+        unbounded multiple of the whole run, which is why this is a
+        footnote rather than the largest unquoted number in the panel.
         """
         seconds_per_tile = (
             OVERPASS_SECONDS_PER_TILE if self.use_overpass else MAP_API_SECONDS_PER_TILE
@@ -391,10 +453,101 @@ class OsmSource:
                 progress.emit("tile_skipped", source=self.id, tile_id=tile.tile_id)
                 paths.append(output_path)
                 continue
-            self._download_tile(tile, output_path)
+            self._fetch_tile(tile, output_path, work_dir, progress, cancel, depth=0)
             progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
             paths.append(output_path)
         return paths
+
+    def _fetch_tile(
+        self,
+        tile: Tile,
+        output_path: Path,
+        work_dir: Path,
+        progress: ProgressSink,
+        cancel: CancelToken | None,
+        depth: int,
+    ) -> None:
+        """Put this tile's data at output_path, splitting it into quarters
+        if it turns out to be too dense to download in one request.
+
+        Recursive, and the recursion is the whole mechanism: a quarter is
+        just a smaller tile, so a quarter that is itself over the cap is
+        handled by the same code that handled its parent, up to
+        MAX_SUBDIVISION_DEPTH. Depth is counted from the tile of the plan,
+        so depth 0 is the tile package.py asked for.
+
+        The quarters are fetched one after another, deliberately not
+        concurrently, even though Task 24 made Overture's types download
+        together. The two situations are opposites: Overture is one
+        request per type against a CDN with no rate limit, while this is
+        one request per quarter against a free public API that this module
+        already spaces out on purpose (see RateLimiter), and the moment to
+        start making concurrent requests is not immediately after that
+        service told us the last request was too big.
+
+        Cancellation lands here the same way it lands in fetch(): checked
+        before a quarter's own request starts, never during one. A stop
+        that arrives mid-subdivision therefore propagates out of fetch()
+        BEFORE the recombine below runs, so no <tile_id>.osm is written
+        from a half-fetched set of quarters and package.py records the
+        tile as pending, not ok and not failed. The quarters that did
+        land stay on disk, and the next run resumes into the subdivision
+        rather than starting it again.
+        """
+        try:
+            self._download_tile(tile, output_path)
+            return
+        except NodeCapExceededError as too_dense:
+            if depth >= MAX_SUBDIVISION_DEPTH:
+                width_m, height_m = extent_metres(tile.query_bbox)
+                raise NodeCapExceededError(
+                    f"Tile {tile.tile_id} is still over the OSM API's 50000-node "
+                    f"limit after being split into quarters {depth} times. This "
+                    f"piece is about {width_m:.0f} by {height_m:.0f} metres and "
+                    f"mapgen does not split further. Draw a smaller extent, or "
+                    f"survey this area in separate pieces.",
+                    tile=tile,
+                ) from too_dense
+
+        quarters = split_tile_into_quarters(tile)
+        # Emitted before the quarters are fetched, not after: the point of
+        # the event is that a run which has just gone quiet on one tile
+        # for four times as long says why while it is happening.
+        progress.emit(
+            "tile_subdivided",
+            source=self.id,
+            tile_id=tile.tile_id,
+            pieces=len(quarters),
+            depth=depth + 1,
+        )
+
+        split_dir = work_dir / SPLIT_DIR_NAME
+        quarter_paths: list[Path] = []
+        for quarter in quarters:
+            quarter_path = split_dir / f"{quarter.tile_id}.osm"
+            quarter_paths.append(quarter_path)
+            if quarter_path.exists() and quarter_path.stat().st_size > 0:
+                # Already downloaded by an earlier run, or by an earlier
+                # pass of this one. A quarter's file is only ever written
+                # whole, either by a successful download or by the
+                # recombine below, so its presence means this quarter's
+                # own ground is complete, however many levels down it was
+                # actually fetched.
+                progress.emit("tile_skipped", source=self.id, tile_id=quarter.tile_id)
+                continue
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            self._fetch_tile(
+                quarter, quarter_path, work_dir, progress, cancel, depth=depth + 1
+            )
+
+        # The existing merge, not a second XML combiner: mapgen.merge is
+        # what OsmSource.merge already uses to fold overlapping tiles into
+        # one file, keyed on element type and id, and two ways to combine
+        # .osm files is how they drift apart. It also means the duplicate
+        # elements along the quarters' shared seams are removed by exactly
+        # the code that already removes them along tile seams.
+        merge_osm_xml(quarter_paths, output_path)
 
     def _download_tile(self, tile: Tile, output_path: Path) -> None:
         last_error: Exception | None = None
@@ -424,42 +577,28 @@ class OsmSource:
                 # OSM map API's own limit, and Overpass is not subject to
                 # it at all. A coordinator review caught that this branch
                 # used to fire regardless of which endpoint was actually
-                # asked, which would have wrongly triggered mapgen.
-                # package's whole-run smaller-tile retry (below) for a
-                # limit a filtered, Overpass-routed run cannot hit in the
-                # first place. On Overpass, any 400 falls through to the
-                # generic branch beneath this one instead, an ordinary
-                # retried-then-reported failure, never a node-cap retry.
+                # asked, which would have wrongly triggered a response to
+                # a limit a filtered, Overpass-routed run cannot hit in
+                # the first place. On Overpass, any 400 falls through to
+                # the generic branch beneath this one instead, an ordinary
+                # retried-then-reported failure, never a subdivision.
                 #
-                # mapgen.package's run_survey catches NodeCapExceededError
-                # specifically and retries the whole run at the next
-                # smaller size in its own fixed ladder before this message
-                # ever reaches a human; it is the message actually shown
-                # only once that ladder is exhausted, so it still needs to
-                # read correctly on its own at that point, not assume the
-                # reader already knows a retry was attempted.
-                #
-                # A coordinator review's Honesty finding 1: this used to
-                # suggest "1500 or 2000 metres" unconditionally, which is
-                # wrong exactly when it matters most: those are two of the
-                # three sizes the automatic retry ladder above already
-                # tried before giving up and reaching this message at all,
-                # and it is also wrong for a run that started at or below
-                # the ladder's own smallest rung, which the ladder never
-                # touches (see package.py's _next_smaller_node_cap_tile_
-                # size). osm.py has no import on package.py's ladder
-                # constant to check against (package.py imports THIS
-                # module, not the other way round) and no tile_size_m
-                # scalar of its own to compare either, a Tile only ever
-                # carries its bbox; naming any specific size here would be
-                # a guess this function cannot actually verify. Relative
-                # instead, and true regardless of what was already tried.
+                # A plain statement of fact, with no advice in it: this
+                # message is a signal to _fetch_tile, which answers it by
+                # splitting the tile, and it reaches a human only if that
+                # is somehow raised outside fetch(). The sentence the
+                # owner actually reads when subdivision has run out of
+                # room is composed in _fetch_tile, where the number of
+                # rounds tried and the size of the piece that still
+                # failed are both known. Neither says "reduce the tile
+                # size to N": a Tile carries a bbox and no tile_size_m at
+                # all, so this module can measure a piece it holds (see
+                # extent_metres) but cannot name a setting it has never
+                # been told, and a coordinator review's Honesty finding 1
+                # was exactly that kind of unverifiable advice.
                 raise NodeCapExceededError(
-                    f"Tile {tile.tile_id} exceeded the OSM API 50000-node limit. "
-                    f"mapgen already retries automatically at smaller tile sizes "
-                    f"where a smaller size is available; seeing this means none "
-                    f"was, or none helped. Draw a smaller extent, or split this "
-                    f"area into smaller pieces and survey them separately."
+                    f"Tile {tile.tile_id} exceeded the OSM API 50000-node limit.",
+                    tile=tile,
                 )
 
             last_error = OsmDownloadError(
