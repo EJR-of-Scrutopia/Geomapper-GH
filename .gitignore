@@ -40,3 +40,12 @@ desktop.ini
 # Vendored front-end libraries: fetched once and committed, keep despite
 # any broad rule above.
 !src/mapgen/web/static/vendor/*
+
+# Test fixtures, kept despite the survey data rules above, deliberately
+# (task 39). tests/data/ holds two real OpenTopography DEMs unchanged and the
+# recorded output of Urbano's own reader and grid builder on them. They are
+# the standard mapgen.geotiff and mapgen.egrid are measured against, and a
+# check that cannot be rerun from the repository is not a check. 80 KB in
+# total; provenance and licence are in tests/data/README.md.
+!tests/data/
+!tests/data/*
