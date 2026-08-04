@@ -1436,6 +1436,32 @@ def test_a_rate_limit_carries_the_period_the_service_asked_for(tmp_path):
     assert failure.retry_after_seconds == pytest.approx(30.0)
 
 
+def test_a_response_with_no_headers_at_all_still_fails_cleanly(tmp_path):
+    # FakeStreamResponse carries no headers, which is not a contrivance:
+    # every double in this file predates Task 32 and none of them has
+    # any. A real requests Response always does, but a response object
+    # that is not one may not, and an AttributeError raised while reading
+    # a header would be caught by fetch()'s own broad except and turned
+    # into a download failure on a request that actually succeeded.
+    assert not hasattr(FakeStreamResponse([], status_code=503), "headers")
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([], status_code=503))
+    )
+    with pytest.raises(ElevationError, match="HTTP 503"):
+        source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+
+    assert source.tile_failures[0].kind == "service_error"
+    assert source.tile_failures[0].retry_after_seconds is None
+
+
+def test_a_successful_response_with_no_headers_is_not_turned_into_a_failure(tmp_path):
+    source = ElevationSource(
+        api_key="k", session=FakeSession(FakeStreamResponse([TIFF_LITTLE_ENDIAN]))
+    )
+    assert source.fetch(BBOX, _TILES, tmp_path, NullProgress())
+    assert source.tile_failures == []
+
+
 def test_a_rate_limit_with_no_retry_after_header_carries_none(tmp_path):
     # The ordinary case, and the one that must not become a zero-second
     # wait dressed up as an instruction the service never gave.

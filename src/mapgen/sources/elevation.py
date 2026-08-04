@@ -728,18 +728,19 @@ class ElevationSource:
                 # on. A plain float or None, which survives the block;
                 # nothing here holds a URL.
                 #
-                # Only on a bad status, and defensively. The happy path
-                # must not touch a single attribute it did not touch
-                # before this task: an AttributeError raised while
-                # reading a header would be caught by the except clause
-                # below and turned into a download failure, on a request
-                # that actually succeeded. A response that cannot say
-                # when to come back is treated exactly like one that did
-                # not say.
-                retry_after_seconds = (
-                    parse_retry_after(getattr(response, "headers", None))
-                    if status_code >= 400
-                    else None
+                # getattr, not response.headers. A real requests Response
+                # always has them; a response object that is not one may
+                # not, and this project's own test doubles are full of
+                # such objects because nothing before this task needed a
+                # header. An AttributeError raised here would be caught
+                # by the except clause below and turned into a download
+                # failure, on a request that actually succeeded, which is
+                # the worst possible outcome for a line that only exists
+                # to make a failure slightly better reported. A response
+                # that cannot say when to come back is treated exactly
+                # like one that did not say.
+                retry_after_seconds = parse_retry_after(
+                    getattr(response, "headers", None)
                 )
                 payload = (
                     b"".join(chunk for chunk in response.iter_content(1024 * 1024) if chunk)

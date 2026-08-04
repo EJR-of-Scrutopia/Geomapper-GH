@@ -13,6 +13,7 @@ from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerpr
 from mapgen.package import (
     MAX_RETRY_AFTER_WAIT_SECONDS,
     IncompleteSurveyError,
+    _FailureLedger,
     SurveyRequest,
     UnbridgeablePackageError,
     bridge_package,
@@ -26,6 +27,7 @@ from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.base import (
     DuplicateSourceError,
     Estimate,
+    TileFailure,
     clear_registry,
     get_source,
     register,
@@ -4482,6 +4484,71 @@ def test_a_wait_of_zero_returns_at_once_and_reports_the_standing_answer():
     assert token.wait(0) is False
     token.cancel()
     assert token.wait(0) is True
+
+
+def test_the_ledger_waits_the_longest_period_any_of_the_tiles_was_given():
+    # Asserted at the unit rather than through a run, and deliberately so.
+    # No source today gives two of its tiles DIFFERENT periods: elevation
+    # records one whole-extent answer against all of them, Overture
+    # records none, and OSM leaves the field alone because its own inner
+    # loop has already served the wait. So a run cannot currently tell
+    # max from min, and the rule would sit unpinned until the first
+    # source that can, which is exactly when getting it wrong would
+    # matter. The rule itself is not arbitrary: these tiles are about to
+    # be fetched in ONE call, so one wait covers all of them, and coming
+    # back before the latest deadline the service set ignores it for the
+    # tiles it applied to.
+    ledger = _FailureLedger()
+    ledger.add_tile_failures(
+        [
+            TileFailure(
+                source="elevation", tile_id="r00_c00", kind="rate_limited",
+                reason="slow down", retry_after_seconds=5.0,
+            ),
+            TileFailure(
+                source="elevation", tile_id="r00_c01", kind="rate_limited",
+                reason="slow down", retry_after_seconds=45.0,
+            ),
+            TileFailure(
+                source="elevation", tile_id="r01_c00", kind="rate_limited",
+                reason="slow down", retry_after_seconds=12.0,
+            ),
+        ]
+    )
+
+    assert ledger.retry_after_for("elevation", ["r00_c00", "r00_c01", "r01_c00"]) == 45.0
+    assert ledger.retry_after_for("elevation", ["r00_c00", "r01_c00"]) == 12.0
+    # A source nobody recorded a period for waits for nothing at all,
+    # rather than for zero seconds dressed up as an instruction.
+    assert ledger.retry_after_for("osm", ["r00_c00"]) is None
+
+
+def test_a_later_failure_with_no_period_clears_an_earlier_one(tmp_path):
+    # The retry pass re-records a tile's failure after asking again. A
+    # service that asked for thirty seconds the first time and said
+    # nothing the second has withdrawn the instruction, and carrying the
+    # stale one forward would pause a run on the strength of a header
+    # that is no longer being sent.
+    ledger = _FailureLedger()
+    ledger.add_tile_failures(
+        [
+            TileFailure(
+                source="elevation", tile_id="r00_c00", kind="rate_limited",
+                reason="slow down", retry_after_seconds=30.0,
+            )
+        ]
+    )
+    assert ledger.retry_after_for("elevation", ["r00_c00"]) == 30.0
+
+    ledger.add_tile_failures(
+        [
+            TileFailure(
+                source="elevation", tile_id="r00_c00", kind="service_error",
+                reason="answered HTTP 503",
+            )
+        ]
+    )
+    assert ledger.retry_after_for("elevation", ["r00_c00"]) is None
 
 
 def test_a_stop_interrupts_an_overture_retry_before_it_downloads(tmp_path):
