@@ -123,6 +123,21 @@ the URL, so nothing else on the machine can drive it. On the page:
   comes from, so a second or third keyed source in a later phase needs no
   new panel. An Appearance setting there too: Match system (the default),
   Light or Dark, applied to the whole page and to the tile grid below.
+- Tile size is a slider, and it says what each size costs for the extent
+  currently drawn: the tile count and the estimated time, re-estimated
+  from the server a moment after you stop moving it rather than on every
+  step of a drag. It does not show a failure risk, and that is a refusal
+  rather than an omission. Risk would depend on how dense the
+  OpenStreetMap data is on that particular ground, which nothing here can
+  know before downloading it, and a percentage or a traffic light would
+  look measured while being invented. What it shows instead is the real
+  trade, in a sentence that changes with the slider: larger tiles mean
+  fewer requests and are quicker on sparse ground, but more of them need
+  splitting on dense ground, and each split costs the requests its pieces
+  take. Splitting is not a failure (see the tile grid below), so there is
+  nothing else honest to warn about. The slider keeps the 500 m minimum
+  the number field before it had, and a saved size outside its range
+  widens the slider rather than being quietly rewritten to fit.
 - Above the Download button you get the extent in kilometres, tile count,
   and an estimated download size and duration, computed before anything is
   fetched, so a mis-drawn box over the wrong country is obvious immediately.
@@ -132,7 +147,18 @@ the URL, so nothing else on the machine can drive it. On the page:
 - The download runs with a live per-tile log, and the tile grid shades each
   rectangle as it goes: not started, in progress, done, or failed, the last
   one drawn distinctly since it is the one worth noticing before deciding
-  you have enough. A Stop button ends the download: it does not discard
+  you have enough. A progress bar underneath answers the other question,
+  how much longer. It is derived from the same progress events the grid
+  is, weighted by what each layer's own estimate says it costs, so a
+  finished OpenStreetMap pass reads as the large majority of the run it
+  actually is. The countdown starts from the estimate and switches to the
+  run's own measured rate once there is enough finished work to measure,
+  and it says which of the two it is using. Nothing is reported to the
+  second, because nothing here is accurate to the second. A run that
+  passes its estimate says so rather than sitting at zero, a tile that
+  needed splitting is called out as having made the run longer, and a
+  stopped run settles at the percentage it actually reached rather than
+  jumping to complete. A Stop button ends the download: it does not discard
   what has already been fetched. A tile already being downloaded is
   finished and kept, whatever source is running next never starts,
   everything fetched so far is merged into the package exactly as a
