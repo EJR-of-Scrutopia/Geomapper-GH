@@ -316,9 +316,10 @@ def _project_setting_lines(survey: dict) -> list[str]:
     """
     record = survey.get("project_setting") or {}
     if record.get("written"):
+        layers = [str(layer) for layer in record.get("layers") or []]
         return [
             f"Urbano project setting: {record.get('file')}",
-            f"  carries {describe_layers([str(l) for l in record.get('layers') or []])}",
+            f"  carries {describe_layers(layers)}",
         ]
     error = record.get("error")
     if error:
