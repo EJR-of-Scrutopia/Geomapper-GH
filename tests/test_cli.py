@@ -111,6 +111,19 @@ def test_estimate_prints_tile_count(tmp_path, capsys):
     assert "Tiles:" in capsys.readouterr().out
 
 
+def test_a_sub_minute_estimate_is_printed_in_seconds_not_as_zero_minutes():
+    # Task 25 refitted every source against the concurrent, untiled code
+    # path, and a real single-tile survey came out at about 29 seconds.
+    # The unconditional minutes format printed that as "0 min", which
+    # reads as instant. Nothing had ever hit it before, because every
+    # estimate was inflated enough to clear a minute.
+    assert cli.format_estimated_duration(29.0) == "29 s"
+    assert cli.format_estimated_duration(0.0) == "0 s"
+    assert cli.format_estimated_duration(59.9) == "60 s"
+    assert cli.format_estimated_duration(60.0) == "1 min"
+    assert cli.format_estimated_duration(175.0) == "3 min"
+
+
 def test_estimate_json_output_is_parseable(tmp_path, capsys):
     main(
         [

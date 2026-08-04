@@ -138,6 +138,28 @@ def _request_from_args(args: argparse.Namespace) -> SurveyRequest:
     )
 
 
+def format_estimated_duration(seconds: float) -> str:
+    """Seconds under a minute, whole minutes above it.
+
+    Task 25 refitted every source's cost model against the concurrent,
+    untiled code path that Tasks 23 and 24 left behind, and a run that
+    used to be quoted at 28 minutes is now quoted at 3. That made a case
+    reachable that had never come up while every estimate was inflated:
+    a single-tile extent totals about 29 seconds, and the old
+    unconditional "{seconds / 60:.0f} min" printed that as "0 min".
+
+    Zero is the one answer that is not merely imprecise but wrong. It
+    reads as "instant" for a job that takes half a minute, and it is the
+    kind of number an owner stops trusting the whole panel over. The
+    browser panel never had this problem because it has always floored
+    at one minute (see app.js), which is a different choice and a worse
+    one now that seconds are the honest unit at small extents.
+    """
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    return f"{seconds / 60:.0f} min"
+
+
 def command_estimate(args: argparse.Namespace) -> int:
     estimate = estimate_survey(_request_from_args(args))
     if args.json:
@@ -147,7 +169,10 @@ def command_estimate(args: argparse.Namespace) -> int:
     print(f"Extent: {extent['width']:.2f} km x {extent['height']:.2f} km")
     print(f"Tiles: {estimate['tiles']} ({estimate['rows']} rows x {estimate['cols']} cols)")
     print(f"Estimated download: {estimate['bytes_estimate'] / 1e6:.0f} MB")
-    print(f"Estimated duration: {estimate['seconds_estimate'] / 60:.0f} min")
+    print(
+        f"Estimated duration: "
+        f"{format_estimated_duration(estimate['seconds_estimate'])}"
+    )
     for source in estimate["sources"]:
         print(f"  {source['display_name']}: {source['licence']}")
     return 0
