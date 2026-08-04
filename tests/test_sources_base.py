@@ -178,25 +178,60 @@ def test_a_rate_limit_is_retryable_and_an_unauthorised_request_is_not():
     assert bad_request not in RETRYABLE_FAILURE_KINDS
 
 
-def test_a_transport_failure_is_classified_by_type_never_by_its_message():
+@pytest.mark.parametrize(
+    "exception, expected_kind",
+    [
+        pytest.param(
+            requests.exceptions.ConnectionError(
+                "Max retries exceeded with url: https://x/?API_Key=sk-secret"
+            ),
+            FAILURE_UNREACHABLE,
+            id="connection_error",
+        ),
+        pytest.param(
+            requests.exceptions.ReadTimeout(
+                "Read timed out for url: https://x/?API_Key=sk-secret"
+            ),
+            FAILURE_TIMEOUT,
+            id="read_timeout",
+        ),
+        pytest.param(
+            OSError("socket died talking to https://x/?API_Key=sk-secret"),
+            FAILURE_UNREACHABLE,
+            id="os_error",
+        ),
+        pytest.param(
+            ValueError("boom at https://x/?API_Key=sk-secret"),
+            FAILURE_UNKNOWN,
+            id="unrecognised",
+        ),
+    ],
+)
+def test_a_transport_failure_is_classified_by_type_never_by_its_message(
+    exception, expected_kind
+):
     # The message is where a URL lives and a URL is where an API key
-    # lives. A classifier shared by the keyed source cannot read one.
-    secret_bearing = requests.exceptions.ConnectionError(
-        "Max retries exceeded with url: https://x/?API_Key=sk-secret"
-    )
-    kind, phrase = classify_transport_failure(secret_bearing)
+    # lives. A classifier shared by the keyed source cannot read one, and
+    # EVERY branch of it has to hold that line, not only the branch that
+    # happened to be written first: elevation composes its recorded
+    # reason out of this phrase, and that reason reaches survey.json.
+    #
+    # Parametrised for exactly that reason. A single test that checked
+    # only the connection-error branch let a mutation putting str(exc)
+    # into the TIMEOUT branch survive it.
+    kind, phrase = classify_transport_failure(exception)
 
-    assert kind == FAILURE_UNREACHABLE
+    assert kind == expected_kind
     assert "sk-secret" not in phrase
     assert "API_Key" not in phrase
-    assert "http" not in phrase.lower()
+    assert "://" not in phrase
+    assert "=" not in phrase
 
-    timed_out, phrase = classify_transport_failure(requests.exceptions.Timeout("..."))
-    assert timed_out == FAILURE_TIMEOUT
 
+def test_an_unrecognised_exception_contributes_its_class_name_and_nothing_else():
     unrecognised, phrase = classify_transport_failure(ValueError("boom"))
     assert unrecognised == FAILURE_UNKNOWN
-    assert "ValueError" in phrase
+    assert phrase == "failed with ValueError"
 
 
 def test_parse_retry_after_reads_the_seconds_form_and_nothing_else():
