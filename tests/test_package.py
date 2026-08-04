@@ -3657,6 +3657,12 @@ def test_a_permanent_failure_survives_the_budget_and_is_reported_everywhere(tmp_
     failed_events = _events_named(log, "tile_failed")
     assert {event["tile_id"] for event in failed_events} == {"r00_c01", "r01_c00"}
     assert all("503" in event["reason"] for event in failed_events)
+    assert all(event["kind"] == "service_error" for event in failed_events)
+    # Twice per tile: once when the first pass resolved it, and again
+    # after the retry pass came back with the same answer. The second one
+    # says so, which is what tells a watcher that this is settled rather
+    # than merely current.
+    assert [event["retried"] for event in failed_events] == [0, 0, 1, 1]
     verified = _events_named(log, "verify_done")
     assert [event["phase"] for event in verified] == ["after_fetch", "after_retry"]
     assert verified[-1]["failed"] == 2

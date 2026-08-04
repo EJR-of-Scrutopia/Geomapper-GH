@@ -794,6 +794,50 @@ def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
     assert [p.name for p in outputs] == ["Cardiff-Bay_2026-09-01_water.geojson"]
 
 
+def test_merge_writes_no_file_for_a_type_that_returned_no_features(tmp_path):
+    # Task 30's ruling, per type: an empty <stem>_water.geojson is the
+    # same fabrication as an empty <stem>.osm, a layer the folder says is
+    # present and Grasshopper reads as containing nothing.
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    (work / "water.geojson").write_text(
+        '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+    )
+    (work / "building.geojson").write_text(_one_feature("building-1"), encoding="utf-8")
+    source = OvertureSource(types=["water", "building"])
+    out = tmp_path / "out"
+    outputs = source.merge(
+        [work / "water.geojson", work / "building.geojson"], out, "Barry_2026-08-01"
+    )
+
+    assert [p.name for p in outputs] == ["Barry_2026-08-01_building.geojson"]
+    assert not (out / "Barry_2026-08-01_water.geojson").exists()
+    # The type that did have features is untouched: this is per type, not
+    # per source, so one empty type never suppresses seven real ones.
+    assert (out / "Barry_2026-08-01_building.geojson").is_file()
+    assert source.merged_features == 1
+
+
+def test_merge_removes_an_earlier_attempts_file_for_a_type_that_is_now_empty(tmp_path):
+    # The stale-output sweep only runs on a complete run, so a previous
+    # attempt's real layer would otherwise sit beside a survey.json that
+    # says this type holds nothing (the shape of review finding I8).
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    (work / "water.geojson").write_text(
+        '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    stale = out / "Barry_2026-08-01_water.geojson"
+    stale.write_text(_one_feature("water-from-an-earlier-run"), encoding="utf-8")
+
+    assert OvertureSource(types=["water"]).merge(
+        [work / "water.geojson"], out, "Barry_2026-08-01"
+    ) == []
+    assert not stale.exists()
+
+
 # --- Task 23: the estimate counts types, not tiles x types -------------
 # --- Task 25: and it counts BATCHES of types for time, not types -------
 

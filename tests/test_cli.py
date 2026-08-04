@@ -1184,10 +1184,17 @@ class _CollectsFailuresSource:
         return paths
 
     def merge(self, parts, out_dir, stem):
+        # Returns no file when there was nothing to merge, like every real
+        # source does since Task 30. A double that wrote a file regardless
+        # would make the "found nothing" line unreachable for a failed
+        # layer for the wrong reason, and a test asserting it is never
+        # printed would then be asserting nothing at all.
+        self.merged_features = len(parts)
+        if not parts:
+            return []
         out = out_dir / "collects-failures.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")
-        self.merged_features = len(parts)
         return [out]
 
 

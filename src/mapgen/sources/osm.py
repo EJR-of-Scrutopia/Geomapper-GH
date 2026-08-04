@@ -920,6 +920,15 @@ class OsmSource:
         nothing and stay that way. What is refused is inventing a merged
         artefact for data that was never there at all.
         """
+        # Both halves are needed, and only one of them is observable from
+        # a test. write_when_empty=False stops the envelope being written
+        # at all; the unlink below removes an earlier attempt's real file.
+        # Writing it and then deleting it would produce the same end state
+        # in every test ever run, and would leave a window, however short,
+        # in which the fabricated file genuinely exists in the package
+        # root. A crash inside that window leaves exactly the artefact
+        # this ruling forbids, in a folder the owner reads straight into
+        # Grasshopper.
         output = out_dir / f"{stem}.osm"
         count = merge_osm_xml(parts, output, write_when_empty=False)
         self.merged_features = count

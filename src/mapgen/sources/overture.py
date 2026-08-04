@@ -762,6 +762,9 @@ class OvertureSource:
         merged_features = 0
         for overture_type, type_parts in sorted(by_type.items()):
             output = out_dir / f"{stem}_{overture_type}.geojson"
+            # write_when_empty=False AND the unlink, for the reason
+            # OsmSource.merge spells out: the pair is not redundant, it
+            # closes the window in which the fabricated file exists.
             count = merge_geojson(type_parts, output, write_when_empty=False)
             merged_features += count
             if count == 0:
