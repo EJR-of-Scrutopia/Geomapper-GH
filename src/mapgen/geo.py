@@ -138,6 +138,122 @@ def _clamp(bbox: BBox, bounds: BBox) -> BBox:
 DEFAULT_MAX_TILES = 10_000
 
 
+def split_tile_into_quarters(tile: Tile) -> list[Tile]:
+    """One tile cut into a 2x2 grid of quarters, standing in the same
+    relationship to their parent that build_tiles' own tiles stand in to
+    the whole extent: the four core_bboxes tile the parent's core exactly,
+    and each query_bbox is its core widened by the parent's own overlap and
+    clamped, never reaching past the ground the parent itself would have
+    asked for.
+
+    Used by OsmSource when a tile exceeds the map API's node cap: the
+    quarters are fetched in its place and merged back into the parent's own
+    file, so nothing outside that module has to know a split happened.
+
+    Two properties this arithmetic exists to guarantee, both pinned by
+    tests in test_geo.py:
+
+    - The four query_bboxes UNION to exactly the parent's query_bbox, so
+      the recombined tile covers the same ground as an unsplit fetch of it,
+      with no hairline gap at the outer edge. Guaranteed by construction
+      rather than by arithmetic that happens to come out even: each outer
+      side is copied straight off the parent, which is the same value
+      widen-then-clamp would have produced, without the float round trip.
+    - No quarter ever reaches OUTSIDE the parent's query_bbox, so a split
+      cannot quietly pull in ground the plan never asked for.
+
+    The interior seams overlap by the parent's own overlap on both sides,
+    which is what stops a feature sitting on a seam being seen only in
+    part. Duplicates along those seams are not a concern here: the
+    recombine goes through mapgen.merge.merge_osm_xml, which keys elements
+    on type and id exactly as the whole-tile merge already does.
+
+    Every value is a plain degree, no projection: build_tiles works in
+    local metres, but both of its conversions (see lonlat_to_local_metres)
+    are linear per axis, so the midpoint of a side in degrees IS its
+    midpoint in metres and an overlap measured in degrees is the same
+    overlap measured in metres. Doing it in degrees keeps the outer edges
+    bit-for-bit identical to the parent's rather than a round trip away
+    from them, and needs no reference latitude, which a tile does not carry
+    and could only guess at.
+    """
+    core, query = tile.core_bbox, tile.query_bbox
+    mid_lon = (core.west + core.east) / 2.0
+    mid_lat = (core.south + core.north) / 2.0
+
+    # The parent's overlap, read back off the tile rather than passed in:
+    # a Tile carries no overlap_m, only the two boxes it produced. An edge
+    # tile's query_bbox is clamped to the extent on the outward side (see
+    # build_tiles), so that side reads 0 and the inward side carries the
+    # real figure; max() recovers it. A tile with no margin at all on
+    # either side (a single-tile extent, or a hand-built Tile whose two
+    # boxes are the same object) genuinely has no overlap to inherit, and
+    # the quarters then meet edge to edge, which is still an exact cover.
+    # The 0.0 floor matters only for a malformed tile whose query does not
+    # contain its core, which build_tiles cannot produce: no overlap is a
+    # safe reading of it, an inverted seam is not.
+    overlap_lon = max(core.west - query.west, query.east - core.east, 0.0)
+    overlap_lat = max(core.south - query.south, query.north - core.north, 0.0)
+
+    quarters: list[Tile] = []
+    for row_offset in (0, 1):
+        for col_offset in (0, 1):
+            core_bbox = BBox(
+                west=core.west if col_offset == 0 else mid_lon,
+                south=core.south if row_offset == 0 else mid_lat,
+                east=mid_lon if col_offset == 0 else core.east,
+                north=mid_lat if row_offset == 0 else core.north,
+            )
+            query_bbox = BBox(
+                # An outer side is the parent's own value, verbatim. An
+                # inner side is the seam widened by the overlap, held
+                # inside the parent in case the overlap is wider than the
+                # half tile it is being added to.
+                west=(
+                    query.west
+                    if col_offset == 0
+                    else max(query.west, mid_lon - overlap_lon)
+                ),
+                south=(
+                    query.south
+                    if row_offset == 0
+                    else max(query.south, mid_lat - overlap_lat)
+                ),
+                east=(
+                    query.east
+                    if col_offset == 1
+                    else min(query.east, mid_lon + overlap_lon)
+                ),
+                north=(
+                    query.north
+                    if row_offset == 1
+                    else min(query.north, mid_lat + overlap_lat)
+                ),
+            )
+            quarters.append(
+                Tile(
+                    # Suffixed, never a bare rNN_cNN: a quarter is not a
+                    # tile of the plan, and package.py's _existing_output_
+                    # files must be able to tell the difference. The suffix
+                    # chain also names the ancestry, so r00_c00_q10_q01
+                    # says which tile of the plan a piece two levels down
+                    # came from and where in it, in the file name alone.
+                    tile_id=f"{tile.tile_id}_q{row_offset}{col_offset}",
+                    # The row and column this quarter would have in a grid
+                    # of twice the resolution. Nothing reads these today
+                    # (a quarter never reaches survey.json or the map's
+                    # tile grid); they are consistent rather than zero so
+                    # that anything which does read them later gets a
+                    # truthful answer.
+                    row=tile.row * 2 + row_offset,
+                    col=tile.col * 2 + col_offset,
+                    core_bbox=core_bbox,
+                    query_bbox=query_bbox,
+                )
+            )
+    return quarters
+
+
 def build_tiles(
     bbox: BBox,
     tile_size_m: float,
