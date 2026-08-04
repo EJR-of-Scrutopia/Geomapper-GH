@@ -1,4 +1,4 @@
-# mapgen handoff, updated 2026-08-04
+# mapgen handoff, updated 2026-08-04 (second revision)
 
 Read this first when resuming. It is tracked in git deliberately, because the
 detailed ledger is not.
@@ -9,13 +9,13 @@ detailed ledger is not.
 - Main worktree: `.../VS code/Rhino Plugins/mapgen`, branch `main`
 - Remote: `https://github.com/EJR-of-Scrutopia/Geomapper-GH.git`
 - **The first push happened.** Both remote branches sit at `3748225`.
-  `feat/phase1` is now **18 commits ahead** of the remote and `main` is 1
+  `feat/phase1` is now **45 commits ahead** of the remote and `main` is 1
   ahead. The permission layer denies `git push` from the assistant's shells,
   so the owner runs it.
 - Run tests: `.venv\Scripts\python.exe -m pytest -q` and
   `node tests/js/test_app.js`. Add `-m live` for the network tests.
-- Last known green: **667 Python (3 deselected `live`), 95 Node**. Use the
-  venv python, not the system one, or every import fails.
+- Last known green: **807 Python (3 deselected `live`), 3 live under `-m live`,
+  151 Node**. Use the venv python, not the system one, or every import fails.
 
 ## The ledger, and why it matters
 
@@ -35,11 +35,15 @@ survives the Urbano bridge failing. The final whole-branch review's two
 Criticals and two Importants are closed and were mutation-verified; see the
 ledger for the detail, which is no longer repeated here.
 
-Since then, four tasks landed. Each was verified by the coordinator directly,
-by running the code, not by relaying the implementer's report. Each of the
-last three found a real defect that the implementer's own summary described
-inaccurately or that the coordinator's brief got wrong, so **do not skip the
-independent verification step**.
+Since then, tasks 21 to 28 landed, followed by a second whole-branch review
+whose 1 Critical and 9 Important findings are being fixed at the time of
+writing. Check `git log` and the ledger for where that finished.
+
+Every task was verified by the coordinator directly, by running the code, not
+by relaying the implementer's report. Every one of the eight found either a
+real defect the implementer's own summary described inaccurately, or an error
+in the coordinator's brief that the implementer was right to push back on, so
+**do not skip the independent verification step in either direction**.
 
 ### Task 21, phase A repairs (`69166c8`)
 
@@ -102,10 +106,61 @@ Welsh diacritics intact.
 
 ### Task 24, concurrent Overture downloads
 
-In flight at the time of writing. Measured first: the 8 whole-extent calls run
-sequentially in 68.54s, 3 at a time in 31.73s, and 8 at a time in 19.07s, with
-byte-identical output at every level. At 8-way the wall clock equals the single
-slowest type, so 8-way is the floor.
+The 8 whole-extent calls now run together. Measured first: sequentially 68.54s,
+3 at a time 31.73s, 8 at a time 19.07s, byte-identical output at every level.
+At 8-way the wall clock equals the single slowest type, so 8-way is the floor.
+
+Worst-case Stop latency roughly doubled as a result, from about 10-12s to about
+17.8s, because every download slows under contention. Accepted: the window a
+stop can land in is 3.4x shorter and the expected wait drops about 40%.
+
+### Task 25, the cost estimate refit
+
+The estimate had drifted to 34x over at a real site extent, because it still
+modelled cost as scaling with ground covered, which stopped being true when
+Overture went untiled and concurrent. Now within about 20%, verified
+independently at two extents 62x apart in area.
+
+Its guard test had been passing for the wrong reason: it asserted a band
+anchored to measurements taken when downloads were sequential, so the number
+stayed inside a band that no longer described anything.
+
+### Task 26, a dense tile splits instead of restarting the run
+
+A tile over the OSM 50,000-node cap used to restart the **whole run** at a
+smaller tile size. Because `tiling_fingerprint` hashes `tile_size_m`, that
+landed in a fresh `_work/` directory and refetched everything, including every
+Overture type that had already succeeded. On the Barry extent: 72 tiles, then
+132, then 272, with a full Overture run each time.
+
+Now the tile splits into quarters, recursively, capped at
+`MAX_SUBDIVISION_DEPTH` (2). Quarters are recombined into the single
+`<tile_id>.osm` the rest of the pipeline expects, so the fingerprint never
+changes and resume keeps working. The whole-run ladder is deleted.
+
+**A path-length caveat worth knowing.** `DEFAULT_PATH_LIMIT` is 240 and does
+not actually protect against Windows MAX_PATH, because every write goes
+through a temp path that appends about 26 characters. An ordinary tile at the
+limit already creates 266. This predates subdivision and applies to every write
+mapgen has ever made. It works here only because `LongPathsEnabled` is 1 on
+this machine. Two tests in `test_naming.py` record this honestly.
+
+### Tasks 27 and 28, the interface
+
+Progress bar with a countdown, tile size slider, folder picker, and the
+elevation DEM model as a validated choice with per-model licence and
+attribution.
+
+**The tile size slider does not show failure risk**, deliberately. Density is
+unknowable before downloading, and since Task 26 a dense tile is not a failure
+at all. A fabricated risk metric that looks measured would be worse than the
+plain sentence it shows instead.
+
+**The most important thing Task 27 found was not a feature.** The Node
+harness's Leaflet stub had no `setStyle`, and no test had ever supplied a real
+`tile_grid`, so Task 22's entire grid-painting path had **never once executed**
+while the suite reported green. Task 28 then found two more stubs with the same
+disease, and the whole-branch review found a third. Assume there are more.
 
 ## What needs the owner, not an agent
 
@@ -139,18 +194,18 @@ slowest type, so 8-way is the floor.
 
 ## Still on the owner's list, not yet built
 
-In their stated order: fix what is broken, then speed, then interface.
+- **Availability watcher.** Check a source on demand and show a quality badge.
+  The only item from the owner's interface list not yet built.
 
-- **Subdivide on failure.** The owner changed their mind from the whole-run
-  tile-size retry to splitting a failed tile into 2 or 4 and continuing, so
-  progress is not lost. Not started.
-- **Interface work.** A save-location button, a progress bar with a countdown,
-  a tile size slider showing time and failure risk, and an availability
-  watcher with a quality badge checked on demand.
-- **`demtype` is hardcoded** to COP30 and is reachable from neither the CLI
-  nor settings. The owner's OpenTopography tier allows higher resolution
-  (OT-hosted High Resolution Global 10m, 250M points per job), so this is
-  leaving detail on the table.
+**A correction worth not re-inheriting.** An earlier version of this file said
+exposing `demtype` would unlock the higher resolution the owner's
+OpenTopography tier allows. That was wrong, and `sources/elevation_models.py`
+was written to refute it. OpenTopography's global DEM API serves nothing finer
+than 30 m anywhere, and OT+ buys North American LiDAR, not sharper global data.
+COP30 was already at the ceiling for Wales. The real benefit of the choice is
+surface model against bare earth at the same 30 m (EU_DTM covers the UK). NRW
+LiDAR through DataMapWales, in phase 2, is the only route to genuine detail on
+Welsh sites.
 
 ## Then
 
