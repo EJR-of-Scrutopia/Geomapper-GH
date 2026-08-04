@@ -5,6 +5,7 @@ import locale
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -15,27 +16,78 @@ from mapgen.sources.base import NullProgress
 from mapgen.sources.overture import OvertureSource
 
 
-@pytest.mark.live
-def test_a_small_welsh_extent_downloads_end_to_end(tmp_path):
-    register_default_sources()
-    request = SurveyRequest(
-        bbox=BBox.parse("-3.29,51.38,-3.285,51.385"),
+# A Barry extent with real streets and buildings in it, verified against
+# the live map API before it was chosen: 3,364 nodes, 595 ways and 17
+# relations in 1.1 MB.
+#
+# It replaces -3.29,51.38,-3.285,51.385 (Task 30), which is off the coast
+# and contains NOTHING. The map API answers that extent 200 with a 385-byte
+# document holding a <bounds> element and no features at all, which this
+# test never noticed, because mapgen used to write the merged XML envelope
+# regardless and the assertion below was on a file being non-empty. What it
+# actually proved for its whole life was that an 85-byte envelope gets
+# written for empty water. Now that no file is written for an extent with
+# nothing in it, that extent has a test of its own, below, saying so on
+# purpose.
+_POPULATED_BBOX = "-3.285,51.395,-3.280,51.400"
+
+# The empty one, kept deliberately. It is a real place, it really does come
+# back empty, and it is the case the ruling is about.
+_EMPTY_BBOX = "-3.29,51.38,-3.285,51.385"
+
+
+def _smoke_request(tmp_path, bbox, site):
+    return SurveyRequest(
+        bbox=BBox.parse(bbox),
         region="South Wales",
-        site="Smoke Test",
+        site=site,
         output_root=tmp_path,
         tile_size_m=1000.0,
         overlap_m=50.0,
         source_ids=("osm",),
         run_bridge_step=False,
     )
-    result = run_survey(request)
+
+
+@pytest.mark.live
+def test_a_small_welsh_extent_downloads_end_to_end(tmp_path):
+    register_default_sources()
+    result = run_survey(_smoke_request(tmp_path, _POPULATED_BBOX, "Smoke Test"))
     assert result.complete is True
     # The merged OSM file is named after the package stem, not a bare
     # "all.osm" (see OsmSource.merge and Task 20 finding 2): the brief's
     # draft of this test predated that rename and would fail here on a
     # file that no longer exists under that name.
-    assert (result.paths.root / f"{result.paths.stem}.osm").stat().st_size > 0
+    merged = result.paths.root / f"{result.paths.stem}.osm"
+    assert merged.stat().st_size > 0
+    # Real elements, not merely a non-empty file. Size alone was what let
+    # this test pass for years on an envelope with nothing in it.
+    root = ET.parse(merged).getroot()
+    assert sum(1 for element in root if element.tag == "node") > 100
+    assert any(element.tag == "way" for element in root)
+    entry = next(s for s in result.survey["sources"] if s["id"] == "osm")
+    assert entry["features_merged"] > 100
+    assert entry["merged_files"] == [merged.name]
+    assert result.survey["tile_failures"] == []
     assert result.paths.survey_json.exists()
+
+
+@pytest.mark.live
+def test_a_real_extent_with_nothing_in_it_is_a_success_with_no_file(tmp_path):
+    # Task 30's ruling, against the real API rather than a fixture: this
+    # extent is open water, the map API answers 200 with no features, and
+    # the honest package is one that says so. Complete, every tile ok, no
+    # merged file, and nothing reported as a failure.
+    register_default_sources()
+    result = run_survey(_smoke_request(tmp_path, _EMPTY_BBOX, "Empty Water"))
+
+    assert result.complete is True
+    assert all(record["osm"] == "ok" for record in result.survey["tiles"])
+    assert not (result.paths.root / f"{result.paths.stem}.osm").exists()
+    entry = next(s for s in result.survey["sources"] if s["id"] == "osm")
+    assert entry["merged_files"] == []
+    assert entry["features_merged"] == 0
+    assert result.survey["tile_failures"] == []
 
 
 # --- overturemaps 0.20.0 specifically ----------------------------------
