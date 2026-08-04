@@ -193,6 +193,34 @@ label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
    style themselves. */
 input[type="range"] { width: 100%; margin: 0; }
 
+/* Task 28: the output root's field and its Browse button on one line.
+   The same flex-with-min-width-0 shape .tile-size-control below uses,
+   for the reason recorded there: an input's intrinsic width does not
+   shrink to fit a narrow container on its own, and this one sits in a
+   360px panel. The button is sized down from the page default so it does
+   not out-weigh the field it assists, which is the honest visual order
+   of the two: the field is the control, the button is help. Both themes
+   are covered already, since every colour it inherits is a variable the
+   two palettes at the top of this file each define. */
+.path-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.path-control input[type="text"] { flex: 1; min-width: 0; }
+
+.path-control button {
+  padding: 7px 10px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* A dialog is open and being waited on, which is the one place in this
+   interface where a disabled control means "in progress" rather than
+   "not available". */
+.path-control button:disabled { opacity: 0.5; cursor: progress; }
+
 .tile-size-control {
   display: flex;
   align-items: center;

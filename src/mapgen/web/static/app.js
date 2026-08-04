@@ -1360,6 +1360,75 @@ function maybePersistFieldSettings() {
   $(id).addEventListener("change", maybePersistFieldSettings)
 );
 
+// --- picking the output folder -------------------------------------------
+//
+// Task 28. A browser cannot hand a page a real filesystem path, and no
+// amount of webkitdirectory changes that: the page can learn a file's
+// name and its bytes, never where it lives. So the dialog is opened
+// server-side, by the local server already running as the owner, and the
+// path comes back over the same token-gated API as everything else. See
+// mapgen.folderpicker for why it runs in a child process rather than in
+// a request handler thread.
+//
+// This is help beside a control that already works, never a replacement
+// for it. Every outcome that is not a chosen path leaves #output-root
+// exactly as it was, including the two that are genuinely failures: the
+// owner can always type the path, which is what they did before this
+// button existed and what they will go on doing if the picker turns out
+// not to work on some future machine.
+
+function setOutputRootNote(message) {
+  const note = $("output-root-note");
+  note.textContent = message || "";
+  note.hidden = !message;
+}
+// Set here rather than left to the markup, the same reasoning
+// closeSettingsPanel and hideProgress already document for the Node
+// harness's synthetic elements.
+setOutputRootNote("");
+
+$("output-root-browse").addEventListener("click", async () => {
+  // Said before the request goes out, not after it comes back: the
+  // dialog is a native window and can open behind a maximised browser,
+  // which looks exactly like nothing having happened. This line is the
+  // only thing on screen that would explain it.
+  setOutputRootNote("A folder picker is open. If you cannot see it, look behind this window.");
+  $("output-root-browse").disabled = true;
+  try {
+    const chosen = await api("/api/folder-dialog", {
+      method: "POST",
+      // Where to open: the field's current value, so the dialog starts
+      // where the owner already is rather than at some default.
+      body: JSON.stringify({ initial: $("output-root").value.trim() }),
+    });
+    if (typeof chosen.path === "string" && chosen.path) {
+      $("output-root").value = chosen.path;
+      setOutputRootNote("");
+      // Assigning .value never fires a change event in a browser, and
+      // this field already has TWO change listeners on it:
+      // refreshEstimate (which is also what persists the value once an
+      // estimate has accepted it) and maybePersistFieldSettings.
+      // Dispatching a real change event puts a picked path through
+      // exactly what a typed path goes through, which is what was asked
+      // for and, more to the point, is one wiring rather than a second
+      // copy of it here that would quietly stop matching the first.
+      $("output-root").dispatchEvent(new Event("change"));
+    } else {
+      // A cancel. A real answer, and never a reason to clear the field.
+      setOutputRootNote("No folder chosen. The path above is unchanged.");
+    }
+  } catch (error) {
+    // The picker could not run, or was open too long and was closed.
+    // Both arrive as the server's own plain sentence, which already ends
+    // by saying to type the path instead.
+    setOutputRootNote(error.message);
+  } finally {
+    // In a finally, so a picker that failed once does not leave the
+    // button dead for the rest of the session.
+    $("output-root-browse").disabled = false;
+  }
+});
+
 // --- elevation model -----------------------------------------------------
 //
 // Task 28. The options are not written into index.html: they come from

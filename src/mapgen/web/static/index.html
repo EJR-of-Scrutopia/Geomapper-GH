@@ -112,8 +112,22 @@
           <span class="hint">Applies to the whole page, including the tile grid drawn on the map while a download runs.</span>
         </label>
 
+        <!--
+          Task 28. The text field is unchanged and still does the whole
+          job on its own; Browse is a convenience beside it, never a
+          replacement for it. A browser cannot hand a page a real
+          filesystem path, so the button asks the local server to open a
+          real folder dialog in a child process (see mapgen.folderpicker)
+          and writes the answer back into this same field. Cancelling,
+          timing out, or there being no picker on the machine all leave
+          the field exactly as it is and say so in the line underneath.
+        -->
         <label>Output root
-          <input id="output-root" type="text" />
+          <span class="path-control">
+            <input id="output-root" type="text" />
+            <button id="output-root-browse" type="button">Browse</button>
+          </span>
+          <span id="output-root-note" class="hint"></span>
         </label>
 
         <!--

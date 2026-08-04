@@ -192,6 +192,23 @@ function makeElement(id) {
       const event = { preventDefault() {}, ...eventLike };
       for (const handler of this._listeners[type] || []) handler(event);
     },
+    // The real DOM method, as opposed to fire() above, which is this
+    // harness's own test-only shorthand. app.js calls this directly
+    // (Task 28: a picked folder path is put through the same "change"
+    // listeners a typed one goes through, since assigning .value never
+    // fires one on its own), so it has to exist here as more than a
+    // synonym a test happens to know about.
+    //
+    // Deliberately does NOT bubble, and that limitation is worth naming:
+    // a real event dispatched on an element also reaches listeners on
+    // its ancestors, which is how the delegated #api-keys listener works
+    // in a browser. Nothing in app.js dispatches an event that needs to
+    // bubble, and the delegated listener is exercised through
+    // setApiKeyField below, which fires on the container directly.
+    dispatchEvent(event) {
+      for (const handler of this._listeners[event.type] || []) handler(event);
+      return true;
+    },
     appendChild(node) {
       this.children.push(node);
     },
@@ -555,6 +572,16 @@ function buildSandbox({ fetch, token = DEFAULT_TOKEN }) {
     clearInterval,
     URL,
     URLSearchParams,
+    // Enough of the real Event for what app.js does with one: construct
+    // it with a type and hand it to dispatchEvent. Nothing here reads a
+    // property a real Event would carry beyond .type, so a fuller
+    // implementation would be inventing surface nothing uses.
+    Event: class Event {
+      constructor(type) {
+        this.type = String(type);
+      }
+      preventDefault() {}
+    },
     AbortController,
     Date,
     Math,
@@ -3980,6 +4007,210 @@ function ok(condition, message) {
     const html = sandbox.document.getElementById("demtype").innerHTML;
     ok(!html.includes("<b>COP30</b>"), `expected the label's tag escaped, got: ${html}`);
     ok(html.includes("&lt;b&gt;"), `expected an escaped label, got: ${html}`);
+  });
+
+  // =======================================================================
+  // Task 28: the Browse button beside the output root.
+  //
+  // A stub that always hands back a path proves nothing about the three
+  // outcomes that actually happen: a cancel, a picker that cannot run,
+  // and a dialog left open until it was closed. All three are here, and
+  // all three have to leave the field alone, because the text input is
+  // the control and this button is only help beside it.
+  // =======================================================================
+
+  const OUTPUT_ROOT_CONFIG = { ...DEFAULT_CONFIG, output_root: "C:\\Surveys" };
+
+  async function bootedWithPicker(dialogResponse) {
+    return bootedSandbox(async (url, options) => {
+      if (url.pathname === "/api/config" && (options.method || "GET").toUpperCase() === "GET") {
+        return jsonResponse(200, OUTPUT_ROOT_CONFIG);
+      }
+      if (url.pathname === "/api/config") return jsonResponse(200, OUTPUT_ROOT_CONFIG);
+      if (url.pathname === "/api/folder-dialog") return dialogResponse();
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: 1,
+          rows: 1,
+          cols: 1,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 60,
+          sources: [],
+          warnings: [],
+          folder: "C:\\Surveys\\South-Wales\\2026-08-04_Barry",
+          tile_grid: [],
+        });
+      }
+      return null;
+    });
+  }
+
+  function clickBrowse(sandbox) {
+    sandbox.document.getElementById("output-root-browse").fire("click");
+  }
+
+  function outputRoot(sandbox) {
+    return sandbox.document.getElementById("output-root").value;
+  }
+
+  function outputRootNote(sandbox) {
+    return sandbox.document.getElementById("output-root-note").textContent;
+  }
+
+  await test("Browse asks the server to open a dialog, starting where the field points", async () => {
+    const { sandbox, fetchCalls } = await bootedWithPicker(() =>
+      jsonResponse(200, { path: "D:\\NewSurveys" })
+    );
+    fetchCalls.length = 0;
+    clickBrowse(sandbox);
+    await flush(10);
+
+    const call = fetchCalls.find((c) => c.url.pathname === "/api/folder-dialog");
+    ok(call, "expected a POST /api/folder-dialog call");
+    ok((call.options.method || "").toUpperCase() === "POST");
+    ok(call.url.searchParams.get("token") === DEFAULT_TOKEN, "the route is token gated");
+    ok(
+      JSON.parse(call.options.body).initial === "C:\\Surveys",
+      `expected the dialog to open where the field points, got: ${call.options.body}`
+    );
+  });
+
+  await test("a chosen folder lands in the output root field", async () => {
+    const { sandbox } = await bootedWithPicker(() => jsonResponse(200, { path: "D:\\NewSurveys" }));
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(outputRoot(sandbox) === "D:\\NewSurveys", `got: ${outputRoot(sandbox)}`);
+    ok(outputRootNote(sandbox) === "", `expected no leftover note, got: ${outputRootNote(sandbox)}`);
+  });
+
+  await test("a Welsh folder path arrives intact", async () => {
+    // The owner's ordinary input, not an edge case: procutil forces UTF-8
+    // on every child precisely because a Welsh name killed a download
+    // under cp1252 once already.
+    const welsh = "C:\\Surveys\\Ynys M\u00f4n\\Rhoscolyn \u0177";
+    const { sandbox } = await bootedWithPicker(() => jsonResponse(200, { path: welsh }));
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(outputRoot(sandbox) === welsh, `got: ${outputRoot(sandbox)}`);
+  });
+
+  await test("picking a folder is treated exactly like typing one", async () => {
+    // Assigning .value fires nothing in a browser. Without a dispatched
+    // change event the picked path would sit in the field, never reach an
+    // estimate, and never be saved, so the next launch would come back
+    // with the old one.
+    const { sandbox, fetchCalls } = await bootedWithPicker(() =>
+      jsonResponse(200, { path: "D:\\NewSurveys" })
+    );
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry");
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    fetchCalls.length = 0;
+
+    clickBrowse(sandbox);
+    await flush(10);
+
+    const estimate = [...fetchCalls].reverse().find((c) => c.url.pathname === "/api/estimate");
+    ok(estimate, "expected a fresh estimate for the picked folder");
+    ok(
+      JSON.parse(estimate.options.body).output_root === "D:\\NewSurveys",
+      `expected the picked folder in the estimate, got: ${estimate.options.body}`
+    );
+    const put = fetchCalls.find(
+      (c) => c.url.pathname === "/api/config" && (c.options.method || "").toUpperCase() === "PUT"
+    );
+    ok(put, "expected the picked folder to be saved once the estimate accepted it");
+    ok(JSON.parse(put.options.body).output_root === "D:\\NewSurveys");
+  });
+
+  await test("cancelling leaves the output root untouched and says so", async () => {
+    const { sandbox } = await bootedWithPicker(() => jsonResponse(200, { path: null }));
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(outputRoot(sandbox) === "C:\\Surveys", `expected the field untouched, got: ${outputRoot(sandbox)}`);
+    ok(/unchanged/i.test(outputRootNote(sandbox)), `got: ${outputRootNote(sandbox)}`);
+  });
+
+  await test("a picker that cannot run leaves the field alone and says to type it", async () => {
+    const { sandbox } = await bootedWithPicker(() =>
+      jsonResponse(503, { error: "The folder picker is not available on this machine. Type the folder path instead." })
+    );
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(outputRoot(sandbox) === "C:\\Surveys", `expected the field untouched, got: ${outputRoot(sandbox)}`);
+    ok(/type the folder path/i.test(outputRootNote(sandbox)), `got: ${outputRootNote(sandbox)}`);
+  });
+
+  await test("a dialog left open leaves the field alone and says nothing changed", async () => {
+    const { sandbox } = await bootedWithPicker(() =>
+      jsonResponse(504, { error: "The folder picker was open for 120 seconds with nothing chosen, so it was closed. Nothing has changed." })
+    );
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(outputRoot(sandbox) === "C:\\Surveys", `expected the field untouched, got: ${outputRoot(sandbox)}`);
+    ok(/nothing has changed/i.test(outputRootNote(sandbox)), `got: ${outputRootNote(sandbox)}`);
+  });
+
+  await test("typing a path still works when the picker is unavailable", async () => {
+    // The whole point of the button being help rather than a control: a
+    // machine with no picker must be exactly as usable as before.
+    const { sandbox, fetchCalls } = await bootedWithPicker(() =>
+      jsonResponse(503, { error: "not available. Type the folder path instead." })
+    );
+    clickBrowse(sandbox);
+    await flush(10);
+    fetchCalls.length = 0;
+
+    setField(sandbox, "output-root", "E:\\Typed");
+    await flush(10);
+
+    const put = fetchCalls.find(
+      (c) => c.url.pathname === "/api/config" && (c.options.method || "").toUpperCase() === "PUT"
+    );
+    ok(put, "expected a typed path to still be saved");
+    ok(JSON.parse(put.options.body).output_root === "E:\\Typed");
+  });
+
+  await test("the browse button cannot be clicked twice while a dialog is open", async () => {
+    // A second native dialog stacked on the first is a window nobody can
+    // attribute an answer to. The server refuses one too (409); this is
+    // the half that stops the request being made at all.
+    let release;
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    const { sandbox, fetchCalls } = await bootedWithPicker(async () => {
+      await pending;
+      return jsonResponse(200, { path: "D:\\NewSurveys" });
+    });
+    fetchCalls.length = 0;
+
+    clickBrowse(sandbox);
+    await flush(5);
+    ok(
+      sandbox.document.getElementById("output-root-browse").disabled === true,
+      "expected the button disabled while the dialog is open"
+    );
+    ok(/look behind this window/i.test(outputRootNote(sandbox)), `got: ${outputRootNote(sandbox)}`);
+
+    release();
+    await flush(10);
+    ok(fetchCalls.filter((c) => c.url.pathname === "/api/folder-dialog").length === 1);
+    ok(outputRoot(sandbox) === "D:\\NewSurveys");
+  });
+
+  await test("the browse button comes back after a failure", async () => {
+    const { sandbox } = await bootedWithPicker(() =>
+      jsonResponse(503, { error: "not available. Type the folder path instead." })
+    );
+    clickBrowse(sandbox);
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("output-root-browse").disabled === false,
+      "a picker that failed once must not leave the button dead for the session"
+    );
   });
 
   console.log(
