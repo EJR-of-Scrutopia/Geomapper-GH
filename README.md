@@ -411,9 +411,9 @@ download itself would have. That is the package positively stating the layer
 was attempted and did not arrive, which is different from a file having been
 moved or deleted, or the wrong folder being passed, all of which are still
 refused. Elevation is the only layer with an API key, so it is the only one
-that fails this way routinely. Nothing but the `bridge` and `project_setting`
-blocks of `survey.json` is written: `complete` and `stopped` describe the
-download, which this command was not present for. It exits 0 when the package
+that fails this way routinely. Nothing but the `bridge`, `elevation_grid` and
+`project_setting` blocks of `survey.json` is written: `complete` and `stopped`
+describe the download, which this command was not present for. It exits 0 when the package
 has its project setting and 1 when it could not be written, unlike `mapgen
 survey`, which exits 0 either way because it still delivered its data.
 
@@ -458,6 +458,8 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_building.geojson        one file per Overture type
   Barry-Waterfront_2026-08-03_water.geojson           ever fetched into this package
   Barry-Waterfront_2026-08-03.tif                     elevation, only if selected
+  Barry-Waterfront_2026-08-03.egrid                   the same DEM, in the format
+                                                      Urbano reads terrain from
   Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here,
                                                       written every run
   survey.json                                         audit trail, read this first
@@ -508,6 +510,15 @@ Each file:
   selected and an OpenTopography key was available. Which model it is comes
   from the `--demtype` setting (COP30 by default) and is recorded in
   `survey.json`.
+- **`<stem>.egrid`**: the same DEM converted into Urbano's own elevation
+  grid, which is the only format any Urbano component reads terrain in.
+  Derived output, like the `layers/` copies: the `.tif` is the original and
+  stays. Written on every run and by `mapgen bridge`, so a package
+  downloaded before this existed gains terrain without being downloaded
+  again. If the DEM cannot be converted the package is finished without it
+  and `survey.json`'s `elevation_grid.error` says which part of the file was
+  refused. See `docs/urbano/README.md` for what is in it and why it is
+  built the way Urbano builds its own.
 - **`<stem>_project_setting.json`**: the single file to point Urbano 2 at.
   Written by mapgen itself on every run, whether or not the Urbano bridge
   ran, succeeded or was skipped. It carries the extent, the UTM world origin
@@ -554,6 +565,7 @@ Fields, as actually written:
 | `stopped` | `true` only when a Stop request is the reason `complete` is `false`, never for an ordinary tile failure and never alongside `complete: true`. Distinguishes the two ways a package can be short: `complete: false, stopped: true` is exactly as far as you asked it to go and is safe to hand to Grasshopper as is; `complete: false, stopped: false` means something failed. Re-running the same extent resumes either way. A Stop that lands after every tile has already finished leaves `complete: true, stopped: false`: nothing about the data is short, so this field has nothing to report and the run is reported as done. The only trace such a run leaves is `bridge.attempted: false`, below; the project setting is still written, so nothing about handing the folder to Grasshopper is affected, and `mapgen bridge` is how you get the bridge's own extras later without downloading the extent again. |
 | `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely, which any run you stopped does, on purpose: `attempted` is `false` and `ok` is `null` the same as `--skip-bridge`, since starting another external process after a Stop request works against stopping promptly. That holds even when the Stop landed too late to cost you any data, so a `complete: true` package with `bridge.attempted: false` and no `--skip-bridge` is a run you stopped right at the end. Two more fields appear only once `mapgen bridge` has been run over the package afterwards, and are described in the row below. |
 | `bridge.ran_at`, `bridge.during_download` | Present only after `mapgen bridge <package-dir>` (see "Command line"), which runs the bridge step alone against a package that already exists. `ran_at` is when that later attempt happened, and `attempted`, `ok` and `error` beside it describe **that** attempt rather than the download: the freshest answer to "does this package have Urbano files" is the useful one, and it is where a reader already looks. `during_download` keeps the download's own `attempted`/`ok`/`error` exactly as it wrote them, so a later success never makes the file claim the bridge succeeded during a run where it did not. Running the command a second time updates the first three again and leaves `during_download` alone: it is the original, not the previous. It is `null`, rather than a fabricated `false`, in the one case where the package's record held no readable `bridge` block for it to keep. **No `ran_at` means the block describes the download**, which is every package written before this existed and every ordinary run since. |
+| `elevation_grid` | `written`, `file`, `nodes`, `covered` and `error`: whether this package has its DEM in the format Urbano reads terrain from, what it is called, how many grid points it has and how many of those the DEM could give a height for, and a plain sentence if the conversion was refused. `written: false` with a null `error` means this package simply has no DEM, which is a different statement from one that could not be converted. `covered` is well under `nodes` on any coastal survey and is not a fault: the grid covers the extent plus 200 m on every side, Urbano's own margin, and the DEM does not reach that far. |
 | `project_setting` | `written`, `file`, `layers` and `error`: whether this package has the one file Urbano 2 is pointed at, what it is called, which layers it names, and a plain sentence if it could not be written. mapgen writes this file itself, so it is a different question from `bridge` above and is answered separately from it: a run whose bridge failed, a `--skip-bridge` run and a run you stopped all still have one. `layers` is what the file actually names, read off what is genuinely in the folder, so it can be shorter than the `sources` list if a layer found nothing. |
 | `started_at`, `finished_at` | UTC timestamps. |
 
@@ -575,15 +587,17 @@ worth knowing, because both are visible from the canvas:
   naming matches, which is what makes a mapgen package a pass-through rather
   than a fresh download. A `.osm` is read as OSM XML, which is what mapgen
   writes, and a `.osm.pbf` as OSM PBF.
-- **The DEM is deliberately not named in the setting.** Urbano's
+- **Terrain is the `.egrid`, never the `.tif`.** Urbano's
   `ElevationFilePath` is not a path to a raster: every component that reads
   it, Import Terrain included, deserialises it as an `ElevationGrid`
   protobuf, so a GeoTIFF there is not ignored, it stops the component with
-  "Unexpected end-group in source data". mapgen leaves the field empty and
-  omits `elevation` from `Layers`, which also means no attempt at Urbano's
-  United States only elevation download and no orange warning about it. The
-  `<stem>.tif` is still in the package and still recorded in `survey.json`;
-  read it with whatever handles a GeoTIFF.
+  "Unexpected end-group in source data". mapgen converts the DEM into that
+  grid and names the grid, which is also what stops Urbano attempting its
+  own United States only elevation download. The `<stem>.tif` is still in
+  the package and still recorded in `survey.json`; nothing in Urbano opens
+  it. Expect the terrain to stop short of the survey edge by 40 to 70 m:
+  the DEM OpenTopography returns is slightly smaller than the extent asked
+  for, and `mapgen survey` prints how many of the grid's points have data.
 
 The GeoJSON files are read separately, and Urbano 2 has a component for
 them: **Import Geojson File** takes a GeoJSON path directly. The

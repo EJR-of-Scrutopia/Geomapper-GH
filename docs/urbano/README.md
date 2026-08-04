@@ -37,9 +37,10 @@ string convention would send it looking for a file nobody has.
 the `Layers` list unioned with every file path field that is not empty. For
 `elevation` with no `<stem>.egrid` beside it, that means
 `DownloadUsgs3DepTiffForBounds`, which is United States only. Since task 37
-mapgen never names an elevation layer it cannot back with a `.egrid`, so a UK
-package no longer provokes that download at all. `climate` is worse and
-mapgen never writes it either: it is re-fetched with no file check at all.
+mapgen never names an elevation layer it cannot back with a `.egrid`, and
+since task 39 it writes that `.egrid` itself, so a UK package carries the
+layer AND skips the download. `climate` is worse and mapgen never writes it
+either: it is re-fetched with no file check at all.
 
 **Overture is not downloaded at all.** The routine has no Overture branch,
 and rewrites `OvertureFilePath` as an empty string. Urbano 2.2.1.2 still
@@ -79,9 +80,10 @@ and that is what produced
 > the source data is corrupt
 
 on Import Streets and Import Buildings. It is protobuf-net reading a TIFF.
-mapgen now leaves the field empty unless a real `.egrid` is in the package,
-which also drops `elevation` from `Layers`. The DEM is still written, still
-named `<stem>.tif`, and still recorded in survey.json.
+The field names a real `.egrid` or nothing, and since task 39 mapgen converts
+the DEM into one, so on an ordinary package it names a real file. The `.tif`
+is still written, still named `<stem>.tif`, and still recorded in survey.json;
+it is simply not what Urbano opens. See "The elevation grid" below.
 
 **`OvertureFilePath` is a GeoParquet file, and mapgen keeps its GeoJSON there
 anyway.** Import Buildings 3D reads it only when its data source dropdown is
@@ -92,6 +94,67 @@ field is inert on every other route, while a real path is exactly what
 **Deserialize Project Setting** hands to **Import Geojson File**, the
 component that does read it. So it stays. If Import Buildings says "not a
 parquet file", set its data source to OSM.
+
+## The elevation grid, which is how terrain reaches Grasshopper
+
+`<stem>.egrid` (task 39, `src/mapgen/egrid.py`) is the DEM in the only format
+any Urbano component reads elevation in. mapgen writes it on every run and on
+every `mapgen bridge`, so a package downloaded before that task gains terrain
+without being downloaded again.
+
+**The contract**, from `Urbano.Core.Data.ElevationGrid` decompiled:
+
+    [ProtoContract(SkipConstructor = true)] sealed class ElevationGrid
+      [ProtoMember(1)] int      NX      nodes across, easting
+      [ProtoMember(2)] int      NY      nodes up, northing
+      [ProtoMember(3)] double   X0      easting of node 0, UTM metres
+      [ProtoMember(4)] double   Y0      northing of node 0, UTM metres
+      [ProtoMember(5)] double   DX      easting step, metres
+      [ProtoMember(6)] double   DY      northing step, metres
+      [ProtoMember(7)] double[] Z1D     NX*NY heights, metres
+      [ProtoIgnore]    double[,] Z      rebuilt from Z1D after reading
+
+Three things about it are not in the field list and are what make a grid right
+or wrong. The frame is **absolute UTM metres** in the zone
+`CoordinateReference.Utm` names, not the local world origin frame: every
+consumer projects to UTM, samples the grid, and only then transforms to the
+origin. **Row zero is the SOUTH edge**, where a GeoTIFF's row zero is its
+north edge, so terrain written straight out of a raster comes out mirrored,
+and it renders rather than failing. And **a hole is `double.NaN`**, which
+`ToRhinoMesh` turns into an omitted face rather than a spike.
+
+**mapgen does not devise the grid, it reproduces Urbano's own.**
+`ProjectSettingComponent`, on the route that writes a `.egrid`, calls
+`ElevationExtensions.BuildElevationGridFromTiff(bounds, 200.0, utm, tiff)` and
+serialises the result. `mapgen.egrid.build_grid` is that method transcribed:
+the same 200 m pad, the same three cell size tiers (5 to 15 m under 2 km, 15
+to 50 m under 10 km, 50 to 200 m above), the same square cell preference, the
+same node-aligned corner, the same bilinear sampling with nodata corners given
+zero weight. The file mapgen writes is the file Urbano itself would have
+written for the same site in the United States, and that was checked: on both
+real Welsh DEMs the two grids have identical dimensions, origin and cell size,
+and identical heights to the last bit of a float.
+
+The 200 m pad is load bearing rather than cautious. Import Terrain does not
+read the grid whole: it snaps the project's bounds to the grid's own lines
+(`SnapBboxToGrid`) and crops (`CropAligned`), and the crop indexes the source
+array with no bounds check at all. A grid sized exactly to the survey bounds
+puts `Math.Ceiling` one line past the end of it.
+
+**Expect holes, and expect them at the edges.** The grid covers the survey
+bounds plus 200 m on every side, and the DEM OpenTopography returns is
+slightly SMALLER than the bounds asked for: it returns whole source pixels
+whose centres fall inside the request, and the bilinear sampler then needs one
+more pixel beyond each edge again. So the outer 40 to 70 m of a survey has no
+terrain under it, on top of the padded ring. On a 500 m Barry extent that is
+3,763 of 12,432 grid points with data; on a 5 km Porthcawl extent it is 20,857
+of 25,893. `mapgen survey` and `mapgen bridge` both print the two numbers, and
+survey.json's `elevation_grid` block carries them.
+
+Geometry placed on a node with no data keeps `z = 0`: `SampleGridBilinear`
+returns NaN and every caller checks `IsFinite` before using it. On the
+Porthcawl package that is 256 of 10,652 street vertices and none of 16,253
+building vertices.
 
 ## Wiring a real mapgen package into Import Streets and Import Buildings
 
