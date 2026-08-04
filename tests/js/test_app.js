@@ -1357,6 +1357,147 @@ function ok(condition, message) {
   );
 
   // =======================================================================
+  // Task 36, item 1: the Download gate re-checks itself once the reverse
+  // lookup has filled in the names it was waiting for.
+  //
+  // The reported failure exists only on the boot path, so neither test
+  // below ever touches region or site: a region restored from config and
+  // a site filled in by /api/reverse are both assigned from script, and
+  // assigning .value fires no change event, so nothing asked the one gate
+  // (refreshEstimate's own success path) to look again. Every field on
+  // screen read as filled and Download sat dead. A test that sets those
+  // fields with setField, which fires a real change event, exercises the
+  // route that always worked and proves nothing about this one.
+  // =======================================================================
+
+  function namedBootRoutes({ reverse, allowEstimate = () => true }) {
+    return (url) => {
+      if (url.pathname === "/api/config") {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, last_region: "Bristol" });
+      }
+      if (url.pathname === "/api/reverse") return jsonResponse(200, reverse);
+      if (url.pathname === "/api/extent") {
+        return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
+      }
+      if (url.pathname === "/api/estimate") {
+        // Unanswered when the guard is meant to have stopped the request:
+        // reaching this route with nothing selected is the guard failing,
+        // and an unhandled-fetch error is the right way for that to fail.
+        if (!allowEstimate()) return null;
+        return jsonResponse(200, {
+          tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000, seconds_estimate: 60, warnings: [], folder: "C:\\out",
+        });
+      }
+      return null;
+    };
+  }
+
+  await test(
+    "Download comes alive when the reverse lookup fills the names, with neither name touched",
+    async () => {
+      const { sandbox } = await bootedSandbox(
+        namedBootRoutes({ reverse: { region: "Bristol", site: "Lawrence Weston" } })
+      );
+      // Restored from config at boot and never touched, exactly as the
+      // owner meets it at the start of a session.
+      ok(
+        sandbox.document.getElementById("region").value === "Bristol",
+        "expected the saved region restored by boot()"
+      );
+      ok(
+        sandbox.document.getElementById("output-root").value === DEFAULT_CONFIG.output_root,
+        "expected the saved output root restored by boot()"
+      );
+
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      await flush(10);
+      ok(
+        sandbox.document.getElementById("download").disabled === true,
+        "expected Download still disabled while the site is genuinely empty"
+      );
+
+      // setBBox's own debounced suggestNames, and then the estimate it
+      // now asks for.
+      await flush(600);
+      ok(
+        sandbox.document.getElementById("site").value === "Lawrence Weston",
+        "expected the reverse lookup to have filled the site"
+      );
+      ok(
+        sandbox.document.getElementById("download").disabled === false,
+        "expected Download enabled once every field it needs is filled, without touching one"
+      );
+      const shown = sandbox.document.getElementById("estimate").innerHTML;
+      ok(
+        !/enter a/i.test(shown),
+        `expected the estimate to stop asking for names it now has, got: ${shown}`
+      );
+    }
+  );
+
+  await test(
+    "a lookup that fills nothing asks for no fresh estimate at all",
+    async () => {
+      // The other half of the same rule: refreshEstimate is asked to look
+      // again because its inputs CHANGED, not on every reverse lookup.
+      // A lookup that comes back with nothing usable leaves the page
+      // exactly as it was and costs no second /api/extent request.
+      const { sandbox, fetchCalls } = await bootedSandbox(
+        namedBootRoutes({ reverse: { region: "", site: "" } })
+      );
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      await flush(10);
+      const extentCallsBefore = fetchCalls.filter((c) => c.url.pathname === "/api/extent").length;
+      await flush(600);
+      ok(
+        fetchCalls.some((c) => c.url.pathname === "/api/reverse"),
+        "expected the reverse lookup to have run"
+      );
+      ok(
+        fetchCalls.filter((c) => c.url.pathname === "/api/extent").length === extentCallsBefore,
+        "expected no second extent request for a lookup that filled nothing"
+      );
+      ok(
+        sandbox.document.getElementById("download").disabled === true,
+        "expected Download still disabled with the site still empty"
+      );
+    }
+  );
+
+  await test(
+    "an empty category selection still disables Download after the lookup fills the names",
+    async () => {
+      // The rule Task 21 added must survive item 1: this is the case a
+      // second, separate gate would have broken, since the names are all
+      // present and only the category selection is empty.
+      let allowEstimate = true;
+      const { sandbox } = await bootedSandbox(
+        namedBootRoutes({
+          reverse: { region: "Bristol", site: "Lawrence Weston" },
+          allowEstimate: () => allowEstimate,
+        })
+      );
+      allowEstimate = false;
+      sandbox.document.querySelectorAll("#categories input").forEach((box) => {
+        box.checked = false;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      await flush(600);
+      ok(
+        sandbox.document.getElementById("site").value === "Lawrence Weston",
+        "expected the reverse lookup to have filled the site"
+      );
+      ok(
+        sandbox.document.getElementById("download").disabled === true,
+        "expected an empty category selection to keep Download disabled"
+      );
+      const message = sandbox.document.getElementById("estimate").innerHTML;
+      ok(/categor/i.test(message), `expected the reason to mention categories, got: ${message}`);
+    }
+  );
+
+  // =======================================================================
   // Task 18, item 6: live extent feedback from /api/extent, needing no
   // region or site, reusing the server's tiling maths rather than any
   // client-side reimplementation of it.

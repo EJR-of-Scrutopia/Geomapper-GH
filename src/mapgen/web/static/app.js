@@ -1149,8 +1149,46 @@ async function suggestNames() {
   try {
     const result = await api(`/api/reverse?lat=${lat}&lon=${lon}`, { signal: controller.signal });
     if (bbox !== requestedBBox) return;
-    if (!$("site").value) $("site").value = result.site || "";
-    if (!$("region").value) $("region").value = result.region || "";
+    let filled = false;
+    if (!$("site").value && result.site) {
+      $("site").value = result.site;
+      filled = true;
+    }
+    if (!$("region").value && result.region) {
+      $("region").value = result.region;
+      filled = true;
+    }
+    // Task 36, item 1. The owner reported Download sitting dead at the
+    // start of every session "even though it had a path saved", and
+    // reported that reopening the folder picker brought it back. The
+    // saved path was never what gated it: output_root is not in
+    // missingFieldsMessage at all, and an empty one would not disable
+    // Download either. What actually gates Download is refreshEstimate's
+    // own success path, the single line `$("download").disabled = false`,
+    // and the only things that re-run refreshEstimate are setBBox and a
+    // "change" event on region, site, tile-size, overlap, output-root,
+    // #sources or #categories.
+    //
+    // Assigning .value from a script fires no change event (the same fact
+    // the folder picker's own dispatchEvent already documents), so the two
+    // lines above used to fill in the very names the missing-fields
+    // message was complaining about and leave the gate un-rechecked. Draw
+    // an extent, wait for the reverse lookup, and the page showed a filled
+    // region and site, an estimate box still asking for a site, and a dead
+    // Download button, for as long as it took to touch some other field.
+    // Reopening the picker is exactly such a touch, which is why it looked
+    // like the path.
+    //
+    // Not a second gate, and not a weakening of the first: this asks the
+    // one gate to look again now that its own inputs have changed. An
+    // empty category or layer selection still disables Download, because
+    // it is still missingFieldsMessage that decides.
+    //
+    // refreshEstimate() directly rather than a dispatched change event on
+    // each field: region and site each carry exactly one change listener,
+    // refreshEstimate itself, so dispatching would fire two estimates for
+    // one lookup and race their two renders against each other.
+    if (filled) refreshEstimate();
   } catch (error) {
     // Quiet on purpose, see the comment above. Includes an AbortError
     // from a newer extent superseding this one.
