@@ -175,19 +175,42 @@ disease, and the whole-branch review found a third. Assume there are more.
    `_project_setting.json` is untested as an actual Urbano input. Task 2's
    gate is narrowed but not closed, see below.
 
-   **Urbano IS installed and the bridge was looking for the wrong files.**
-   Urbano 2.2.1.2 sits at
-   `AppData\Roaming\McNeel\Rhinoceros\packages\8.0\Urbano2\2.2.1.2\` and ships
-   exactly one assembly, `Urbano.SiteAnalysis.gha` (17.3 MB). `Urbano.Core.dll`
-   and `ProjectSetup.dll`, the two files the bridge searches for, exist nowhere
-   on this machine. The `.gha` is a genuine .NET assembly
-   (`Urbano.SiteAnalysis, Version=2.2.1.0`) and contains both `ProjectSetup`
-   and `Urbano.Core` as names inside it. Nothing was ever missing; the
-   filenames were wrong.
+   **Urbano IS installed, and the bridge targets an API that is not there.**
+   This is worse than a wrong filename, and an earlier version of this file
+   said otherwise. Corrected, with the method, because the wrong version was
+   reached by a method that looked convincing:
 
-   Caveat from the same inspection: the string `project_setting` appears
-   nowhere in that assembly, so fixing the lookup does not by itself prove
-   mapgen's output format is what Urbano consumes.
+   - Urbano 2.2.1.2 sits at
+     `AppData\Roaming\McNeel\Rhinoceros\packages\8.0\Urbano2\2.2.1.2\` and
+     ships exactly one assembly, `Urbano.SiteAnalysis.gha` (17.3 MB).
+   - `Urbano.Core.dll` and `ProjectSetup.dll`, the two files
+     `tools/UrbanoBridge/Program.cs` loads by name, exist **nowhere on this
+     machine**.
+   - A raw binary string search of the `.gha` finds "Urbano.Core" 30 times and
+     "ProjectSetup" 7 times. **That is not evidence those types are defined
+     there, and reading it that way was the error.** A string search cannot
+     tell a definition from a reference.
+   - Reading the metadata properly: the `.gha` defines 314 types across 99
+     namespaces and **not one** matches `Urbano.Core` or `ProjectSetup`. The
+     namespaces are vendored third-party libraries (Apache.Arrow, CsvHelper,
+     DnsClient, DotSpatial.Projections, FlatBuffers) plus `Ed.Eto`.
+   - The `.gha` **references** `Ed.Core` and `Ed.Common`. Both exist, at
+     `C:\Program Files\Rhino 8\System\`, shipped with Rhino rather than with
+     the Urbano package. `Ed.Core.dll` is 10.2 MB, identity
+     `Ed.Core, Version=1.0.0.0`.
+   - `Ed.Core.dll` could not be enumerated reflection-only (104 loader errors,
+     its dependencies do not resolve outside Rhino), and a string search of it
+     finds none of the bridge's required names, not even generic ones like
+     `WorldOrigin` or `ProgressBar`.
+
+   So the bridge was written against an API surface that the installed Urbano
+   does not present. Retargeting it needs proper assembly inspection tooling
+   (ildasm, or Mono.Cecil under `dotnet`) run against `Ed.Core.dll`, not
+   another filename guess. Task 2's gate is still shut.
+
+   Separately: `project_setting` appears nowhere in the `.gha` either, though
+   its embedded resources do include a `DeserializeProjectSettingComponent`
+   icon, so the concept exists in Urbano 2 even if the string does not.
 4. **The Barry package is abandoned deliberately.** The owner has said to drop
    it and download a fresh one from the interface instead, so the resume
    instructions that used to be here no longer apply. The folder can be
