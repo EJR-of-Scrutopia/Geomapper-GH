@@ -1297,3 +1297,106 @@ def test_an_ordinary_complete_run_says_nothing_new_at_all(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "did not download" not in captured.err
     assert "nothing was found" not in captured.out
+
+
+# --- Task 32: the terminal says when a run only completed on a retry ------
+
+
+class _RecoversOnRetrySource(_CollectsFailuresSource):
+    """Fails a named tile a FIXED number of times, with a retryable kind,
+    then serves it.
+
+    A double that fails forever tests the give-up path and nothing else,
+    and one that never fails tests neither. This one is told how many
+    refusals to give, so the same class covers a run that recovers and a
+    run that does not.
+    """
+
+    id = "recovers-on-retry"
+    display_name = "Recovers On Retry"
+
+    def __init__(self, fail_on=("r00_c01",), failures=1):
+        super().__init__(fail_on=fail_on)
+        self._failures_left = {tile_id: failures for tile_id in fail_on}
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.tile_failures = []
+        paths = []
+        for tile in tiles:
+            if self._failures_left.get(tile.tile_id, 0) > 0:
+                self._failures_left[tile.tile_id] -= 1
+                self.tile_failures.append(
+                    self._TileFailure(
+                        source=self.id,
+                        tile_id=tile.tile_id,
+                        kind="service_error",
+                        reason="the service answered HTTP 503.",
+                    )
+                )
+                continue
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(tile.tile_id, encoding="utf-8")
+            paths.append(path)
+        if self.tile_failures:
+            raise RuntimeError("recovers-on-retry: a tile failed")
+        return paths
+
+    def merge(self, parts, out_dir, stem):
+        self.merged_features = len(parts)
+        if not parts:
+            return []
+        out = out_dir / "recovers-on-retry.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("merged", encoding="utf-8")
+        return [out]
+
+
+def test_a_run_that_only_completed_on_a_retry_says_so_on_the_terminal(tmp_path, capsys):
+    # The complete run that was not complete first time. Without this line
+    # it reads on screen exactly like one that never stumbled, because a
+    # recovered tile is correctly dropped from tile_failures.
+    register(_RecoversOnRetrySource())
+    exit_code = main(
+        _survey_error_case_args(
+            tmp_path, "recovers-on-retry", tile_size_m=600, overlap_m=50
+        )
+    )
+    assert exit_code == 0, "a run whose retry worked is a complete run"
+    captured = capsys.readouterr()
+    assert "1 tile arrived only on a retry (recovers-on-retry)" in captured.err
+    assert "did not download" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_a_clean_run_says_nothing_about_retries(tmp_path, capsys):
+    register(_RecoversOnRetrySource(failures=0))
+    exit_code = main(
+        _survey_error_case_args(
+            tmp_path, "recovers-on-retry", tile_size_m=600, overlap_m=50
+        )
+    )
+    assert exit_code == 0
+    assert "arrived only on a retry" not in capsys.readouterr().err
+
+
+def test_a_whole_layer_failure_is_one_terminal_line_not_one_per_tile(
+    tmp_path, capsys
+):
+    # Elevation and Overture record one whole-extent failure against every
+    # planned tile, so the owner's own extent would otherwise print
+    # seventy-two copies of one sentence.
+    register(
+        _CollectsFailuresSource(fail_on=("r00_c00", "r00_c01", "r01_c00", "r01_c01"))
+    )
+    main(
+        _survey_error_case_args(
+            tmp_path, "collects-failures", tile_size_m=600, overlap_m=50
+        )
+        + ["--force"]
+    )
+    captured = capsys.readouterr()
+    assert "collects-failures, all 4 tiles:" in captured.err
+    assert "HTTP 401" in captured.err
+    # The four per-tile lines are gone, not merely joined by a summary.
+    assert "collects-failures r00_c00" not in captured.err
