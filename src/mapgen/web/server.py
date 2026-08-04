@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from mapgen.categories import CATEGORY_GROUPS, ROAD_SUBTYPES
 from mapgen.config import load_config, save_config
+from mapgen.elevation_models import DEFAULT_DEMTYPE
 from mapgen.geo import BBox, BBoxError, build_tiles
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, NominatimClient
 from mapgen.jobs import CancelToken, Cancelled, EventLog
@@ -258,6 +259,13 @@ def _survey_request(payload: dict) -> SurveyRequest:
         categories=(
             tuple(payload["categories"]) if payload.get("categories") is not None else None
         ),
+        # Absent means the default, exactly as it does for every other
+        # optional field here, and covers a client that predates Task 28
+        # or one whose model select never populated. NOT `or
+        # DEFAULT_DEMTYPE`: an explicitly sent empty string is a malformed
+        # request, not a request for the default, and must come back as
+        # the same plain 400 naming the valid models that a typo does.
+        elevation_demtype=payload.get("elevation_demtype", DEFAULT_DEMTYPE),
         keep_work=bool(payload.get("keep_work", False)),
         coordinate_stem=bool(payload.get("coordinate_stem", False)),
         run_bridge_step=bool(payload.get("run_bridge", True)),
@@ -368,6 +376,15 @@ def make_handler(
                             # key, so a second or third keyed source in
                             # phase 2 needs no redesign here.
                             "api_key_config_field": getattr(s, "api_key_config_field", None),
+                            # Task 28, the same convention once more: a
+                            # source with a model to choose between says
+                            # what the choices are, and the settings
+                            # panel's select is built from that rather
+                            # than from a second copy of the list living
+                            # in index.html. None for every source that
+                            # has no such choice, which is both of the
+                            # others.
+                            "demtype_choices": getattr(s, "demtype_choices", None),
                         }
                         for s in available_sources()
                     ],

@@ -17,6 +17,7 @@ from typing import Sequence
 from mapgen import __version__
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
 from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
+from mapgen.elevation_models import DEFAULT_DEMTYPE, validate_demtype
 from mapgen.fsutil import (
     atomic_write_text,
     best_effort_rmtree,
@@ -86,6 +87,13 @@ class SurveyRequest:
     source_ids: Sequence[str] = ("osm", "overture")
     overture_types: Sequence[str] | None = None
     categories: Sequence[str] | None = None
+    # Task 28. Source-prefixed the same way overture_types is, since it
+    # belongs to one source rather than to the request as a whole. Not
+    # Optional and not None-defaulted, unlike categories: there is no
+    # useful difference here between "not asked about" and "asked for the
+    # default", because a DEM is always fetched with exactly one model and
+    # COP30 is what every run before this task used.
+    elevation_demtype: str = DEFAULT_DEMTYPE
     keep_work: bool = False
     coordinate_stem: bool = False
     force: bool = False
@@ -102,6 +110,17 @@ class SurveyRequest:
         # the browser's checklist both get the same rejection through the
         # same code path: SurveyRequest is the one place both already meet.
         validate_categories(self.categories)
+        # Task 28's elevation model, refused here for exactly the same
+        # reason and in exactly the same place. The alternative was a
+        # check inside ElevationSource, which would have been a second
+        # validation site reached only once a download had already
+        # started: OpenTopography answers an unknown demtype with an error
+        # page, which this project turns into "OpenTopography did not
+        # return a TIFF", a message that names neither the typo nor the
+        # valid values. A saved config.json holding a bad model is caught
+        # by this too, on the next estimate, because that is also a
+        # SurveyRequest.
+        validate_demtype(self.elevation_demtype)
 
     @property
     def effective_date(self) -> date:
@@ -206,7 +225,12 @@ def _plan(request: SurveyRequest):
         fingerprint,
         stem_override=stem_override,
     )
-    check_path_length(paths, request.effective_overture_types, source_ids=request.source_ids)
+    check_path_length(
+        paths,
+        request.effective_overture_types,
+        source_ids=request.source_ids,
+        elevation_demtype=request.elevation_demtype,
+    )
     return tiles, paths
 
 
@@ -224,10 +248,11 @@ def _configured_sources(request: SurveyRequest) -> list:
     GET /api/sources keep seeing the original, always-present instance),
     then, only for sources that expose the optional `configure` extension
     documented on LayerSource, asks for a fresh, request-scoped copy
-    rather than mutating the registered one. Only overture (types) and
-    osm (category tag filtering) have any such per-request selection
-    today; every other source id is used exactly as registered, with no
-    id-specific branch needed for it to keep working unchanged.
+    rather than mutating the registered one. Overture (types), osm
+    (category tag filtering) and, since Task 28, elevation (which DEM
+    model) each have such a per-request selection; every other source id
+    is used exactly as registered, with no id-specific branch needed for
+    it to keep working unchanged.
     """
     configured = []
     for source_id in request.source_ids:
@@ -238,6 +263,8 @@ def _configured_sources(request: SurveyRequest) -> list:
                 source = configure(request.effective_overture_types)
             elif source_id == "osm":
                 source = configure(request.effective_categories)
+            elif source_id == "elevation":
+                source = configure(request.elevation_demtype)
         configured.append(source)
     return configured
 
@@ -860,6 +887,23 @@ def _source_provenance(source) -> dict[str, object]:
     types = getattr(source, "types", None)
     if types is not None:
         entry["types"] = list(types)
+    # demtype is ElevationSource-specific today (Task 28), read the same
+    # defensive way. It records which DEM the package actually holds,
+    # which nothing else in survey.json says: licence and attribution
+    # above already follow the model, but neither of them names it, and a
+    # 30 m surface model and a 30 m bare earth model are a different
+    # ground plane in Rhino for the same extent, the same date and the
+    # same file size.
+    #
+    # Truthful about what was downloaded rather than what was selected,
+    # per the brief, because of a detail that is not obvious from here:
+    # the source's own downloaded file carries the model in its NAME (see
+    # elevation_models.work_file_name), so a resumed run cannot skip
+    # another model's file and have this line describe it. Without that,
+    # this would be a record of the setting, not of the package.
+    demtype = getattr(source, "demtype", None)
+    if demtype is not None:
+        entry["demtype"] = demtype
     check_routing_note = getattr(source, "routing_note", None)
     if callable(check_routing_note):
         note = check_routing_note()

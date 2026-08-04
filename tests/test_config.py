@@ -179,3 +179,49 @@ def test_an_unknown_key_does_not_warn(recwarn, tmp_path):
     target.write_text('{"from_the_future": 1}', encoding="utf-8")
     load_config(target)
     assert len(recwarn) == 0
+
+
+# --- Task 28: which elevation model, saved between runs -----------------
+
+
+def test_the_elevation_model_defaults_to_cop30():
+    # Every run before this task downloaded COP30 and every existing
+    # config.json predates the field entirely, so the default is what
+    # keeps those behaving identically.
+    assert Config().elevation_demtype == "COP30"
+
+
+def test_a_config_written_before_this_field_existed_still_loads(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text('{"output_root": "C:\\Surveys", "tile_size_m": 2000}', encoding="utf-8")
+    loaded = load_config(target)
+    assert loaded.elevation_demtype == "COP30"
+    assert loaded.tile_size_m == 2000.0
+
+
+def test_save_then_load_round_trips_the_elevation_model(tmp_path):
+    target = tmp_path / "config.json"
+    save_config(Config(elevation_demtype="EU_DTM"), target)
+    assert load_config(target).elevation_demtype == "EU_DTM"
+
+
+def test_a_numeric_elevation_model_falls_back_to_the_default(tmp_path):
+    # load_config only ever checks a field's TYPE; it has no notion of the
+    # model vocabulary, which is deliberately known in exactly one place
+    # (see mapgen.elevation_models, refused at SurveyRequest). This covers
+    # the type half only.
+    target = tmp_path / "config.json"
+    target.write_text('{"elevation_demtype": 30}', encoding="utf-8")
+    with pytest.warns(UserWarning, match="elevation_demtype"):
+        assert load_config(target).elevation_demtype == "COP30"
+
+
+def test_an_unrecognised_but_string_model_is_loaded_unchanged(tmp_path):
+    # And is refused later, by SurveyRequest, with a message naming the
+    # valid models. Coercing it to the default here instead would be a
+    # second, silent vocabulary check in the one module that is supposed
+    # not to have one, and the owner would never learn their saved
+    # setting was wrong.
+    target = tmp_path / "config.json"
+    target.write_text('{"elevation_demtype": "nonsense"}', encoding="utf-8")
+    assert load_config(target).elevation_demtype == "nonsense"

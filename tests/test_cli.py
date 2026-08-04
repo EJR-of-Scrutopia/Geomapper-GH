@@ -822,3 +822,197 @@ def test_console_progress_still_prints_one_readable_line_per_event(capsys):
     progress.emit("tile_done", source="overture", tile_id="r00_c00")
     lines = capsys.readouterr().out.splitlines()
     assert lines == ["[tile_done] source=overture tile_id=r00_c00"]
+
+
+# --- Task 28: --demtype -------------------------------------------------
+
+# ElevationSource refuses anything that is not a real TIFF (see is_tiff),
+# so the fake transport below has to hand back one.
+_TIFF_HEADER = b"II*\x00" + b"\x00" * 128
+
+
+class _FakeDemResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def iter_content(self, chunk_size=None):
+        return iter([self._payload])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _FakeDemSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeDemResponse(_TIFF_HEADER)
+
+
+def _register_real_elevation_source():
+    """The real ElevationSource with a fake transport, not a stub.
+
+    register_default_sources(), which main() calls on every invocation,
+    skips an id already held by an instance of the same TYPE (see
+    package.register_default_sources), so registering a real one here is
+    what lets the CLI's own default registration leave it alone. A stub
+    class would collide instead, and a stub that did not collide would
+    prove the CLI passed a string somewhere rather than that the real
+    source ended up configured with it.
+    """
+    from mapgen.sources.base import register as register_source
+    from mapgen.sources.elevation import ElevationSource
+
+    session = _FakeDemSession()
+    register_source(ElevationSource(api_key="test-key", session=session))
+    return session
+
+
+def _estimate_args(tmp_path, *extra):
+    return [
+        "estimate",
+        "--bbox=-3.29,51.38,-3.28,51.39",
+        "--region=South Wales",
+        "--site=Barry",
+        "--output-root",
+        str(tmp_path),
+        "--tile-size-m",
+        "600",
+        "--source",
+        "elevation",
+        *extra,
+    ]
+
+
+def test_demtype_flag_reaches_the_source(tmp_path, capsys, monkeypatch):
+    # `mapgen estimate` prints each selected source's display_name, and
+    # only a source configure()d for this request names its model, so this
+    # line is the whole chain: flag, SurveyRequest, _configured_sources,
+    # ElevationSource.configure.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "no-such-config.json")
+    _register_real_elevation_source()
+
+    exit_code = main(_estimate_args(tmp_path, "--demtype", "EU_DTM"))
+
+    assert exit_code == 0
+    assert "Elevation (OpenTopography EU_DTM)" in capsys.readouterr().out
+
+
+def test_without_the_flag_the_saved_model_is_used(tmp_path, capsys, monkeypatch):
+    # The browser saves this setting; the CLI has to honour it, or the two
+    # halves of one tool disagree about what a plain `mapgen survey` does.
+    config = tmp_path / "config.json"
+    config.write_text('{"elevation_demtype": "NASADEM"}', encoding="utf-8")
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", config)
+    _register_real_elevation_source()
+
+    exit_code = main(_estimate_args(tmp_path))
+
+    assert exit_code == 0
+    assert "Elevation (OpenTopography NASADEM)" in capsys.readouterr().out
+
+
+def test_the_flag_wins_over_the_saved_model_without_overwriting_it(tmp_path, capsys, monkeypatch):
+    config = tmp_path / "config.json"
+    config.write_text('{"elevation_demtype": "NASADEM"}', encoding="utf-8")
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", config)
+    _register_real_elevation_source()
+
+    main(_estimate_args(tmp_path, "--demtype", "SRTMGL3"))
+
+    assert "Elevation (OpenTopography SRTMGL3)" in capsys.readouterr().out
+    # A flag passed for one run is that run's choice, never a new default.
+    assert json.loads(config.read_text(encoding="utf-8"))["elevation_demtype"] == "NASADEM"
+
+
+def test_the_chosen_model_is_what_gets_downloaded(tmp_path, monkeypatch):
+    # And not merely what gets printed: the same flag, through `survey`
+    # this time, ends up as the demtype parameter on the actual request.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "no-such-config.json")
+    session = _register_real_elevation_source()
+
+    exit_code = main(
+        [
+            "survey",
+            "--bbox=-3.29,51.38,-3.28,51.39",
+            "--region=South Wales",
+            "--site=Barry",
+            "--output-root",
+            str(tmp_path),
+            "--tile-size-m",
+            "600",
+            "--source",
+            "elevation",
+            "--skip-bridge",
+            "--demtype",
+            "AW3D30",
+        ]
+    )
+
+    assert exit_code == 0
+    assert session.calls, "the elevation source was never asked for anything"
+    assert session.calls[0]["params"]["demtype"] == "AW3D30"
+
+
+def test_survey_reports_an_unknown_demtype_without_a_traceback(tmp_path, capsys, monkeypatch):
+    # Raised by SurveyRequest.__post_init__ before any source is touched,
+    # exactly as an unknown --category is, and reported the same plain
+    # one-line way rather than as twenty lines of Python.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "no-such-config.json")
+    exit_code = main(_survey_error_case_args(tmp_path, "stub", demtype="COP-30"))
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Unknown elevation model" in err
+    assert "COP-30" in err
+    assert "COP30" in err
+    assert "Traceback" not in err
+
+
+def test_a_hand_edited_config_with_a_bad_model_fails_plainly_too(tmp_path, capsys, monkeypatch):
+    # The other way a bad value arrives: not a typed flag, a saved file.
+    # load_config only checks the TYPE of a field, so a bad string reaches
+    # SurveyRequest, which is the single place that knows the vocabulary.
+    config = tmp_path / "config.json"
+    config.write_text('{"elevation_demtype": "nonsense"}', encoding="utf-8")
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", config)
+
+    exit_code = main(
+        [
+            "estimate",
+            "--bbox=-3.29,51.38,-3.28,51.39",
+            "--region=South Wales",
+            "--site=Barry",
+            "--output-root",
+            str(tmp_path),
+            "--tile-size-m",
+            "600",
+            "--source",
+            "stub",
+        ]
+    )
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "Unknown elevation model" in err
+    assert "Traceback" not in err
+
+
+def test_the_demtype_help_does_not_promise_higher_resolution():
+    # The claim this task was originally justified with, and which turned
+    # out to be wrong: OpenTopography's global API serves nothing finer
+    # than 30 m anywhere, so nothing offered here is sharper than the
+    # default. Read off the parser rather than out of --help's rendered
+    # output, which argparse wraps at the terminal width and would break
+    # this phrase across a line.
+    parser = build_parser()
+    survey = parser._subparsers._group_actions[0].choices["survey"]
+    action = next(a for a in survey._actions if "--demtype" in a.option_strings)
+    assert "higher resolution than COP30" in action.help
+    assert "COP30" in action.help

@@ -2611,3 +2611,128 @@ def test_a_source_without_the_declaration_is_skipped_not_crashed(tmp_path):
     assert result.complete is True
     # Nothing declared, so nothing swept, and nothing raised.
     assert (root / f"{stem}_water.geojson").exists()
+
+
+# --- Task 28: which elevation model, validated where categories are ------
+
+
+class _FakeDemResponse:
+    """The shape ElevationSource.fetch actually uses of a requests
+    response: a context manager with a status code and iter_content.
+    Deliberately the real ElevationSource in the tests below rather than a
+    stub with a `demtype` attribute: a stub would prove that package.py
+    passes a string to something, not that the source it passes it to
+    fetches, merges and reports with it.
+    """
+
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def iter_content(self, chunk_size=None):
+        return iter([self._payload])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _FakeDemSession:
+    def __init__(self, payload=b"II*\x00" + b"\x00" * 128):
+        self._payload = payload
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeDemResponse(self._payload)
+
+
+def _register_fake_elevation():
+    from mapgen.sources.elevation import ElevationSource
+
+    session = _FakeDemSession()
+    register(ElevationSource(api_key="test-key", session=session))
+    return session
+
+
+def test_the_default_elevation_model_is_unchanged(tmp_path):
+    assert _request(tmp_path).elevation_demtype == "COP30"
+
+
+def test_survey_request_rejects_an_unknown_elevation_model_at_construction(tmp_path):
+    # The same place, and the same reason, as the category checks above:
+    # SurveyRequest is where the CLI's --demtype and the browser's select
+    # already meet, so one check covers both. Left to the source, this
+    # would only surface once OpenTopography had answered an error page
+    # instead of a TIFF, as "did not return a TIFF", which names neither
+    # the typo nor the valid values.
+    from mapgen.elevation_models import UnknownDemTypeError
+
+    with pytest.raises(UnknownDemTypeError, match="COP-30"):
+        _request(tmp_path, elevation_demtype="COP-30")
+
+
+def test_the_chosen_model_reaches_the_actual_download(tmp_path):
+    session = _register_fake_elevation()
+
+    run_survey(_request(tmp_path, source_ids=("elevation",), elevation_demtype="EU_DTM"))
+
+    assert session.calls, "the elevation source was never asked for anything"
+    assert session.calls[0]["params"]["demtype"] == "EU_DTM"
+
+
+def test_survey_json_records_the_model_the_package_actually_holds(tmp_path):
+    _register_fake_elevation()
+
+    result = run_survey(
+        _request(tmp_path, source_ids=("elevation",), elevation_demtype="EU_DTM")
+    )
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "elevation")
+    assert entry["demtype"] == "EU_DTM"
+    # And the terms recorded are that model's own, not the Copernicus
+    # ones this source carried when COP30 was the only possibility.
+    assert entry["licence"] == "CC BY 4.0"
+    assert "Airbus" not in entry["attribution"]
+
+
+def test_a_resumed_run_that_changed_model_downloads_rather_than_relabelling(tmp_path):
+    # The failure the model-bearing filename exists to prevent, end to end
+    # through run_survey rather than at the source in isolation: work_dir
+    # is fingerprinted by TILING, so an earlier attempt's DEM really is
+    # still sitting there when only the model changed.
+    session = _register_fake_elevation()
+    first = _request(tmp_path, source_ids=("elevation",), keep_work=True)
+    run_survey(first)
+    assert len(session.calls) == 1
+
+    result = run_survey(
+        _request(
+            tmp_path,
+            source_ids=("elevation",),
+            elevation_demtype="EU_DTM",
+            keep_work=True,
+        )
+    )
+
+    assert len(session.calls) == 2, "the COP30 file was reused for an EU_DTM run"
+    assert session.calls[1]["params"]["demtype"] == "EU_DTM"
+    entry = next(s for s in result.survey["sources"] if s["id"] == "elevation")
+    assert entry["demtype"] == "EU_DTM"
+
+
+def test_the_estimate_names_the_model_this_request_will_use(tmp_path):
+    _register_fake_elevation()
+
+    estimate = estimate_survey(
+        _request(tmp_path, source_ids=("elevation",), elevation_demtype="SRTMGL1")
+    )
+
+    summary = next(s for s in estimate["sources"] if s["id"] == "elevation")
+    assert summary["display_name"] == "Elevation (OpenTopography SRTMGL1)"
+    # While the registered instance, which is what the layer checklist
+    # reads, still claims no model at all.
+    assert get_source("elevation").display_name == "Elevation (OpenTopography)"

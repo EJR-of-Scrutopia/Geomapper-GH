@@ -14,6 +14,7 @@ import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from mapgen.elevation_models import DEFAULT_DEMTYPE
 from mapgen.fsutil import atomic_write_text
 
 CONFIG_PATH = Path.home() / ".mapgen" / "config.json"
@@ -42,6 +43,19 @@ class Config:
     # server's job events never include it, and the interface field is
     # type="password".
     opentopography_api_key: str = ""
+    # Task 28: which OpenTopography DEM the elevation layer downloads.
+    # Source-qualified, like opentopography_api_key and unlike
+    # output_root, because config.json is one flat namespace shared by
+    # everything and a bare "demtype" would not say whose. Validated the
+    # same structural way as every other field here (must be a str; an
+    # unrecognised value is not rejected by load_config itself, which has
+    # no notion of a vocabulary, only a type), so the actual refusal
+    # happens where it does for categories: SurveyRequest.__post_init__,
+    # the one place the CLI and the browser both pass through. A
+    # hand-edited config.json holding a model that does not exist
+    # therefore reports a plain "Unknown elevation model" on the next
+    # estimate rather than failing mid-download.
+    elevation_demtype: str = DEFAULT_DEMTYPE
 
 
 def load_config(path: Path | None = None) -> Config:

@@ -2230,3 +2230,128 @@ def test_the_heartbeat_timeout_clears_browser_background_throttling():
     # pins the property, not the number, so a future tweak that drops it
     # back under a minute fails here with the reason attached.
     assert DEFAULT_HEARTBEAT_TIMEOUT_SECONDS > 60.0
+
+
+# --- Task 28: the elevation model over the wire ---------------------------
+
+
+def test_sources_endpoint_offers_no_model_choice_for_a_source_that_has_none(server):
+    status, payload = _get(server, "/api/sources")
+    assert status == 200
+    assert payload[0]["demtype_choices"] is None
+
+
+def test_sources_endpoint_carries_the_model_choices_for_the_elevation_source(server):
+    # The settings panel's select is built from this rather than from a
+    # second copy of the vocabulary in index.html, the same
+    # registry-driven convention api_key_config_field established.
+    from mapgen.elevation_models import OFFERED_DEMTYPE_IDS
+    from mapgen.sources.elevation import ElevationSource
+
+    clear_registry()
+    register(ElevationSource())
+    status, payload = _get(server, "/api/sources")
+
+    assert status == 200
+    entry = next(s for s in payload if s["id"] == "elevation")
+    assert [choice["id"] for choice in entry["demtype_choices"]] == list(OFFERED_DEMTYPE_IDS)
+    assert all(choice["label"] for choice in entry["demtype_choices"])
+
+
+def test_the_layer_checklist_is_never_told_a_model(server):
+    # display_name is read off the ONE registered instance, whose demtype
+    # is not what any request will use. Naming COP30 there would
+    # contradict a settings panel showing something else, permanently.
+    from mapgen.sources.elevation import ElevationSource
+
+    clear_registry()
+    register(ElevationSource())
+    _status, payload = _get(server, "/api/sources")
+
+    entry = next(s for s in payload if s["id"] == "elevation")
+    assert entry["display_name"] == "Elevation (OpenTopography)"
+
+
+@pytest.mark.parametrize("path", ["/api/estimate", "/api/jobs"])
+def test_an_unknown_elevation_model_is_a_400_on_every_route_that_builds_a_request(
+    server, tmp_path, path
+):
+    # Rejected synchronously, from SurveyRequest.__post_init__, exactly
+    # like an unknown category: /api/jobs must not answer 202 for a
+    # request that is certain to fail.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            path,
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "sources": ["stub"],
+                "elevation_demtype": "COP-30",
+            },
+        )
+    assert excinfo.value.code == 400
+    body = json.loads(excinfo.value.read().decode("utf-8"))
+    assert "Unknown elevation model" in body["error"]
+    assert "COP30" in body["error"]
+
+
+def test_an_empty_model_is_refused_rather_than_read_as_the_default(server, tmp_path):
+    # The browser omits the key entirely when its select never populated.
+    # An empty string arriving is a malformed request, and coalescing it
+    # into COP30 would hide a broken client rather than report it.
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(
+            server,
+            "/api/estimate",
+            {
+                "bbox": "-3.29,51.38,-3.28,51.39",
+                "region": "R",
+                "site": "S",
+                "output_root": str(tmp_path),
+                "sources": ["stub"],
+                "elevation_demtype": "",
+            },
+        )
+    assert excinfo.value.code == 400
+
+
+def test_a_request_with_no_model_at_all_still_works(server, tmp_path):
+    # A client that predates this task sends no such key, and must behave
+    # exactly as it always did.
+    status, payload = _post(
+        server,
+        "/api/estimate",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "R",
+            "site": "S",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+        },
+    )
+    assert status == 200
+    assert payload["tiles"] >= 1
+
+
+def test_config_put_saves_and_round_trips_the_elevation_model(server, tmp_path, monkeypatch):
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+
+    status, payload = _put(server, "/api/config", {"elevation_demtype": "EU_DTM"})
+    assert status == 200
+    assert payload["elevation_demtype"] == "EU_DTM"
+
+    status, reloaded = _get(server, "/api/config")
+    assert status == 200
+    assert reloaded["elevation_demtype"] == "EU_DTM"
+
+
+def test_config_get_reports_the_default_model_for_a_config_that_has_never_had_one(
+    server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "no-such-config.json")
+    status, payload = _get(server, "/api/config")
+    assert status == 200
+    assert payload["elevation_demtype"] == "COP30"

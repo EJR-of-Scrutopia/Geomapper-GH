@@ -23,6 +23,11 @@ from mapgen.categories import (
     EmptyCategorySelectionError,
     UnknownCategoryError,
 )
+from mapgen.elevation_models import (
+    ALL_DEMTYPE_IDS,
+    OFFERED_DEMTYPE_IDS,
+    UnknownDemTypeError,
+)
 from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
 from mapgen.package import (
@@ -104,6 +109,14 @@ def _add_survey_arguments(parser: argparse.ArgumentParser) -> None:
              "(unless --overture-type is also given, which wins outright). "
              "Defaults to every category, today's behaviour.",
     )
+    parser.add_argument(
+        "--demtype", dest="elevation_demtype", default=None,
+        help="Which OpenTopography DEM the elevation layer downloads. Defaults to "
+             "the saved config, which starts at COP30. Nothing here is higher "
+             f"resolution than COP30: what changes is the kind of model. "
+             f"Offered in the interface: {', '.join(OFFERED_DEMTYPE_IDS)}. "
+             f"Also accepted: {', '.join(sorted(set(ALL_DEMTYPE_IDS) - set(OFFERED_DEMTYPE_IDS)))}.",
+    )
     parser.add_argument("--date", type=_parse_date, default=None,
                         help="Survey date, ISO format. Defaults to today.")
     parser.add_argument("--keep-work", action="store_true",
@@ -119,7 +132,11 @@ def _add_survey_arguments(parser: argparse.ArgumentParser) -> None:
 def _request_from_args(args: argparse.Namespace) -> SurveyRequest:
     from mapgen.config import load_config
 
-    output_root = args.output_root or load_config().output_root
+    # Loaded once and read twice: --output-root and --demtype both fall
+    # back to the saved config, and reading the file a second time for the
+    # second field would be two chances to see two different states of it.
+    config = load_config()
+    output_root = args.output_root or config.output_root
     return SurveyRequest(
         bbox=args.bbox,
         region=args.region,
@@ -130,6 +147,11 @@ def _request_from_args(args: argparse.Namespace) -> SurveyRequest:
         source_ids=tuple(args.sources or ("osm", "overture")),
         overture_types=tuple(args.overture_types) if args.overture_types else None,
         categories=tuple(args.categories) if args.categories else None,
+        # The flag wins over the saved setting, and neither one is
+        # written back: a --demtype passed for one run is that run's
+        # choice, not a new default. Same precedence --output-root has
+        # always had, for the same reason.
+        elevation_demtype=args.elevation_demtype or config.elevation_demtype,
         keep_work=args.keep_work,
         coordinate_stem=args.coordinate_stem,
         force=args.force,
@@ -393,6 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         TilingError,
         UnknownCategoryError,
         EmptyCategorySelectionError,
+        UnknownDemTypeError,
         OsmDownloadError,
         OvertureError,
         ElevationError,
@@ -416,6 +439,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # but this CLI path names its exceptions explicitly rather than
         # catching ValueError itself, so it needs the same one-line
         # addition here that every new request-validation error has.
+        # UnknownDemTypeError (Task 28) is the next one along, added the
+        # same way for the same reason.
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
