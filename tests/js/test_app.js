@@ -3546,12 +3546,21 @@ function ok(condition, message) {
   // Boots a sandbox with a real estimate and a job whose status replies
   // are handed out one per poll, so a test can walk a run through as many
   // states as it needs without touching app.js's own timers.
-  async function jobSandbox({ tileIds, polls, sources = TWO_SOURCES, sourceSeconds }) {
+  async function jobSandbox({ tileIds, polls, sources = TWO_SOURCES, sourceSeconds, cancelReply }) {
     let pollIndex = 0;
     const { sandbox, fetchCalls } = await bootedSandbox((url, options) => {
       const method = (options.method || "GET").toUpperCase();
       if (url.pathname === "/api/sources") return jsonResponse(200, sources);
       if (url.pathname === "/api/config" && method === "PUT") return jsonResponse(200, DEFAULT_CONFIG);
+      // Answered at the job's OWN cancel path and nowhere else, on
+      // purpose (review finding I4): a Stop posted anywhere but here
+      // falls through to the stub's "unhandled fetch" error rather than
+      // being quietly accepted, which is what makes the route itself part
+      // of what the checks below pin. cancelReply lets a test choose what
+      // the server says back, including refusing.
+      if (url.pathname === "/api/jobs/job1/cancel" && method === "POST") {
+        return cancelReply ? cancelReply() : jsonResponse(200, { cancelled: true });
+      }
       if (url.pathname === "/api/estimate") {
         return jsonResponse(200, {
           tiles: tileIds.length,
@@ -3659,6 +3668,82 @@ function ok(condition, message) {
       sandbox.document.getElementById("progress").className === "progress",
       "a finished run is neither the stopped nor the failed styling"
     );
+  });
+
+  // Review finding I4: the Stop button, the browser half of Task 22's
+  // headline feature, had no test at all. V8 coverage showed the handler
+  // body never running, and changing its route to /api/jobs/<id>/NOTcancel
+  // left all 151 checks green.
+
+  await test("the Stop button posts to the running job's own cancel route", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox, fetchCalls } = await jobSandbox({
+      tileIds,
+      polls: [{ state: "running", events: [] }],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("cancel").hidden === false,
+      "expected Stop visible while a job runs"
+    );
+
+    fetchCalls.length = 0;
+    sandbox.document.getElementById("cancel").fire("click");
+    await flush(10);
+
+    const call = fetchCalls.find(
+      (c) => (c.options.method || "").toUpperCase() === "POST"
+    );
+    ok(call, "expected the Stop click to send a POST");
+    // The exact path, not a substring: this is the assertion the route
+    // mutation has to get past.
+    ok(
+      call.url.pathname === "/api/jobs/job1/cancel",
+      `expected /api/jobs/job1/cancel, got ${call.url.pathname}`
+    );
+    ok(call.url.searchParams.get("token") === DEFAULT_TOKEN, "the route is token gated");
+  });
+
+  await test("a Stop the server refuses says so instead of failing silently", async () => {
+    // The owner's real case: the server has stopped, or the token is
+    // stale, or the job id is unknown after a restart. api() throws for
+    // all three, and with no try/catch that became an unhandled promise
+    // rejection with nothing on screen and nothing in the log: the bar
+    // kept counting down and the button looked dead.
+    const rejections = [];
+    const onRejection = (reason) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const tileIds = tileIdsUpTo(4);
+      const { sandbox } = await jobSandbox({
+        tileIds,
+        polls: [{ state: "running", events: [] }],
+        cancelReply: () => jsonResponse(404, { error: "Unknown job." }),
+      });
+      sandbox.document.getElementById("download").fire("click");
+      await flush(900);
+      const before = sandbox.document.getElementById("log").children.length;
+
+      sandbox.document.getElementById("cancel").fire("click");
+      await flush(50);
+
+      const lines = sandbox.document.getElementById("log").children;
+      ok(lines.length > before, "expected the refused Stop to say something in the log");
+      const said = lines.slice(before).map((l) => l.textContent).join(" ");
+      ok(/stop/i.test(said), `expected the message to be about stopping, got: ${said}`);
+      ok(/unknown job/i.test(said), `expected the server's own reason, got: ${said}`);
+      ok(
+        lines.slice(before).some((l) => l.className === "fail"),
+        "expected the failure styling, not a plain informational line"
+      );
+      ok(
+        rejections.length === 0,
+        `expected no unhandled rejection, got ${rejections.length}: ${rejections[0]}`
+      );
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
   });
 
   await test("a stopped run settles the bar at what it reached, not at 100%", async () => {

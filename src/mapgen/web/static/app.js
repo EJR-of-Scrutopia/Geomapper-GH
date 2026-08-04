@@ -1754,8 +1754,27 @@ $("download").addEventListener("click", async () => {
   }
 });
 
+// Review finding I4. This was the one request in the file with no
+// try/catch: download, stop-server and output-root-browse all wrap theirs
+// and report the failure. api() throws on a 403, on a 404 (an unknown job
+// id after a server restart) and on an unreachable server, so a Stop that
+// did not land became an unhandled promise rejection with nothing on
+// screen and nothing in the log. The bar kept counting down, the button
+// stayed visible, and the button looked dead.
+//
+// api() already composes the right sentence for the commonest case here
+// ("Cannot reach the mapgen server..."); this is what finally displays
+// it. Logged in the red "fail" styling rather than shown as an estimate
+// error, because the estimate box is not what the owner is looking at
+// while a download is running, and the log line sits beside the progress
+// bar that is still moving.
 $("cancel").addEventListener("click", async () => {
-  if (jobId) await api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+  if (!jobId) return;
+  try {
+    await api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+  } catch (error) {
+    log(`Could not stop the download: ${error.message}`, true);
+  }
 });
 
 // --- keep-alive and shutdown -------------------------------------------
