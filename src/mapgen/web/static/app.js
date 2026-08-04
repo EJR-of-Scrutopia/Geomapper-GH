@@ -254,12 +254,19 @@ function renderTileFailures(records) {
 // actually read. Clicking anything else clears the mark rather than
 // leaving a stale one pointing at a tile they are no longer looking at.
 function selectFailedTile(tileId) {
-  // While the draw tool is armed, a click on the map belongs to it: it is
+  // While the draw tool is armed, a press on the map belongs to it: it is
   // placing a corner, not asking about a failure. Leaflet passes a click
   // on a rectangle through to the map as well, which is what makes
   // drawing a new extent over an old grid work at all, so this guard is
-  // what keeps the two from both acting on the same click.
-  if (drawing) return;
+  // what keeps the two from both acting on the same gesture.
+  //
+  // suppressNextMapClick covers the other half of that, added with the
+  // press-drag-release tool (Task 36, item 2): a completed drag disarms
+  // on the release, and the click the browser then fires would arrive
+  // with `drawing` already false. Leaflet does suppress a click after a
+  // drag of its own, but only for a drag IT handled, and map dragging is
+  // switched off for the whole time this tool is armed.
+  if (drawing || suppressNextMapClick) return;
   const failed = lastTileFailures.some((record) => record.tile_id === tileId);
   selectedFailedTile = failed ? tileId : null;
   renderTileFailures(lastTileFailures);
@@ -829,20 +836,40 @@ function setBBox(next, fit = true) {
   refreshEstimate();
 }
 
-// --- draw extent: click a corner, move, click the opposite corner ------
+// --- draw extent: press, drag, release ---------------------------------
 //
-// The button click only arms the tool; nothing is drawn by pressing it.
-// The first map click fixes one corner. Every mousemove after that
-// redraws a live preview rectangle from that corner to the cursor, the
-// way any ordinary map tool's rubber-band selection behaves; the second
-// click fixes the opposite corner and commits it via setBBox, the one
-// place that actually replaces the committed extent. The preview
-// rectangle is its own separate layer specifically so a cancelled draw
-// (Escape) can remove only the preview and never touch whatever extent
-// was already committed.
+// Task 36, item 2. This was click a corner, move, click the opposite
+// corner, and the owner asked for "a more standard way of doing this
+// with click and drag", which is what every other map tool does and what
+// their hand expects. The button click still only ARMS the tool; nothing
+// is drawn by pressing it. The press on the map fixes one corner, every
+// mousemove while the button is held redraws a live preview rectangle
+// from that corner to the cursor, and the release fixes the opposite
+// corner and commits it via setBBox, the one place that actually
+// replaces the committed extent. The preview rectangle is still its own
+// separate layer specifically so a cancelled draw (Escape) can remove
+// only the preview and never touch whatever extent was already
+// committed.
+//
+// Map dragging has to be switched off while the tool is armed, and that
+// is not a nicety: Leaflet's own Drag handler is watching the same
+// mousedown, so without this the map would pan under the cursor for the
+// whole length of every rectangle the owner tried to draw. Switched off
+// on arming rather than on the press itself, so the very first pixel of
+// movement is already the rectangle's and never the map's, and switched
+// back on by disarmDrawing, which every exit from the tool goes through.
 
 let firstCorner = null;
 let previewRectangle = null;
+// A press-drag-release ends with the browser firing a click as well, on
+// whatever ancestor the press and the release have in common. That click
+// is part of the gesture that has just finished, not a new question
+// about a tile, so selectFailedTile has to stay out of its way in
+// exactly the sense it already stays out of an armed tool's way. Set on
+// the release, and cleared by the next click OR the next press, so it
+// can never outlive one interaction even if the release happened
+// somewhere no click ever followed.
+let suppressNextMapClick = false;
 
 function disarmDrawing() {
   drawing = false;
@@ -851,6 +878,7 @@ function disarmDrawing() {
     map.removeLayer(previewRectangle);
     previewRectangle = null;
   }
+  map.dragging.enable();
   $("draw").textContent = "Draw extent";
   $("draw").className = "";
   map.getContainer().style.cursor = "";
@@ -862,39 +890,17 @@ $("draw").addEventListener("click", () => {
   // rather than leaving them stranded with no way back short of Escape.
   disarmDrawing();
   drawing = true;
-  $("draw").textContent = "Click a corner";
+  map.dragging.disable();
+  $("draw").textContent = "Drag a rectangle";
   $("draw").className = "armed";
   map.getContainer().style.cursor = "crosshair";
 });
 
-map.on("click", (event) => {
+map.on("mousedown", (event) => {
+  suppressNextMapClick = false;
   if (!drawing) return;
-  if (!firstCorner) {
-    firstCorner = event.latlng;
-    $("draw").textContent = "Click the opposite corner";
-    return;
-  }
-  const a = firstCorner;
-  const b = event.latlng;
-  if (a.lat === b.lat || a.lng === b.lng) {
-    // A degenerate, zero-width or zero-height box: the server would
-    // reject this outright (BBox.validated()), and it is not something
-    // the estimate panel can safely surface while names are still
-    // incomplete (see refreshEstimate's own /api/extent error handling,
-    // fixed alongside this to stop swallowing that case too). Rejected
-    // here instead, at the click: disarm and leave whatever extent was
-    // already committed untouched, exactly like Escape.
-    disarmDrawing();
-    return;
-  }
-  const finished = {
-    west: Math.min(a.lng, b.lng),
-    south: Math.min(a.lat, b.lat),
-    east: Math.max(a.lng, b.lng),
-    north: Math.max(a.lat, b.lat),
-  };
-  disarmDrawing();
-  setBBox(finished, false);
+  firstCorner = event.latlng;
+  $("draw").textContent = "Release to finish";
 });
 
 map.on("mousemove", (event) => {
@@ -914,6 +920,39 @@ map.on("mousemove", (event) => {
     });
     previewRectangle.addTo(map);
   }
+});
+
+map.on("mouseup", (event) => {
+  if (!drawing || !firstCorner) return;
+  suppressNextMapClick = true;
+  const a = firstCorner;
+  const b = event.latlng;
+  if (a.lat === b.lat || a.lng === b.lng) {
+    // A drag that ended where it started, or that only ever moved along
+    // one axis: a degenerate, zero-width or zero-height box. The server
+    // would reject this outright (BBox.validated()), and it is not
+    // something the estimate panel can safely surface while names are
+    // still incomplete (see refreshEstimate's own /api/extent error
+    // handling). Rejected here instead, at the release: disarm and leave
+    // whatever extent was already committed untouched, exactly like
+    // Escape. This is the case a press and release on the same point
+    // produces, which is now the ordinary way to change your mind
+    // mid-gesture rather than an unlikely double click on one pixel.
+    disarmDrawing();
+    return;
+  }
+  const finished = {
+    west: Math.min(a.lng, b.lng),
+    south: Math.min(a.lat, b.lat),
+    east: Math.max(a.lng, b.lng),
+    north: Math.max(a.lat, b.lat),
+  };
+  disarmDrawing();
+  setBBox(finished, false);
+});
+
+map.on("click", () => {
+  suppressNextMapClick = false;
 });
 
 // Escape cancels a drawing in progress and disarms, leaving any previous

@@ -485,6 +485,26 @@ function makeLeaflet() {
     removeLayer(layer) {
       if (layer) layer.removed = true;
     },
+    // Task 36, item 2. Leaflet's Drag handler watches the same mousedown
+    // the press-drag-release tool now does, so app.js switches it off
+    // while the tool is armed. Modelled as the real thing a test can
+    // check, its enabled state, rather than as two no-op methods: a stub
+    // that merely accepted the calls could not tell "switched off for the
+    // whole gesture" from "never switched off at all", which is the
+    // difference between drawing a rectangle and panning the map under
+    // the cursor while trying to.
+    dragging: {
+      _enabled: true,
+      enabled() {
+        return this._enabled;
+      },
+      enable() {
+        this._enabled = true;
+      },
+      disable() {
+        this._enabled = false;
+      },
+    },
   };
 
   return {
@@ -2672,32 +2692,96 @@ function ok(condition, message) {
   });
 
   // =======================================================================
-  // Task 18, item 3: the rubber-band draw tool. Armed state, the click-
-  // move-click sequence, the preview rectangle's lifecycle, and Escape
-  // leaving any previous extent untouched.
+  // Task 18, item 3, rebuilt by Task 36, item 2: the rubber-band draw
+  // tool. Armed state, the press-drag-release sequence, the preview
+  // rectangle's lifecycle, and Escape leaving any previous extent
+  // untouched.
+  //
+  // The gesture is modelled as the four events a real browser and a real
+  // Leaflet actually produce, in the order they produce them: mousedown,
+  // mousemove, mouseup, and then the click the browser fires on whatever
+  // ancestor the press and release have in common. That trailing click is
+  // not an embellishment: it is the event that used to place a corner,
+  // and it now arrives after the tool has already disarmed itself, which
+  // is the whole reason app.js has anything to say about it.
   // =======================================================================
+
+  // One committed gesture, in the order a browser fires it. Deliberately
+  // NOT a helper that skips the trailing click: every real drag ends with
+  // one, and a harness that quietly left it out would be more forgiving
+  // than the page it is testing.
+  function dragExtent(sandbox, from, to, { click = true } = {}) {
+    sandbox.L._mapObject.fire("mousedown", { latlng: from });
+    sandbox.L._mapObject.fire("mousemove", { latlng: to });
+    sandbox.L._mapObject.fire("mouseup", { latlng: to });
+    if (click) sandbox.L._mapObject.fire("click", { latlng: to });
+  }
 
   await test("pressing Draw extent arms the button with a visible state", async () => {
     const { sandbox } = await bootedSandbox();
     sandbox.document.getElementById("draw").fire("click");
     const button = sandbox.document.getElementById("draw");
     ok(button.className === "armed", `expected the armed class, got ${JSON.stringify(button.className)}`);
-    ok(/corner/i.test(button.textContent), `expected the label to mention a corner, got ${button.textContent}`);
+    ok(/drag/i.test(button.textContent), `expected the label to say to drag, got ${button.textContent}`);
   });
 
-  await test("clicking two corners on the map commits the extent and disarms", async () => {
+  await test("arming the draw tool switches map panning off, and disarming switches it back on", async () => {
+    // Without this, Leaflet's own Drag handler answers the same mousedown
+    // and the map pans under the cursor for the whole length of every
+    // rectangle the owner tries to draw.
+    const { sandbox } = await bootedSandbox();
+    ok(sandbox.L._mapObject.dragging.enabled() === true, "expected panning on to begin with");
+    sandbox.document.getElementById("draw").fire("click");
+    ok(sandbox.L._mapObject.dragging.enabled() === false, "expected panning off while armed");
+    dragExtent(sandbox, { lat: 51.4, lng: -3.3 }, { lat: 51.42, lng: -3.28 });
+    ok(sandbox.L._mapObject.dragging.enabled() === true, "expected panning back on once the draw is over");
+  });
+
+  await test("Escape switches map panning back on too, not only the button's look", async () => {
     const { sandbox } = await bootedSandbox();
     sandbox.document.getElementById("draw").fire("click");
-    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
-    ok(sandbox.document.getElementById("draw").className === "armed", "expected still armed after one corner");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.document.fire("keydown", { key: "Escape" });
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "a cancelled draw must not leave the map unpannable"
+    );
+  });
+
+  await test("pressing, dragging and releasing on the map commits the extent and disarms", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("draw").fire("click");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
+    ok(sandbox.document.getElementById("draw").className === "armed", "expected still armed while held");
     sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
-    ok(sandbox.L._rectangles.some((r) => !r.removed), "expected a live preview rectangle after moving the cursor");
-    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.42, lng: -3.28 } });
-    ok(sandbox.document.getElementById("draw").className === "", "expected disarmed after the second click");
+    ok(sandbox.L._rectangles.some((r) => !r.removed), "expected a live preview rectangle while dragging");
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.42, lng: -3.28 } });
+    ok(sandbox.document.getElementById("draw").className === "", "expected disarmed on the release");
     ok(sandbox.document.getElementById("draw").textContent === "Draw extent");
     ok(
       sandbox.document.getElementById("bbox").value === "-3.3,51.4,-3.28,51.42",
       `expected the committed bbox, got ${sandbox.document.getElementById("bbox").value}`
+    );
+  });
+
+  await test("a press with no release commits nothing at all", async () => {
+    // The press is one half of a gesture, not a corner that stands on its
+    // own: nothing may be committed until the button comes back up.
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("draw").fire("click");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
+    ok(sandbox.document.getElementById("bbox").value === "", "expected nothing committed mid-drag");
+    ok(sandbox.document.getElementById("draw").className === "armed", "expected the tool still armed mid-drag");
+  });
+
+  await test("moving the cursor before pressing draws no preview", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("draw").fire("click");
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
+    ok(
+      sandbox.L._rectangles.length === 0,
+      `expected no rectangle from a hover before the press, got ${sandbox.L._rectangles.length}`
     );
   });
 
@@ -2706,7 +2790,7 @@ function ok(condition, message) {
     async () => {
       const { sandbox } = await bootedSandbox();
       sandbox.document.getElementById("draw").fire("click");
-      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
+      sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
       sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.41, lng: -3.29 } });
       sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
       ok(
@@ -2714,7 +2798,7 @@ function ok(condition, message) {
         `expected exactly one rectangle created across two mousemoves, got ${sandbox.L._rectangles.length}`
       );
       ok(sandbox.L._rectangles[0].removed === false);
-      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.42, lng: -3.28 } });
+      sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.42, lng: -3.28 } });
       ok(sandbox.L._rectangles[0].removed === true, "expected the preview rectangle removed on commit");
       ok(sandbox.L._rectangles.length === 2, "expected a second, committed rectangle from setBBox");
       ok(sandbox.L._rectangles[1].removed === false, "expected the committed rectangle to remain");
@@ -2726,7 +2810,7 @@ function ok(condition, message) {
     setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39"); // the committed rectangle: _rectangles[0]
     const before = sandbox.document.getElementById("bbox").value;
     sandbox.document.getElementById("draw").fire("click");
-    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.1 } });
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.5, lng: -3.1 } });
     sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.55, lng: -3.05 } }); // the preview: _rectangles[1]
     ok(sandbox.L._rectangles.length === 2, "expected a committed rectangle plus a live preview mid-drag");
     ok(sandbox.L._rectangles[0].removed === false, "expected the committed rectangle untouched before Escape");
@@ -2741,6 +2825,13 @@ function ok(condition, message) {
     ok(
       sandbox.document.getElementById("bbox").value === before,
       `expected the previous extent untouched, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    // And a release after Escape is not a second chance to commit the
+    // rectangle the owner just cancelled.
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.55, lng: -3.05 } });
+    ok(
+      sandbox.document.getElementById("bbox").value === before,
+      "a release after Escape must commit nothing"
     );
   });
 
@@ -2767,20 +2858,22 @@ function ok(condition, message) {
   await test("pressing Draw extent again mid-draw discards the stranded first corner", async () => {
     const { sandbox } = await bootedSandbox();
     sandbox.document.getElementById("draw").fire("click");
-    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
     sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
-    ok(sandbox.document.getElementById("draw").textContent === "Click the opposite corner");
-    sandbox.document.getElementById("draw").fire("click"); // pressed again instead of a second corner
+    ok(sandbox.document.getElementById("draw").textContent === "Release to finish");
+    sandbox.document.getElementById("draw").fire("click"); // pressed again mid-gesture
     ok(
-      sandbox.document.getElementById("draw").textContent === "Click a corner",
-      "expected a fresh arm, waiting for a first corner again"
+      sandbox.document.getElementById("draw").textContent === "Drag a rectangle",
+      "expected a fresh arm, waiting for a press again"
     );
     ok(sandbox.L._rectangles.every((r) => r.removed), "expected the stranded preview rectangle cleaned up");
-    // Confirms the map is genuinely waiting for a FIRST corner again, not
-    // carrying a leftover firstCorner from before: this click must be
-    // treated as the first, not the second.
-    sandbox.L._mapObject.fire("click", { latlng: { lat: 52.0, lng: -4.0 } });
-    ok(sandbox.document.getElementById("draw").textContent === "Click the opposite corner");
+    // Confirms the map is genuinely waiting for a fresh press, not
+    // carrying a leftover firstCorner from before: a release on its own
+    // must commit nothing.
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 52.0, lng: -4.0 } });
+    ok(sandbox.document.getElementById("bbox").value === "", "expected nothing committed by a stray release");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 52.0, lng: -4.0 } });
+    ok(sandbox.document.getElementById("draw").textContent === "Release to finish");
   });
 
   // =======================================================================
@@ -2791,15 +2884,17 @@ function ok(condition, message) {
   // =======================================================================
 
   await test(
-    "a second click on the same point is rejected, leaving the previous extent untouched",
+    "a drag that ends where it started is rejected, leaving the previous extent untouched",
     async () => {
       const { sandbox } = await bootedSandbox();
       setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
       const before = sandbox.document.getElementById("bbox").value;
-      const rectanglesBefore = sandbox.L._rectangles.length;
+      // Live rectangles, not every rectangle ever created: a drag draws a
+      // preview while it is happening, and what matters is that nothing
+      // of it is left on the map afterwards.
+      const liveBefore = sandbox.L._rectangles.filter((r) => !r.removed).length;
       sandbox.document.getElementById("draw").fire("click");
-      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.1 } });
-      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.1 } }); // same point
+      dragExtent(sandbox, { lat: 51.5, lng: -3.1 }, { lat: 51.5, lng: -3.1 }); // released on the press
       ok(
         sandbox.document.getElementById("bbox").value === before,
         `expected the previous extent untouched, got ${sandbox.document.getElementById("bbox").value}`
@@ -2807,19 +2902,18 @@ function ok(condition, message) {
       ok(sandbox.document.getElementById("draw").className === "", "expected disarmed, not stuck armed");
       ok(sandbox.document.getElementById("draw").textContent === "Draw extent");
       ok(
-        sandbox.L._rectangles.length === rectanglesBefore,
-        "expected no new committed rectangle from a degenerate click pair"
+        sandbox.L._rectangles.filter((r) => !r.removed).length === liveBefore,
+        "expected no new rectangle left on the map by a zero-size drag"
       );
     }
   );
 
   await test(
-    "a zero-width click pair (same longitude, different latitude) is also rejected",
+    "a zero-width drag (same longitude, different latitude) is also rejected",
     async () => {
       const { sandbox } = await bootedSandbox();
       sandbox.document.getElementById("draw").fire("click");
-      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
-      sandbox.L._mapObject.fire("click", { latlng: { lat: 51.5, lng: -3.3 } }); // same lng only
+      dragExtent(sandbox, { lat: 51.4, lng: -3.3 }, { lat: 51.5, lng: -3.3 }); // same lng only
       ok(sandbox.document.getElementById("bbox").value === "", "expected no bbox committed");
       ok(sandbox.document.getElementById("draw").className === "");
     }
@@ -5297,25 +5391,56 @@ function ok(condition, message) {
     );
   });
 
-  await test("a click that is drawing an extent is not also a question about a failure", async () => {
+  await test("a press that is drawing an extent is not also a question about a failure", async () => {
     // Leaflet passes a click on a rectangle up to the map as well, which
     // is what lets a new extent be drawn over an existing grid. Both
-    // handlers see the same click, so the rectangle's own has to know to
-    // stay out of the way.
+    // handlers see the same gesture, so the rectangle's own has to know
+    // to stay out of the way.
     const tileIds = tileIdsUpTo(4);
     const { sandbox } = await runWithFailures([OSM_TIMEOUT, { event: "source_done", source: "osm" }]);
     const rects = gridRectangles(sandbox, tileIds);
 
     sandbox.document.getElementById("draw").fire("click");
     rects[1].fire("click");
-    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
     ok(
       !/selected/.test(failureList(sandbox)),
-      "a corner-placing click must not have selected a failure as well"
+      "a click while the tool is armed must not have selected a failure as well"
     );
     ok(
-      sandbox.document.getElementById("draw").textContent === "Click the opposite corner",
-      "expected the draw tool to have taken the click"
+      sandbox.document.getElementById("draw").textContent === "Release to finish",
+      "expected the draw tool to have taken the press"
+    );
+  });
+
+  await test("the click a finished drag leaves behind is not a question about a failure", async () => {
+    // Task 36, item 2. The tool disarms on the release, so the click the
+    // browser then fires on the common ancestor of the press and the
+    // release arrives with the tool already disarmed. Leaflet suppresses
+    // a click after a drag it handled itself, and map dragging is
+    // switched off for exactly as long as this tool is armed, so there is
+    // no Leaflet drag to suppress it here.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([OSM_TIMEOUT, { event: "source_done", source: "osm" }]);
+    const rects = gridRectangles(sandbox, tileIds);
+
+    sandbox.document.getElementById("draw").fire("click");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.42, lng: -3.28 } });
+    rects[1].fire("click"); // the trailing click, on a rectangle the drag crossed
+    ok(
+      !/selected/.test(failureList(sandbox)),
+      "the click left over by a finished drag must not select a failure"
+    );
+
+    // And the suppression lasts exactly one click: an ordinary click on a
+    // red tile afterwards still answers "why is this one red".
+    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.42, lng: -3.28 } });
+    rects[1].fire("click");
+    ok(
+      /selected/.test(failureList(sandbox)),
+      "expected a plain click on a red tile to still mark its entry"
     );
   });
 
