@@ -274,8 +274,31 @@ def command_survey(args: argparse.Namespace) -> int:
     # tile is never complete) but would be the more dangerous silence if
     # it ever did.
     failures = result.survey.get("tile_failures") or []
-    for line in describe_tile_failures(failures):
+    # planned_tiles from the package's own record of its plan, not from a
+    # recount here, so this prints exactly what IncompleteSurveyError
+    # would have said for the same run (Task 32: a layer whose every
+    # planned tile failed identically is one line, not seventy-two).
+    planned = len(result.survey.get("tiles") or []) or None
+    for line in describe_tile_failures(failures, planned_tiles=planned):
         print(line, file=sys.stderr)
+    # Task 32, section 4: a run that completed only because a retry
+    # worked is not the same run as one that never stumbled, and nothing
+    # else here would say so. tile_failures is empty for a recovered
+    # tile, deliberately, so without this line a fragile run and a clean
+    # one print identically.
+    recovered = [
+        record
+        for record in (result.survey.get("retries") or [])
+        if record.get("recovered")
+    ]
+    if recovered:
+        layers = ", ".join(sorted({str(record.get("source")) for record in recovered}))
+        noun = "tile" if len(recovered) == 1 else "tiles"
+        print(
+            f"{len(recovered)} {noun} arrived only on a retry ({layers}). "
+            f"See survey.json for which.",
+            file=sys.stderr,
+        )
     if not result.complete:
         print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
         return 1

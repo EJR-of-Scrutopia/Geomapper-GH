@@ -38,6 +38,27 @@ class CancelToken:
         if self._event.is_set():
             raise Cancelled("Job cancelled at the user's request.")
 
+    def wait(self, seconds: float) -> bool:
+        """Sleep for up to `seconds`, waking the instant a stop lands.
+        Returns True if it was a stop that ended the wait.
+
+        Task 32, and the only reason this exists: a rate-limited service
+        can name the period it wants to be left alone for, and package.py
+        honours it before retrying. time.sleep would honour it too, and
+        would also mean a Stop press did nothing at all for up to a
+        minute, on the one control this project's own brief calls
+        load-bearing. Waiting on the same Event the token already holds
+        makes the pause exactly as interruptible as everything else here.
+
+        A non-positive wait returns immediately, and reports whether a
+        stop is already standing, which is the same answer
+        is_cancelled() would give. Callers therefore need no special case
+        for "no wait was asked for".
+        """
+        if seconds <= 0:
+            return self._event.is_set()
+        return self._event.wait(seconds)
+
 
 class EventLog:
     """A ProgressSink that keeps history and optionally forwards live."""

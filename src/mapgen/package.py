@@ -749,6 +749,28 @@ def run_survey(
             verified = _verify_tiles(
                 state, fetched, tiles, current_tile_ids, ledger, sink, "after_retry"
             )
+            # Task 32, section 4. A run that completed only because a
+            # retry worked is not the same run as one that never
+            # stumbled, and by this point nothing else says so: a tile
+            # that recovered has had its reason forgotten by the verify
+            # pass, correctly, so tile_failures is empty and the package
+            # reads as an ordinary success. This is the one event that
+            # says the run was fragile, and survey.json's `retries`
+            # below is its saved form.
+            still_failed = {
+                (str(record.get("source")), str(record.get("tile_id")))
+                for record in verified["failures"]
+            }
+            attempted = ledger.retry_records(still_failed)
+            recovered = [record for record in attempted if record["recovered"]]
+            sink.emit(
+                "retry_done",
+                pass_number=retry_pass,
+                of=RETRY_PASS_BUDGET,
+                attempted=len(attempted),
+                recovered=len(recovered),
+                still_failing=len(attempted) - len(recovered),
+            )
 
         # Without --force, tiles still missing after all of that end the
         # run, exactly as the first failing tile used to. What changed is
@@ -776,14 +798,28 @@ def run_survey(
             if record.get("source") in failed_layer_ids
         ]
         unrecoverable = bool(unresolved) and not request.force and not stopped
+        # Which layers are STILL short, as opposed to which ones reported
+        # a failure at some point during the run. Since Task 32 those are
+        # routinely different sets: elevation and Overture now report
+        # per-tile failures too, so an unforced run can reach here with
+        # one layer permanently short beside another whose retry worked.
+        short_layer_ids = {str(record.get("source")) for record in unresolved}
 
         for source, source_work in deferred_merges:
-            if unrecoverable:
+            if unrecoverable and source.id in short_layer_ids:
                 # No merged output for a source whose tiles are still
                 # missing on an unforced run, which is what happened
-                # before this task too: the first failing tile raised out
+                # before Task 30 too: the first failing tile raised out
                 # of fetch() and nothing was merged for that layer.
-                break
+                #
+                # Scoped to that source, and not to every deferred merge,
+                # which is what this did while OSM was the only layer
+                # that could get here. A layer whose retry recovered it
+                # has all of its tiles and is merged; withholding it
+                # because a DIFFERENT layer failed would throw away work
+                # that is complete and paid for, and the run is about to
+                # raise and say what is missing in any case.
+                continue
             parts = _existing_output_files(source_work, current_tile_ids)
             parts = assert_inputs_present(parts, force=request.force or stopped)
             merged = source.merge(parts, paths.root, paths.stem)
@@ -898,6 +934,12 @@ def run_survey(
         reported_stopped,
         outputs_by_source,
         verified,
+        ledger.retry_records(
+            {
+                (str(record.get("source")), str(record.get("tile_id")))
+                for record in verified["failures"]
+            }
+        ),
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -933,7 +975,7 @@ def run_survey(
         # the file and for the terminal.
         raise IncompleteSurveyError(
             "\n".join(
-                describe_tile_failures(survey["tile_failures"])
+                describe_tile_failures(survey["tile_failures"], planned_tiles=len(tiles))
                 + [
                     "Nothing was merged for the layers that are short. Run the "
                     "survey again over the same extent to pick up where it "
@@ -1444,18 +1486,82 @@ class _FailureLedger:
         self._tiles: dict[tuple[str, str], dict[str, object]] = {}
         self._source_errors: dict[str, str] = {}
         self._retries: dict[tuple[str, str], int] = {}
+        # How long each failure's own service asked to be left alone for,
+        # when it said (Task 32). Kept here rather than inside the record
+        # to_record() produces, because it is a fact about what this run
+        # should do next rather than about what happened, and survey.json
+        # would otherwise carry a mostly-null field on every failure in
+        # every package to serve one decision made seconds later in the
+        # same process.
+        self._retry_after: dict[tuple[str, str], float] = {}
+        # One entry per tile this run actually asked for a second time,
+        # kept whatever the answer was. tile_failures cannot carry this:
+        # a tile that recovered is forgotten from it, deliberately and
+        # correctly, so without a separate list the run has no way to say
+        # "this completed, but it was fragile" (Task 32, section 4).
+        self._retry_records: list[dict[str, object]] = []
 
     def add_tile_failures(self, failures: Sequence[TileFailure]) -> None:
         for failure in failures:
             self._tiles[(failure.source, failure.tile_id)] = failure.to_record()
+            key = (failure.source, failure.tile_id)
+            if failure.retry_after_seconds is None:
+                self._retry_after.pop(key, None)
+            else:
+                self._retry_after[key] = failure.retry_after_seconds
 
     def set_source_error(self, source_id: str, error: str) -> None:
         self._source_errors[source_id] = error
 
-    def note_retry(self, source_id: str, tile_ids: Sequence[str]) -> None:
+    def retry_after_for(self, source_id: str, tile_ids: Sequence[str]) -> float | None:
+        """The longest period any of these tiles' services asked for, or
+        None if none of them asked.
+
+        The longest rather than the first: the tiles are about to be
+        fetched in one call, so one wait covers all of them, and coming
+        back before the latest of the deadlines the service set would be
+        ignoring it for the tiles it applied to.
+        """
+        asked = [
+            self._retry_after[(source_id, tile_id)]
+            for tile_id in tile_ids
+            if (source_id, tile_id) in self._retry_after
+        ]
+        return max(asked) if asked else None
+
+    def note_retry(
+        self, source_id: str, tile_ids: Sequence[str], pass_number: int
+    ) -> None:
         for tile_id in tile_ids:
             key = (source_id, tile_id)
             self._retries[key] = self._retries.get(key, 0) + 1
+            record = self.record_for(source_id, tile_id)
+            self._retry_records.append(
+                {
+                    "source": source_id,
+                    "tile_id": tile_id,
+                    "pass_number": pass_number,
+                    "kind": record["kind"],
+                    "reason": record["reason"],
+                }
+            )
+
+    def retry_records(self, still_failed: set[tuple[str, str]]) -> list[dict[str, object]]:
+        """What this run retried, and whether it worked.
+
+        `recovered` is decided from the run's FINAL verdict rather than
+        from anything observed during the retry itself, because the final
+        verdict is the one that read the disk. A retry whose fetch()
+        returned cleanly while writing nothing has not recovered
+        anything, and only the verify pass is in a position to say so.
+        """
+        return [
+            {
+                **record,
+                "recovered": (record["source"], record["tile_id"]) not in still_failed,
+            }
+            for record in self._retry_records
+        ]
 
     def forget(self, source_id: str, tile_id: str) -> None:
         """Drop a tile's reason once it is genuinely on disk.
@@ -1491,7 +1597,9 @@ class _FailureLedger:
         return {**record, "retried": self._retries.get((source_id, tile_id), 0)}
 
 
-def describe_tile_failures(records: Sequence[Mapping[str, object]]) -> list[str]:
+def describe_tile_failures(
+    records: Sequence[Mapping[str, object]], planned_tiles: int | None = None
+) -> list[str]:
     """The account of what did not arrive, as plain lines.
 
     One composer for all three places the owner can meet this (Task 30,
@@ -1503,17 +1611,61 @@ def describe_tile_failures(records: Sequence[Mapping[str, object]]) -> list[str]
 
     Sorted by source then tile id, so the same run always reads the same
     way, rather than in whatever order the failures happened to land.
+
+    planned_tiles is Task 32's, and it is what stops a whole-layer
+    failure being reported one tile at a time. Elevation and Overture
+    have no tiles of their own: they make one whole-extent request, so a
+    failure is recorded against every planned tile with one identical
+    reason. On the owner's own Barry extent that is seventy-two copies of
+    the same sentence, for one thing that went wrong once, and it is now
+    the ordinary shape of an unforced elevation failure rather than an
+    exotic one. When a layer's every planned tile carries the same
+    reason, that is a LAYER failure and is said once, naming the layer
+    and the count.
+
+    A partial failure is untouched and must be: two OSM tiles of
+    seventy-two timing out is two tiles, is named as two tiles, and
+    collapsing it would hide which ones. The rule is exactly "all of
+    them, identically", never "several of them", which is why this needs
+    to be told how many were planned rather than inferring anything from
+    the records it holds.
+
+    planned_tiles defaults to None, which never collapses, so a caller
+    that does not know the plan gets the same output this has always
+    produced.
     """
     if not records:
         return []
     count = len(records)
     noun = "tile" if count == 1 else "tiles"
     lines = [f"{count} {noun} did not download:"]
+
+    grouped: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for record in records:
+        key = (str(record.get("source", "")), str(record.get("reason", "")))
+        grouped.setdefault(key, []).append(record)
+
+    said: set[tuple[str, str]] = set()
     for record in sorted(
         records, key=lambda r: (str(r.get("source", "")), str(r.get("tile_id", "")))
     ):
         retried = record.get("retried") or 0
         again = " Retried, and it failed again." if retried else ""
+        key = (str(record.get("source", "")), str(record.get("reason", "")))
+        whole_layer = (
+            planned_tiles is not None
+            and len(grouped[key]) == planned_tiles
+            and planned_tiles > 1
+        )
+        if whole_layer:
+            if key in said:
+                continue
+            said.add(key)
+            lines.append(
+                f"  {record.get('source')}, all {planned_tiles} tiles: "
+                f"{record.get('reason')}{again}"
+            )
+            continue
         lines.append(
             f"  {record.get('source')} {record.get('tile_id')}: "
             f"{record.get('reason')}{again}"
@@ -1715,10 +1867,29 @@ def _retry_failed_tiles(
     competing delay on top of one that already honours Retry-After would
     be slower for no benefit and impossible to reason about.
 
+    Since Task 32 every source reaches this, not only OSM. Elevation and
+    Overture both keep whole-extent output rather than tile-stamped
+    files, so their failures are recorded against every planned tile and
+    arrive here as one group per source. Asking them again is one fetch()
+    call each, and each of them already skips what is on disk: elevation
+    returns immediately if its DEM is there, and Overture re-downloads
+    only the types that are missing. So "retry the layer that failed, for
+    the reason it failed, and nothing else" needs no per-source knowledge
+    in this function, which has none.
+
+    A service that named a period to wait is waited for, once per source,
+    before its retry. See MAX_RETRY_AFTER_WAIT_SECONDS for the ceiling
+    and for what happens past it. This is the only place in the outer
+    layer that pauses at all, and it pauses only when a service asked in
+    writing: there is deliberately no generic backoff out here, because
+    the sources that have one have already served it by the time a tile
+    gets this far.
+
     Cancellation interrupts this as promptly as it interrupts the first
-    attempt: checked before each source is asked, and threaded into
-    fetch() itself for the sources that accept it, so a stop lands between
-    tiles rather than after all of them.
+    attempt: checked before each source is asked, waited on rather than
+    slept through, and threaded into fetch() itself for the sources that
+    accept it, so a stop lands between tiles rather than after all of
+    them.
 
     A tile whose retry never happened because a stop landed first stays
     FAILED, not pending, and that is deliberate. Task 22's rule is that a
@@ -1744,6 +1915,37 @@ def _retry_failed_tiles(
         retry_tiles = [tiles_by_id[t] for t in tile_ids if t in tiles_by_id]
         if not retry_tiles:
             continue
+
+        asked_for = ledger.retry_after_for(
+            source_id, [tile.tile_id for tile in retry_tiles]
+        )
+        if asked_for is not None and asked_for > MAX_RETRY_AFTER_WAIT_SECONDS:
+            # The service named a period longer than this run will pause
+            # for, so it is not retried at all. Coming back early would
+            # spend the owner's own quota to be told the same thing
+            # again, and waiting it out would stop a survey they are
+            # watching for as long as the service felt like naming.
+            #
+            # Announced rather than silent. survey.json records this tile
+            # as retried: 0, which is true and which describes a
+            # non-retryable kind identically, so the live stream is where
+            # the difference is said out loud.
+            sink.emit(
+                "retry_postponed",
+                source=source_id,
+                seconds_requested=asked_for,
+                seconds_ceiling=MAX_RETRY_AFTER_WAIT_SECONDS,
+                tiles=len(retry_tiles),
+            )
+            continue
+        if asked_for:
+            sink.emit("retry_waiting", source=source_id, seconds=asked_for)
+            if token.wait(asked_for):
+                # The stop landed during the wait. Nothing has been
+                # asked for a second time, so nothing changes state:
+                # these tiles keep the failure they already had.
+                return True
+
         for tile in retry_tiles:
             record = ledger.record_for(source_id, tile.tile_id)
             sink.emit(
@@ -1755,7 +1957,9 @@ def _retry_failed_tiles(
                 kind=record["kind"],
                 reason=record["reason"],
             )
-        ledger.note_retry(source_id, [tile.tile_id for tile in retry_tiles])
+        ledger.note_retry(
+            source_id, [tile.tile_id for tile in retry_tiles], retry_pass
+        )
 
         fetch_kwargs = {"cancel": token} if _fetch_accepts_cancel(source) else {}
         fetch_succeeded = False
@@ -2115,6 +2319,7 @@ def _build_survey_json(
     stopped,
     outputs_by_source=None,
     verified=None,
+    retries=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
@@ -2122,6 +2327,7 @@ def _build_survey_json(
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
     }
+    retries = retries or []
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": __version__,
@@ -2173,6 +2379,27 @@ def _build_survey_json(
         # service is still saying no". Only kinds a retry could plausibly
         # fix are ever retried; see RETRYABLE_FAILURE_KINDS.
         "tile_failures": verified["failures"],
+        # Task 32, section 4: what this run had to ask for twice, and
+        # whether asking again worked. Empty on a run that never
+        # stumbled, which is the ordinary one.
+        #
+        # A separate list from tile_failures, and it has to be, because
+        # the two answer opposite questions. tile_failures is what is
+        # still missing, so a tile the retry recovered is deliberately
+        # NOT in it: the verify pass forgets a reason once the file is
+        # genuinely on disk, or a reader would find an explanation
+        # attached to something that is not a problem. That is right,
+        # and it leaves a complete-but-fragile run indistinguishable
+        # from a clean one. This is the field that tells them apart.
+        #
+        # `recovered: true` is the interesting value, not the alarming
+        # one. It says the package is complete and that it was not
+        # complete on the first attempt, which is what an owner wanting
+        # to know whether their link or the service is deteriorating
+        # actually needs. `recovered: false` duplicates a tile_failures
+        # entry on purpose: the same fact is worth having in both the
+        # "what is missing" and the "what was fragile" reading.
+        "retries": retries,
         # What the end-of-run verify actually checked, and what it had to
         # correct. corrections is normally empty, and when it is not, it
         # is the interesting part: it means this run had recorded a tile

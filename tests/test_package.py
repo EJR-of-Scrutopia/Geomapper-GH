@@ -1,14 +1,17 @@
 import json
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 
 from mapgen.geo import BBox, build_tiles
 from mapgen.jobs import CancelToken, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
+    MAX_RETRY_AFTER_WAIT_SECONDS,
     IncompleteSurveyError,
     SurveyRequest,
     UnbridgeablePackageError,
@@ -19,6 +22,7 @@ from mapgen.package import (
     register_default_sources,
     run_survey,
 )
+from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.base import (
     DuplicateSourceError,
     Estimate,
@@ -4119,3 +4123,617 @@ def test_a_real_survey_whose_elevation_failed_can_be_bridged_afterwards(tmp_path
     # The download's own record is untouched by the later command.
     assert payload["complete"] is False
     assert all(record["elevation"] == "failed" for record in payload["tiles"])
+
+
+# --- Task 32: retry every layer, not just OSM ------------------------------
+#
+# Task 30 built the verify pass, the failure classification and the retry,
+# and wired the retry to OSM alone: elevation and Overture failed as whole
+# layers with no per-tile cause, and a failure with no kind is never
+# retried. The owner asked for the rest, and named the constraint
+# themselves: "only if they specifically fail".
+#
+# These go through the REAL OvertureSource and the REAL ElevationSource
+# against fake transports, never through a stub layer, for the reason the
+# Task 30 block above gives: almost everything asserted here is a
+# collaboration between the source's classification and package.py's
+# policy, and a stub in the middle would assert the test's own idea of the
+# contract rather than the contract.
+#
+# Every double below fails a SPECIFIC number of times and then works. A
+# double that fails forever exercises the give-up path and nothing else;
+# one that succeeds immediately exercises neither.
+
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FlakyOvertureRunner(_FakeOvertureRunner):
+    """An overturemaps that refuses NAMED types a fixed number of times and
+    then serves them, in the shape 0.20.0 actually fails in: exit code
+    zero, no output file, and its own account of the failure printed to
+    its own stdout.
+
+    Counted per type, because that is the unit Task 23 and Task 24 made
+    Overture fail in and the unit Task 32 retries.
+    """
+
+    def __init__(self, failures_by_type=(), returncode=0):
+        super().__init__()
+        self.failures_left = dict(failures_by_type)
+        self.returncode = returncode
+
+    def __call__(self, command, **kwargs):
+        overture_type = command[command.index("--type") + 1]
+        with self.lock:
+            remaining = self.failures_left.get(overture_type, 0)
+            failing = remaining > 0
+            if failing:
+                self.failures_left[overture_type] = remaining - 1
+                self.commands.append(command)
+        if failing:
+            return _FakeCompleted(
+                self.returncode,
+                stdout=(
+                    f"Error reading data from path "
+                    f"s3://overturemaps/{overture_type}: timed out"
+                ),
+            )
+        return super().__call__(command, **kwargs)
+
+    def types_requested(self):
+        return [command[command.index("--type") + 1] for command in self.commands]
+
+
+def _overture_request(tmp_path, types=("water", "building"), **overrides):
+    defaults = dict(
+        source_ids=("overture",),
+        overture_types=types,
+        tile_size_m=600.0,
+        overlap_m=50.0,
+        run_bridge_step=False,
+    )
+    defaults.update(overrides)
+    return _request(tmp_path, **defaults)
+
+
+def _register_overture(runner):
+    register(OvertureSource(runner=runner, executable_finder=lambda _n: "overturemaps"))
+
+
+def test_an_overture_type_recovered_by_a_retry_leaves_its_siblings_untouched(tmp_path):
+    # The case the owner will actually hit: several concurrent reads of a
+    # cloud store on a home link, and one of them dies part way through.
+    runner = _FlakyOvertureRunner(failures_by_type={"water": 1})
+    _register_overture(runner)
+    log = EventLog()
+
+    result = run_survey(_overture_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert result.survey["tile_failures"] == []
+    # Three downloads for two types: building once, water twice. The retry
+    # did not restart the batch, and nothing that landed was fetched again.
+    assert sorted(runner.types_requested()) == ["building", "water", "water"]
+    retried = _events_named(log, "tile_retrying")
+    assert {event["source"] for event in retried} == {"overture"}
+    # And the package really holds both layers.
+    assert (result.paths.root / f"{result.paths.stem}_water.geojson").is_file()
+    assert (result.paths.root / f"{result.paths.stem}_building.geojson").is_file()
+
+
+def test_an_overture_type_that_fails_permanently_is_asked_exactly_twice(tmp_path):
+    # The end-to-end attempt count for this source, which must not
+    # silently grow. Overture has no per-request retry of its own, so one
+    # first attempt plus one retry pass is two, and no more.
+    runner = _FlakyOvertureRunner(failures_by_type={"water": 99})
+    _register_overture(runner)
+    log = EventLog()
+
+    result = run_survey(_overture_request(tmp_path, force=True), progress=log)
+
+    assert result.complete is False
+    assert runner.types_requested().count("water") == 2, (
+        "the retry budget is one extra pass, not an unbounded loop"
+    )
+    assert runner.types_requested().count("building") == 1
+
+    failures = result.survey["tile_failures"]
+    assert {record["source"] for record in failures} == {"overture"}
+    assert all(record["retried"] == 1 for record in failures)
+    assert all("water" in record["reason"] for record in failures)
+    # The type that landed is still merged and still in the package: a
+    # failure never discards work that was paid for.
+    assert (result.paths.root / f"{result.paths.stem}_building.geojson").is_file()
+    assert not (result.paths.root / f"{result.paths.stem}_water.geojson").exists()
+
+
+def test_an_overture_type_the_cli_refused_is_never_retried(tmp_path):
+    # A non-zero exit is treated conservatively, so the layer is asked
+    # once and reported. The count is the assertion: a retry would show up
+    # as a second command before anything else here noticed.
+    runner = _FlakyOvertureRunner(failures_by_type={"water": 99}, returncode=2)
+    _register_overture(runner)
+    log = EventLog()
+
+    result = run_survey(_overture_request(tmp_path, force=True), progress=log)
+
+    assert result.complete is False
+    assert runner.types_requested().count("water") == 1
+    assert _events_named(log, "tile_retrying") == []
+    assert {r["kind"] for r in result.survey["tile_failures"]} == {"refused"}
+    assert all(r["retried"] == 0 for r in result.survey["tile_failures"])
+
+
+# --- elevation ------------------------------------------------------------
+
+
+class _FakeElevationResponse:
+    def __init__(self, status_code, payload, headers):
+        self.status_code = status_code
+        self.headers = dict(headers)
+        self._payload = payload
+
+    def iter_content(self, chunk_size=None):
+        return iter([self._payload] if self._payload else [])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _FlakyElevationSession:
+    """An OpenTopography that answers a fixed number of times with a named
+    failure and then serves the DEM.
+
+    Counts its own calls, which is the arithmetic every attempt-count
+    assertion below rests on.
+    """
+
+    TIFF = b"II*\x00" + b"\x00" * 128
+
+    def __init__(self, failures=0, status_code=503, headers=None, exception=None):
+        self.failures_left = failures
+        self.status_code = status_code
+        self.headers = dict(headers or {})
+        self.exception = exception
+        self.calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        if self.failures_left > 0:
+            self.failures_left -= 1
+            if self.exception is not None:
+                raise self.exception
+            return _FakeElevationResponse(self.status_code, b"", self.headers)
+        return _FakeElevationResponse(200, self.TIFF, {})
+
+
+class _RecordingWaitToken(CancelToken):
+    """A token whose wait() records what it was asked for and returns at
+    once, so a test can assert the PERIOD without spending it."""
+
+    def __init__(self):
+        super().__init__()
+        self.waits = []
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        return False
+
+
+def _elevation_request(tmp_path, **overrides):
+    defaults = dict(
+        source_ids=("elevation",),
+        tile_size_m=600.0,
+        overlap_m=50.0,
+        run_bridge_step=False,
+    )
+    defaults.update(overrides)
+    return _request(tmp_path, **defaults)
+
+
+def _register_elevation(session, api_key="test-key"):
+    register(ElevationSource(api_key=api_key, session=session))
+
+
+def test_an_elevation_timeout_is_retried_and_the_dem_arrives(tmp_path):
+    session = _FlakyElevationSession(
+        failures=1, exception=requests.exceptions.ReadTimeout("slow")
+    )
+    _register_elevation(session)
+    log = EventLog()
+
+    result = run_survey(_elevation_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert result.survey["tile_failures"] == []
+    assert session.calls == 2, "one first attempt plus one retry, no more"
+    retried = _events_named(log, "tile_retrying")
+    assert {event["source"] for event in retried} == {"elevation"}
+    assert all(event["kind"] == "timeout" for event in retried)
+    assert (result.paths.root / f"{result.paths.stem}.tif").is_file()
+
+
+def test_an_elevation_401_is_never_retried_and_the_error_is_not_delayed(tmp_path):
+    # The failure the owner meets most often on the one keyed source, and
+    # the one a retry can only make worse: it fails identically every
+    # time, it spends their own quota to find that out, and it delays the
+    # honest error.
+    session = _FlakyElevationSession(failures=99, status_code=401)
+    _register_elevation(session)
+    log = EventLog()
+
+    result = run_survey(_elevation_request(tmp_path, force=True), progress=log)
+
+    assert result.complete is False
+    assert session.calls == 1, "a rejected key was asked again"
+    assert _events_named(log, "tile_retrying") == []
+    failures = result.survey["tile_failures"]
+    assert {record["kind"] for record in failures} == {"not_authorised"}
+    assert all(record["retried"] == 0 for record in failures)
+    assert result.survey["retries"] == []
+
+
+def test_an_elevation_5xx_that_never_clears_is_asked_exactly_twice(tmp_path):
+    session = _FlakyElevationSession(failures=99, status_code=503)
+    _register_elevation(session)
+
+    result = run_survey(_elevation_request(tmp_path, force=True), progress=EventLog())
+
+    assert result.complete is False
+    assert session.calls == 2, "the budget is one extra pass, not an unbounded loop"
+    assert {r["kind"] for r in result.survey["tile_failures"]} == {"service_error"}
+    assert all(r["retried"] == 1 for r in result.survey["tile_failures"])
+
+
+def test_a_rate_limit_waits_the_period_the_service_asked_for(tmp_path):
+    session = _FlakyElevationSession(
+        failures=1, status_code=429, headers={"Retry-After": "7"}
+    )
+    _register_elevation(session)
+    log = EventLog()
+    token = _RecordingWaitToken()
+
+    result = run_survey(_elevation_request(tmp_path), progress=log, cancel=token)
+
+    assert result.complete is True
+    assert token.waits == [7.0], f"the service asked for 7 seconds and got {token.waits}"
+    waiting = _events_named(log, "retry_waiting")
+    assert [event["seconds"] for event in waiting] == [7.0]
+    assert session.calls == 2
+
+
+def test_a_retry_after_longer_than_the_ceiling_is_not_retried_at_all(tmp_path):
+    # An exhausted daily quota can answer with an hour. A survey the owner
+    # is watching must not silently stop for an hour inside a step that
+    # presents itself as automatic, and coming back early would spend
+    # their quota to be told the same thing again.
+    session = _FlakyElevationSession(
+        failures=99, status_code=429, headers={"Retry-After": "3600"}
+    )
+    _register_elevation(session)
+    log = EventLog()
+    token = _RecordingWaitToken()
+
+    result = run_survey(
+        _elevation_request(tmp_path, force=True), progress=log, cancel=token
+    )
+
+    assert result.complete is False
+    assert token.waits == [], "the run paused for longer than its own ceiling"
+    assert session.calls == 1, "the retry happened anyway"
+    postponed = _events_named(log, "retry_postponed")
+    assert len(postponed) == 1
+    assert postponed[0]["source"] == "elevation"
+    assert postponed[0]["seconds_requested"] == 3600.0
+    assert postponed[0]["seconds_ceiling"] == MAX_RETRY_AFTER_WAIT_SECONDS
+    assert _events_named(log, "tile_retrying") == []
+
+
+def test_a_stop_during_a_retry_after_wait_lands_at_once(tmp_path):
+    # Cancellation must interrupt a retry as promptly as it interrupts a
+    # first attempt, and a wait built on time.sleep would have made a Stop
+    # press do nothing at all for up to a minute.
+    session = _FlakyElevationSession(
+        failures=99, status_code=429, headers={"Retry-After": "30"}
+    )
+    _register_elevation(session)
+    log = EventLog()
+
+    class _StoppingToken(CancelToken):
+        def wait(self, seconds):
+            # What the real CancelToken.wait does when a stop lands during
+            # the wait: it returns True rather than sleeping out the rest.
+            self.cancel()
+            return True
+
+    result = run_survey(
+        _elevation_request(tmp_path), progress=log, cancel=_StoppingToken()
+    )
+
+    assert result.stopped is True
+    assert session.calls == 1, "the retry was made after the stop landed"
+    assert _events_named(log, "tile_retrying") == []
+
+
+def test_the_real_cancel_token_wakes_from_a_wait_the_instant_a_stop_lands():
+    # The token above is a double, so the real thing is pinned separately
+    # rather than assumed. A ten second wait, cancelled from another
+    # thread, must return in a small fraction of it.
+    token = CancelToken()
+    threading.Timer(0.05, token.cancel).start()
+    started = time.monotonic()
+    interrupted = token.wait(10.0)
+    elapsed = time.monotonic() - started
+
+    assert interrupted is True
+    assert elapsed < 2.0, f"the wait ignored the stop for {elapsed:.1f}s"
+
+
+def test_a_wait_of_zero_returns_at_once_and_reports_the_standing_answer():
+    token = CancelToken()
+    assert token.wait(0) is False
+    token.cancel()
+    assert token.wait(0) is True
+
+
+def test_a_stop_interrupts_an_overture_retry_before_it_downloads(tmp_path):
+    runner = _FlakyOvertureRunner(failures_by_type={"water": 99})
+    _register_overture(runner)
+    token = CancelToken()
+    sink = _CancellingSink(token, stop_on="tile_retrying")
+
+    result = run_survey(_overture_request(tmp_path), progress=sink, cancel=token)
+
+    assert result.stopped is True
+    assert result.complete is False
+    assert runner.types_requested().count("water") == 1, (
+        "the retry downloaded after the stop had landed"
+    )
+    # Failed, not pending: this layer was reached and it did fail. Task
+    # 22's rule is about a tile a stop never reached.
+    records = {r["tile_id"]: r["overture"] for r in result.survey["tiles"]}
+    assert set(records.values()) == {"failed"}
+
+
+# --- the record of what was retried ---------------------------------------
+
+
+def test_a_run_that_only_completed_because_of_a_retry_says_so(tmp_path):
+    # The whole of section 4. tile_failures is empty for a recovered tile,
+    # deliberately and correctly, so without this a fragile run and a
+    # clean one are indistinguishable afterwards.
+    session = _FlakyElevationSession(failures=1, status_code=503)
+    _register_elevation(session)
+    log = EventLog()
+
+    result = run_survey(_elevation_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert result.survey["tile_failures"] == []
+
+    retries = result.survey["retries"]
+    assert len(retries) == 4, "one record per planned tile of the retried layer"
+    for record in retries:
+        assert record["source"] == "elevation"
+        assert record["pass_number"] == 1
+        assert record["kind"] == "service_error"
+        assert record["recovered"] is True
+        assert "503" in record["reason"]
+
+    done = _events_named(log, "retry_done")
+    assert len(done) == 1
+    assert done[0] == {
+        "event": "retry_done",
+        "pass_number": 1,
+        "of": 1,
+        "attempted": 4,
+        "recovered": 4,
+        "still_failing": 0,
+    }
+
+
+def test_a_clean_run_records_no_retries_at_all(tmp_path):
+    session = _FlakyElevationSession(failures=0)
+    _register_elevation(session)
+    log = EventLog()
+
+    result = run_survey(_elevation_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert result.survey["retries"] == []
+    assert _events_named(log, "retry_done") == []
+    assert _events_named(log, "tile_retrying") == []
+
+
+def test_a_retry_that_did_not_work_is_recorded_as_not_recovered(tmp_path):
+    session = _FlakyElevationSession(failures=99, status_code=503)
+    _register_elevation(session)
+
+    result = run_survey(_elevation_request(tmp_path, force=True), progress=EventLog())
+
+    retries = result.survey["retries"]
+    assert retries, "a retry that failed is still a retry and must be recorded"
+    assert all(record["recovered"] is False for record in retries)
+
+
+# --- the account the owner reads ------------------------------------------
+
+
+def test_a_whole_layer_failure_is_one_line_not_one_line_per_tile():
+    # An elevation or Overture failure is recorded against every planned
+    # tile, because that is what a whole-extent download covers. On the
+    # owner's own Barry extent that would be seventy-two copies of one
+    # sentence for one thing that went wrong once.
+    records = [
+        {
+            "source": "elevation",
+            "tile_id": f"r00_c{n:02d}",
+            "kind": "not_authorised",
+            "reason": (
+                "Failed to download DEM: OpenTopography refused the request "
+                "as not allowed (HTTP 401)."
+            ),
+            "retried": 0,
+        }
+        for n in range(4)
+    ]
+    lines = describe_tile_failures(records, planned_tiles=4)
+
+    assert lines[0] == "4 tiles did not download:"
+    assert len(lines) == 2
+    assert lines[1].startswith("  elevation, all 4 tiles:")
+    assert "HTTP 401" in lines[1]
+
+
+def test_a_partial_failure_is_still_named_tile_by_tile():
+    # The rule is "all of them, identically", never "several of them". Two
+    # OSM tiles of four is two tiles, and collapsing it would hide which.
+    records = [
+        {
+            "source": "osm",
+            "tile_id": "r00_c01",
+            "kind": "service_error",
+            "reason": "the OpenStreetMap map API answered HTTP 503, on all 4 attempts.",
+            "retried": 1,
+        },
+        {
+            "source": "osm",
+            "tile_id": "r01_c00",
+            "kind": "service_error",
+            "reason": "the OpenStreetMap map API answered HTTP 503, on all 4 attempts.",
+            "retried": 1,
+        },
+    ]
+    lines = describe_tile_failures(records, planned_tiles=4)
+
+    assert len(lines) == 3
+    assert any("r00_c01" in line for line in lines)
+    assert any("r01_c00" in line for line in lines)
+
+
+def test_a_caller_that_does_not_know_the_plan_gets_the_output_it_always_got():
+    records = [
+        {
+            "source": "elevation",
+            "tile_id": f"r00_c{n:02d}",
+            "kind": "unknown",
+            "reason": "boom",
+            "retried": 0,
+        }
+        for n in range(3)
+    ]
+    assert len(describe_tile_failures(records)) == 4
+
+
+# --- one layer failing must not cost another layer that recovered ---------
+
+
+def test_a_layer_that_recovered_is_merged_even_when_another_failed(tmp_path):
+    # Reachable only since this task, because elevation and Overture now
+    # defer their failures to the end of the run the way OSM already did.
+    # Withholding a layer that is complete and paid for because a
+    # DIFFERENT layer failed throws away work for nothing: the run is
+    # about to raise and say what is missing in any case.
+    osm_session = _FlakyOsmSession(failures_by_tile={"r00_c01": 4})
+    _register_flaky_osm(osm_session)
+    _register_elevation(_FlakyElevationSession(failures=99, status_code=401))
+
+    request = _request(
+        tmp_path,
+        source_ids=("osm", "elevation"),
+        tile_size_m=600.0,
+        overlap_m=50.0,
+        run_bridge_step=False,
+    )
+    with pytest.raises(IncompleteSurveyError) as excinfo:
+        run_survey(request, progress=EventLog())
+
+    root = tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront"
+    assert (root / "Barry-Waterfront_2026-08-01.osm").is_file(), (
+        "an OSM layer whose retry recovered every tile was withheld because "
+        "elevation failed"
+    )
+    assert not (root / "Barry-Waterfront_2026-08-01.tif").exists()
+    payload = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    assert all(record["osm"] == "ok" for record in payload["tiles"])
+    assert all(record["elevation"] == "failed" for record in payload["tiles"])
+    # And the OSM tile that needed a second attempt is recorded as having
+    # needed one, even though the package holds it.
+    assert {r["source"] for r in payload["retries"]} == {"osm"}
+    assert all(r["recovered"] is True for r in payload["retries"])
+    # One line for the whole elevation layer, four tiles' worth of it.
+    assert "elevation, all 4 tiles" in str(excinfo.value)
+
+
+def test_an_elevation_failure_no_longer_costs_osm_its_retry(tmp_path):
+    # Task 30's own concern 2, closed by this task. Elevation used to
+    # raise out of the source loop the moment it failed, so a run with
+    # both an OSM tile failure and an elevation 401 ended on the elevation
+    # error with the OSM retry never attempted.
+    osm_session = _FlakyOsmSession(failures_by_tile={"r00_c01": 4})
+    _register_flaky_osm(osm_session)
+    _register_elevation(_FlakyElevationSession(failures=99, status_code=401))
+
+    request = _request(
+        tmp_path,
+        source_ids=("elevation", "osm"),
+        tile_size_m=600.0,
+        overlap_m=50.0,
+        run_bridge_step=False,
+        force=True,
+    )
+    result = run_survey(request, progress=EventLog())
+
+    assert osm_session.requests_by_tile["r00_c01"] == 5, (
+        "the OSM retry never happened because elevation failed first"
+    )
+    records = {r["tile_id"]: r["osm"] for r in result.survey["tiles"]}
+    assert all(status == "ok" for status in records.values())
+
+
+# --- the key, through the whole run ---------------------------------------
+
+
+def test_no_api_key_reaches_survey_json_or_the_event_stream_by_any_route(tmp_path):
+    # The brief's own requirement, asserted where it actually matters: not
+    # at the source's own boundary, which test_sources_elevation.py
+    # already covers, but in the file the package keeps and in the event
+    # stream the browser reads. Both outlive the run.
+    secret = "sk-real-secret-should-never-leak"
+    leaky_url = f"https://portal.opentopography.org/API/globaldem?API_Key={secret}"
+
+    class _LeakingSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            raise requests.exceptions.ConnectionError(
+                f"Max retries exceeded with url: {leaky_url}"
+            )
+
+    session = _LeakingSession()
+    _register_elevation(session, api_key=secret)
+    log = EventLog()
+
+    result = run_survey(_elevation_request(tmp_path, force=True), progress=log)
+
+    # Not vacuous: the run really did fail, was really retried, and really
+    # did record it.
+    assert session.calls == 2
+    assert result.survey["tile_failures"]
+    assert result.survey["retries"]
+
+    written = (result.paths.root / "survey.json").read_text(encoding="utf-8")
+    assert secret not in written
+    assert "API_Key" not in written
+    for event in log.events:
+        assert secret not in json.dumps(event, default=str)
