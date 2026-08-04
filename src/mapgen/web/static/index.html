@@ -33,7 +33,47 @@
     <main>
       <section class="map-pane">
         <div id="map"></div>
-        <div id="tile-legend" class="tile-legend" hidden></div>
+        <!--
+          Task 36, item 5. "put it on the white space just below the
+          viewport to the right not left where the key is showing the
+          colour scheme of tiles. then the description of whats happening
+          can find a new space near it without pushing the ui around too
+          much".
+
+          One strip under the map, the legend keeping the left and the
+          progress bar taking the right of the same line. The strip is
+          the one the legend already had: its padding, background and top
+          border moved out here so the two sit on one row, and the row is
+          no taller than the legend alone was, which is the constraint the
+          owner set as much as the move itself.
+
+          The bar's own longer sentence, #progress-note, deliberately did
+          NOT come with it and is still down in the form pane. It is a
+          whole sentence about why a run is running long, it appears only
+          when a tile has been split, and there is no width here for a
+          paragraph without the strip growing a second line the moment it
+          shows up.
+
+          Hidden until either child has something to show, by app.js
+          rather than by CSS, so the map keeps this height back on a page
+          with no grid and no run.
+        -->
+        <div id="map-status" class="map-status" hidden>
+          <div id="tile-legend" class="tile-legend" hidden></div>
+          <!--
+            Task 27's bar, moved here whole. role/aria-valuenow are set
+            here and updated in app.js so a screen reader gets the same
+            number the bar is drawing. #progress-status is new: one short
+            line saying what is happening now, which is the one thing the
+            percentage and the countdown beside it cannot say.
+          -->
+          <div id="progress" class="progress" hidden role="progressbar"
+               aria-valuemin="0" aria-valuemax="100" aria-label="Download progress">
+            <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+            <div id="progress-status" class="progress-status"></div>
+            <div id="progress-text" class="progress-text"></div>
+          </div>
+        </div>
         <div class="map-tools">
           <button id="draw" type="button">Draw extent</button>
           <!--
@@ -112,19 +152,16 @@
         <button id="cancel" type="button" class="danger" hidden>Stop</button>
 
         <!--
-          Task 27. Hidden until a download starts, and left on screen
-          afterwards showing how the run actually ended, since "it
-          stopped at 68%" is the thing worth still being able to read
-          once the log has scrolled. The bar itself is filled by app.js;
-          role/aria-valuenow are set here and updated there so a screen
-          reader gets the same number the bar is drawing.
+          Task 27's note about a run that is longer than its estimate,
+          left here when Task 36 moved the bar itself out to the strip
+          under the map. It is a whole sentence and it belongs beside the
+          other whole sentence about a run, the failed-tile list below,
+          rather than in a strip that has one line of height to work with.
+          Both appear only when they apply and both stay on screen
+          afterwards, which is the same argument the bar itself makes for
+          not disappearing when a run ends.
         -->
-        <div id="progress" class="progress" hidden role="progressbar"
-             aria-valuemin="0" aria-valuemax="100" aria-label="Download progress">
-          <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
-          <div id="progress-text" class="progress-text"></div>
-          <div id="progress-note" class="progress-note" hidden></div>
-        </div>
+        <div id="progress-note" class="progress-note" hidden></div>
 
         <!--
           Task 31. The reason behind a red tile, in the one place it can

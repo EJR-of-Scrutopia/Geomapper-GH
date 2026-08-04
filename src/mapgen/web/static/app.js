@@ -425,14 +425,30 @@ function repaintTileGridTheme() {
   renderTileLegend();
 }
 
+// Task 36, item 5. The legend and the progress bar now share one strip
+// under the map, and each of them hides on its own account: there is no
+// legend before an extent has been drawn, and no bar before a download
+// has been started. The strip itself has to go when NEITHER has anything
+// to show, or the page carries an empty band under the map for the whole
+// of the time before the first estimate.
+//
+// Read back off the two children rather than kept as a third piece of
+// state, so this cannot come to disagree with what is actually on screen.
+// Called from every place that hides or shows either one.
+function syncMapStatus() {
+  $("map-status").hidden = $("tile-legend").hidden && $("progress").hidden;
+}
+
 function renderTileLegend() {
   const legend = $("tile-legend");
   if (tileRectangles.size === 0) {
     legend.hidden = true;
     legend.innerHTML = "";
+    syncMapStatus();
     return;
   }
   legend.hidden = false;
+  syncMapStatus();
   const items = Object.keys(TILE_STATE_LABELS).map((state) => {
     const style = tileStyleFor(state);
     return (
@@ -582,6 +598,7 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const skippedTiles = new Map(); // source id -> Set of plan tile ids
   const subdividedTiles = new Map(); // plan tile id -> { pieces, depth }
   const liveFailures = new Map(); // failureKey(source, tile_id) -> record
+  let phase = null; // { kind, source } for the status line, Task 36 item 5
 
   const setFor = (bucket, source) => {
     if (!bucket.has(source)) bucket.set(source, new Set());
@@ -589,6 +606,8 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   };
 
   for (const event of events || []) {
+    const nextPhase = PHASE_FOR_EVENT[event.event];
+    if (nextPhase) phase = { kind: nextPhase, source: event.source || "" };
     if (event.tile_id && state.has(event.tile_id)) {
       if (event.event === "tile_failed") {
         liveFailures.set(failureKey(event.source, event.tile_id), failureRecord(event));
@@ -715,7 +734,77 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     fractionFetched: Math.max(0, fractionDone - fractionSkipped),
     subdivisions: subdividedTiles.size,
     tileSubdivisions: subdividedTiles,
+    phase,
   };
+}
+
+// --- what is happening now ------------------------------------------------
+//
+// Task 36, item 5. The bar says how far along a run is and the countdown
+// says how much longer; neither says what the run is actually DOING, and
+// "the description of whats happening" is what the owner asked to have
+// beside them.
+//
+// This is the only place in this file that reads an event BY NAME, and
+// the shape is what makes that safe. An event this table does not know
+// leaves the phase exactly as it was, so a new event from the Python side
+// can never make this line say something untrue; it can only leave it
+// saying the last true thing until the next one it does know. The log at
+// the bottom of the page still formats nothing by name and still shows
+// every event in full, which is where a new event genuinely needs to
+// appear.
+//
+// source_done is a phase of its own rather than a return to nothing:
+// package.py emits it after that source's merge, so between one source
+// finishing and the next one's first tile there is a real gap with a
+// true thing to say about it.
+const PHASE_FOR_EVENT = {
+  job_started: "starting",
+  tile_skipped: "downloading",
+  tile_done: "downloading",
+  tile_failed: "downloading",
+  tile_subdivided: "downloading",
+  source_failed: "finished-source",
+  source_done: "finished-source",
+  tile_retrying: "retrying",
+  retry_waiting: "retrying",
+  retry_postponed: "retrying",
+  retry_done: "retrying",
+  verify_done: "checking",
+  bridge_started: "bridge",
+  bridge_done: "bridge",
+  project_setting_started: "setting",
+  project_setting_written: "setting",
+  job_finished: "finishing",
+};
+
+// Short, and short on purpose: this has one line on a strip it shares
+// with the tile legend, and a sentence here would push the map up, which
+// is the one thing the owner asked this move not to do.
+const PHASE_WORDS = {
+  starting: () => "Starting",
+  downloading: (source) => `Downloading ${sourceLabel(source)}`.trim(),
+  "finished-source": (source) => `Finished ${sourceLabel(source)}`.trim(),
+  retrying: (source) => `Retrying ${sourceLabel(source)}`.trim(),
+  checking: () => "Checking the files",
+  bridge: () => "Writing the Urbano bridge",
+  setting: () => "Writing the project setting",
+  finishing: () => "Writing the package",
+};
+
+// The name the owner picked the layer by, from GET /api/sources, not an
+// id invented here: "OpenStreetMap" is what the checklist says and what
+// the licence tooltip says, so it is what this should say too. Falls back
+// to the id, which is what a page whose /api/sources call failed has.
+function sourceLabel(sourceId) {
+  const source = (currentSources || []).find((entry) => entry.id === sourceId);
+  return (source && source.display_name) || sourceId || "";
+}
+
+function phaseLabel(phase) {
+  if (!phase) return "Starting";
+  const words = PHASE_WORDS[phase.kind];
+  return words ? words(phase.source) : "";
 }
 
 // pieces and depth, read once and defaulted, for the same reason
@@ -2200,9 +2289,11 @@ function hideProgress() {
   $("progress").className = "progress";
   $("progress").setAttribute("aria-valuenow", "0");
   $("progress-fill").style.width = "0%";
+  $("progress-status").textContent = "";
   $("progress-text").textContent = "";
   $("progress-note").hidden = true;
   $("progress-note").textContent = "";
+  syncMapStatus();
 }
 // Set here rather than left to index.html's own hidden attribute, the
 // same reasoning clearTileGrid and closeSettingsPanel already document.
@@ -2217,8 +2308,15 @@ function renderProgress(summary, job, elapsedSeconds) {
   const progress = $("progress");
   progress.hidden = false;
   progress.className = "progress";
+  syncMapStatus();
   $("progress-fill").style.width = `${percent}%`;
   progress.setAttribute("aria-valuenow", String(percent));
+
+  // The phase, while there is one. A run that has stopped, finished or
+  // failed says so in the line beside this one, and repeating it here in
+  // fewer words would be two labels for one fact on a strip with room
+  // for neither.
+  $("progress-status").textContent = job.state === "running" ? phaseLabel(summary.phase) : "";
 
   let note = "";
   if (job.state === "running") {
@@ -2325,6 +2423,9 @@ $("download").addEventListener("click", async () => {
         // page just cannot see it.
         $("progress-text").textContent =
           "Lost contact with the job. The bar has stopped updating.";
+        // The phase would otherwise sit there naming whatever this page
+        // last saw happening, as though it were still happening.
+        $("progress-status").textContent = "";
         $("progress-note").hidden = true;
         return;
       }

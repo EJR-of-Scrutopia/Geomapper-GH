@@ -39,6 +39,15 @@ const SOURCE = fs.readFileSync(APP_JS_PATH, "utf8");
 // real browser instead ran clean here, 12/12, exit 0.
 const INDEX_HTML = fs.readFileSync(INDEX_HTML_PATH, "utf8");
 
+// Task 36, item 5 is a layout constraint as much as a feature: the strip
+// under the map must not grow and nothing else may move. Nothing in this
+// harness can measure a box, so the stylesheet is read for the one
+// structural fact the constraint rests on, that the legend's own padding
+// and border moved to the row that now holds both it and the bar rather
+// than a second set being added beside them. See cssRule further down for
+// how narrowly that is asserted.
+const STYLES_CSS = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+
 // Comments stripped before anything below reads ids or attributes out of
 // the markup. index.html is heavily commented, and those comments discuss
 // the very elements underneath them, so an id or an <input> quoted inside
@@ -4506,6 +4515,232 @@ function ok(condition, message) {
     ok(
       sandbox.document.getElementById("progress").hidden === true,
       "expected the previous run's full bar cleared, not left claiming this one is finished"
+    );
+  });
+
+  // =======================================================================
+  // Task 36, item 5: the bar moved out of the form pane onto the strip
+  // under the map, right of the tile legend, and gained one short line
+  // saying what is happening now.
+  //
+  // The owner's constraint was a layout one as much as a feature: the
+  // strip must not grow, and nothing else must move. A Node harness
+  // cannot measure a box, so what is pinned here is the structure the
+  // constraint rests on (one strip, carrying the legend's own padding and
+  // border rather than a second set beside them, with the bar as a row
+  // inside it) and the behaviour that would otherwise leave an empty band
+  // under the map.
+  // =======================================================================
+
+  // The body of one rule, by exact selector, from the committed
+  // stylesheet. Deliberately not a CSS parser and deliberately not a
+  // substring search over the whole file: a check that "border-top
+  // appears somewhere in styles.css" would pass against any of the
+  // several rules that have one.
+  function cssRule(selector) {
+    const start = STYLES_CSS.indexOf(`\n${selector} {`);
+    ok(start !== -1, `no rule for ${selector} in styles.css`);
+    const open = STYLES_CSS.indexOf("{", start);
+    const close = STYLES_CSS.indexOf("}", open);
+    return STYLES_CSS.slice(open + 1, close);
+  }
+
+  await test("the bar is on the strip under the map, and the form pane no longer holds it", () => {
+    const status = INDEX_HTML_MARKUP.indexOf('id="map-status"');
+    const legend = INDEX_HTML_MARKUP.indexOf('id="tile-legend"');
+    const bar = INDEX_HTML_MARKUP.indexOf('id="progress"');
+    const tools = INDEX_HTML_MARKUP.indexOf('class="map-tools"');
+    const formPane = INDEX_HTML_MARKUP.indexOf('class="form-pane"');
+    ok(status !== -1 && legend !== -1 && bar !== -1, "expected all three elements in the markup");
+    ok(status < legend && legend < bar, "expected the legend on the left of the bar, inside the strip");
+    ok(bar < tools, "expected the whole strip above the map tools row");
+    ok(bar < formPane, "expected the bar out of the form pane entirely, not copied out of it");
+    ok(
+      INDEX_HTML_MARKUP.split('id="progress"').length === 2,
+      "expected exactly one progress bar in the document"
+    );
+  });
+
+  await test("the strip is the legend's own strip, not a second one beside it", () => {
+    // The whole no-taller argument rests on this: the padding, border and
+    // background that used to draw the legend's band now draw the row
+    // that holds both, so there is one band under the map and not two.
+    const strip = cssRule(".map-status");
+    const legend = cssRule(".tile-legend");
+    ok(/border-top/.test(strip), `expected the strip to carry the top border: ${strip}`);
+    ok(/padding/.test(strip), `expected the strip to carry the padding: ${strip}`);
+    ok(!/border-top/.test(legend), `expected the legend to have given up its border: ${legend}`);
+    ok(!/padding/.test(legend), `expected the legend to have given up its padding: ${legend}`);
+    // And the bar is a row on that line rather than the stacked card it
+    // was in the form pane, which is what makes one line of height enough.
+    const bar = cssRule(".progress");
+    ok(/flex-direction:\s*row/.test(bar), `expected the bar laid out as a row: ${bar}`);
+    ok(/margin-left:\s*auto/.test(bar), `expected the bar pushed to the right: ${bar}`);
+  });
+
+  await test("the strip stays out of the way until there is something on it", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [{ state: "running", events: [] }],
+    });
+    // jobSandbox has already drawn a grid, so the legend is showing.
+    ok(sandbox.document.getElementById("map-status").hidden === false, "expected the strip up with a legend on it");
+
+    // No grid and no run: the map keeps the height back.
+    setField(sandbox, "bbox", "10,20,10,25"); // rejected, clears the grid
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("tile-legend").hidden === true,
+      "expected the legend gone with the grid"
+    );
+    ok(
+      sandbox.document.getElementById("map-status").hidden === true,
+      "expected the empty strip to take its band back"
+    );
+  });
+
+  await test("the strip stays up for a bar with no legend beside it", async () => {
+    // The two hide on their own account, so the strip must not read one
+    // of them as the whole answer.
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("tile-legend").hidden = true;
+    sandbox.document.getElementById("progress").hidden = false;
+    sandbox.syncMapStatus();
+    ok(
+      sandbox.document.getElementById("map-status").hidden === false,
+      "a bar with no legend still needs the strip"
+    );
+  });
+
+  await test("the status line says what is happening now, by the layer's own name", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      polls: [
+        {
+          state: "running",
+          events: [
+            { event: "job_started", tiles: 4, root: "C:\\out" },
+            { event: "tile_done", source: "osm", tile_id: tileIds[0] },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("progress-status").textContent === "Downloading OpenStreetMap",
+      `expected the display name from /api/sources, got ${sandbox.document.getElementById("progress-status").textContent}`
+    );
+  });
+
+  await test("the status line follows the run through its phases", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const seen = [];
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      polls: [
+        { state: "running", events: [{ event: "job_started", tiles: 4, root: "C:\\out" }] },
+        {
+          state: "running",
+          events: [{ event: "job_started" }, { event: "tile_done", source: "overture", tile_id: tileIds[0] }],
+        },
+        {
+          state: "running",
+          events: [{ event: "job_started" }, { event: "source_done", source: "overture" }],
+        },
+        {
+          state: "running",
+          events: [{ event: "job_started" }, { event: "verify_done", phase: "after_fetch", failures: [] }],
+        },
+        {
+          state: "running",
+          events: [{ event: "job_started" }, { event: "bridge_started" }],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    for (let tick = 0; tick < 5; tick += 1) {
+      await flush(800);
+      seen.push(sandbox.document.getElementById("progress-status").textContent);
+    }
+    ok(seen[0] === "Starting", `got ${JSON.stringify(seen)}`);
+    ok(seen[1] === "Downloading Overture", `got ${JSON.stringify(seen)}`);
+    ok(seen[2] === "Finished Overture", `got ${JSON.stringify(seen)}`);
+    ok(seen[3] === "Checking the files", `got ${JSON.stringify(seen)}`);
+    ok(seen[4] === "Writing the Urbano bridge", `got ${JSON.stringify(seen)}`);
+  });
+
+  await test("an event this page has never heard of leaves the status line alone", async () => {
+    // The one place in app.js that reads an event by name. A new event
+    // from the Python side must be able to arrive without this line
+    // saying something untrue, and the log below still shows it in full.
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00"],
+      ["osm"],
+      [
+        { event: "tile_done", source: "osm", tile_id: "r00_c00" },
+        { event: "something_new_in_phase_2", source: "osm", detail: "whatever" },
+      ],
+      true
+    );
+    ok(summary.phase.kind === "downloading", `got ${JSON.stringify(summary.phase)}`);
+    ok(sandbox.phaseLabel(summary.phase) === "Downloading OpenStreetMap", sandbox.phaseLabel(summary.phase));
+  });
+
+  await test("a run that has ended leaves the status to the line that already says so", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(
+      sandbox.document.getElementById("progress-status").textContent === "",
+      `a finished run needs one label, not two: ${sandbox.document.getElementById("progress-status").textContent}`
+    );
+    ok(
+      /finished/i.test(sandbox.document.getElementById("progress-text").textContent),
+      sandbox.document.getElementById("progress-text").textContent
+    );
+  });
+
+  await test("losing contact stops the status line naming something still happening", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        { state: "running", events: [{ event: "tile_done", source: "osm", tile_id: tileIds[0] }] },
+        { httpError: true },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(800);
+    ok(
+      sandbox.document.getElementById("progress-status").textContent === "Downloading OpenStreetMap",
+      sandbox.document.getElementById("progress-status").textContent
+    );
+    await flush(800);
+    ok(
+      sandbox.document.getElementById("progress-status").textContent === "",
+      `expected the phase cleared once nothing is watching it: ${sandbox.document.getElementById("progress-status").textContent}`
     );
   });
 

@@ -103,19 +103,53 @@ main {
   background: var(--paper);
 }
 
-/* Task 22: the tile grid legend, keyed to whatever palette app.js's
-   TILE_COLOURS actually drew the rectangles with for the current theme,
-   read back from data attributes app.js sets on each swatch rather than
-   duplicated here as a second, separately-maintained set of colours. */
-.tile-legend {
+/* Task 36, item 5: the strip directly under the map. The legend keeps
+   the left, exactly where it was, and the progress bar takes the right
+   of the same line.
+
+   The padding, background, border and font size are the ones .tile-legend
+   itself used to carry: they moved out here so the two sit on one row
+   under one top border rather than each drawing its own. That is what
+   makes this a MOVE rather than an addition, and it is why the strip is
+   no taller with the bar in it than it was with the legend alone: the
+   tallest thing on the row is still an 11px line of legend text, since
+   the bar's track is 8px and its copy is the same 11px.
+
+   nowrap on the row itself, so a narrow window shortens the copy (see
+   .progress-status/.progress-text below) instead of wrapping the bar
+   onto a second line and pushing the map up, which is the one thing the
+   owner asked this not to do. The legend keeps its own wrap, which it
+   has always had. */
+.map-status {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 16px;
   padding: 6px 10px;
   font-size: 11px;
   background: var(--surface);
   border-top: 1px solid var(--line);
 }
+
+/* Both children hide independently (no grid yet, no run yet), so the
+   strip itself has to go when neither has anything to say, or the page
+   gains an empty band under the map. app.js sets it, for the same reason
+   it sets the panel's and the bar's own hidden states rather than leaving
+   them to the markup. */
+.map-status[hidden] { display: none; }
+
+/* Task 22: the tile grid legend, keyed to whatever palette app.js's
+   TILE_COLOURS actually drew the rectangles with for the current theme,
+   rather than duplicated here as a second, separately-maintained set of
+   colours. */
+.tile-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
+}
+
+.tile-legend[hidden] { display: none; }
 
 .tile-legend-item {
   display: inline-flex;
@@ -428,21 +462,40 @@ button.armed {
    top of this file already covers it and there is nothing for
    effectiveTheme() to resolve. --line for the empty track and --accent
    for the filled part keeps it the same two colours the estimate box
-   and the drawn extent already use, rather than introducing a third. */
+   and the drawn extent already use, rather than introducing a third.
+
+   Task 36, item 5 turned it from a boxed card stacked in the form pane
+   into one line on the strip under the map. It is a row now, not a
+   column, and it has no box of its own: the strip is the surface, and a
+   second border inside it would read as a panel sitting in a panel. What
+   is kept is the 3px left edge, because that edge is how a stopped run
+   and a failed one are told apart at a glance (.progress.stopped and
+   .progress.failed below), and losing it would lose the distinction
+   Task 22 built.
+
+   margin-left: auto is what puts it on the RIGHT of the strip, as asked
+   for, and it does so whether or not the legend beside it is showing. */
 .progress {
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--accent);
-  padding: 8px 10px;
-  font-size: 12px;
-  background: var(--surface);
+  margin-left: auto;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  border-left: 3px solid var(--accent);
+  padding-left: 8px;
 }
 
 .progress[hidden] { display: none; }
 
 .progress-track {
+  /* Fixed, and not a share of the strip: a track that grew and shrank
+     with the length of the sentence next to it would move under the eye
+     every time the countdown changed word. Wide enough to read a
+     percentage off, narrow enough to leave the copy room on a laptop
+     screen. */
+  width: 140px;
+  flex: none;
   height: 8px;
   border-radius: 4px;
   background: var(--line);
@@ -458,8 +511,36 @@ button.armed {
   transition: width 250ms linear;
 }
 
-.progress-text { line-height: 1.4; }
-.progress-note { line-height: 1.4; color: var(--warn); }
+/* One line each, and they shorten rather than wrap: the strip has one
+   row of height and both of these are sentences whose length changes
+   with the run. The status is the first to be given up on a narrow
+   window, which is the right order, because the percentage and the
+   countdown are the numbers the owner is actually watching. */
+.progress-status,
+.progress-text {
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.progress-status { min-width: 0; opacity: 0.75; }
+.progress-text { flex: none; }
+
+/* The note is no longer part of the bar (Task 36, item 5): it is a whole
+   sentence about why a run is taking longer than its estimate, and it
+   lives in the form pane beside the failed-tile list, which is the other
+   whole sentence about a run. Given the same box those two already share
+   so it does not read as a stray line of text. */
+.progress-note {
+  line-height: 1.4;
+  color: var(--warn);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  padding: 8px 10px;
+  font-size: 12px;
+  background: var(--surface);
+}
 .progress-note[hidden] { display: none; }
 
 /* A stopped run is not a failed one (Task 22), so it gets its own
