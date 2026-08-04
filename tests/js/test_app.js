@@ -6328,6 +6328,58 @@ function ok(condition, message) {
     );
   });
 
+  // =======================================================================
+  // Task 38, item 1: the Site field is labelled "Site name".
+  //
+  // A label rename is one word of markup and one whole class of silent
+  // damage if it reaches any further: the id, the request key and the
+  // config the owner already has on disk all have to be exactly what they
+  // were, or a rename nobody asked for empties a field that was full.
+  // =======================================================================
+
+  await test("the Site field is labelled Site name", () => {
+    const match = INDEX_HTML_MARKUP.match(/<label>\s*([^<]*?)\s*<input id="site"/);
+    ok(match, "expected a label wrapping the site input in the committed markup");
+    ok(match[1] === "Site name", `expected "Site name", got ${JSON.stringify(match[1])}`);
+  });
+
+  await test("renaming the label renamed nothing the server or a saved config reads", async () => {
+    // The half of the rename that could break the owner's machine. The id
+    // is what every $() call and every querySelector in app.js resolves
+    // through, and `site` is the key SurveyRequest reads and
+    // mapgen.naming slugifies into the folder name; a page that started
+    // sending `site_name` would fail every estimate against the server
+    // already installed.
+    ok(INPUT_MARKUP.has("site"), "expected the input to keep id=site");
+    const { sandbox, fetchCalls } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: 1,
+          rows: 1,
+          cols: 1,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 175,
+          warnings: [],
+          folder: "C:\\out",
+          tile_grid: [],
+          sources: [],
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "South Wales");
+    setField(sandbox, "site", "Barry Waterfront");
+    await flush(20);
+    const call = fetchCalls.filter((c) => c.url.pathname === "/api/estimate").pop();
+    ok(call, "expected an estimate request once both names are filled");
+    const sent = JSON.parse(call.options.body);
+    ok(sent.site === "Barry Waterfront", `expected the site under the "site" key, got ${JSON.stringify(sent)}`);
+    ok(sent.region === "South Wales", `expected the region unchanged, got ${JSON.stringify(sent)}`);
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );

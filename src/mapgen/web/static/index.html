@@ -96,7 +96,15 @@
         <label>Region
           <input id="region" type="text" placeholder="South Wales" />
         </label>
-        <label>Site
+        <!--
+          Task 38, item 1. "Can we rename Site to Site name." The LABEL
+          only: the field keeps id="site", payload() keeps sending it as
+          `site`, and mapgen.naming keeps slugifying that same value into
+          the folder name. A renamed id or config key here would have
+          silently emptied the field on every saved config on the owner's
+          machine, which is a rename nobody asked for.
+        -->
+        <label>Site name
           <input id="site" type="text" placeholder="Barry Waterfront" />
         </label>
 
