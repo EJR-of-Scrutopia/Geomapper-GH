@@ -55,6 +55,54 @@ from mapgen.sources.overture import OvertureError
 # live in one place the owner can find.
 WINDOWLESS_LOG_PATH = Path.home() / ".mapgen" / "ui.log"
 
+# Task 33: verify_done carries corrections and failures as one record per
+# tile, and a whole-layer failure produces one per planned tile. Twenty-four
+# of them is around 4,500 characters; the owner's own Barry extent, at
+# seventy-two, is around 14,000, arriving as a single unbroken line of
+# Python reprs. _LIST_FULL_LIMIT and _LIST_SAMPLE decide where
+# ConsoleProgress stops printing such a field whole and starts compacting
+# it.
+#
+# _LIST_FULL_LIMIT is 3, not 2, so the two-failure run this task's own
+# brief calls out (small enough that the detail is the point) sits
+# comfortably inside the limit rather than on its edge.
+#
+# _LIST_SAMPLE is 2. A verify_done record (source, tile_id, kind, reason,
+# retried) runs upward of 150 characters once the reason names a service
+# and a URL, and the owner's real 72-tile failures average nearer 190; even
+# three sampled records would put the compacted line past 500 characters
+# before the count and the wrapper text are added. Two is enough to show
+# the SHAPE of the failure, not just that one exists, while keeping the
+# whole line something read in one glance rather than one wrapped
+# paragraph.
+_LIST_FULL_LIMIT = 3
+_LIST_SAMPLE = 2
+
+
+def _render_field(value: object) -> str:
+    """The value half of one key=value in a ConsoleProgress line.
+
+    A list or tuple past _LIST_FULL_LIMIT entries is compacted to a count,
+    a short sample, and how many were left out of the sample; that last
+    number is the point, since a count alone still lets a silent
+    truncation hide behind it. Everything else, short lists and tuples
+    included, renders exactly as str() already did, which is the whole of
+    what this function changes.
+
+    Blind to the field name and the event name on purpose. A renderer that
+    recognised verify_done's failures by name would need to be revisited
+    every time an event's shape changes; this one compacts any long
+    sequence any event ever carries, including ones that do not exist yet.
+    """
+    if isinstance(value, (list, tuple)) and len(value) > _LIST_FULL_LIMIT:
+        sample = list(value[:_LIST_SAMPLE])
+        omitted = len(value) - _LIST_SAMPLE
+        return (
+            f"{len(value)} items, first {_LIST_SAMPLE} shown, "
+            f"{omitted} omitted: {sample!r}"
+        )
+    return str(value)
+
 
 class ConsoleProgress:
     """One whole line per event on stdout, from any number of threads.
@@ -81,7 +129,12 @@ class ConsoleProgress:
         self._lock = threading.Lock()
 
     def emit(self, event: str, **fields: object) -> None:
-        detail = " ".join(f"{key}={value}" for key, value in fields.items())
+        # Task 33: the compaction happens here, before the lock is taken,
+        # for the same reason the join always has: this can iterate and
+        # repr a large structure, and doing that while the lock is held
+        # would block every other worker thread for the duration, not just
+        # serialise the print() call the lock exists to protect.
+        detail = " ".join(f"{key}={_render_field(value)}" for key, value in fields.items())
         line = f"[{event}] {detail}".rstrip()
         with self._lock:
             print(line, flush=True)

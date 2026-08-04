@@ -850,6 +850,129 @@ def test_console_progress_still_prints_one_readable_line_per_event(capsys):
     assert lines == ["[tile_done] source=overture tile_id=r00_c00"]
 
 
+# --- Task 33: long list fields are compacted, not flooded ---------------
+
+# What a real whole-layer failure looks like: one record per planned tile,
+# same source, same reason, only tile_id varying. Task 32's own docstring
+# names this exact shape on the owner's Barry extent at seventy-two tiles,
+# and Task 33's brief exists because nobody had built one of these in a
+# test before, so nobody saw the line it produced.
+def _whole_layer_failure_records(count: int) -> list[dict]:
+    reason = (
+        "OpenTopography returned 503 for https://portal.opentopography.org/"
+        "API/globaldem?demtype=COP30&south=51.30&north=51.50&west=-3.35"
+        "&east=-3.10&outputFormat=GTiff"
+    )
+    return [
+        {
+            "source": "elevation",
+            "tile_id": f"r{i // 9:02d}_c{i % 9:02d}",
+            "kind": "service_error",
+            "reason": reason,
+            "retried": 0,
+        }
+        for i in range(count)
+    ]
+
+
+def test_console_progress_renders_a_short_list_in_full(capsys):
+    # Task 33's brief, verbatim: "a run with two failures should still
+    # print those two failures in full, because that is the case where the
+    # detail is the point." Two stays two, not a count and a sample.
+    failures = [
+        {"source": "osm", "tile_id": "r00_c00", "kind": "service_error", "reason": "503"},
+        {"source": "osm", "tile_id": "r00_c01", "kind": "service_error", "reason": "503"},
+    ]
+    progress = cli.ConsoleProgress()
+    progress.emit("verify_done", phase="after_fetch", failures=failures)
+    line = capsys.readouterr().out.splitlines()[0]
+    assert line == f"[verify_done] phase=after_fetch failures={failures}"
+
+
+def test_console_progress_compacts_a_72_tile_failure_list(capsys):
+    # The bug this task exists to fix: a realistic 72-tile whole-layer
+    # failure, measured by actual character count rather than by trusting
+    # the format string looks right.
+    failures = _whole_layer_failure_records(72)
+    uncompacted = f"[verify_done] phase=after_retry failures={failures}"
+    expected_sample = failures[:2]
+    expected = (
+        "[verify_done] phase=after_retry "
+        f"failures=72 items, first 2 shown, 70 omitted: {expected_sample!r}"
+    )
+
+    progress = cli.ConsoleProgress()
+    progress.emit("verify_done", phase="after_retry", failures=failures)
+    line = capsys.readouterr().out.splitlines()[0]
+
+    # The fixture itself has to be the realistic size the brief describes,
+    # or a passing assertion below would prove nothing.
+    assert len(uncompacted) > 10_000, f"fixture is not realistically large: {len(uncompacted)}"
+    assert line == expected
+    assert len(line) < 600, f"still not readable at a glance: {len(line)} chars"
+
+
+def test_console_progress_leaves_scalars_untouched(capsys):
+    progress = cli.ConsoleProgress()
+    progress.emit("verify_done", phase="after_fetch", checked=72, ok=70, failed=2, pending=0)
+    line = capsys.readouterr().out.splitlines()[0]
+    assert line == "[verify_done] phase=after_fetch checked=72 ok=70 failed=2 pending=0"
+
+
+def test_console_progress_compacts_tuples_the_same_as_lists(capsys):
+    # Kept generic on purpose (the brief: "keep it generic, do not
+    # special-case verify_done by name"), so any future event carrying a
+    # long tuple gets the same treatment a long list already does.
+    ids = tuple(f"r00_c{i:02d}" for i in range(10))
+    progress = cli.ConsoleProgress()
+    progress.emit("some_future_event", tile_ids=ids)
+    line = capsys.readouterr().out.splitlines()[0]
+    assert "10 items" in line
+    assert "8 omitted" in line
+
+
+class _LockCheckingSequence(list):
+    """A list whose length and slicing fail if the caller's lock is held.
+
+    Proves _render_field's compaction runs before ConsoleProgress.emit
+    takes its lock, not after: Task 33 must not turn what was a cheap
+    string join into iteration over a 72-entry list done while every other
+    worker thread is blocked on the same lock.
+    """
+
+    def __init__(self, items, lock):
+        super().__init__(items)
+        self._lock = lock
+
+    def __len__(self):
+        assert not self._lock.held, "list length read while the console lock was held"
+        return super().__len__()
+
+    def __getitem__(self, item):
+        assert not self._lock.held, "list sliced while the console lock was held"
+        return super().__getitem__(item)
+
+
+def test_console_progress_compacts_before_taking_the_lock(monkeypatch):
+    # Covers both halves of the same property: the compacted line still
+    # goes out with the lock held (thread safety, unchanged from Task 24),
+    # and building it never touches the list while the lock is held
+    # (the new work this task adds must not undo that).
+    progress = cli.ConsoleProgress()
+    lock = _RecordingLock()
+    progress._lock = lock
+    stream = _HeldWhenWritten(lock)
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    failures = _LockCheckingSequence(_whole_layer_failure_records(10), lock)
+    progress.emit("verify_done", phase="after_fetch", failures=failures)
+
+    assert stream.writes, "nothing was written at all"
+    assert all(held for _text, held in stream.writes), (
+        f"a write went out with the lock released: {stream.writes}"
+    )
+
+
 # --- Task 28: --demtype -------------------------------------------------
 
 # ElevationSource refuses anything that is not a real TIFF (see is_tiff),
