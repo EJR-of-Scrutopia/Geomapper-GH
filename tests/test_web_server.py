@@ -2,6 +2,7 @@ import hashlib
 import http.client
 import json
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 
+from mapgen.folderpicker import RESULT_MARKER, choose_directory, dialog_is_open
 from mapgen.geo import BBox
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, GeocodeResult, ReverseResult
 from mapgen.jobs import EventLog
@@ -2593,3 +2595,99 @@ def test_the_folder_dialog_route_does_not_hold_the_server_for_other_requests(pic
         del picker.__class__.__call__
 
     assert answers["dialog"][0] == 200
+
+
+def test_closing_the_page_while_the_folder_dialog_is_open_does_not_orphan_it():
+    # Review finding I7. /api/closing (app.js's pagehide beacon)
+    # backdates last_heartbeat_at by the whole timeout, so the watchdog
+    # fires on its very next poll. Its only exemption was
+    # manager.is_busy(), which knows about survey jobs and nothing else,
+    # so an in-flight folder dialog did not hold the server open.
+    # ThreadingHTTPServer sets daemon_threads = True and ThreadingMixIn
+    # never tracks daemon threads, so server_close() never joins the
+    # handler thread blocked inside subprocess.run: the process exited,
+    # that thread died mid-call, run_hidden never reached its own timeout
+    # kill, and choose_directory's finally never ran, leaving a
+    # pythonw.exe dialog on the desktop belonging to nothing. The two
+    # numbers made it certain: the dialog waits 120 seconds and the
+    # heartbeat gives up after 90.
+    #
+    # Driven through the REAL choose_directory, with only its child
+    # process runner faked, because the lock it takes is the mechanism
+    # under test: a stub picker would hold no lock and this would pass
+    # for the wrong reason. No native window opens, since the runner
+    # never starts one.
+    opened = threading.Event()
+    release = threading.Event()
+
+    def blocking_runner(command, **kwargs):
+        opened.set()
+        release.wait(timeout=10)
+        return subprocess.CompletedProcess(
+            command, 0, stdout=f'{RESULT_MARKER}{{"path": "C:\\\\Surveys"}}\n', stderr=""
+        )
+
+    def picker(initial_dir=None):
+        return choose_directory(initial_dir, timeout_seconds=30, runner=blocking_runner)
+
+    manager = JobManager()
+    handler = make_handler(manager, TOKEN, STATIC_DIR, StubGeocodeClient(), picker)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    httpd.manager = manager
+    httpd.last_heartbeat_at = time.monotonic()
+    serving = threading.Thread(target=httpd.serve_forever, daemon=True)
+    serving.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    stop_event = threading.Event()
+    dialog_thread = threading.Thread(
+        target=lambda: _post(base, "/api/folder-dialog", {}), daemon=True
+    )
+    watchdog = None
+    try:
+        dialog_thread.start()
+        assert opened.wait(timeout=5), "the dialog request never reached the picker"
+        assert dialog_is_open(), "the real picker must be holding its lock by now"
+        # No survey job is running: the old exemption had nothing to say
+        # about this session at all.
+        assert manager.is_busy() is False
+
+        # The pagehide beacon, exactly as app.js sends it.
+        status, _ = _post(base, "/api/closing", {})
+        assert status == 200
+
+        watchdog = threading.Thread(
+            target=_watch_heartbeat, args=(httpd, 0.05, stop_event, 0.01), daemon=True
+        )
+        watchdog.start()
+        # Comfortably past both the watchdog's own poll interval and
+        # serve_forever's internal 0.5s one, so a shutdown that HAD been
+        # ordered has genuinely had time to take effect: a shorter wait
+        # here passes against a broken implementation, because
+        # httpd.shutdown() only returns once the poll loop next comes
+        # round, and the thread is still alive until then.
+        time.sleep(1.2)
+        assert serving.is_alive(), (
+            "the server shut down with a folder dialog still open, which is what "
+            "orphans the child process"
+        )
+        # Alive AND still answering, not merely a thread that has not
+        # exited yet. GET /api/sources rather than a heartbeat, which
+        # would refresh the very timestamp /api/closing just backdated.
+        assert _get(base, "/api/sources")[0] == 200
+
+        # And once the dialog is answered, nothing holds it open any more:
+        # this is an exemption, not a way to make the watchdog useless.
+        release.set()
+        dialog_thread.join(timeout=5)
+        serving.join(timeout=5)
+        assert not serving.is_alive(), (
+            "expected the server to shut down once the dialog was no longer open"
+        )
+    finally:
+        stop_event.set()
+        release.set()
+        dialog_thread.join(timeout=5)
+        httpd.shutdown()
+        serving.join(timeout=5)
+        httpd.server_close()

@@ -28,6 +28,7 @@ from mapgen.folderpicker import (
     FolderPickerTimeout,
     choose_directory,
 )
+from mapgen.folderpicker import dialog_is_open as folderpicker_dialog_is_open
 from mapgen.geo import BBox, BBoxError, build_tiles
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, NominatimClient
 from mapgen.jobs import CancelToken, Cancelled, EventLog
@@ -104,7 +105,7 @@ def _watch_heartbeat(
     enabled server. Shuts httpd down (causing its serve_forever() to
     return, in build_server/serve) once more than timeout_seconds have
     passed since the last /api/heartbeat ping, checked every poll_interval,
-    UNLESS a download is currently running.
+    UNLESS a download is currently running or a folder dialog is open.
 
     The running-job exemption is not a refinement, it is the difference
     between this watchdog being safe and being destructive. A survey takes
@@ -120,6 +121,28 @@ def _watch_heartbeat(
     The heartbeat still governs the idle case, which is the one the
     watchdog exists for.
 
+    An open folder dialog holds it open by the same rule, and review
+    finding I7 is why. The exemption knew about survey jobs and nothing
+    else, so an in-flight /api/folder-dialog did not count as work: the
+    owner clicked Browse, the native dialog opened, and closing the
+    browser while looking for a folder sent the pagehide beacon, which
+    backdates last_heartbeat_at by the whole timeout and so fires this on
+    its very next poll. ThreadingHTTPServer sets daemon_threads = True
+    and ThreadingMixIn never tracks daemon threads, so server_close()
+    does not join the handler thread blocked inside subprocess.run: the
+    process exited, that thread died mid-call, run_hidden never reached
+    its own timeout kill, and choose_directory's finally never ran. A
+    pythonw.exe dialog was left on the desktop belonging to nothing,
+    which is the exact "process behind that only Task Manager can end"
+    this watchdog was built to prevent. The two numbers made it certain
+    rather than unlikely: the dialog waits 120 seconds and this gives up
+    after 90.
+
+    Unlike the job exemption this one is bounded, which is what makes it
+    safe to add: the dialog's own timeout kills the child and releases
+    the lock, so the worst case is a shutdown that waits out one dialog,
+    never one that does not happen.
+
     stop_event.wait(poll_interval) is an interruptible sleep: serve()'s own
     cleanup sets it when the server is stopping for any OTHER reason
     (Ctrl+C, /api/shutdown), so this thread notices and exits promptly
@@ -133,6 +156,13 @@ def _watch_heartbeat(
             continue
         manager = getattr(httpd, "manager", None)
         if manager is not None and manager.is_busy():
+            continue
+        # Read through the attribute rather than calling the imported
+        # function directly, so a test can drive this branch without a
+        # native window opening on somebody's screen, exactly as
+        # folder_picker itself is injected into the handler.
+        dialog_open = getattr(httpd, "dialog_is_open", folderpicker_dialog_is_open)
+        if dialog_open():
             continue
         httpd.shutdown()
         return

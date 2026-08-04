@@ -85,6 +85,34 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 _dialog_in_progress = threading.Lock()
 
 
+def dialog_is_open() -> bool:
+    """Whether a folder dialog is on somebody's screen right now.
+
+    Read by the web server's heartbeat watchdog (review finding I7). The
+    watchdog's only exemption was a running survey job, which knows
+    nothing about this module, so closing the browser while the native
+    dialog was open shut the server down within a second of the pagehide
+    beacon. ThreadingHTTPServer sets daemon_threads = True and
+    ThreadingMixIn does not track daemon threads, so server_close() never
+    joins the handler thread blocked inside subprocess.run: the process
+    exited, that thread died mid-call, run_hidden never reached its own
+    timeout kill, and choose_directory's finally never ran. The dialog
+    was left on the desktop belonging to nothing, which is exactly the
+    "process behind that only Task Manager can end" the watchdog was
+    built to prevent.
+
+    The two timeouts made it certain rather than unlikely: the dialog
+    waits 120 seconds and the heartbeat gives up after 90.
+
+    Lock.locked() rather than a counter of our own: this is the same lock
+    choose_directory already acquires for the whole life of the child and
+    releases in a finally, so there is no second piece of state here to
+    fall out of step with the first. It can go stale by at most the
+    length of one dialog, since the timeout kills the child regardless.
+    """
+    return _dialog_in_progress.locked()
+
+
 class FolderPickerError(RuntimeError):
     """Base class: the pick did not produce a path, for some reason the
     caller should report plainly and then leave the field alone."""
