@@ -654,35 +654,17 @@ def run_survey(
         bridge_ok: bool | None = None
         bridge_error: str | None = None
         if bridge_attempted:
-            sink.emit("bridge_started")
             osm_outputs = outputs_by_source.get("osm", [])
             elevation_outputs = outputs_by_source.get("elevation", [])
-            bridge_request = BridgeRequest(
+            bridge_ok, bridge_error = _run_bridge_step(
                 bbox=request.bbox,
-                output_dir=paths.root,
+                root=paths.root,
                 file_name_stem=None if request.coordinate_stem else paths.stem,
-                osm_file_path=osm_outputs[0] if osm_outputs else None,
-                elevation_tiff_path=elevation_outputs[0] if elevation_outputs else None,
-                skip_elevation=not elevation_outputs,
+                osm_file=osm_outputs[0] if osm_outputs else None,
+                elevation_file=elevation_outputs[0] if elevation_outputs else None,
+                sink=sink,
+                bridge_runner=bridge_runner,
             )
-            try:
-                if bridge_runner is None:
-                    run_bridge(bridge_request)
-                else:
-                    run_bridge(bridge_request, runner=bridge_runner)
-            except (BridgeError, OSError) as exc:
-                # BridgeError covers a missing project or a non-zero exit
-                # (today's case: Urbano.Core.dll/ProjectSetup.dll absent, so
-                # the bridge process itself runs and fails). OSError also
-                # covers dotnet itself being missing from PATH, which raises
-                # from the subprocess call rather than from bridge.py. Both
-                # are already plain, one-line messages, never a traceback.
-                bridge_ok = False
-                bridge_error = str(exc)
-                sink.emit("bridge_failed", error=bridge_error)
-            else:
-                bridge_ok = True
-                sink.emit("bridge_done")
 
     survey = _build_survey_json(
         request,
@@ -725,6 +707,63 @@ def run_survey(
     return SurveyResult(
         paths=paths, complete=state.complete, survey=survey, stopped=reported_stopped
     )
+
+
+def _run_bridge_step(
+    bbox: BBox,
+    root: Path,
+    file_name_stem: str | None,
+    osm_file: Path | None,
+    elevation_file: Path | None,
+    sink: ProgressSink,
+    bridge_runner=None,
+) -> tuple[bool, str | None]:
+    """One attempt at the Urbano bridge, reported as (ok, error).
+
+    The ONLY place in mapgen that calls run_bridge. Task 29 hoisted it out
+    of run_survey rather than letting `mapgen bridge` grow a second call
+    site of its own: the two would then have had to be kept agreeing about
+    which exceptions are survivable, which progress events are emitted, and
+    which BridgeRequest fields are filled, forever, with nothing but
+    vigilance holding them together. Every decision that used to be inline
+    in run_survey is now made here, once, for both callers.
+
+    Never raises for a bridge that ran and failed. BridgeError covers a
+    missing project or a non-zero exit (today's case on the owner's
+    machine: Urbano.Core.dll/ProjectSetup.dll absent, so the bridge process
+    itself runs and fails); OSError also covers dotnet itself being missing
+    from PATH, which raises from the subprocess call rather than from
+    bridge.py. Both are already plain, one-line messages, never a
+    traceback, and both are returned as `error` rather than propagated,
+    which is Task 20's ruling: real work already on disk is never discarded
+    because the bridge step failed.
+
+    skip_elevation follows the file, not the selection: a package with no
+    DEM on disk has nothing to hand Urbano whatever its survey.json asked
+    for, and telling the bridge to process an elevation file that is not
+    there is the one way this call could fail for a reason nobody wants
+    explained.
+    """
+    sink.emit("bridge_started")
+    request = BridgeRequest(
+        bbox=bbox,
+        output_dir=root,
+        file_name_stem=file_name_stem,
+        osm_file_path=osm_file,
+        elevation_tiff_path=elevation_file,
+        skip_elevation=elevation_file is None,
+    )
+    try:
+        if bridge_runner is None:
+            run_bridge(request)
+        else:
+            run_bridge(request, runner=bridge_runner)
+    except (BridgeError, OSError) as exc:
+        error = str(exc)
+        sink.emit("bridge_failed", error=error)
+        return False, error
+    sink.emit("bridge_done")
+    return True, None
 
 
 _TILE_ID_SHAPE = re.compile(r"^r\d+_c\d+$")
