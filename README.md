@@ -378,14 +378,12 @@ mapgen sources
 mapgen categories
 ```
 
-`mapgen bridge` is the inverse of `--skip-bridge`, and it exists for two
-situations that are ordinary rather than exotic. If Urbano was not installed
-when you downloaded a package, the bridge failed and that package has no
-`<stem>_project_setting.json`; install Urbano, point this at the folder, and
-it gets one without a byte being downloaded again. And a Stop pressed right
-at the end of a run skips the bridge deliberately (see `stopped` in the
-survey.json table), leaving a package that is otherwise complete, in a folder
-a later survey will never reuse; this is how those files are recovered.
+`mapgen bridge` gives a package that already exists its
+`<stem>_project_setting.json`, without a byte being downloaded again. Any
+package produced before mapgen started writing that file itself has none, so
+this is how those are brought up to date. It attempts the C# bridge too, and
+exits on whether the project setting was produced rather than on whether that
+step worked, because the project setting is what the command is for.
 
 It reads the package's own `survey.json` for the extent, the file stem and
 which layers the package holds, and re-derives none of that from the folder
@@ -400,11 +398,11 @@ download itself would have. That is the package positively stating the layer
 was attempted and did not arrive, which is different from a file having been
 moved or deleted, or the wrong folder being passed, all of which are still
 refused. Elevation is the only layer with an API key, so it is the only one
-that fails this way routinely. Nothing but the `bridge` block of
-`survey.json` is written: `complete` and `stopped` describe the download,
-which this command was not present for. It exits 0 on a bridge that
-succeeded and 1 on one that ran and failed, unlike `mapgen survey`, which
-exits 0 for the same bridge failure because it still delivered its data.
+that fails this way routinely. Nothing but the `bridge` and `project_setting`
+blocks of `survey.json` is written: `complete` and `stopped` describe the
+download, which this command was not present for. It exits 0 when the package
+has its project setting and 1 when it could not be written, unlike `mapgen
+survey`, which exits 0 either way because it still delivered its data.
 
 `mapgen survey` exits 0 on a complete package and 1 if any tile failed
 (`--force` continues past a failed tile instead of stopping, and marks the
@@ -447,7 +445,8 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_building.geojson        one file per Overture type
   Barry-Waterfront_2026-08-03_water.geojson           ever fetched into this package
   Barry-Waterfront_2026-08-03.tif                     elevation, only if selected
-  Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here
+  Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here,
+                                                      written every run
   survey.json                                         audit trail, read this first
   layers/
     water.geojson                                     friendly-named copies of
@@ -496,10 +495,14 @@ Each file:
   selected and an OpenTopography key was available. Which model it is comes
   from the `--demtype` setting (COP30 by default) and is recorded in
   `survey.json`.
-- **`<stem>_project_setting.json`**: written by the Urbano bridge, only when
-  the bridge succeeds. This is the single file to point Urbano 2 at. If it is
-  not there, `survey.json`'s `bridge` block says why, and `mapgen bridge` on
-  this folder is how to produce it later without downloading anything again.
+- **`<stem>_project_setting.json`**: the single file to point Urbano 2 at.
+  Written by mapgen itself on every run, whether or not the Urbano bridge
+  ran, succeeded or was skipped. It carries the extent, the UTM world origin
+  and an absolute path to every layer the package actually holds, and it
+  names only files that are genuinely there: a package with no DEM has an
+  empty `ElevationFilePath` and no `elevation` in its `Layers`. The one case
+  where it is absent is a package holding nothing Urbano can read at all, and
+  then `survey.json`'s `project_setting.error` says so in a sentence.
 - **`survey.json`**: see below.
 - **`_work/`**: the in-progress scratch folder, keyed by a fingerprint of the
   exact bbox, tile size, overlap, category selection and Overture type
@@ -535,25 +538,52 @@ Fields, as actually written:
 | `retries` | One entry per tile this run had to ask for a second time, whatever the answer was: `source`, `tile_id`, `pass_number`, `kind`, `reason` and `recovered`. Empty on a run that never stumbled. This is what tells a package that completed first time from one that completed only because a retry worked, and it exists because `tile_failures` cannot say: a tile the retry recovered is deliberately dropped from that list, so without this a fragile run and a clean one read identically afterwards. `recovered: true` is the interesting value rather than the alarming one, and the terminal prints one line for it. `recovered: false` deliberately duplicates a `tile_failures` entry, because the same fact is worth having in both the "what is missing" and the "what was fragile" reading. |
 | `verified` | What the end-of-run check found: `checked`, `ok`, `failed`, `pending`, and `corrections`. Every planned tile of every fetched layer is reconciled against what is genuinely on disk before the run is declared finished. `corrections` is normally empty, and when it is not it is the important part: it lists tiles this run had recorded as downloaded that had no file behind them, and which have been put right rather than left to be believed. |
 | `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
-| `stopped` | `true` only when a Stop request is the reason `complete` is `false`, never for an ordinary tile failure and never alongside `complete: true`. Distinguishes the two ways a package can be short: `complete: false, stopped: true` is exactly as far as you asked it to go and is safe to hand to Grasshopper as is; `complete: false, stopped: false` means something failed. Re-running the same extent resumes either way. A Stop that lands after every tile has already finished leaves `complete: true, stopped: false`: nothing about the data is short, so this field has nothing to report and the run is reported as done. The only trace such a run leaves is `bridge.attempted: false`, below, and `mapgen bridge` is how you get those files without downloading the extent again. |
+| `stopped` | `true` only when a Stop request is the reason `complete` is `false`, never for an ordinary tile failure and never alongside `complete: true`. Distinguishes the two ways a package can be short: `complete: false, stopped: true` is exactly as far as you asked it to go and is safe to hand to Grasshopper as is; `complete: false, stopped: false` means something failed. Re-running the same extent resumes either way. A Stop that lands after every tile has already finished leaves `complete: true, stopped: false`: nothing about the data is short, so this field has nothing to report and the run is reported as done. The only trace such a run leaves is `bridge.attempted: false`, below; the project setting is still written, so nothing about handing the folder to Grasshopper is affected, and `mapgen bridge` is how you get the bridge's own extras later without downloading the extent again. |
 | `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely, which any run you stopped does, on purpose: `attempted` is `false` and `ok` is `null` the same as `--skip-bridge`, since starting another external process after a Stop request works against stopping promptly. That holds even when the Stop landed too late to cost you any data, so a `complete: true` package with `bridge.attempted: false` and no `--skip-bridge` is a run you stopped right at the end. Two more fields appear only once `mapgen bridge` has been run over the package afterwards, and are described in the row below. |
 | `bridge.ran_at`, `bridge.during_download` | Present only after `mapgen bridge <package-dir>` (see "Command line"), which runs the bridge step alone against a package that already exists. `ran_at` is when that later attempt happened, and `attempted`, `ok` and `error` beside it describe **that** attempt rather than the download: the freshest answer to "does this package have Urbano files" is the useful one, and it is where a reader already looks. `during_download` keeps the download's own `attempted`/`ok`/`error` exactly as it wrote them, so a later success never makes the file claim the bridge succeeded during a run where it did not. Running the command a second time updates the first three again and leaves `during_download` alone: it is the original, not the previous. It is `null`, rather than a fabricated `false`, in the one case where the package's record held no readable `bridge` block for it to keep. **No `ran_at` means the block describes the download**, which is every package written before this existed and every ordinary run since. |
+| `project_setting` | `written`, `file`, `layers` and `error`: whether this package has the one file Urbano 2 is pointed at, what it is called, which layers it names, and a plain sentence if it could not be written. mapgen writes this file itself, so it is a different question from `bridge` above and is answered separately from it: a run whose bridge failed, a `--skip-bridge` run and a run you stopped all still have one. `layers` is what the file actually names, read off what is genuinely in the folder, so it can be shorter than the `sources` list if a layer found nothing. |
 | `started_at`, `finished_at` | UTC timestamps. |
 
 ## Using the output in Grasshopper, with Urbano 2
 
-This is the point of the tool. In Grasshopper, place the Urbano 2 component
-that consumes a project setting file and point its file path input at
-`<stem>_project_setting.json`. That one file already carries absolute paths
-to the OSM file and, if generated, the elevation GeoTIFF and an Overture
-buildings geoparquet that the bridge fetches on its own account, separate
-from the `.geojson` files described above.
+This is the point of the tool. In Grasshopper, on the **Urbano2** tab, in the
+**1 Download/Import** panel, place the **Project Setting** component, paste
+the contents of `<stem>_project_setting.json` into a panel, wire that panel
+into the component's text input, and set its boolean input to true. You need
+to be signed in to Urbano: the component checks its token first and refuses
+before it does anything else.
+
+That one file carries the extent, the UTM world origin and an absolute path
+to every layer the package holds. Two things about how Urbano reads it are
+worth knowing, because both are visible from the canvas:
+
+- **It rebuilds the OSM path itself**, as the folder plus the file stem plus
+  `.osm`, and skips the download if that file is already there. mapgen's
+  naming matches, which is what makes a mapgen package a pass-through rather
+  than a fresh download.
+- **It does not read the elevation path.** It looks for `<stem>.egrid`, its
+  own format, and if that is missing it goes to the USGS 3DEP service, which
+  is United States only, and reports the failure on the component. For a UK
+  site expect an orange warning saying so. That is a truthful report that
+  Urbano's own elevation route does not work here, not a mapgen failure, and
+  it costs the rest of the setting nothing.
+
+The GeoTIFF and the GeoJSON files are read separately, and Urbano 2 has
+components for both: **Import Geojson File** takes a GeoJSON path directly,
+and there is an Import Terrain component for the surface. The
+`<stem>_project_setting.json` paths for those layers are there for those
+components and for the **Deserialize Project Setting** component, which
+unpacks the file into its folder, bound string, granularity, layer names and
+file paths, verbatim.
 
 The `layers/*.geojson` files (and the `<stem>_<type>.geojson` files in the
-package root) are independent of Urbano and read directly into any
-Grasshopper component that understands GeoJSON. This matters because Urbano
-may or may not do anything with paths placed in its own `Layers` array; both
-outcomes are fine, since these files work as standalone inputs either way.
+package root) are also independent of Urbano entirely, and read into any
+Grasshopper component that understands GeoJSON.
+
+To check the world origin against Urbano's own arithmetic rather than against
+mapgen's tests, use the **WSG84 to UTM ProjPt** component on the same tab:
+feed it the bottom left and bottom right corners of your extent and compare
+its answer with `CoordinateReference` in the file.
 
 ## Data sources, licences and attribution
 
@@ -630,16 +660,21 @@ output root or region/site name. This is a real limit, already hit once
 during development, not a theoretical one: choose output roots and site
 names accordingly if you are working from a deeply nested folder.
 
-**The Urbano bridge.** Urbano 2 is optional. If it is not installed, or the
-bridge fails for any other reason, mapgen records the failure as a plain
-sentence in `survey.json`'s `bridge.error`, prints it to the console, and
-still finishes the rest of the package: the OSM, Overture and elevation data
-on disk are unaffected, only `<stem>_project_setting.json` is missing. Pass
-`--skip-bridge` to skip the step outright rather than have it attempt and
-fail. Nothing about that is permanent: `mapgen bridge <package-dir>` runs the
-bridge step alone against a package you already have, so a package downloaded
-before Urbano was installed gets its project setting later without being
-downloaded again. To build the bridge once Urbano 2 is installed:
+**The Urbano bridge.** `tools/UrbanoBridge` is a C# program that loads
+Urbano's own assemblies to do work mapgen cannot do natively. It is optional
+and, as shipped, it does not work: it looks for `Urbano.Core.dll` and
+`ProjectSetup.dll`, and Urbano 2 has neither, having merged both into
+`Urbano.SiteAnalysis.gha`. What a retarget would involve is written up in
+`docs/urbano/README.md`.
+
+Nothing in a package depends on it. mapgen writes
+`<stem>_project_setting.json` itself, so a failed bridge costs a survey
+nothing: the failure is recorded as a plain sentence in `survey.json`'s
+`bridge.error` and printed to the console, and the package is finished and
+usable. Pass `--skip-bridge` to skip the step outright rather than have it
+attempt and fail. Three of its steps (census blocks, EPW climate and USGS
+3DEP elevation) are United States only in any case, so for UK work there is
+little it would add. To build it:
 
 ```powershell
 dotnet build tools/UrbanoBridge/UrbanoBridge.csproj
