@@ -22,6 +22,13 @@ tiling it cost one process launch per tile per type and bought nothing: on
 one measured extent, 16 tiled calls took 69 to 93 seconds against 4.5
 seconds for the single call that returned the identical 9,910 features.
 
+Overture's eight data types are downloaded at the same time rather than one
+after another, which on a 10 by 14 km extent takes the same 168 MB from
+around 60 seconds to around 18. OpenStreetMap is deliberately left
+sequential: its tiles go to a shared public API with its own rate limits,
+and pointing many concurrent requests at it is a good way to get throttled
+part way through a survey.
+
 It replaces an earlier script, `osm_overture_tiles.py`, that did the same job
 by hand-composed command line. Everything that script did is either here
 under a real command, or is called out below as intentionally dropped.
@@ -137,7 +144,13 @@ the URL, so nothing else on the machine can drive it. On the page:
   interrupted or failed run. There is no separate Pause: stopping already
   keeps everything, and resuming already continues from where it stopped,
   so a second button promising the same outcome would only be one more
-  thing to explain.
+  thing to explain. One honest caveat about how long Stop takes to land:
+  Overture's eight types download together, so a stop during that step
+  waits for all eight rather than for one, and if they were already all
+  running it will finish the whole Overture step before it stops. That is
+  the same "an in-progress download is finished and kept" rule as
+  everywhere else, and the step it applies to is now around 18 seconds
+  long instead of around 60, so in practice Stop lands sooner than it did.
 - A Stop server button ends the session immediately from the page itself,
   useful under a terminal launch too, not only the windowless one below.
 
