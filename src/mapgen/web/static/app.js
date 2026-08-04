@@ -64,10 +64,18 @@ function effectiveTheme() {
 // this can never disagree with the server about the geometry.
 //
 // Four states, not three: pending (not started), active (touched by at
-// least one event but not yet settled), done, and failed. Failed is
-// checked first everywhere below and is sticky (nothing ever downgrades
-// it), because it is the one state the owner would want to notice before
-// deciding they have enough, per the brief.
+// least one event but not yet settled), done, and failed. Failed is the
+// one state the owner would want to notice before deciding they have
+// enough, per the brief, so it wins over the other three wherever a tile
+// could be read as more than one.
+//
+// Still four after Task 31, which added the explanation behind a failed
+// tile and deliberately added no colour to carry it. A fifth state would
+// have to MEAN something the other four do not, and "failed, and there
+// is a sentence about it" is not a different condition from failed: every
+// red tile has a reason, so a colour that marked the ones that do would
+// mark all of them. The explanation is text, and it is in two places that
+// are text: a tooltip on the tile and a list beside the progress bar.
 const TILE_COLOURS = {
   light: {
     pending: { color: "#9c9686", fillColor: "#9c9686", fillOpacity: 0.05, weight: 1 },
@@ -91,6 +99,17 @@ const TILE_STATE_LABELS = {
 
 let tileRectangles = new Map(); // tile_id -> Leaflet rectangle
 let tileState = new Map(); // tile_id -> "pending" | "active" | "done" | "failed"
+// The tooltip html currently bound to each rectangle, so a poll that
+// changes nothing rebinds nothing: bindTooltip on a layer whose tooltip
+// is open closes it first (see Leaflet's own implementation), and doing
+// that every 700ms would make a tooltip the owner is reading flicker or
+// vanish under the cursor.
+let tileTooltips = new Map(); // tile_id -> bound tooltip html
+// The failure records the panel is currently showing, kept because a
+// click on the map arrives between polls and has to be able to look up
+// what it just selected without waiting for the next one.
+let lastTileFailures = [];
+let selectedFailedTile = null;
 
 function tileStyleFor(state) {
   return TILE_COLOURS[effectiveTheme()][state] || TILE_COLOURS[effectiveTheme()].pending;
@@ -100,7 +119,150 @@ function clearTileGrid() {
   for (const rect of tileRectangles.values()) map.removeLayer(rect);
   tileRectangles = new Map();
   tileState = new Map();
+  tileTooltips = new Map();
+  renderTileFailures([]);
   renderTileLegend();
+}
+
+// --- why a tile is red ---------------------------------------------------
+//
+// Task 31. The colour was Task 22's and it says a tile did not arrive;
+// what it never said is why, and "this tile failed" is not an
+// explanation, it is the colour written out in words. Task 30 made the
+// reasons exist: every tile_failed event now carries a `kind` for code
+// and a `reason` written for the owner, and the same records reach
+// survey.json as tile_failures. This is the browser reading them.
+//
+// One sentence per failed tile, in the same shape package.py's own
+// describe_tile_failures composes for the terminal and for
+// IncompleteSurveyError, because the owner should not have to learn two
+// readings of the same fact depending on which window it appears in.
+//
+// Composed once and read by both places that show it, the map's tooltip
+// and the list beside the progress bar. The first draft of this file had
+// the two assembling the same sentence separately, and a mutation that
+// took the retried clause out of one of them left every check green off
+// the other: two copies of one sentence is how two views of the same run
+// come to disagree, which is the argument summariseJob already makes
+// about the grid and the bar.
+function tileFailureReason(record) {
+  // The reason itself, never a substitute for it. The fallback names the
+  // gap rather than restating the colour: a run that failed a tile and
+  // recorded no sentence for it is a different thing from a timeout, and
+  // saying "this tile failed" here would hide that behind the one string
+  // this whole feature exists to stop showing. package.py's own ledger
+  // makes the same distinction and for the same reason.
+  const reason = record.reason || "No reason was recorded for this tile.";
+  // Retried is the difference between a service that was busy and one
+  // that is still saying no, which is the difference between waiting and
+  // going to do something else.
+  const again = record.retried > 0 ? " Retried, and it failed again." : "";
+  return `${reason}${again}`;
+}
+
+function tileFailureLine(record) {
+  return `${record.source} ${record.tile_id}: ${tileFailureReason(record)}`;
+}
+
+// Hover, and on a touchscreen tap, since Leaflet opens a non-permanent
+// tooltip on click as well as on mouseover. Sticky so it follows the
+// pointer across a rectangle that can be a good fraction of the map
+// rather than sitting at a fixed corner of it.
+const TILE_FAILURE_TOOLTIP = {
+  sticky: true,
+  direction: "top",
+  opacity: 1,
+  className: "tile-failure-tooltip",
+};
+
+// Leaflet assigns a string tooltip through innerHTML, so this escapes.
+// The reasons are composed server-side from a fixed vocabulary and never
+// from a URL or a raw exception (see TileFailure's own docstring), so
+// there is nothing hostile expected here; escaping is what makes that a
+// property of this line rather than of a promise made somewhere else.
+function tileFailureTooltip(records) {
+  return records.map((record) => escapeHtml(tileFailureLine(record))).join("<br />");
+}
+
+function failuresByTile(records) {
+  const byTile = new Map();
+  for (const record of records) {
+    if (!byTile.has(record.tile_id)) byTile.set(record.tile_id, []);
+    byTile.get(record.tile_id).push(record);
+  }
+  return byTile;
+}
+
+// Binds a tooltip to every rectangle that has a live reason and takes it
+// off every rectangle that does not. The second half is the half that
+// matters: a tile whose retry succeeded, or one the verify pass found on
+// disk after all, must not be left carrying the sentence explaining a
+// problem it no longer has.
+function paintTileFailures(records) {
+  const byTile = failuresByTile(records);
+  for (const [tileId, rect] of tileRectangles) {
+    const forTile = byTile.get(tileId);
+    const html = forTile ? tileFailureTooltip(forTile) : "";
+    if ((tileTooltips.get(tileId) || "") === html) continue;
+    if (html) {
+      rect.bindTooltip(html, TILE_FAILURE_TOOLTIP);
+      tileTooltips.set(tileId, html);
+    } else {
+      rect.unbindTooltip();
+      tileTooltips.delete(tileId);
+    }
+  }
+}
+
+// The list beside the progress bar. The map answers "why is THIS one
+// red"; this answers "what went wrong in this run", which is the question
+// the owner has without having to first find a small red rectangle among
+// seventy-two and know that hovering it does anything. It appears on its
+// own the moment a run has a failure and stays afterwards, like the bar.
+function renderTileFailures(records) {
+  lastTileFailures = records || [];
+  if (!lastTileFailures.some((record) => record.tile_id === selectedFailedTile)) {
+    selectedFailedTile = null;
+  }
+  const box = $("tile-failures");
+  const list = $("tile-failures-list");
+  if (!lastTileFailures.length) {
+    box.hidden = true;
+    $("tile-failures-heading").textContent = "";
+    list.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  const noun = lastTileFailures.length === 1 ? "tile" : "tiles";
+  $("tile-failures-heading").textContent =
+    `${lastTileFailures.length} ${noun} did not download. ` +
+    `Hover or click a red tile on the map to find it here.`;
+  list.innerHTML = lastTileFailures
+    .map((record) => {
+      const selected = record.tile_id === selectedFailedTile ? " selected" : "";
+      return (
+        `<li class="tile-failure${selected}">` +
+        `<span class="tile-failure-tile">${escapeHtml(record.source)} ${escapeHtml(record.tile_id)}</span>` +
+        `<span class="tile-failure-reason">${escapeHtml(tileFailureReason(record))}</span></li>`
+      );
+    })
+    .join("");
+}
+
+// Clicking a red tile marks its entry in the list, which is what turns a
+// rectangle on a grid of seventy-two into a row of text the owner can
+// actually read. Clicking anything else clears the mark rather than
+// leaving a stale one pointing at a tile they are no longer looking at.
+function selectFailedTile(tileId) {
+  // While the draw tool is armed, a click on the map belongs to it: it is
+  // placing a corner, not asking about a failure. Leaflet passes a click
+  // on a rectangle through to the map as well, which is what makes
+  // drawing a new extent over an old grid work at all, so this guard is
+  // what keeps the two from both acting on the same click.
+  if (drawing) return;
+  const failed = lastTileFailures.some((record) => record.tile_id === tileId);
+  selectedFailedTile = failed ? tileId : null;
+  renderTileFailures(lastTileFailures);
 }
 
 // Drawn every time the extent, tile size or overlap changes (see
@@ -116,6 +278,13 @@ function renderTileGrid(tileGrid) {
       [tile.north, tile.east],
     ];
     const rect = L.rectangle(bounds, tileStyleFor("pending"));
+    // Bound once, at creation, for every tile rather than only the ones
+    // that later fail: a rectangle's failure comes and goes across a run
+    // (a retry can clear it, the verify pass can clear it), and adding or
+    // removing a listener each time it changes is a second piece of
+    // bookkeeping that can drift from the first. selectFailedTile decides
+    // what a click means from the failures the panel is currently showing.
+    rect.on("click", () => selectFailedTile(tile.tile_id));
     rect.addTo(map);
     tileRectangles.set(tile.tile_id, rect);
   }
@@ -182,16 +351,46 @@ function renderTileLegend() {
 // every source got a source_done of its own, a stopped or a hard-failed
 // run in particular.
 //
-// "failed" is sticky: nothing here ever moves a tile OFF "failed" once a
-// tile_failed event (see package.py's _record_tile_outcomes) has set it,
-// which matters more than the other states per the brief. This falls out
-// of the tile_done/tile_skipped branch's own guard rather than needing a
-// separate check: it only ever promotes a tile FROM "pending", so once a
-// tile has moved to "failed" (or "active"), a later tile_done/tile_skipped
-// for it (Overture's own multiple per-tile events, most often) has
-// nothing to do. tile_failed itself stays unconditional, deliberately: a
-// genuine failure discovered after a tile was already marked done ought
-// to still register as failed, not be masked by having arrived "too late".
+// "failed" was sticky, and Task 31 stopped it being so, because Task 30
+// made a later event for a failed tile mean something it could not mean
+// before. A tile can now be fetched again, at the end of the run, and
+// land: the stream is tile_failed, then tile_retrying, then tile_done,
+// and a sticky rule leaves that tile red for a run that is complete. The
+// brief is explicit that a tile which was retried and then succeeded is
+// not a failure.
+//
+// So failure is no longer a state written into the state map as events go
+// past. It is a LEDGER of live reasons, keyed by (source, tile), applied
+// over the finished state map at the end, and it is kept by exactly the
+// rules package.py's own _FailureLedger keeps:
+//
+//   tile_failed              records a reason for that source and tile,
+//                            replacing any earlier one, so the retry's
+//                            answer settles over the first pass's.
+//   tile_done, tile_skipped  forget that source's reason for that tile.
+//                            This is ledger.forget: a tile that is
+//                            genuinely on disk must not keep the sentence
+//                            explaining why it once was not.
+//   verify_done              replaces the ledger wholesale with the
+//                            server's own verdict for that phase.
+//
+// Keyed per SOURCE, not per tile, which is what makes the second rule
+// safe: an Overture tile_done cannot clear an OpenStreetMap failure for
+// the same ground. And a tile is red if any live reason names it, so a
+// tile that failed one layer and finished another stays red, which is
+// what it should be.
+//
+// verify_done is not decoration on top of the other two. It is the only
+// event that reports the reverse correction: a tile recorded failed whose
+// file the verify pass then found on disk is put right there and nowhere
+// else, with no tile_done to announce it. Without reading it, that tile
+// stays red on the map against a survey.json that says it is fine.
+//
+// A tile_failed arriving AFTER a tile_done for the same source still
+// reads failed, and that has not changed: it is the ordinary shape of an
+// OSM tile whose file turned out not to be there, and of every Overture
+// type failure, since _record_tile_outcomes runs after fetch() has
+// emitted its own events.
 // Task 27: one walk of the event stream, producing BOTH the per-tile
 // states the grid paints and the fractions the progress bar and the
 // countdown read. Deliberately one function and not two: the progress
@@ -257,6 +456,7 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const fetchedTiles = new Map(); // source id -> Set of plan tile ids
   const skippedTiles = new Map(); // source id -> Set of plan tile ids
   const subdividedTiles = new Set(); // plan tile ids that needed splitting
+  const liveFailures = new Map(); // failureKey(source, tile_id) -> record
 
   const setFor = (bucket, source) => {
     if (!bucket.has(source)) bucket.set(source, new Set());
@@ -266,12 +466,10 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   for (const event of events || []) {
     if (event.tile_id && state.has(event.tile_id)) {
       if (event.event === "tile_failed") {
-        state.set(event.tile_id, "failed");
-      } else if (
-        (event.event === "tile_done" || event.event === "tile_skipped") &&
-        state.get(event.tile_id) === "pending"
-      ) {
-        state.set(event.tile_id, "active");
+        liveFailures.set(failureKey(event.source, event.tile_id), failureRecord(event));
+      } else if (event.event === "tile_done" || event.event === "tile_skipped") {
+        liveFailures.delete(failureKey(event.source, event.tile_id));
+        if (state.get(event.tile_id) === "pending") state.set(event.tile_id, "active");
       }
       // Counted per (tile, source), never per event, which is the whole
       // Overture problem: eight events for one tile are one tile's worth
@@ -289,6 +487,19 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     }
     if (event.event === "source_done" && event.source) {
       finishedSources.add(event.source);
+    }
+    // The run's own verdict, and the only place a failure the server has
+    // since resolved is ever taken back. Replaces rather than merges, for
+    // the same reason survey.json's tile_failures is a list and not a
+    // history: this is what is wrong NOW, and a browser that kept
+    // everything it had ever been told would go on showing a tile the
+    // server has already put right.
+    if (event.event === "verify_done") {
+      liveFailures.clear();
+      for (const record of event.failures || []) {
+        if (!record || !state.has(record.tile_id)) continue;
+        liveFailures.set(failureKey(record.source, record.tile_id), failureRecord(record));
+      }
     }
     // Counted per TILE OF THE PLAN, and this sat outside the
     // state.has(event.tile_id) guard above, incrementing per EVENT, until
@@ -312,6 +523,20 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
       if (value === "active") state.set(tileId, "done");
     }
   }
+
+  // The ledger, applied last, so failure wins over every other reading of
+  // the same tile no matter which order the events arrived in. Sorted by
+  // source then tile id, exactly as describe_tile_failures sorts them for
+  // the terminal, so the same run reads the same way in both places
+  // rather than in whatever order the failures happened to land.
+  const tileFailures = [...liveFailures.values()].sort((a, b) =>
+    a.source === b.source
+      ? (a.tile_id < b.tile_id ? -1 : a.tile_id > b.tile_id ? 1 : 0)
+      : a.source < b.source
+      ? -1
+      : 1
+  );
+  for (const record of tileFailures) state.set(record.tile_id, "failed");
 
   // The tile states settle when the job stops running; the FRACTIONS
   // never do. A stopped run that got two sources through of three is
@@ -352,10 +577,38 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const fractionSkipped = weightTotal > 0 ? skippedTotal / weightTotal : 0;
   return {
     tileStates: state,
+    tileFailures,
     fractionDone,
     fractionSkipped,
     fractionFetched: Math.max(0, fractionDone - fractionSkipped),
     subdivisions: subdividedTiles.size,
+  };
+}
+
+// A tile with no source on the event is keyed under the empty string
+// rather than dropped: the real event stream always carries one, and a
+// test fixture or an older server that does not should still have its
+// failures cleared by its own later tile_done, which keying on undefined
+// consistently achieves. The separator is a character no source id or
+// tile id can contain, so two different pairs can never collide into one
+// key by accident.
+function failureKey(source, tileId) {
+  return `${source || ""}\u0000${tileId}`;
+}
+
+// Every field read once, here, and defaulted, so nothing downstream has
+// to guard: a record out of this function always has five fields of the
+// right type. Task 30 guarantees the event carries all of them, and this
+// is what keeps a page served against an older server from rendering
+// "undefined" at the owner as though it were a reason.
+function failureRecord(event) {
+  const retried = Number(event.retried);
+  return {
+    source: typeof event.source === "string" ? event.source : "",
+    tile_id: String(event.tile_id),
+    kind: typeof event.kind === "string" ? event.kind : "",
+    reason: typeof event.reason === "string" ? event.reason : "",
+    retried: Number.isFinite(retried) && retried > 0 ? retried : 0,
   };
 }
 
@@ -1638,6 +1891,26 @@ $("api-keys").addEventListener("change", async (event) => {
 
 // --- job -------------------------------------------------------------
 
+// Every event is logged as its name plus its fields, by name, with no
+// per-event formatting anywhere: that is what makes a new event from the
+// Python side safe to add. Task 30 added the first events carrying a
+// LIST, though (verify_done's corrections and failures), and a list
+// interpolated into a template literal reads "[object Object]", which is
+// not a field the owner can do anything with. JSON for anything that is
+// not a scalar, and nothing else changes: a string, a number or a boolean
+// still prints exactly as it always did, which is what keeps the rest of
+// the log looking like itself.
+function describeEventValue(value) {
+  if (value === null || typeof value !== "object") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    // A structure that cannot be serialised (a cycle, in principle) must
+    // not take the whole log line down with it.
+    return String(value);
+  }
+}
+
 function log(message, failed = false) {
   const line = document.createElement("div");
   if (failed) line.className = "fail";
@@ -1750,7 +2023,15 @@ $("download").addEventListener("click", async () => {
     for (const [tileId, rect] of tileRectangles) {
       tileState.set(tileId, "pending");
       rect.setStyle(tileStyleFor("pending"));
+      rect.unbindTooltip();
     }
+    // And the previous run's reasons go with its colours. A second
+    // download over the same extent is a fresh account of that ground,
+    // and last run's failures sitting beside a bar that has gone back to
+    // zero would be the clearest way to make the owner chase a problem
+    // that has already been fixed.
+    tileTooltips = new Map();
+    renderTileFailures([]);
     persistConfig({ last_region: $("region").value.trim() });
     $("download").disabled = true;
     $("cancel").hidden = false;
@@ -1781,7 +2062,7 @@ $("download").addEventListener("click", async () => {
       job.events.slice(seen).forEach((e) => {
         const detail = Object.entries(e)
           .filter(([k]) => k !== "event")
-          .map(([k, v]) => `${k}=${v}`)
+          .map(([k, v]) => `${k}=${describeEventValue(v)}`)
           .join(" ");
         log(`${e.event} ${detail}`.trim());
       });
@@ -1797,6 +2078,13 @@ $("download").addEventListener("click", async () => {
         activeJobSourceSeconds
       );
       paintTileStates(summary.tileStates);
+      // The same records twice, on purpose: on the map, where the owner
+      // is already looking at the red rectangle, and in the list, which
+      // is the only one of the two that can be read without knowing it
+      // is there. renderTileFailures first, so a click that lands
+      // between this tick and the next has the current set to look up.
+      renderTileFailures(summary.tileFailures);
+      paintTileFailures(summary.tileFailures);
       renderProgress(summary, job, (Date.now() - jobStartedAt) / 1000);
       if (job.state !== "running") {
         clearInterval(poller);

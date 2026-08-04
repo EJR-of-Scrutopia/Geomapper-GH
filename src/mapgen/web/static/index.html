@@ -117,6 +117,21 @@
           <div id="progress-text" class="progress-text"></div>
           <div id="progress-note" class="progress-note" hidden></div>
         </div>
+
+        <!--
+          Task 31. The reason behind a red tile, in the one place it can
+          be read without first knowing to hover a small rectangle. Filled
+          by app.js from the same records survey.json holds as
+          tile_failures, so the page and the file cannot tell the owner
+          two different stories about the same run. Hidden until a run
+          actually has a failure, and left on screen afterwards for the
+          same reason the progress bar is: what went wrong is worth still
+          being able to read once the log has scrolled past it.
+        -->
+        <div id="tile-failures" class="tile-failures" hidden>
+          <div id="tile-failures-heading" class="tile-failures-heading"></div>
+          <ul id="tile-failures-list" class="tile-failures-list"></ul>
+        </div>
       </section>
     </main>
 

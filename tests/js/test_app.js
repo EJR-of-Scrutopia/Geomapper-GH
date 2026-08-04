@@ -495,10 +495,52 @@ function makeLeaflet() {
       },
     }),
     rectangle: (bounds, options) => {
+      const layerListeners = {};
       const handle = {
         bounds,
         options,
         removed: false,
+        // Task 31 binds a tooltip to a failed tile and takes it off again
+        // when that tile recovers. Modelled as the two facts a test can
+        // check and the owner meets: whether this rectangle carries a
+        // tooltip at all, and what it says.
+        //
+        // Faithful to Leaflet in the respect that matters here.
+        // bindTooltip REPLACES what was bound before (the real one
+        // unbinds an open tooltip first, then rebuilds it) and
+        // unbindTooltip leaves the layer carrying nothing rather than an
+        // empty one. A stub that appended, or that left the old content
+        // behind on an unbind, would let a reason for a problem that has
+        // been fixed pass for a live one, which is the exact defect this
+        // feature exists to prevent.
+        tooltip: null,
+        tooltipOptions: null,
+        bindTooltip(content, tooltipOptions) {
+          handle.tooltip = String(content);
+          handle.tooltipOptions = tooltipOptions || {};
+          return handle;
+        },
+        unbindTooltip() {
+          handle.tooltip = null;
+          handle.tooltipOptions = null;
+          return handle;
+        },
+        // Layer.on, the same shape mapObject.on above already has. Real
+        // Leaflet also propagates a click on a vector layer up to the
+        // map, which is why app.js guards its own handler on the draw
+        // tool's state rather than stopping propagation. A test that
+        // needs both fires both: modelling the propagation here would be
+        // inventing behaviour rather than recording it, and getting the
+        // invention subtly wrong is how a stub starts proving things
+        // about itself.
+        on(type, handler) {
+          (layerListeners[type] = layerListeners[type] || []).push(handler);
+          return handle;
+        },
+        fire(type, eventLike = {}) {
+          const event = { preventDefault() {}, ...eventLike };
+          for (const listener of layerListeners[type] || []) listener(event);
+        },
         setBounds(newBounds) {
           handle.bounds = newBounds;
         },
@@ -3029,15 +3071,81 @@ function ok(condition, message) {
     }
   );
 
-  await test("classifyTiles: a failed tile stays failed even if a later event for it arrives", async () => {
+  // This check used to be "a failed tile stays failed even if a later
+  // event for it arrives", and it fed exactly the stream below: a
+  // tile_failed, then a tile_done for the same tile, commented in the
+  // fixture as "stale/late, must not un-fail it". It was right when it
+  // was written, because nothing in mapgen could fetch a tile twice.
+  //
+  // Task 30 can. A tile that fails is retried once at the end of the run,
+  // and when the retry lands the stream is tile_failed, tile_retrying,
+  // tile_done. Under the old rule that tile stayed red through a run that
+  // finished complete, which is the one thing the grid's red must never
+  // do: red has to mean a real attempt came up short, or the owner stops
+  // believing it. So the reading of a later tile_done changed from
+  // "stale" to "recovered", and it changed because the world under it did.
+  //
+  // What the old check was actually protecting is not gone, it is the
+  // check below it: a tile_failed AFTER a tile_done still reads failed,
+  // which is the ordinary shape of an OSM tile whose file turns out not
+  // to be there and of every Overture type failure, since
+  // _record_tile_outcomes runs after fetch() has emitted its own events.
+  await test("classifyTiles: a tile retried and then landed is not a failure", async () => {
     const { sandbox } = await bootedSandbox();
     const events = [
-      { event: "tile_failed", tile_id: "r00_c00" },
-      { event: "tile_done", tile_id: "r00_c00" }, // stale/late, must not un-fail it
+      { event: "tile_failed", source: "osm", tile_id: "r00_c00", kind: "timeout", reason: "timed out.", retried: 0 },
+      { event: "tile_retrying", source: "osm", tile_id: "r00_c00", pass_number: 1, of: 1, kind: "timeout", reason: "timed out." },
+      { event: "tile_done", source: "osm", tile_id: "r00_c00" },
       { event: "source_done", source: "osm" },
     ];
-    const result = sandbox.classifyTiles(["r00_c00"], ["osm"], events, false);
-    ok(result.get("r00_c00") === "failed", `expected failed to stick, got ${result.get("r00_c00")}`);
+    const summary = sandbox.summariseJob(["r00_c00"], ["osm"], events, true);
+    ok(
+      summary.tileStates.get("r00_c00") === "done",
+      `a recovered tile is done, got ${summary.tileStates.get("r00_c00")}`
+    );
+    ok(
+      summary.tileFailures.length === 0,
+      `expected no live reason for a tile that landed, got ${JSON.stringify(summary.tileFailures)}`
+    );
+  });
+
+  await test("classifyTiles: a tile_failed arriving after a tile_done still reads failed", async () => {
+    // The real ordering for an OSM tile whose file is not there: fetch()
+    // emits tile_done per tile it thinks it got, and _record_tile_outcomes
+    // reads the disk afterwards and disagrees.
+    const { sandbox } = await bootedSandbox();
+    const events = [
+      { event: "tile_done", source: "osm", tile_id: "r00_c00" },
+      { event: "tile_failed", source: "osm", tile_id: "r00_c00", kind: "no_output", reason: "no file.", retried: 0 },
+      { event: "source_done", source: "osm" },
+    ];
+    const summary = sandbox.summariseJob(["r00_c00"], ["osm"], events, false);
+    ok(
+      summary.tileStates.get("r00_c00") === "failed",
+      `expected failed, got ${summary.tileStates.get("r00_c00")}`
+    );
+    ok(summary.tileFailures.length === 1, "expected the reason kept");
+  });
+
+  await test("classifyTiles: one layer finishing a tile does not clear another layer's failure", async () => {
+    // The reason the ledger is keyed per source and not per tile. An
+    // Overture tile_done for the same ground says nothing about whether
+    // OpenStreetMap got it, and a tile short of one of two layers is
+    // still a tile the owner needs to know about.
+    const { sandbox } = await bootedSandbox();
+    const events = [
+      { event: "tile_failed", source: "osm", tile_id: "r00_c00", kind: "timeout", reason: "timed out.", retried: 0 },
+      { event: "tile_done", source: "overture", tile_id: "r00_c00", overture_type: "water" },
+      { event: "source_done", source: "overture" },
+      { event: "source_done", source: "osm" },
+    ];
+    const summary = sandbox.summariseJob(["r00_c00"], ["osm", "overture"], events, true);
+    ok(
+      summary.tileStates.get("r00_c00") === "failed",
+      `expected failed, got ${summary.tileStates.get("r00_c00")}`
+    );
+    ok(summary.tileFailures.length === 1, "expected exactly the OpenStreetMap failure");
+    ok(summary.tileFailures[0].source === "osm", summary.tileFailures[0].source);
   });
 
   await test(
@@ -4783,6 +4891,408 @@ function ok(condition, message) {
       sandbox.document.getElementById("settings-panel").hidden === true,
       "picking a folder must not have needed the settings panel opened"
     );
+  });
+
+  // =======================================================================
+  // Task 31, part 2: a red tile says why it is red.
+  //
+  // Driven through the real poll loop wherever the answer depends on the
+  // wiring rather than on the classification, because the classification
+  // is the half that was easy: a summary that computes a perfect list of
+  // reasons and never reaches a rectangle or a panel is exactly the
+  // test-green-nothing-works shape this file exists to catch.
+  // =======================================================================
+
+  // Real reasons, in the shape Task 30 emits: kind for code, reason for
+  // the owner, retried for whether it has already been asked twice. Two
+  // different kinds, because "the explanation must be the recorded cause"
+  // is only demonstrated by two failures that say different things.
+  const OSM_TIMEOUT = {
+    event: "tile_failed",
+    source: "osm",
+    tile_id: "r00_c01",
+    kind: "timeout",
+    reason: "the OpenStreetMap map API did not answer within 60 seconds, on all 4 attempts.",
+    retried: 1,
+  };
+  const OSM_RATE_LIMITED = {
+    event: "tile_failed",
+    source: "osm",
+    tile_id: "r00_c02",
+    kind: "rate_limited",
+    reason: "the OpenStreetMap map API answered HTTP 429, on all 4 attempts.",
+    retried: 0,
+  };
+
+  function verifyDone(phase, failureEvents) {
+    return {
+      event: "verify_done",
+      phase,
+      checked: 4,
+      ok: 4 - failureEvents.length,
+      failed: failureEvents.length,
+      pending: 0,
+      corrections: [],
+      failures: failureEvents.map(({ event, ...record }) => record),
+    };
+  }
+
+  // The grid's own rectangles, which are the LAST ones created: setBBox
+  // makes the committed extent's rectangle first, and renderTileGrid
+  // clears and remakes one per tile on every estimate. The same slice the
+  // Task 22 checks above already use, with liveness asserted rather than
+  // assumed, so a change in drawing order fails here loudly instead of
+  // quietly handing back dead rectangles that carry no tooltips and would
+  // make every check below pass for nothing.
+  function gridRectangles(sandbox, tileIds) {
+    const found = sandbox.L._rectangles.slice(-tileIds.length);
+    ok(
+      found.length === tileIds.length && found.every((rect) => !rect.removed),
+      "expected one live rectangle per tile at the end of the creation order"
+    );
+    return found;
+  }
+
+  function failureList(sandbox) {
+    return sandbox.document.getElementById("tile-failures-list").innerHTML;
+  }
+
+  function failureHeading(sandbox) {
+    return sandbox.document.getElementById("tile-failures-heading").textContent;
+  }
+
+  function failuresHidden(sandbox) {
+    return sandbox.document.getElementById("tile-failures").hidden;
+  }
+
+  async function runWithFailures(events, { tileIds = tileIdsUpTo(4), polls } = {}) {
+    const { sandbox, fetchCalls } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: polls || [{ state: "done", events }],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    return { sandbox, fetchCalls, tileIds };
+  }
+
+  await test("a failed tile explains itself with the cause that was recorded", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      { event: "tile_done", source: "osm", tile_id: tileIds[0] },
+      OSM_TIMEOUT,
+      { event: "tile_done", source: "osm", tile_id: tileIds[3] },
+      { event: "source_done", source: "osm" },
+    ]);
+
+    ok(failuresHidden(sandbox) === false, "expected the failure list shown once a tile failed");
+    ok(/1 tile did not download/.test(failureHeading(sandbox)), failureHeading(sandbox));
+    const list = failureList(sandbox);
+    ok(
+      list.includes("did not answer within 60 seconds"),
+      `expected the recorded cause in the list, got: ${list}`
+    );
+    ok(list.includes("osm r00_c01"), `expected the source and tile named, got: ${list}`);
+    // Retried once and still short, which is the difference between a
+    // service that was busy and one that is still saying no.
+    ok(list.includes("Retried, and it failed again."), list);
+
+    // And on the map, on the tile itself, which is where the owner is
+    // already looking when they notice the colour.
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(
+      rects[1].tooltip && rects[1].tooltip.includes("did not answer within 60 seconds"),
+      `expected the failed tile to carry its reason, got: ${rects[1].tooltip}`
+    );
+    ok(
+      rects[1].tooltip.includes("Retried, and it failed again."),
+      `the tooltip carries the whole sentence, not the reason without it: ${rects[1].tooltip}`
+    );
+    ok(rects[1].tooltipOptions.sticky === true, "expected a sticky tooltip over a large shape");
+    for (const index of [0, 2, 3]) {
+      ok(
+        rects[index].tooltip === null,
+        `tile ${index} did not fail and must carry no explanation, got: ${rects[index].tooltip}`
+      );
+    }
+  });
+
+  await test("two tiles that failed differently are not given the same explanation", async () => {
+    // The brief's own line: if a tile was rate limited, say that, not the
+    // sentence belonging to the tile that timed out.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      OSM_TIMEOUT,
+      OSM_RATE_LIMITED,
+      { event: "source_done", source: "osm" },
+    ]);
+    const list = failureList(sandbox);
+    ok(/2 tiles did not download/.test(failureHeading(sandbox)), failureHeading(sandbox));
+    ok(list.includes("did not answer within 60 seconds"), list);
+    ok(list.includes("HTTP 429"), list);
+
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(rects[1].tooltip.includes("did not answer within 60 seconds"), rects[1].tooltip);
+    ok(rects[2].tooltip.includes("HTTP 429"), rects[2].tooltip);
+    ok(
+      !rects[2].tooltip.includes("60 seconds"),
+      `the rate limited tile must not be handed the timeout's sentence: ${rects[2].tooltip}`
+    );
+    // The one that was not retried does not claim to have been.
+    ok(
+      !/Retried/.test(rects[2].tooltip),
+      `retried: 0 must not read as retried, got: ${rects[2].tooltip}`
+    );
+  });
+
+  await test("a tile the verify pass put right stops being red and loses its explanation", async () => {
+    // The case only verify_done reports. A tile recorded failed whose
+    // file the verify pass then finds on disk is corrected there and
+    // nowhere else: there is no tile_done for it, so a browser reading
+    // only tile_failed would show it red for good against a survey.json
+    // saying the package is complete.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures(null, {
+      tileIds,
+      polls: [
+        { state: "running", events: [OSM_TIMEOUT] },
+        {
+          state: "done",
+          events: [
+            OSM_TIMEOUT,
+            verifyDone("after_retry", []),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(
+      rects[1].tooltip && rects[1].tooltip.includes("60 seconds"),
+      "expected the tile explained while it was still failed"
+    );
+    ok(failuresHidden(sandbox) === false, "expected the list shown on the first poll");
+
+    await flush(800);
+    ok(
+      rects[1].tooltip === null,
+      `expected the explanation taken off a tile no longer failed, got: ${rects[1].tooltip}`
+    );
+    ok(failuresHidden(sandbox) === true, "expected the list gone with the failure");
+    ok(failureList(sandbox) === "", `expected the list emptied, got: ${failureList(sandbox)}`);
+    ok(
+      rects[1].options.fillColor !== "#8c3b2e",
+      "expected the tile off the failed colour once the failure was retracted"
+    );
+  });
+
+  await test("verify_done's verdict replaces what it no longer lists, one tile at a time", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      OSM_TIMEOUT,
+      OSM_RATE_LIMITED,
+      verifyDone("after_fetch", [OSM_TIMEOUT, OSM_RATE_LIMITED]),
+      // The retry got the rate limited one and not the other.
+      { event: "tile_done", source: "osm", tile_id: "r00_c02" },
+      verifyDone("after_retry", [OSM_TIMEOUT]),
+      { event: "source_done", source: "osm" },
+    ]);
+    ok(/1 tile did not download/.test(failureHeading(sandbox)), failureHeading(sandbox));
+    const list = failureList(sandbox);
+    ok(list.includes("r00_c01"), list);
+    ok(!list.includes("r00_c02"), `the recovered tile must be gone from the list: ${list}`);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(rects[1].tooltip !== null, "the tile that is still short keeps its reason");
+    ok(rects[2].tooltip === null, "the tile that landed loses its reason");
+  });
+
+  await test("a tile that came back empty is a success and is offered no explanation", async () => {
+    // The owner was explicit: a rural tile keeps whatever it captured and
+    // an empty one is a success. package.py never emits tile_failed for
+    // it, and nothing here may invent one, so this is exactly what the
+    // browser sees on that run: four ordinary tile_done events.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+      verifyDone("after_fetch", []),
+      { event: "source_done", source: "osm" },
+    ]);
+    ok(failuresHidden(sandbox) === true, "an empty tile must not produce a failure list");
+    const rects = gridRectangles(sandbox, tileIds);
+    for (const rect of rects) {
+      ok(rect.tooltip === null, `expected no explanation on a successful tile, got: ${rect.tooltip}`);
+      ok(
+        rect.options.fillColor === "#2f5d4f",
+        `expected the done colour, got ${rect.options.fillColor}`
+      );
+    }
+  });
+
+  await test("clicking a failed tile marks its entry, and clicking a good one clears the mark", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      OSM_TIMEOUT,
+      OSM_RATE_LIMITED,
+      { event: "source_done", source: "osm" },
+    ]);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(!/selected/.test(failureList(sandbox)), "expected nothing marked before a click");
+
+    rects[2].fire("click");
+    const marked = failureList(sandbox);
+    ok(/tile-failure selected/.test(marked), `expected the clicked tile's entry marked: ${marked}`);
+    // The marked one is r00_c02's entry, not simply the first.
+    const selectedEntry = marked.slice(marked.indexOf("tile-failure selected"));
+    ok(
+      selectedEntry.includes("r00_c02"),
+      `expected the entry for the tile that was clicked: ${selectedEntry}`
+    );
+
+    rects[0].fire("click");
+    ok(
+      !/selected/.test(failureList(sandbox)),
+      "clicking a tile that is fine must not leave a mark on another tile's entry"
+    );
+  });
+
+  await test("a click that is drawing an extent is not also a question about a failure", async () => {
+    // Leaflet passes a click on a rectangle up to the map as well, which
+    // is what lets a new extent be drawn over an existing grid. Both
+    // handlers see the same click, so the rectangle's own has to know to
+    // stay out of the way.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([OSM_TIMEOUT, { event: "source_done", source: "osm" }]);
+    const rects = gridRectangles(sandbox, tileIds);
+
+    sandbox.document.getElementById("draw").fire("click");
+    rects[1].fire("click");
+    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.4, lng: -3.3 } });
+    ok(
+      !/selected/.test(failureList(sandbox)),
+      "a corner-placing click must not have selected a failure as well"
+    );
+    ok(
+      sandbox.document.getElementById("draw").textContent === "Click the opposite corner",
+      "expected the draw tool to have taken the click"
+    );
+  });
+
+  await test("a reason from the server is escaped in both places it is shown", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([
+      {
+        event: "tile_failed",
+        source: "osm",
+        tile_id: "r00_c01",
+        kind: "service_error",
+        reason: "<img src=x onerror=alert(1)> answered HTTP 503.",
+        retried: 0,
+      },
+      { event: "source_done", source: "osm" },
+    ]);
+    const list = failureList(sandbox);
+    ok(!list.includes("<img"), `expected the tag escaped in the list, got: ${list}`);
+    ok(list.includes("&lt;img"), `expected an escaped tag, got: ${list}`);
+    // Leaflet assigns a string tooltip through innerHTML, so this one is
+    // not merely tidiness.
+    const tooltip = gridRectangles(sandbox, tileIds)[1].tooltip;
+    ok(!tooltip.includes("<img"), `expected the tag escaped in the tooltip, got: ${tooltip}`);
+    ok(tooltip.includes("&lt;img"), `expected an escaped tag, got: ${tooltip}`);
+  });
+
+  await test("a failure with no recorded reason names the gap instead of restating the colour", async () => {
+    // Task 30 guarantees a reason on every tile_failed, so this is the
+    // page meeting an older server. "This tile failed" is the one answer
+    // it must not give, because the colour already said that.
+    const { sandbox } = await runWithFailures([
+      { event: "tile_failed", source: "osm", tile_id: "r00_c01" },
+      { event: "source_done", source: "osm" },
+    ]);
+    const list = failureList(sandbox);
+    ok(list.includes("No reason was recorded"), `got: ${list}`);
+    ok(!list.includes("undefined"), `expected no undefined rendered at the owner: ${list}`);
+  });
+
+  await test("a second download does not inherit the last one's failures", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures([OSM_TIMEOUT, { event: "source_done", source: "osm" }]);
+    ok(failuresHidden(sandbox) === false, "expected the first run's failure shown");
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(rects[1].tooltip !== null, "expected the first run's explanation bound");
+
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10);
+    ok(failuresHidden(sandbox) === true, "expected the list cleared the moment a new run starts");
+    ok(
+      rects[1].tooltip === null,
+      `expected the previous run's explanation taken off the tile, got: ${rects[1].tooltip}`
+    );
+  });
+
+  await test("a mark means the owner clicked it, never that this tile failed before", async () => {
+    // The selection is pruned the moment the tile it points at stops
+    // failing, and this is the case that makes that visible rather than
+    // merely tidy: a tile that fails, is clicked, recovers, and then
+    // fails again in a later run must come back UNmarked. A selection
+    // that outlived its own failure would reappear as a mark the owner
+    // never made, pointing at a tile they never asked about.
+    const tileIds = tileIdsUpTo(4);
+    const failedRun = { state: "done", events: [OSM_TIMEOUT, { event: "source_done", source: "osm" }] };
+    // One poll settles each run, since every reply below is already
+    // "done", so these three are the three downloads in order: it failed,
+    // it was clean, it failed again.
+    const { sandbox } = await runWithFailures(null, {
+      tileIds,
+      polls: [
+        failedRun,
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            verifyDone("after_fetch", []),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+        failedRun,
+      ],
+    });
+    gridRectangles(sandbox, tileIds)[1].fire("click");
+    ok(/tile-failure selected/.test(failureList(sandbox)), "expected the clicked entry marked");
+
+    // The same tile recovers, which retracts the failure and with it the
+    // only thing the mark was ever attached to.
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(failuresHidden(sandbox) === true, "expected no failures on the clean run");
+
+    // And now it fails again, all on its own.
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    ok(failuresHidden(sandbox) === false, "expected the fresh failure listed");
+    ok(
+      !/selected/.test(failureList(sandbox)),
+      `a mark must not survive the failure it pointed at: ${failureList(sandbox)}`
+    );
+  });
+
+  await test("verify_done's own lists are logged as readable JSON, not as [object Object]", async () => {
+    // app.js formats no event by name, which is what makes a new event
+    // from the Python side safe to add. verify_done is the first to carry
+    // a LIST, and a list interpolated into a template literal is a field
+    // the owner can do nothing with.
+    const { sandbox } = await runWithFailures([
+      verifyDone("after_retry", [OSM_TIMEOUT]),
+      { event: "source_done", source: "osm" },
+    ]);
+    const lines = sandbox.document
+      .getElementById("log")
+      .children.map((line) => line.textContent);
+    const verifyLine = lines.find((line) => line.startsWith("verify_done"));
+    ok(verifyLine, `expected a verify_done log line, got: ${JSON.stringify(lines)}`);
+    ok(!verifyLine.includes("[object Object]"), verifyLine);
+    ok(verifyLine.includes('"tile_id":"r00_c01"'), verifyLine);
+    ok(verifyLine.includes("phase=after_retry"), `a scalar must still print plainly: ${verifyLine}`);
   });
 
   console.log(

@@ -210,7 +210,23 @@ the URL, so nothing else on the machine can drive it. On the page:
 - The download runs with a live per-tile log, and the tile grid shades each
   rectangle as it goes: not started, in progress, done, or failed, the last
   one drawn distinctly since it is the one worth noticing before deciding
-  you have enough. A progress bar underneath answers the other question,
+  you have enough.
+- A red tile says why it is red. Hover one, or tap it on a touchscreen, and
+  the reason the run actually recorded appears on the tile: the service
+  timed out, or answered 429, or answered 503 four times over, and whether
+  it was retried and failed again. The same reasons are listed under the
+  progress bar as well, so the account is there without having to know to
+  hover anything, and clicking a red tile marks its entry in that list,
+  which is how you tell one rectangle from seventy-one others. The
+  sentences are the ones `survey.json` records under `tile_failures` and
+  the ones the command line prints, composed in one place, so the page, the
+  file and the terminal cannot tell you three different stories about the
+  same run. A tile that failed and then landed on the retry is not a
+  failure and stops being red; a tile the verify pass finds on disk after
+  all is corrected the same way. A tile that downloaded successfully and
+  happened to contain nothing is a success, is not red, and is offered no
+  explanation, because it does not need one.
+- A progress bar underneath answers the other question,
   how much longer. It is derived from the same progress events the grid
   is, weighted by what each layer's own estimate says it costs, so a
   finished OpenStreetMap pass reads as the large majority of the run it

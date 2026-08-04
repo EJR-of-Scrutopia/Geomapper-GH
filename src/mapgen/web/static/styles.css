@@ -461,6 +461,94 @@ button.armed {
 .progress.failed { border-left-color: var(--warn); }
 .progress.failed .progress-fill { background: var(--warn); }
 
+/* Task 31: why the red tiles are red. Ordinary markup, so both themes
+   are already covered by the two palettes at the top of this file, the
+   same as the progress bar it sits under and unlike the tile grid, whose
+   colours have to live in JS because Leaflet draws it as SVG shapes.
+   --warn on the left edge to match the failed bar and the estimate's own
+   error state: this is the third thing on the page that means "something
+   did not arrive", and it should be the same colour as the other two
+   rather than a fourth signal to learn. */
+.tile-failures {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  padding: 8px 10px;
+  font-size: 12px;
+  background: var(--surface);
+}
+
+.tile-failures[hidden] { display: none; }
+
+.tile-failures-heading {
+  line-height: 1.4;
+  margin-bottom: 6px;
+}
+
+.tile-failures-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  /* Long enough to read a handful without the form pane growing a second
+     scrollbar's worth of height, and scrollable past that: a run can fail
+     seventy-two tiles, and all seventy-two are worth having, just not all
+     at once between the bar and the bottom of the panel. */
+  max-height: 190px;
+  overflow-y: auto;
+}
+
+.tile-failure {
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tile-failure:first-child { border-top: none; }
+
+/* The tile the owner just clicked on the map. Marked with the warn
+   colour it already carries on the map rather than a new highlight
+   colour, so the link between the rectangle and the row is the one thing
+   the eye has to follow. */
+.tile-failure.selected {
+  border-left: 2px solid var(--warn);
+  padding-left: 6px;
+  margin-left: -8px;
+}
+
+.tile-failure-tile {
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.tile-failure-reason { line-height: 1.4; }
+
+/* The same sentence on the map itself. Leaflet's own tooltip is a white
+   box with dark text and a white arrow, hardcoded in the vendored
+   stylesheet, which is right in the light theme and a bright card in the
+   middle of a dark one. Overridden here rather than there: the vendored
+   files are hash-pinned and are not ours to edit. white-space is the
+   other thing that has to change, since Leaflet sets nowrap and these are
+   whole sentences, not the one-word labels a tooltip usually holds. */
+.leaflet-tooltip.tile-failure-tooltip {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--warn);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  white-space: normal;
+  max-width: 260px;
+  line-height: 1.4;
+  font: 12px/1.4 "Segoe UI", system-ui, sans-serif;
+}
+
+/* The little arrow, which is a separate border colour per direction and
+   would otherwise stay white against the themed box above. */
+.leaflet-tooltip-top.tile-failure-tooltip:before { border-top-color: var(--warn); }
+.leaflet-tooltip-bottom.tile-failure-tooltip:before { border-bottom-color: var(--warn); }
+.leaflet-tooltip-left.tile-failure-tooltip:before { border-left-color: var(--warn); }
+.leaflet-tooltip-right.tile-failure-tooltip:before { border-right-color: var(--warn); }
+
 footer { border-top: 1px solid var(--line); }
 
 .log {
