@@ -68,35 +68,95 @@ LAYER_FILENAMES = {
 
 # Real measurements on this machine against the live release, not a model.
 #
-# The per-type base comes from a full EIGHT-type run over a 2.08 x 2.00 km
-# extent (4.17 sq km), sampled twice back to back: 77.84s and 98.30s in
-# total, 23,587,730 bytes, which is 9.73s and 12.29s per type and about
-# 2.95 MB per type.
+# Refitted on 2026-08-04 (Task 25), against overturemaps 0.20.0 from the
+# venv, driven through this module's own fetch() on the shipping
+# concurrent code path with MAX_CONCURRENT_TYPE_DOWNLOADS at 8. What they
+# replaced was fitted before Task 23 untiled this source and before Task
+# 24 made it concurrent, and by 2026-08-04 it overstated a full 8-type run
+# by 6.5x at 4 sq km and by 34x at 260 sq km. The old constants were not
+# wrong when they were taken; the code underneath them changed and they
+# were not retaken.
 #
-# Calibrating "per type" from ONE type is the easy mistake here and an
-# expensive one. `building` alone over that same extent takes 4.5s and
-# 5.96 MB, so it is roughly 2.4 times cheaper in time and 2 times larger
-# in bytes than the average of the eight. The first cut of these constants
-# was fitted to `building` measurements and understated a real 8-type run
-# by 2.2x, which the 8-type run above is what caught.
+# 42 timed runs. The area sweep is all 8 default types over four Welsh
+# extents, six samples each, interleaved (small, mid, big, large, and
+# again) so no extent gets a systematically better network than another:
 #
-# The area slope is the weakest number here and is flagged as such. The
-# only large-extent measurement available is `building` alone over
-# 10 x 14 km (43.73s, 55 MB, 89,722 features), so the slope is derived
-# from that one type and scaled to an average type by the ratio measured
-# at the small extent. It is a line through two points, one of which had
-# to be adjusted to compare like with like.
+#     4.17 sq km   12.42s to 20.09s   mean 15.21s (12 samples)
+#    38.63 sq km   15.03s to 20.71s   mean 17.43s
+#   144.92 sq km   16.56s to 19.45s   mean 17.81s
+#   259.60 sq km   17.43s to 20.67s   mean 18.77s
 #
-# No more precision than that is claimed, and none would be honest:
-# run-to-run variance on the SAME query has been seen at 4.66s against
-# 28.48s, and the two 8-type samples above differ from each other by 26%.
-# That is wider than any refinement this data could justify. Treat the
-# output as "seconds, not minutes" or "minutes, not hours", never as a
-# countdown.
-BASE_SECONDS_PER_TYPE = 9.8
-SECONDS_PER_TYPE_PER_SQ_KM = 0.28
+# Sixty-two times the area for 1.23x the time. Wall clock is set by the
+# slowest single download in the pool now, not by the sum of eight and
+# not by how much ground is covered.
+#
+# The batch is what costs, and how many downloads share it matters far
+# more than the extent does. Same 4.17 sq km extent, three samples each:
+#
+#   1 type     3.52s to  3.70s   mean  3.59s
+#   2 types    3.70s to  4.54s   mean  4.22s
+#   4 types    7.06s to 13.97s   mean 10.15s
+#   8 types   12.42s to 20.09s   mean 15.21s
+#
+# Eight at once take 4.2x one, not 8x and not 1x: they overlap, and they
+# also slow each other down (see MAX_CONCURRENT_TYPE_DOWNLOADS for the
+# bandwidth measurements behind that). So the model is per BATCH, with a
+# term for how many downloads share the batch, and emphatically not a
+# per-type cost multiplied out.
+#
+# Least squares over all 42 runs gives
+#   1.623 + 1.789 * types_in_batch + 0.01177 * sq_km
+# rounded below to the two significant figures this data can carry. Every
+# fitted cell lands within 0.87x to 1.24x of its measured mean; the two
+# worst are the 2-type and 4-type cells, where WHICH types are in the
+# batch matters more than how many (`segment` is the slowest of the eight
+# and `water` among the cheapest).
+#
+# Checked afterwards against a cell that was not fitted: one type over
+# 144.92 sq km measured 5.41s against 5.11s predicted.
+#
+# Two significant figures is all that is claimed. Run-to-run variance on
+# the same query has been seen at 4.66s against 28.48s, and the twelve
+# samples of the SAME 8-type run at 4.17 sq km span 12.42s to 20.09s.
+# That spread is wider than any refinement this data could justify.
+#
+# Both overturemaps on this machine were checked, because they perform
+# differently often enough to be worth ruling out: 0.19.0 (what
+# shutil.which finds, from C:\Python313\Scripts, which is what an
+# unactivated shell gets) and 0.20.0 (what the activated venv gives, as
+# the README instructs), alternated back to back over the same extent,
+# three samples each. 15.81s to 18.10s against 12.42s to 16.82s, and byte
+# totals differing by 10,498 in 23.6 million, which is 0.04%. They do not
+# differ enough to change any constant here, so these fit both.
+BASE_SECONDS_PER_BATCH = 1.6
+SECONDS_PER_TYPE_IN_BATCH = 1.8
+SECONDS_PER_BATCH_PER_SQ_KM = 0.012
+
+# Bytes, unlike seconds, are deterministic. Every sample at a given extent
+# returned a byte-identical total. Measured 2026-08-04, all 8 default
+# types, same runs as above:
+#
+#     4.17 sq km    23,596,128
+#    38.63 sq km    41,491,052
+#   144.92 sq km    70,398,078
+#   259.60 sq km   168,020,582
+#
+# The shape was already close and is kept: a fixed per-type base plus an
+# area term, one unit per type. Only the slope moved, from 172,000 to
+# 66,000, by least squares over all four extents with the base held where
+# it was.
+#
+# The residuals say something the model cannot express: bytes depend on
+# what is on the ground, not on how much ground there is. 144.92 sq km
+# that is mostly the Bristol Channel returns 70 MB, while 259.60 sq km of
+# Barry and Cardiff returns 168 MB. The fitted line reads 0.85x at the
+# smallest extent, 0.92x at 38.63, 1.34x at 144.92 and 0.92x at 259.60.
+# No area-only model does better, and a slope that nailed any single
+# extent would be worse at every other. That is exactly how the old
+# 172,000 went wrong: it was fitted to the smallest extent alone, where
+# it was accurate to 1%, and it read 2.2x high at the owner's real one.
 BASE_BYTES_PER_TYPE = 2_230_000
-BYTES_PER_TYPE_PER_SQ_KM = 172_000
+BYTES_PER_TYPE_PER_SQ_KM = 66_000
 
 # How many type downloads run at once (Task 24).
 #
@@ -239,21 +299,51 @@ class OvertureSource:
         self._find = executable_finder
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
-        """One unit per type, not per tile per type (Task 23).
+        """Bytes per type, seconds per BATCH of concurrent types.
 
-        fetch() makes exactly one overturemaps call per type over the whole
-        bbox, so tiles no longer multiplies anything here. It stays in the
-        signature because the LayerSource protocol defines it and OsmSource
-        genuinely needs it; this source simply has nothing to do with it.
+        Neither number has anything to do with tiles (Task 23): fetch()
+        makes exactly one overturemaps call per type over the whole bbox.
+        `tiles` stays in the signature because the LayerSource protocol
+        defines it and OsmSource genuinely needs it.
 
-        The shape is a fixed per-type cost plus a mild area term, because
-        that is what the two measurements behind BASE_SECONDS_PER_TYPE and
-        its three companions actually show: per-call overhead dominates,
-        and area matters but only mildly. See those constants for how few
-        data points support them and how wide the run-to-run variance is.
+        Bytes are per type because every type really is downloaded and
+        really does land on disk, so eight types cost eight types' worth
+        of disk and of the owner's data allowance however they are
+        scheduled.
+
+        Seconds are not, and that is the whole point of this method since
+        Task 24. Downloads run up to MAX_CONCURRENT_TYPE_DOWNLOADS at a
+        time, so a selection at or under the cap costs ONE batch: its
+        wall clock is the slowest download in the pool, not the sum of
+        them. Multiplying a per-type cost by the type count, which is
+        what this did until Task 25, is how the panel came to overstate a
+        real run by up to 34x.
+
+        The cap is read here, not assumed away, because --overture-type
+        is repeatable and takes any string (see fetch()). A caller naming
+        more types than the cap genuinely does serialise: the pool runs
+        the first MAX_CONCURRENT_TYPE_DOWNLOADS, and the rest wait. The
+        loop below charges for each batch, so twelve types read as two
+        batches rather than as one impossibly fast one.
+
+        Deliberately a slight overstatement for a type count that is not
+        a multiple of the cap. ThreadPoolExecutor is a pool and not a
+        barrier: with twelve types the ninth starts the moment any of the
+        first eight finishes, rather than waiting for all eight. Charging
+        two whole batches is the pessimistic reading, chosen because it
+        cannot be measured today (the default selection is eight, exactly
+        one batch, and nothing in the interface offers more) and because
+        an estimate that runs slightly long is a better failure than one
+        that runs out early. Said plainly here so the next person knows
+        it is a decision and not an oversight.
         """
         width_m, height_m = extent_metres(bbox)
         area_sq_km = (width_m / 1000.0) * (height_m / 1000.0)
+        # Deduplicated exactly as fetch() deduplicates, and for the same
+        # reason: `--overture-type water --overture-type water` is a thing
+        # the owner can type, and fetch() downloads it once. An estimate
+        # that charged twice would describe a run that does not happen.
+        type_count = len(dict.fromkeys(self.types))
         # Rounded to whole bytes once, per type, and only then multiplied.
         # Rounding the product instead would make the estimate for two
         # types differ from twice the estimate for one by a byte or two,
@@ -261,11 +351,21 @@ class OvertureSource:
         # shape impossible to assert cleanly and invites a future reader to
         # go looking for a scaling subtlety that is not there.
         per_type_bytes = int(BASE_BYTES_PER_TYPE + BYTES_PER_TYPE_PER_SQ_KM * area_sq_km)
-        per_type_seconds = BASE_SECONDS_PER_TYPE + SECONDS_PER_TYPE_PER_SQ_KM * area_sq_km
-        type_count = len(self.types)
+
+        seconds = 0.0
+        remaining = type_count
+        while remaining > 0:
+            in_batch = min(remaining, MAX_CONCURRENT_TYPE_DOWNLOADS)
+            seconds += (
+                BASE_SECONDS_PER_BATCH
+                + SECONDS_PER_TYPE_IN_BATCH * in_batch
+                + SECONDS_PER_BATCH_PER_SQ_KM * area_sq_km
+            )
+            remaining -= in_batch
+
         return Estimate(
             bytes_estimate=per_type_bytes * type_count,
-            seconds_estimate=per_type_seconds * type_count,
+            seconds_estimate=seconds,
         )
 
     def configure(self, types: Sequence[str]) -> "OvertureSource":

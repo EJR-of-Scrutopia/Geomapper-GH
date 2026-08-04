@@ -763,15 +763,53 @@ def test_merge_names_the_output_after_whatever_stem_it_is_given(tmp_path):
 
 
 # --- Task 23: the estimate counts types, not tiles x types -------------
+# --- Task 25: and it counts BATCHES of types for time, not types -------
 
 
-def test_estimate_scales_with_types():
+def test_the_byte_estimate_scales_with_the_type_count():
+    # Bytes still multiply out, and always will: every type really is
+    # downloaded and really does land on disk, whatever order the pool
+    # ran them in.
     bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
     one_type = OvertureSource(types=["water"]).estimate(bbox, [_tile()])
     two_types = OvertureSource(types=["water", "building"]).estimate(bbox, [_tile()])
 
     assert two_types.bytes_estimate == 2 * one_type.bytes_estimate
-    assert two_types.seconds_estimate == pytest.approx(2 * one_type.seconds_estimate)
+
+
+def test_the_time_estimate_does_not_scale_with_the_type_count():
+    # Was asserted the other way (two types cost exactly twice one type)
+    # and was true when the types downloaded in turn. Since Task 24 they
+    # download together, and measurement says eight at once cost 4.2x
+    # one, not 8x: 3.59s against 15.21s over the same 4.17 sq km extent.
+    # The old assertion is what let a 6.5x overstatement pass as correct.
+    bbox = BBox.parse("-3.2830,51.4000,-3.2530,51.4180")
+    one_type = OvertureSource(types=["building"]).estimate(bbox, [])
+    eight_types = OvertureSource().estimate(bbox, [])
+
+    assert len(OvertureSource().types) == 8
+    ratio = eight_types.seconds_estimate / one_type.seconds_estimate
+    assert 2.0 < ratio < 6.0, (
+        f"eight concurrent types measured 4.2x one type on this extent "
+        f"(15.21s against 3.59s); the estimate makes it {ratio:.1f}x. Above 6 "
+        f"is a per-type cost being multiplied out as though nothing ran "
+        f"concurrently; below 2 is a batch cost that has forgotten that eight "
+        f"downloads sharing a link slow each other down"
+    )
+
+
+def test_a_repeated_type_is_estimated_once_because_it_is_fetched_once():
+    # --overture-type is repeatable and takes any string, so naming the
+    # same type twice is reachable from the command line. fetch()
+    # deduplicates before it submits anything (it has to: two workers
+    # racing for one .part path would delete each other's download), so
+    # an estimate that charged twice would be describing a run that does
+    # not happen.
+    bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
+    once = OvertureSource(types=["water"]).estimate(bbox, [])
+    twice = OvertureSource(types=["water", "water"]).estimate(bbox, [])
+
+    assert twice == once
 
 
 def test_estimate_does_not_multiply_by_the_tile_count():
@@ -803,63 +841,144 @@ def test_estimate_grows_with_the_extent_not_the_tiling():
     assert large.bytes_estimate > small.bytes_estimate
 
 
-def test_estimate_stays_close_to_the_eight_type_run_it_was_fitted_to():
-    # The anchor: a full 8-type run over this exact extent, measured twice
-    # back to back against the live release, at 77.84s and 98.30s for
-    # 23,587,730 bytes. This is not a claim of accuracy, it is a guard, so
-    # a future edit that moves the constants away from the only real
-    # evidence there is fails here rather than quietly shipping a wrong
-    # number to the estimate panel.
+def test_the_estimate_matches_the_eight_way_concurrent_run_it_was_fitted_to():
+    # THE ANCHOR, and the thing every number in this file hangs on.
     #
-    # The bounds span both samples with room around them, deliberately:
-    # the two differ from each other by 26%, and run-to-run variance on a
-    # single query has been seen at 4.66s against 28.48s. Anything tighter
-    # would be pinning noise.
+    # Measured 2026-08-04 through OvertureSource.fetch itself, on the
+    # shipping code path, against overturemaps 0.20.0 and the live
+    # release, all 8 default types over this exact extent, with
+    # MAX_CONCURRENT_TYPE_DOWNLOADS at 8, so every type was in flight at
+    # the same time. Twelve samples: 12.42s to 20.09s, mean 15.21s, and a
+    # byte total of 23,596,128 that came back identical on every one.
+    #
+    # The version this replaced asserted 60s to 120s, anchored to 77.84s
+    # and 98.30s measured when Overture still downloaded SEQUENTIALLY. It
+    # still passed after Task 24 made the same run take 13.54s, because
+    # the estimate stayed inside a band that had stopped describing
+    # anything real. A test that passes for the wrong reason is worse than
+    # no test, so the band here is the measured range and nothing wider.
+    assert overture_module.MAX_CONCURRENT_TYPE_DOWNLOADS == 8, (
+        "the seconds constants were fitted at eight-way concurrency; if the "
+        "cap has moved, every timing in this file has to be measured again "
+        "rather than reasoned about"
+    )
+    assert len(OvertureSource().types) == 8
     eight_types = OvertureSource().estimate(
         BBox.parse("-3.2830,51.4000,-3.2530,51.4180"), []
     )
-    assert len(OvertureSource().types) == 8
-    assert 60.0 <= eight_types.seconds_estimate <= 120.0, (
-        f"measured 77.84s and 98.30s for this run, estimate says "
-        f"{eight_types.seconds_estimate:.1f}s"
+    assert 12.4 <= eight_types.seconds_estimate <= 20.1, (
+        f"twelve samples of this exact run spanned 12.42s to 20.09s; the "
+        f"estimate says {eight_types.seconds_estimate:.1f}s"
     )
-    assert 18_000_000 <= eight_types.bytes_estimate <= 30_000_000, (
-        f"measured 23,587,730 bytes for this run, estimate says "
-        f"{eight_types.bytes_estimate}"
-    )
-
-
-def test_estimate_is_not_calibrated_from_a_single_cheap_type():
-    # The specific mistake this guards, because it was made once already
-    # and cost a 2.2x underestimate: `building` alone over the anchor
-    # extent takes 4.5s, and treating that as the per-type cost makes a
-    # full 8-type run look like 36 seconds when it is nearer 90. A per-type
-    # cost fitted to the average of eight has to be well above any single
-    # cheap type's own measured time.
-    per_type = OvertureSource(types=["building"]).estimate(
-        BBox.parse("-3.2830,51.4000,-3.2530,51.4180"), []
-    )
-    assert per_type.seconds_estimate > 4.66, (
-        "the per-type cost is at or below `building`'s own measured time on "
-        "this extent, which means it was fitted to one cheap type rather "
-        "than to the average of the eight"
+    assert 20_000_000 <= eight_types.bytes_estimate <= 27_000_000, (
+        f"measured 23,596,128 bytes for this run, every sample identical; "
+        f"the estimate says {eight_types.bytes_estimate}"
     )
 
 
-def test_estimate_for_a_large_extent_stays_in_the_right_order_of_magnitude():
-    # Only one large-extent measurement exists (building alone over
-    # 10 x 14 km: 43.73s, 55 MB), so this checks the order of magnitude
-    # rather than a value. A full 8-type run over that extent should read
-    # as minutes, not seconds and not hours.
-    large = OvertureSource().estimate(BBox.parse("-3.35,51.35,-3.20,51.475"), [])
-    assert 120.0 <= large.seconds_estimate <= 1800.0, (
-        f"an 8-type run over 10 x 14 km should read as minutes, got "
-        f"{large.seconds_estimate:.0f}s"
+def test_the_estimate_matches_the_owners_own_barry_extent():
+    # The case the owner actually hits, as opposed to the small one that
+    # is convenient to measure: 16.66 x 15.58 km, 259.60 sq km, all eight
+    # types. Six samples on 2026-08-04, 17.43s to 20.67s, mean 18.77s, and
+    # 168,020,582 bytes on every sample.
+    #
+    # This is where the model that was here before was worst: it read
+    # 659.9s and 375 MB, over by 34x and 2.2x. An extent term fitted at
+    # one scale and never checked at the other is exactly how that
+    # happened, so both ends are pinned now and neither can move alone.
+    barry = OvertureSource().estimate(
+        BBox.parse("-3.3400,51.3600,-3.1000,51.5000"), []
     )
-    assert large.bytes_estimate > 8 * 55_000_000 * 0.3, (
-        "building alone over this extent measured 55 MB, so eight types "
-        "cannot plausibly be far below that"
+    assert 17.4 <= barry.seconds_estimate <= 20.7, (
+        f"six samples of this run spanned 17.43s to 20.67s; the estimate says "
+        f"{barry.seconds_estimate:.1f}s"
     )
+    assert 120_000_000 <= barry.bytes_estimate <= 220_000_000, (
+        f"measured 168,020,582 bytes for this run; the estimate says "
+        f"{barry.bytes_estimate}"
+    )
+
+
+def test_a_type_list_longer_than_the_cap_costs_more_than_one_batch():
+    # The cap is not decoration. --overture-type is repeatable and takes
+    # any string, so a caller can name more types than
+    # MAX_CONCURRENT_TYPE_DOWNLOADS, and the pool then runs them in
+    # batches: the ninth type waits for a free worker. An estimate that
+    # assumed everything always runs at once would report the same number
+    # for nine types as for eight.
+    #
+    # The counts here are LITERAL and not derived from the cap, on
+    # purpose. Deriving them would move the test's own input whenever the
+    # cap moved, and it would keep passing while saying nothing, which is
+    # the same defect the anchor test above exists to stop.
+    bbox = BBox.parse("-3.2830,51.4000,-3.2530,51.4180")
+    exotic = [f"unlikely_type_{index}" for index in range(9)]
+    eight = OvertureSource(types=exotic[:8]).estimate(bbox, [])
+    nine = OvertureSource(types=exotic).estimate(bbox, [])
+
+    assert nine.seconds_estimate > eight.seconds_estimate * 1.15, (
+        f"nine types cannot cost what eight cost when only "
+        f"{overture_module.MAX_CONCURRENT_TYPE_DOWNLOADS} download at once; "
+        f"eight reads {eight.seconds_estimate:.1f}s and nine "
+        f"{nine.seconds_estimate:.1f}s"
+    )
+    # And the second batch is a second batch, not a second whole run.
+    assert nine.seconds_estimate < 2 * eight.seconds_estimate
+
+
+def test_the_time_estimate_is_not_calibrated_from_a_single_type():
+    # Was test_estimate_is_not_calibrated_from_a_single_cheap_type, and
+    # guarded a real past mistake: fitting a per-type cost to `building`
+    # alone, which is the cheapest of the eight, then multiplying by
+    # eight. Its old form asserted that a ONE-type estimate must exceed
+    # `building`'s own measured solo time, which was right while every
+    # type cost the same whatever else was running, and is wrong now: a
+    # one-type run really does cost about what one type costs (3.59s
+    # measured, 3.45s estimated), and asserting otherwise would demand a
+    # deliberate overstatement.
+    #
+    # The mistake survives in its modern form, which is fitting the batch
+    # from a one-type run and assuming batch cost is flat in how many
+    # types share it. That would make a full eight-type run read as 3.6s
+    # when it measures 15.21s. So the guard moves to the eight-type end,
+    # where the error would now show up.
+    bbox = BBox.parse("-3.2830,51.4000,-3.2530,51.4180")
+    one_type = OvertureSource(types=["building"]).estimate(bbox, [])
+    eight_types = OvertureSource().estimate(bbox, [])
+
+    assert one_type.seconds_estimate < 6.0, (
+        f"`building` alone over this extent measured 3.52s to 3.70s; an "
+        f"estimate of {one_type.seconds_estimate:.1f}s for it is the old "
+        f"eight-type cost being charged to a one-type run"
+    )
+    assert eight_types.seconds_estimate > 3 * one_type.seconds_estimate, (
+        f"eight types measured 4.2x one type (15.21s against 3.59s); an "
+        f"estimate that makes them nearly equal was fitted to a single type "
+        f"and assumes concurrency is free"
+    )
+
+
+def test_the_estimate_covers_the_middle_of_the_range_it_was_fitted_over():
+    # Two points make a line whatever the truth is. These are the two
+    # intermediate extents from the same 2026-08-04 sweep, six samples
+    # each, and they are here so a future refit cannot satisfy both ends
+    # while bending badly in between.
+    #
+    #    38.63 sq km   15.03s to 20.71s,  41,491,052 bytes
+    #   144.92 sq km   16.56s to 19.45s,  70,398,078 bytes
+    mid = OvertureSource().estimate(BBox.parse("-3.32,51.40,-3.22,51.45"), [])
+    big = OvertureSource().estimate(BBox.parse("-3.35,51.35,-3.20,51.475"), [])
+
+    assert 15.0 <= mid.seconds_estimate <= 20.8
+    assert 16.5 <= big.seconds_estimate <= 19.5
+    # Bytes get a wider band than seconds, and honestly so: they are
+    # deterministic per extent but depend on what is on the ground rather
+    # than how much ground there is. 144.92 sq km of mostly Bristol
+    # Channel returns less than half what 259.60 sq km of Barry and
+    # Cardiff does, so an area-only model reads 1.34x high here and no
+    # slope fixes that. See BYTES_PER_TYPE_PER_SQ_KM.
+    assert 0.6 <= mid.bytes_estimate / 41_491_052 <= 1.5
+    assert 0.6 <= big.bytes_estimate / 70_398_078 <= 1.5
 
 
 def test_possible_outputs_declares_every_default_type_even_when_narrowed():
