@@ -955,6 +955,50 @@ map.on("click", () => {
   suppressNextMapClick = false;
 });
 
+// --- select viewport ------------------------------------------------------
+//
+// Task 36, item 3. "so it will rectangle exactly what is on the viewport,
+// thats a one press per time capture, so if i then scroll about after it
+// doesnt just keep remaking the rectangle it stay on that one capture and
+// if i press it again it recaptures that new viewport".
+//
+// A snapshot, and deliberately not a binding. There is a Leaflet event
+// for exactly the tempting version of this (moveend, which fires after
+// every pan and every zoom), and wiring this to it would give the owner
+// a rectangle they cannot look away from: every scroll to check a
+// neighbouring street would silently replace the extent, and the tile
+// grid, the estimate and the folder preview would all be recomputed for
+// ground they were only passing over. So this reads map.getBounds() once,
+// here, at the press, and nothing in this file listens to the map moving
+// at all.
+//
+// fit: false for the same reason. The rectangle IS the current view, so
+// fitting to it would move the map to frame something that already fills
+// it, and Leaflet's fitBounds pads the bounds and snaps to a whole zoom
+// level, so the one thing it would reliably do is step the view the owner
+// just captured back out again.
+$("viewport").addEventListener("click", () => {
+  // An armed draw tool is put away first: the owner has just said which
+  // of the two ways of choosing an extent they meant, and leaving a
+  // half-drawn preview and an unpannable map behind would answer neither.
+  disarmDrawing();
+  const bounds = map.getBounds();
+  const captured = {
+    west: bounds.getWest(),
+    south: bounds.getSouth(),
+    east: bounds.getEast(),
+    north: bounds.getNorth(),
+  };
+  if (captured.west === captured.east || captured.south === captured.north) {
+    // A view with no width or height at all is not something a laid-out
+    // map produces, and a zero-area extent is refused everywhere else on
+    // this page (the draw tool's own release, the pasted bbox). Refused
+    // here too rather than left as the one way in.
+    return;
+  }
+  setBBox(captured, false);
+});
+
 // Escape cancels a drawing in progress and disarms, leaving any previous
 // extent untouched: disarmDrawing only ever removes the PREVIEW
 // rectangle, never the committed one setBBox owns. Bound on document

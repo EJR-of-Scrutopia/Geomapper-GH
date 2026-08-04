@@ -464,9 +464,26 @@ function makeLeaflet() {
   const mapListeners = {};
   const rectangles = [];
 
+  // Task 36, item 3. What the map currently shows, as the four accessors
+  // a real LatLngBounds carries rather than a plain object: app.js reads
+  // getWest/getSouth/getEast/getNorth off it, and a bare {west, south,
+  // ...} here would let a version of app.js that read the wrong shape
+  // pass. Movable through _setBounds below, which is how a test pans or
+  // zooms the map without a real one.
+  let viewBounds = { west: -3.4, south: 51.3, east: -3.0, north: 51.6 };
+
   const mapObject = {
     setView() {
       return this;
+    },
+    getBounds() {
+      const current = viewBounds;
+      return {
+        getWest: () => current.west,
+        getSouth: () => current.south,
+        getEast: () => current.east,
+        getNorth: () => current.north,
+      };
     },
     on(type, handler) {
       (mapListeners[type] = mapListeners[type] || []).push(handler);
@@ -504,6 +521,16 @@ function makeLeaflet() {
       disable() {
         this._enabled = false;
       },
+    },
+    // Test-only: the map has been panned or zoomed. Fires the events a
+    // real Leaflet fires when that happens, so a test can prove app.js
+    // is NOT listening to them rather than merely that it did not
+    // happen to be called.
+    _setBounds(next) {
+      viewBounds = next;
+      this.fire("move", {});
+      this.fire("moveend", {});
+      this.fire("zoomend", {});
     },
   };
 
@@ -2877,9 +2904,87 @@ function ok(condition, message) {
   });
 
   // =======================================================================
-  // Review round 1: a zero-area extent (a second click on the first
-  // point, or a degenerate pasted bbox) must be rejected at the point of
-  // entry, leaving any previously committed extent untouched, rather than
+  // Task 36, item 3: Select viewport. One press captures what is on
+  // screen; the capture then stays put through any amount of panning and
+  // zooming, and a second press captures the new view.
+  // =======================================================================
+
+  await test("Select viewport captures exactly what the map is showing", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.L._mapObject._setBounds({ west: -3.25, south: 51.45, east: -3.15, north: 51.52 });
+    sandbox.document.getElementById("viewport").fire("click");
+    ok(
+      sandbox.document.getElementById("bbox").value === "-3.25,51.45,-3.15,51.52",
+      `expected the current view committed verbatim, got ${sandbox.document.getElementById("bbox").value}`
+    );
+  });
+
+  await test("a captured viewport stays put when the map is panned and zoomed afterwards", async () => {
+    // The subtlety the owner named: this is a snapshot, not a binding.
+    // The stub fires the real move/moveend/zoomend events, so a version
+    // wired to any of them would move the extent here.
+    const { sandbox } = await bootedSandbox();
+    sandbox.L._mapObject._setBounds({ west: -3.25, south: 51.45, east: -3.15, north: 51.52 });
+    sandbox.document.getElementById("viewport").fire("click");
+    const captured = sandbox.document.getElementById("bbox").value;
+    const rectanglesAfterCapture = sandbox.L._rectangles.length;
+
+    sandbox.L._mapObject._setBounds({ west: -4.00, south: 50.00, east: -3.00, north: 51.00 });
+    sandbox.L._mapObject._setBounds({ west: -2.00, south: 52.00, east: -1.00, north: 53.00 });
+
+    ok(
+      sandbox.document.getElementById("bbox").value === captured,
+      `expected the captured extent unmoved by panning, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    ok(
+      sandbox.L._rectangles.length === rectanglesAfterCapture,
+      "expected no rectangle redrawn by a pan: setBBox must not have run again"
+    );
+  });
+
+  await test("pressing Select viewport again captures the new view", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.L._mapObject._setBounds({ west: -3.25, south: 51.45, east: -3.15, north: 51.52 });
+    sandbox.document.getElementById("viewport").fire("click");
+    sandbox.L._mapObject._setBounds({ west: -2.5, south: 52.1, east: -2.4, north: 52.2 });
+    sandbox.document.getElementById("viewport").fire("click");
+    ok(
+      sandbox.document.getElementById("bbox").value === "-2.5,52.1,-2.4,52.2",
+      `expected the second capture, got ${sandbox.document.getElementById("bbox").value}`
+    );
+  });
+
+  await test("Select viewport does not move the map to frame what is already on it", async () => {
+    // fitBounds pads and snaps to a whole zoom level, so fitting to the
+    // view that was just captured is the one thing that would reliably
+    // change it.
+    const { sandbox } = await bootedSandbox();
+    let fitted = 0;
+    sandbox.L._mapObject.fitBounds = () => {
+      fitted += 1;
+    };
+    sandbox.document.getElementById("viewport").fire("click");
+    ok(fitted === 0, "expected no fitBounds call from a viewport capture");
+  });
+
+  await test("Select viewport puts an armed draw tool away rather than fighting it", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.getElementById("draw").fire("click");
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.4, lng: -3.3 } });
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.42, lng: -3.28 } });
+    sandbox.document.getElementById("viewport").fire("click");
+    ok(sandbox.document.getElementById("draw").className === "", "expected the draw tool disarmed");
+    ok(sandbox.L._mapObject.dragging.enabled() === true, "expected panning switched back on");
+    ok(
+      sandbox.document.getElementById("bbox").value === "-3.4,51.3,-3,51.6",
+      `expected the viewport committed, not the half-drawn rectangle, got ${sandbox.document.getElementById("bbox").value}`
+    );
+  });
+
+  // =======================================================================
+  // Review round 1: a zero-area extent (a drag that ends where it began,
+  // or a degenerate pasted bbox) must be rejected at the point of entry,
+  // leaving any previously committed extent untouched, rather than
   // silently committing a degenerate box that only the server notices.
   // =======================================================================
 

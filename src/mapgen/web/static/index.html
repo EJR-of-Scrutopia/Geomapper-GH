@@ -36,6 +36,14 @@
         <div id="tile-legend" class="tile-legend" hidden></div>
         <div class="map-tools">
           <button id="draw" type="button">Draw extent</button>
+          <!--
+            Task 36, item 3. Beside Draw extent, as asked for. One press
+            captures what is on screen right now; panning or zooming
+            afterwards leaves the captured rectangle exactly where it is,
+            and pressing again captures the new view. See app.js for why
+            it is deliberately not wired to any map move event.
+          -->
+          <button id="viewport" type="button">Select viewport</button>
           <div class="place-search">
             <input id="place" type="search" placeholder="Search a place name" autocomplete="off" />
             <ul id="place-results" class="place-results" hidden></ul>
