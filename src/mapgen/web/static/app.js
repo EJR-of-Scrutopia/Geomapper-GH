@@ -1198,6 +1198,13 @@ function setBBox(next, fit = true) {
   rectangle.addTo(map);
   if (fit) map.fitBounds(bounds);
   $("bbox").value = `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`;
+  // Task 38, item 2. Every way of setting an extent comes through this
+  // one function, which is why the corner handles are put in step here
+  // and nowhere else: a drawn rectangle, a pasted bbox, a captured
+  // viewport, a chosen place and an edit of the rectangle itself all end
+  // on this line, so all five get handles without any of them having to
+  // know that handles exist.
+  syncExtentHandles();
   clearTimeout(suggestDebounce);
   suggestDebounce = setTimeout(suggestNames, SUGGEST_DEBOUNCE_MS);
   refreshEstimate();
@@ -1249,6 +1256,12 @@ function disarmDrawing() {
   $("draw").textContent = "Draw extent";
   $("draw").className = "";
   map.getContainer().style.cursor = "";
+  // Task 38, item 2: the corner handles come back once the tool is put
+  // away, and go while it is armed. Called here rather than only in the
+  // button's own handler because every exit from the tool goes through
+  // this function, which is the same reason panning is switched back on
+  // here.
+  syncExtentHandles();
 }
 
 $("draw").addEventListener("click", () => {
@@ -1257,6 +1270,9 @@ $("draw").addEventListener("click", () => {
   // rather than leaving them stranded with no way back short of Escape.
   disarmDrawing();
   drawing = true;
+  // Task 38, item 2: an armed tool means a new rectangle, so the old
+  // one's handles are out of the way for the whole of the gesture.
+  syncExtentHandles();
   map.dragging.disable();
   $("draw").textContent = "Drag a rectangle";
   $("draw").className = "armed";
@@ -1364,6 +1380,323 @@ $("viewport").addEventListener("click", () => {
     return;
   }
   setBBox(captured, false);
+});
+
+// --- editing the extent that is already there ---------------------------
+//
+// Task 38, item 2. "add an ability once a rectangle is drawn to drag it
+// and resize it with just 4 corner nodes on the rectangle". Four corners
+// and no edge midpoints, exactly as asked: a midpoint moves one side,
+// which is a thing this owner has never wanted to do and four more things
+// to hit by accident.
+//
+// Two gestures, and they are deliberately built on two different
+// mechanisms, because the two halves are not the same problem:
+//
+//   a corner   is a real Leaflet marker with draggable: true, so
+//              Leaflet's own Draggable does the pointer work. That
+//              matters for more than tidiness. Draggable binds its
+//              mousemove and mouseup on the DOCUMENT, so a release
+//              outside the map still ends the gesture; it handles touch;
+//              and its own static _dragging guard is what stops the map
+//              panning underneath. None of that is worth re-writing here.
+//
+//   the body   has no element of its own to grab (the rectangle is a
+//              path under the tile grid, which is drawn after it and
+//              therefore over it), so it is driven from the map's own
+//              mousedown/mousemove/mouseup with a plain "is this latlng
+//              inside the box" test. That is immune to which layer
+//              happens to be on top, which a listener on the rectangle
+//              itself would not be.
+//
+// The handles are markers with a DIV icon rather than image markers or
+// CircleMarkers, for three reasons that all point the same way: the
+// vendored Leaflet ships without its marker PNGs (see vendor/README.md),
+// a div is styled by styles.css and therefore themed by the same two
+// palettes as the rest of the page rather than a second palette in JS the
+// way the tile grid needs, and markers live in Leaflet's markerPane,
+// which is above the overlayPane every path is drawn in. That last one is
+// not a nicety either: the tile grid is redrawn on every estimate, after
+// the extent, so anything drawn as a path would end up underneath it and
+// be unclickable exactly when a grid is on screen.
+const EXTENT_CORNERS = ["nw", "ne", "se", "sw"];
+const OPPOSITE_CORNER = { nw: "se", ne: "sw", se: "nw", sw: "ne" };
+// The div's own size, mirrored in styles.css. Both are needed: the icon
+// size is what Leaflet positions and hit-tests, the CSS is what draws it.
+const EXTENT_HANDLE_PX = 14;
+
+let extentHandles = new Map(); // corner name -> Leaflet marker
+// The corner gesture in flight, with the anchor captured once at its
+// start. Recomputing "the opposite corner" on each move would be wrong
+// the moment a drag crosses the anchor: past that point the corner the
+// hand is holding is a different named corner of the normalised box, and
+// the anchor would walk away under the cursor.
+let extentCornerDrag = null; // { corner, anchorLat, anchorLng, box }
+let extentBodyDrag = null; // { fromLat, fromLng, box, next }
+// Whether a download is in flight. Editing the extent mid-download must
+// not be possible: the grid on screen belongs to the run, the estimate
+// the bar and countdown are weighed by belongs to the run, and the server
+// has already been told what to fetch, so an edit could only ever make
+// the page describe something the run is not doing.
+let jobRunning = false;
+
+// Handles are shown only when there is something to edit and only when
+// editing means anything: no extent, a running download, or an armed
+// draw tool (the owner has just said they are replacing this rectangle,
+// not adjusting it) each take them away.
+function extentEditable() {
+  return Boolean(bbox) && !jobRunning && !drawing;
+}
+
+function cornerLatLng(box, corner) {
+  return [
+    corner === "nw" || corner === "ne" ? box.north : box.south,
+    corner === "nw" || corner === "sw" ? box.west : box.east,
+  ];
+}
+
+function boxFromCorners(aLat, aLng, bLat, bLng) {
+  return {
+    west: Math.min(aLng, bLng),
+    south: Math.min(aLat, bLat),
+    east: Math.max(aLng, bLng),
+    north: Math.max(aLat, bLat),
+  };
+}
+
+function insideBox(box, latlng) {
+  return (
+    latlng.lat >= box.south &&
+    latlng.lat <= box.north &&
+    latlng.lng >= box.west &&
+    latlng.lng <= box.east
+  );
+}
+
+function sameBox(a, b) {
+  return a.west === b.west && a.south === b.south && a.east === b.east && a.north === b.north;
+}
+
+function removeExtentHandles() {
+  for (const handle of extentHandles.values()) map.removeLayer(handle);
+  extentHandles = new Map();
+}
+
+// Positions all four handles from whatever box is being shown, which is
+// the committed one at rest and the live one mid-drag. exceptCorner is
+// the handle currently under the hand: Leaflet is placing that one and
+// setting its position from here would fight the drag.
+function syncExtentHandles(box = bbox, exceptCorner = null) {
+  if (!extentEditable() || !box) {
+    removeExtentHandles();
+    return;
+  }
+  for (const corner of EXTENT_CORNERS) {
+    if (corner === exceptCorner) continue;
+    const at = cornerLatLng(box, corner);
+    const existing = extentHandles.get(corner);
+    if (existing) existing.setLatLng(at);
+    else extentHandles.set(corner, addExtentHandle(corner, at));
+  }
+}
+
+function addExtentHandle(corner, at) {
+  const handle = L.marker(at, {
+    draggable: true,
+    // No keyboard focus: these are four more tab stops in front of the
+    // form for a gesture that has no keyboard equivalent anyway.
+    keyboard: false,
+    title: "Drag to resize the extent",
+    icon: L.divIcon({
+      // The corner is in the class name so styles.css can give each one
+      // its own resize cursor, which is the only difference between them.
+      className: `extent-handle extent-handle-${corner}`,
+      iconSize: [EXTENT_HANDLE_PX, EXTENT_HANDLE_PX],
+      iconAnchor: [EXTENT_HANDLE_PX / 2, EXTENT_HANDLE_PX / 2],
+    }),
+  });
+  // This listener is not decoration and it is not a no-op: it is what
+  // keeps a press ON a handle from also starting a move of the body
+  // underneath it, and every corner of the rectangle is a point inside
+  // the rectangle, so without it every resize would also be a move.
+  //
+  // Leaflet's Map._findEventTargets walks up the DOM from the pressed
+  // element and ends at the map container, which is registered as a
+  // target for the map itself, so a mousedown on a marker fires on the
+  // marker AND on the map. bubblingMouseEvents does not help: the option
+  // is only consulted for click, dblclick, mouseover, mouseout and
+  // contextmenu (Map._mouseEvents), never for mousedown. stopPropagation
+  // on the Leaflet event sets originalEvent._stopped, which is exactly
+  // what Map._fireDOMEvent's own loop checks before firing on the next
+  // target, and it is the documented way to say "this press was mine".
+  // Leaflet's marker drag is unaffected: that runs off its own DOM
+  // listeners on the icon element, not off this dispatch.
+  handle.on("mousedown", (event) => L.DomEvent.stopPropagation(event));
+  handle.on("dragstart", () => beginCornerDrag(corner));
+  handle.on("drag", (event) => dragCorner(event && event.latlng));
+  handle.on("dragend", () => endCornerDrag());
+  handle.addTo(map);
+  return handle;
+}
+
+// What the map shows mid-gesture: the rectangle, the other handles and
+// the bbox field, all following the cursor, and nothing else. No estimate
+// is requested from here, which is how "an edit mid-drag must not fire an
+// estimate request per pixel" is answered: not by debouncing the request
+// but by not making one until the gesture is over. The tile-size slider's
+// own pairing is the model, one step further on: its "input" updates the
+// readout on every step and its "change" is what asks the server, and a
+// mousemove is the input while the release is the change.
+//
+// The committed bbox is deliberately not touched until the release, so a
+// gesture abandoned halfway (Escape, or a press that never moved) leaves
+// the page describing exactly the extent it described before.
+function previewExtentEdit(box, exceptCorner = null) {
+  if (rectangle) {
+    rectangle.setBounds([
+      [box.south, box.west],
+      [box.north, box.east],
+    ]);
+  }
+  syncExtentHandles(box, exceptCorner);
+  $("bbox").value = `${box.west},${box.south},${box.east},${box.north}`;
+}
+
+// The one way an edit becomes the extent. setBBox is the only thing on
+// this page that replaces the committed box, and it is what re-estimates
+// and therefore what redraws the tile grid over the new ground, so the
+// grid follows an edit exactly as it follows a freshly drawn rectangle.
+// fit is false for the same reason Select viewport passes false: the
+// owner is looking at the rectangle they just dragged, and fitBounds
+// would pad it and snap the zoom, moving the view out from under them.
+function commitExtentEdit(box) {
+  if (!bbox) return;
+  if (!box || box.west === box.east || box.south === box.north || sameBox(box, bbox)) {
+    // A zero-area result is refused here exactly as the draw tool refuses
+    // one at its release and the bbox field refuses a pasted one: the
+    // server would reject it, and the previously committed extent is a
+    // better thing to be left with than nothing. An unchanged box takes
+    // the same path, because there is no reason to spend an estimate on
+    // the extent that is already estimated.
+    previewExtentEdit(bbox);
+    return;
+  }
+  setBBox(box, false);
+}
+
+function beginCornerDrag(corner) {
+  if (!bbox) return;
+  const [anchorLat, anchorLng] = cornerLatLng(bbox, OPPOSITE_CORNER[corner]);
+  extentCornerDrag = { corner, anchorLat, anchorLng, box: bbox };
+}
+
+function dragCorner(latlng) {
+  if (!extentCornerDrag || !latlng) return;
+  // A corner dragged exactly onto the anchor's own latitude or longitude
+  // is a zero-area box. The last good geometry is kept rather than the
+  // rectangle collapsing to a line under the cursor and springing back.
+  if (latlng.lat === extentCornerDrag.anchorLat || latlng.lng === extentCornerDrag.anchorLng) {
+    return;
+  }
+  extentCornerDrag.box = boxFromCorners(
+    extentCornerDrag.anchorLat,
+    extentCornerDrag.anchorLng,
+    latlng.lat,
+    latlng.lng
+  );
+  previewExtentEdit(extentCornerDrag.box, extentCornerDrag.corner);
+}
+
+function endCornerDrag() {
+  const drag = extentCornerDrag;
+  extentCornerDrag = null;
+  if (!drag) return;
+  commitExtentEdit(drag.box);
+}
+
+// The body. A press inside the committed rectangle takes hold of it and
+// the whole box follows the cursor until the release.
+//
+// The cost is real and worth naming rather than discovering: dragging
+// inside the rectangle no longer pans the map, because the same gesture
+// cannot mean two things. Panning from outside the rectangle, the scroll
+// wheel and the keyboard are all unaffected, and an extent that fills the
+// window can still be moved off the ground it is on.
+map.on("mousedown", (event) => {
+  // A press on a handle never reaches here (see addExtentHandle), and the
+  // draw tool owns the press whenever it is armed.
+  if (drawing || extentCornerDrag || !extentEditable()) return;
+  if (!event.latlng || !insideBox(bbox, event.latlng)) return;
+  extentBodyDrag = { fromLat: event.latlng.lat, fromLng: event.latlng.lng, box: bbox, next: null };
+  // Leaflet's own Drag handler is watching this same mousedown from a
+  // listener registered after the map's event dispatch, so taking it off
+  // here, during the dispatch, is what stops the map panning under a
+  // rectangle being moved. The same reasoning the draw tool documents,
+  // one step later in the gesture because there is no arming step.
+  map.dragging.disable();
+});
+
+map.on("mousemove", (event) => {
+  if (!extentBodyDrag || !event.latlng) return;
+  // A release that happened somewhere this map never hears about (off the
+  // window, over a native dialog) leaves no mouseup behind, and without
+  // this the rectangle would follow the cursor with no button held. The
+  // browser tells us on the next move that nothing is pressed; the work
+  // done so far is kept, since the owner did mean to move it.
+  if (event.originalEvent && event.originalEvent.buttons === 0) {
+    endBodyDrag();
+    return;
+  }
+  const dLat = event.latlng.lat - extentBodyDrag.fromLat;
+  const dLng = event.latlng.lng - extentBodyDrag.fromLng;
+  const box = {
+    west: extentBodyDrag.box.west + dLng,
+    south: extentBodyDrag.box.south + dLat,
+    east: extentBodyDrag.box.east + dLng,
+    north: extentBodyDrag.box.north + dLat,
+  };
+  // Off the top or bottom of the world is not a survey extent and is not
+  // something the server would accept. The box stays where it was rather
+  // than being silently clamped into a different shape than the one the
+  // hand is describing.
+  if (box.north > 90 || box.south < -90) return;
+  extentBodyDrag.next = box;
+  previewExtentEdit(box);
+});
+
+map.on("mouseup", () => {
+  if (extentBodyDrag) endBodyDrag();
+});
+
+function endBodyDrag() {
+  const drag = extentBodyDrag;
+  extentBodyDrag = null;
+  // Never while the draw tool is armed: it switched panning off itself
+  // and expects it to stay off until it disarms.
+  if (!drawing) map.dragging.enable();
+  if (!drag) return;
+  if (!drag.next) {
+    // A press inside the rectangle that never moved. Nothing is
+    // committed and, just as importantly, the click that follows is left
+    // alone: that click is how a red tile is selected in the failure
+    // list, and swallowing it would break the one thing on this map that
+    // answers to a plain click.
+    return;
+  }
+  suppressNextMapClick = true;
+  commitExtentEdit(drag.next);
+}
+
+// Escape gets out of a body drag, the same way it gets out of a
+// half-drawn rectangle, and leaves the committed extent exactly as it
+// was. A corner drag is Leaflet's gesture rather than this file's and
+// ends on the release wherever that happens, so there is nothing here to
+// cancel for it.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !extentBodyDrag) return;
+  extentBodyDrag = null;
+  if (!drawing) map.dragging.enable();
+  previewExtentEdit(bbox);
 });
 
 // Escape cancels a drawing in progress and disarms, leaving any previous
@@ -2501,6 +2834,15 @@ $("download").addEventListener("click", async () => {
       body: JSON.stringify(requestPayload),
     });
     jobId = started.id;
+    // Task 38, item 2. The extent is now the server's business for as
+    // long as this job lasts: the handles come off the map and every
+    // edit gesture is refused until it ends, whichever way it ends. Set
+    // after the POST has been answered, so a job the server refused (a
+    // 409 from a busy server) never takes the handles away.
+    jobRunning = true;
+    extentCornerDrag = null;
+    extentBodyDrag = null;
+    syncExtentHandles();
     activeJobSourceIds = requestPayload.sources;
     activeJobSeconds = lastSizing && lastSizing.seconds > 0 ? lastSizing.seconds : 0;
     activeJobSourceSeconds = (lastSizing && lastSizing.sourceSeconds) || {};
@@ -2554,6 +2896,11 @@ $("download").addEventListener("click", async () => {
         clearInterval(poller);
         $("cancel").hidden = true;
         $("download").disabled = false;
+        // Nothing is watching this job any more, so nothing here can be
+        // made inconsistent by an edit: the extent goes back to being the
+        // owner's to change, exactly as it does when a run ends normally.
+        jobRunning = false;
+        syncExtentHandles();
         log(`Lost contact with the job: ${error.message}`, true);
         // The bar would otherwise sit frozen at whatever the last poll
         // saw, with a countdown still promising a number that nothing is
@@ -2598,6 +2945,8 @@ $("download").addEventListener("click", async () => {
         clearInterval(poller);
         $("cancel").hidden = true;
         $("download").disabled = false;
+        jobRunning = false;
+        syncExtentHandles();
         if (job.state === "done") log(`Finished: ${job.result_root}`);
         // Stopped is a deliberate, successful outcome, not a failure: the
         // owner asked for this, and the package at result_root is real

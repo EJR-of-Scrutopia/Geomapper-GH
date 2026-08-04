@@ -472,6 +472,15 @@ function makeNavigator() {
 function makeLeaflet() {
   const mapListeners = {};
   const rectangles = [];
+  const markers = [];
+
+  // L.latLng accepts [lat, lng] and {lat, lng} interchangeably, and
+  // app.js hands markers the array form while Leaflet hands its own drag
+  // events the object form. Normalised here for the same reason: a stub
+  // that only understood one of the two would be pickier than the real
+  // build and would fail code that works.
+  const toLatLng = (value) =>
+    Array.isArray(value) ? { lat: value[0], lng: value[1] } : { lat: value.lat, lng: value.lng };
 
   // Task 36, item 3. What the map currently shows, as the four accessors
   // a real LatLngBounds carries rather than a plain object: app.js reads
@@ -618,11 +627,102 @@ function makeLeaflet() {
       rectangles.push(handle);
       return handle;
     },
+    // Task 38, item 2. The four corner handles are markers with a DIV
+    // icon: no image is ever fetched, which is what lets the vendored
+    // Leaflet stay without its marker PNGs.
+    divIcon: (options) => ({ options: options || {} }),
+    marker: (latlng, options) => {
+      const markerListeners = {};
+      const marker = {
+        options: options || {},
+        latlng: toLatLng(latlng),
+        removed: false,
+        getLatLng() {
+          return marker.latlng;
+        },
+        setLatLng(next) {
+          marker.latlng = toLatLng(next);
+          return marker;
+        },
+        on(type, handler) {
+          (markerListeners[type] = markerListeners[type] || []).push(handler);
+          return marker;
+        },
+        fire(type, eventLike = {}) {
+          for (const handler of markerListeners[type] || []) handler(eventLike);
+          return marker;
+        },
+        listens(type) {
+          return Boolean(markerListeners[type] && markerListeners[type].length);
+        },
+        addTo() {
+          return marker;
+        },
+        // Test-only, and modelled on Leaflet's own dispatch rather than
+        // on what would be convenient here, because this is the exact
+        // place a stub could hide a real bug.
+        //
+        // Map._findEventTargets walks up the DOM from the pressed
+        // element and stops at the map container, which Map._initEvents
+        // registers as a target for the map itself. So a mousedown on a
+        // marker fires on the MARKER and then on the MAP, and
+        // bubblingMouseEvents does not stop it: that option is only
+        // consulted for click, dblclick, mouseover, mouseout and
+        // contextmenu (Map._mouseEvents). The only thing that stops the
+        // second fire is originalEvent._stopped, which is what
+        // L.DomEvent.stopPropagation sets, and which Map._fireDOMEvent's
+        // loop checks between targets.
+        //
+        // Every corner of a rectangle is also a point inside it, so a
+        // page that does not stop that press has a resize that is also a
+        // move. Firing both here is what makes that failure visible.
+        _press() {
+          const originalEvent = { _stopped: false, buttons: 1 };
+          marker.fire("mousedown", { originalEvent, latlng: marker.latlng });
+          if (!originalEvent._stopped) {
+            mapObject.fire("mousedown", { originalEvent, latlng: marker.latlng });
+          }
+          return originalEvent;
+        },
+        // One whole marker drag, in the order Leaflet produces it:
+        // the press, then dragstart on the first move (Draggable fires it
+        // there, not on the press), then the marker's own latlng updated
+        // BEFORE each drag event with that latlng on the event too, then
+        // dragend. The map's mousemove and mouseup deliberately do not
+        // fire: Leaflet's Draggable binds those on the document, not on
+        // the map container, which is exactly why a marker drag survives
+        // a release outside the map.
+        _dragTo(...points) {
+          marker._press();
+          marker.fire("dragstart", { latlng: marker.latlng });
+          for (const point of points) {
+            marker.latlng = toLatLng(point);
+            marker.fire("move", { latlng: marker.latlng });
+            marker.fire("drag", { latlng: marker.latlng });
+          }
+          marker.fire("dragend", { latlng: marker.latlng });
+          return marker;
+        },
+      };
+      markers.push(marker);
+      return marker;
+    },
+    // The real function's own second branch: a Leaflet layer event is a
+    // plain object with no stopPropagation method of its own, so the real
+    // implementation falls through to setting originalEvent._stopped,
+    // which is the flag Map._fireDOMEvent reads.
+    DomEvent: {
+      stopPropagation(event) {
+        if (event && event.originalEvent) event.originalEvent._stopped = true;
+        return this;
+      },
+    },
     // Test-only hooks, not part of the real Leaflet API: every rectangle
     // ever created in this sandbox in creation order, and the map object
     // itself, so a test can drive map.fire(...) and inspect what setBBox
     // and the draw tool's preview actually did with it.
     _rectangles: rectangles,
+    _markers: markers,
     _mapObject: mapObject,
   };
 }
@@ -6378,6 +6478,368 @@ function ok(condition, message) {
     const sent = JSON.parse(call.options.body);
     ok(sent.site === "Barry Waterfront", `expected the site under the "site" key, got ${JSON.stringify(sent)}`);
     ok(sent.region === "South Wales", `expected the region unchanged, got ${JSON.stringify(sent)}`);
+  });
+
+  // =======================================================================
+  // Task 38, item 2: a drawn rectangle can be edited. Four corner handles
+  // resize it, a drag of the body moves it, and both go through the same
+  // one commit the draw tool uses.
+  //
+  // The gestures are driven the way the real build produces them, which
+  // for a corner means Leaflet's own marker drag (press, dragstart on the
+  // first move, the marker's latlng set before each drag event, dragend)
+  // and for the body means the map's own mousedown/mousemove/mouseup. The
+  // press on a handle deliberately fires on the map as well unless app.js
+  // stops it, because that is what Leaflet does and it is the one thing
+  // that would make every resize a move too.
+  // =======================================================================
+
+  const EDIT_BBOX = "-3.3,51.4,-3.2,51.5";
+
+  function extentGrid() {
+    return [{ tile_id: "r00_c00", west: -3.3, south: 51.4, east: -3.2, north: 51.5 }];
+  }
+
+  async function editableSandbox() {
+    const extentCalls = [];
+    const { sandbox, fetchCalls } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/extent") {
+        extentCalls.push(JSON.parse(options.body));
+        return jsonResponse(200, {
+          tiles: 1,
+          rows: 1,
+          cols: 1,
+          extent_km: { width: 7, height: 11 },
+          tile_grid: extentGrid(),
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", EDIT_BBOX);
+    await flush(10);
+    extentCalls.length = 0;
+    return { sandbox, fetchCalls, extentCalls };
+  }
+
+  function liveHandles(sandbox) {
+    return sandbox.L._markers.filter((marker) => !marker.removed);
+  }
+
+  function handleFor(sandbox, corner) {
+    return liveHandles(sandbox).find((marker) =>
+      String(((marker.options.icon || {}).options || {}).className || "").includes(
+        `extent-handle-${corner}`
+      )
+    );
+  }
+
+  function bboxNumbers(sandbox) {
+    return sandbox.document
+      .getElementById("bbox")
+      .value.split(",")
+      .map((part) => parseFloat(part));
+  }
+
+  function closeTo(actual, expected, what) {
+    ok(
+      Math.abs(actual - expected) < 1e-6,
+      `${what}: expected ${expected}, got ${actual}`
+    );
+  }
+
+  await test("a committed extent gets four corner handles, one on each corner", async () => {
+    const { sandbox } = await editableSandbox();
+    const handles = liveHandles(sandbox);
+    ok(handles.length === 4, `expected four handles, got ${handles.length}`);
+    const corners = handles
+      .map((marker) => `${marker.getLatLng().lat},${marker.getLatLng().lng}`)
+      .sort();
+    ok(
+      corners.join(" | ") === ["51.5,-3.3", "51.5,-3.2", "51.4,-3.2", "51.4,-3.3"].sort().join(" | "),
+      `expected the four corners of the box, got ${corners.join(" | ")}`
+    );
+    // Four corners and no edge midpoints, which is what was asked for.
+    ok(handleFor(sandbox, "nw") && handleFor(sandbox, "se"), "expected the corners to be named");
+  });
+
+  await test("the handles move with a new extent rather than a fifth being added", async () => {
+    // Every way of setting an extent goes through setBBox, so a capture
+    // of the viewport has to leave four handles on the new box, not four
+    // on the old one and four more on this.
+    const { sandbox } = await editableSandbox();
+    sandbox.L._mapObject._setBounds({ west: -3.25, south: 51.45, east: -3.15, north: 51.52 });
+    sandbox.document.getElementById("viewport").fire("click");
+    await flush(10);
+    const handles = liveHandles(sandbox);
+    ok(handles.length === 4, `expected still four handles, got ${handles.length}`);
+    ok(
+      handles.every((marker) => [51.45, 51.52].includes(marker.getLatLng().lat)),
+      `expected every handle on the new box, got ${handles.map((m) => m.getLatLng().lat).join()}`
+    );
+  });
+
+  await test("dragging a corner resizes the extent and leaves the opposite corner where it was", async () => {
+    const { sandbox, extentCalls } = await editableSandbox();
+    handleFor(sandbox, "nw")._dragTo({ lat: 51.55, lng: -3.35 });
+    await flush(10);
+    const [west, south, east, north] = bboxNumbers(sandbox);
+    closeTo(west, -3.35, "west followed the corner");
+    closeTo(north, 51.55, "north followed the corner");
+    closeTo(east, -3.2, "east is the anchor and must not move");
+    closeTo(south, 51.4, "south is the anchor and must not move");
+    // And the grid follows the new extent, exactly as it does for a
+    // freshly drawn one: the same estimate that redraws it.
+    ok(extentCalls.length === 1, `expected one estimate for the finished edit, got ${extentCalls.length}`);
+    ok(
+      extentCalls[0].bbox === "-3.35,51.4,-3.2,51.55",
+      `expected the edited extent estimated, got ${extentCalls[0].bbox}`
+    );
+  });
+
+  await test("nothing is estimated per pixel: the request waits for the release", async () => {
+    const { sandbox, extentCalls } = await editableSandbox();
+    const handle = handleFor(sandbox, "se");
+    // The gesture, opened by hand so the middle of it can be inspected.
+    handle._press();
+    handle.fire("dragstart", { latlng: handle.getLatLng() });
+    for (const lat of [51.41, 51.42, 51.43, 51.44]) {
+      handle.setLatLng({ lat, lng: -3.21 });
+      handle.fire("drag", { latlng: handle.getLatLng() });
+    }
+    await flush(10);
+    ok(extentCalls.length === 0, `expected no estimate mid-drag, got ${extentCalls.length}`);
+    // The rectangle and the field still follow every step, so the drag is
+    // not silently doing nothing.
+    const [, south] = bboxNumbers(sandbox);
+    closeTo(south, 51.44, "the field follows the cursor mid-drag");
+    handle.fire("dragend", { latlng: handle.getLatLng() });
+    await flush(10);
+    ok(extentCalls.length === 1, `expected exactly one estimate on the release, got ${extentCalls.length}`);
+  });
+
+  await test("a corner dragged past the opposite one takes the box with it, anchor still fixed", async () => {
+    // The anchor has to be captured when the gesture starts. Recomputed
+    // per move, "the corner opposite the north west" becomes the corner
+    // under the cursor the moment the drag crosses it, and the box would
+    // walk away.
+    const { sandbox } = await editableSandbox();
+    handleFor(sandbox, "nw")._dragTo({ lat: 51.45, lng: -3.25 }, { lat: 51.3, lng: -3.1 });
+    await flush(10);
+    const [west, south, east, north] = bboxNumbers(sandbox);
+    closeTo(west, -3.2, "the anchor's longitude is now the west edge");
+    closeTo(east, -3.1, "the cursor is now the east edge");
+    closeTo(south, 51.3, "the cursor is now the south edge");
+    closeTo(north, 51.4, "the anchor's latitude is now the north edge");
+  });
+
+  await test("a corner dragged onto its anchor's own line commits nothing", async () => {
+    // A zero-area box, refused where the draw tool refuses its own and
+    // where a pasted one is refused, leaving the committed extent alone.
+    const { sandbox, extentCalls } = await editableSandbox();
+    handleFor(sandbox, "nw")._dragTo({ lat: 51.4, lng: -3.25 }); // onto the anchor's latitude
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("bbox").value === EDIT_BBOX,
+      `expected the extent untouched, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    ok(extentCalls.length === 0, `expected no estimate for a rejected edit, got ${extentCalls.length}`);
+  });
+
+  await test("pressing a corner does not also take hold of the body underneath it", async () => {
+    // Every corner of a rectangle is a point inside that rectangle, so
+    // without app.js stopping the press at the marker this gesture is a
+    // resize and a move at once. The stub fires the map's own mousedown
+    // after the marker's unless it is stopped, which is what Leaflet
+    // does, so a page that forgets leaves a body drag open here.
+    const { sandbox } = await editableSandbox();
+    handleFor(sandbox, "nw")._dragTo({ lat: 51.55, lng: -3.35 });
+    await flush(10);
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "a body drag was left open by the press on the handle: panning is still switched off"
+    );
+    const [west, south, east, north] = bboxNumbers(sandbox);
+    closeTo(west, -3.35, "west");
+    closeTo(south, 51.4, "south");
+    closeTo(east, -3.2, "east");
+    closeTo(north, 51.55, "north");
+  });
+
+  await test("dragging the body moves the whole extent and keeps its size", async () => {
+    const { sandbox, extentCalls } = await editableSandbox();
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.45, lng: -3.25 } });
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === false,
+      "expected map panning switched off for the length of the move"
+    );
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.46, lng: -3.24 } });
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.46, lng: -3.24 } });
+    await flush(10);
+    const [west, south, east, north] = bboxNumbers(sandbox);
+    closeTo(west, -3.29, "west moved by the drag");
+    closeTo(east, -3.19, "east moved by the same amount");
+    closeTo(south, 51.41, "south moved by the drag");
+    closeTo(north, 51.51, "north moved by the same amount");
+    closeTo(east - west, 0.1, "the width is unchanged");
+    closeTo(north - south, 0.1, "the height is unchanged");
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "expected panning back on once the move is over"
+    );
+    ok(extentCalls.length === 1, `expected one estimate for the move, got ${extentCalls.length}`);
+    // The handles came with it.
+    const nw = handleFor(sandbox, "nw").getLatLng();
+    closeTo(nw.lat, 51.51, "the north west handle followed");
+    closeTo(nw.lng, -3.29, "the north west handle followed");
+  });
+
+  await test("a press outside the extent is not a move, and still pans the map", async () => {
+    const { sandbox, extentCalls } = await editableSandbox();
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 52.5, lng: -2.0 } });
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "a press on open map must leave Leaflet's own panning alone"
+    );
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 52.6, lng: -2.1 } });
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 52.6, lng: -2.1 } });
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("bbox").value === EDIT_BBOX,
+      `expected the extent untouched, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    ok(extentCalls.length === 0, "expected no estimate from a press that was never on the extent");
+  });
+
+  await test("a press inside the extent that never moves commits nothing and keeps its click", async () => {
+    // That click is how a red tile is selected in the failure list, so a
+    // press that turned out not to be a drag must not swallow it.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await runWithFailures(null, {
+      tileIds,
+      polls: [
+        {
+          state: "done",
+          events: [OSM_TIMEOUT, { event: "source_done", source: "osm" }],
+        },
+      ],
+    });
+    const before = sandbox.document.getElementById("bbox").value;
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.385, lng: -3.285 } });
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.385, lng: -3.285 } });
+    ok(
+      sandbox.document.getElementById("bbox").value === before,
+      "a press with no movement must commit nothing"
+    );
+    gridRectangles(sandbox, tileIds)[1].fire("click");
+    sandbox.L._mapObject.fire("click", { latlng: { lat: 51.385, lng: -3.285 } });
+    ok(
+      /tile-failure selected/.test(failureList(sandbox)),
+      `expected the click to still select the failed tile: ${failureList(sandbox)}`
+    );
+  });
+
+  await test("Escape puts back an extent being moved and leaves panning on", async () => {
+    const { sandbox, extentCalls } = await editableSandbox();
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.45, lng: -3.25 } });
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.48, lng: -3.22 } });
+    sandbox.document.fire("keydown", { key: "Escape" });
+    ok(
+      sandbox.document.getElementById("bbox").value === EDIT_BBOX,
+      `expected the committed extent back, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    ok(sandbox.L._mapObject.dragging.enabled() === true, "expected panning back on");
+    // And the release that follows a cancelled move commits nothing.
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.48, lng: -3.22 } });
+    await flush(10);
+    ok(sandbox.document.getElementById("bbox").value === EDIT_BBOX, "a release after Escape commits nothing");
+    ok(extentCalls.length === 0, `expected no estimate at all, got ${extentCalls.length}`);
+  });
+
+  await test("a release the map never saw ends the move on the next report of no button", async () => {
+    // A mouseup off the window, or over a native folder dialog, never
+    // reaches the map. Without this the rectangle would follow the cursor
+    // with nothing held down.
+    const { sandbox } = await editableSandbox();
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.45, lng: -3.25 } });
+    sandbox.L._mapObject.fire("mousemove", {
+      latlng: { lat: 51.46, lng: -3.24 },
+      originalEvent: { buttons: 1 },
+    });
+    sandbox.L._mapObject.fire("mousemove", {
+      latlng: { lat: 51.47, lng: -3.23 },
+      originalEvent: { buttons: 0 },
+    });
+    await flush(10);
+    ok(sandbox.L._mapObject.dragging.enabled() === true, "expected the stuck drag ended");
+    const [, south] = bboxNumbers(sandbox);
+    closeTo(south, 51.41, "the work done before the lost release is kept");
+    // And the map is genuinely free again: a further move changes nothing.
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.9, lng: -3.9 } });
+    const [, stillSouth] = bboxNumbers(sandbox);
+    closeTo(stillSouth, 51.41, "the rectangle must not follow the cursor after the drag ended");
+  });
+
+  await test("the extent cannot be edited while a download is running", async () => {
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        { state: "running", events: [{ event: "tile_done", source: "osm", tile_id: tileIds[0] }] },
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    ok(liveHandles(sandbox).length === 4, "expected handles before the run");
+    const before = sandbox.document.getElementById("bbox").value;
+    sandbox.document.getElementById("download").fire("click");
+    await flush(10);
+    ok(
+      liveHandles(sandbox).length === 0,
+      `expected no handles on the map mid-run, got ${liveHandles(sandbox).length}`
+    );
+    // And the body cannot be taken hold of either, handles or no handles.
+    sandbox.L._mapObject.fire("mousedown", { latlng: { lat: 51.385, lng: -3.285 } });
+    ok(
+      sandbox.L._mapObject.dragging.enabled() === true,
+      "a press mid-run must not take hold of the extent"
+    );
+    sandbox.L._mapObject.fire("mousemove", { latlng: { lat: 51.4, lng: -3.27 } });
+    sandbox.L._mapObject.fire("mouseup", { latlng: { lat: 51.4, lng: -3.27 } });
+    ok(
+      sandbox.document.getElementById("bbox").value === before,
+      `expected the extent untouched mid-run, got ${sandbox.document.getElementById("bbox").value}`
+    );
+    // The run ends and the extent is the owner's again.
+    await flush(1500);
+    ok(
+      liveHandles(sandbox).length === 4,
+      `expected the handles back once the run ended, got ${liveHandles(sandbox).length}`
+    );
+  });
+
+  await test("an armed draw tool takes the handles off the old rectangle", async () => {
+    const { sandbox } = await editableSandbox();
+    sandbox.document.getElementById("draw").fire("click");
+    ok(liveHandles(sandbox).length === 0, "expected no handles while a new rectangle is being drawn");
+    sandbox.document.fire("keydown", { key: "Escape" });
+    ok(liveHandles(sandbox).length === 4, "expected them back once the tool is put away");
+  });
+
+  await test("the handles are drawn from the page's own palette, so both themes are covered", () => {
+    // A DIV icon and not a Leaflet path, which is what lets the two
+    // palettes at the top of the stylesheet cover these without a second
+    // set of colours in JS the way the tile grid needs.
+    const handle = cssRule(".extent-handle");
+    ok(/var\(--surface\)/.test(handle), `expected the page's surface colour: ${handle}`);
+    ok(/var\(--accent\)/.test(handle), `expected the page's accent colour: ${handle}`);
+    ok(/box-shadow/.test(handle), `expected the handles to lift off the map tiles: ${handle}`);
   });
 
   console.log(

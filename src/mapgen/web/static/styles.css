@@ -387,6 +387,36 @@ button.armed {
   box-shadow: 0 0 0 2px rgba(47, 93, 79, 0.35);
 }
 
+/* Task 38, item 2: the four corner handles on a drawn extent. Drawn here
+   rather than in JS, unlike the tile grid's own colours: these are DIV
+   icons (see app.js's addExtentHandle), which are ordinary markup, so the
+   two palettes at the top of this file already cover both themes and
+   there is nothing for effectiveTheme() to resolve. --surface for the
+   core and --accent for the ring keeps them the same two colours as the
+   estimate box and the extent rectangle they belong to, rather than a
+   third signal to learn.
+
+   The shadow is not decoration: these sit on a map tile that is light in
+   both themes and can be any colour underneath, and a ring on its own
+   disappears over a light roof. */
+.extent-handle {
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+}
+
+/* The only difference between the four, and the reason the corner name is
+   in the class: the cursor says which way that corner will move before it
+   is pressed. Leaflet's own .leaflet-marker-draggable sets cursor: move
+   for every draggable marker; these come later in a later stylesheet, at
+   the same specificity, so they win. */
+.extent-handle-nw,
+.extent-handle-se { cursor: nwse-resize; }
+.extent-handle-ne,
+.extent-handle-sw { cursor: nesw-resize; }
+
 /* Settings panel: appearance, tile size, overlap, elevation model and
    API keys, the defaults the owner sets once rather than the per-survey
    choices that stay in the main form. The output root used to be here
