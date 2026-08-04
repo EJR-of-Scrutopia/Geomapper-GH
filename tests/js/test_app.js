@@ -5754,13 +5754,21 @@ function ok(condition, message) {
   // =======================================================================
 
   // The settings panel's own markup, from its opening tag to the end of
-  // the file's <div id="settings-panel"> block. Sliced at the footer that
-  // follows it rather than by counting nested tags, which a regex cannot
-  // do: the assertion below only needs to know whether the picker's
-  // markup is anywhere inside that region.
+  // the file's <div id="settings-panel"> block. Sliced at what follows it
+  // rather than by counting nested tags, which a regex cannot do: the
+  // assertion below only needs to know whether the picker's markup is
+  // anywhere inside that region.
+  //
+  // That end marker used to be "<footer>", and Task 38, item 3 took the
+  // footer away: the log moved into the map's own column so the form pane
+  // could run the full height. indexOf would have returned -1 and slice
+  // would have quietly read to one character from the end of the file,
+  // which is a check that still passes while no longer being the check
+  // it says it is. The scripts at the foot of the page are the marker
+  // now, and they are the last thing in the body.
   const SETTINGS_PANEL_MARKUP = INDEX_HTML_MARKUP.slice(
     INDEX_HTML_MARKUP.indexOf('<div id="settings-panel"'),
-    INDEX_HTML_MARKUP.indexOf("<footer>")
+    INDEX_HTML_MARKUP.indexOf("<script")
   );
 
   await test("the output root is out of the settings panel entirely, not copied out of it", () => {
@@ -6840,6 +6848,124 @@ function ok(condition, message) {
     ok(/var\(--surface\)/.test(handle), `expected the page's surface colour: ${handle}`);
     ok(/var\(--accent\)/.test(handle), `expected the page's accent colour: ${handle}`);
     ok(/box-shadow/.test(handle), `expected the handles to lift off the map tiles: ${handle}`);
+  });
+
+  // =======================================================================
+  // Task 38, item 3: the log lives under the map, and the form pane runs
+  // the full height beside it.
+  //
+  // Layout, so these are assertions about the committed markup and the
+  // committed stylesheet: this harness models elements by id with no tree
+  // between them and cannot measure a box. What can be pinned is the
+  // structure the claim rests on, which is that the log is inside the map
+  // pane, that there is one of it, and that everything Task 31 and Task
+  // 36 put somewhere is still where they put it.
+  // =======================================================================
+
+  const MAP_PANE_MARKUP = INDEX_HTML_MARKUP.slice(
+    INDEX_HTML_MARKUP.indexOf('class="map-pane"'),
+    INDEX_HTML_MARKUP.indexOf('class="form-pane"')
+  );
+
+  await test("the log is the last thing in the map's own column, and there is one of it", () => {
+    ok(MAP_PANE_MARKUP.length > 0, "expected to have found the map pane's markup to check");
+    ok(MAP_PANE_MARKUP.includes('id="log"'), "expected the log inside the map pane");
+    const logs = INDEX_HTML_MARKUP.match(/id="log"/g) || [];
+    ok(logs.length === 1, `expected exactly one log, found ${logs.length}: it was moved, not copied`);
+    ok(!/<footer>/.test(INDEX_HTML_MARKUP), "expected the full-width footer gone with the move");
+    // Last, under the map's own furniture rather than between the map and
+    // the strip that reports on it.
+    ok(
+      MAP_PANE_MARKUP.indexOf('class="map-tools"') < MAP_PANE_MARKUP.indexOf('id="log"'),
+      "expected the log below the map tools row"
+    );
+  });
+
+  await test("the strip and the tools row are still where Task 36 put them", () => {
+    // The log arriving in this column must not have pushed anything else
+    // around inside it.
+    const map = MAP_PANE_MARKUP.indexOf('id="map"');
+    const strip = MAP_PANE_MARKUP.indexOf('id="map-status"');
+    const tools = MAP_PANE_MARKUP.indexOf('class="map-tools"');
+    ok(map !== -1 && strip !== -1 && tools !== -1, "expected all three still in the map pane");
+    ok(map < strip && strip < tools, "expected map, then the legend/progress strip, then the tools");
+  });
+
+  await test("the form pane is still the second column of a two-column main", () => {
+    // "leave the entire right tab running all the way down" is a
+    // consequence of the log leaving <main>, not of a new rule: main is
+    // still the same two-column grid, and a grid column stretches.
+    const main = cssRule("main");
+    // Anchored on the semicolon: without it a third column added on the
+    // end still matches the two this is meant to be pinning.
+    ok(/grid-template-columns:\s*1fr 340px;/.test(main), `expected the two columns unchanged: ${main}`);
+    ok(/min-height:\s*0/.test(main), `expected main still able to shrink: ${main}`);
+    ok(
+      INDEX_HTML_MARKUP.indexOf('class="map-pane"') < INDEX_HTML_MARKUP.indexOf('class="form-pane"'),
+      "expected the map column first and the form column second"
+    );
+    // The log holds the height it is given rather than sharing out what
+    // is left with the map beside it.
+    const log = cssRule(".log");
+    ok(/flex:\s*none/.test(log), `expected the log to hold its own height: ${log}`);
+    ok(/overflow-y:\s*auto/.test(log), `expected the log still scrollable: ${log}`);
+  });
+
+  await test("the settings panel is still an overlay, not a third column", () => {
+    const panelAt = INDEX_HTML_MARKUP.indexOf('<div id="settings-panel"');
+    const mainEnds = INDEX_HTML_MARKUP.indexOf("</main>");
+    ok(panelAt !== -1 && mainEnds !== -1, "expected both the panel and the end of main");
+    ok(panelAt > mainEnds, "the settings panel must stay outside the grid, or it becomes a column");
+    const panel = cssRule(".settings-panel");
+    ok(/position:\s*fixed/.test(panel), `expected the panel still fixed over the page: ${panel}`);
+  });
+
+  await test("the form pane still holds everything the last two tasks put in it", () => {
+    // The destination box above Download, the folder preview above that,
+    // Task 27's overrun note and Task 31's failure list. All of them are
+    // in the column that just changed height, so all of them are worth a
+    // line here.
+    const formPane = INDEX_HTML_MARKUP.slice(INDEX_HTML_MARKUP.indexOf('class="form-pane"'));
+    for (const id of [
+      "estimate",
+      "folder-preview",
+      "output-root",
+      "output-root-browse",
+      "download",
+      "progress-note",
+      "tile-failures",
+    ]) {
+      ok(formPane.includes(`id="${id}"`), `expected id="${id}" still in the form pane`);
+    }
+    // And the progress bar is still on the strip under the map rather
+    // than having drifted back into the form with the rest.
+    ok(!formPane.includes('id="progress"'), "the progress bar belongs to the strip under the map");
+  });
+
+  await test("the log still takes the job's own lines after the move", async () => {
+    // The one behavioural half of a layout change: log() writes by id, so
+    // this proves the id it writes to is the element that moved rather
+    // than a second one left behind.
+    const tileIds = tileIdsUpTo(2);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "done",
+          events: [
+            ...tileIds.map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+            { event: "source_done", source: "osm" },
+          ],
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const lines = sandbox.document.getElementById("log").children.map((line) => line.textContent);
+    ok(lines.length > 0, "expected the run's events in the log");
+    ok(lines.some((line) => line.startsWith("tile_done")), `got ${JSON.stringify(lines)}`);
   });
 
   console.log(

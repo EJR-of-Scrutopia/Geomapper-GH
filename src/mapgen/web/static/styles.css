@@ -692,14 +692,25 @@ button.armed {
 .leaflet-tooltip-left.tile-note-tooltip:before { border-left-color: var(--line); }
 .leaflet-tooltip-right.tile-note-tooltip:before { border-right-color: var(--line); }
 
-footer { border-top: 1px solid var(--line); }
+/* Task 38, item 3: the log is the last thing in the map's own column
+   rather than a footer across the whole page, so the form pane beside it
+   runs the full height of the window. The <footer> rule that used to
+   carry this top border went with the element it styled; the border
+   itself did not, because the line between the map's furniture and the
+   log is the one thing that rule was doing.
 
+   flex: none because this is now a child of the .map-pane flex column,
+   beside a map that is flex: 1. Without it the log would share out the
+   leftover height with the map instead of holding the height it has been
+   given, which is the height item 4 lets the owner set. */
 .log {
+  flex: none;
   height: 120px;
   overflow-y: auto;
   padding: 8px 20px;
   font: 12px/1.5 Consolas, monospace;
   background: var(--surface);
+  border-top: 1px solid var(--line);
 }
 
 .log .fail { color: var(--warn); }

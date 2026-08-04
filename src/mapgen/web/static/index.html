@@ -90,6 +90,24 @@
           </div>
           <input id="bbox" type="text" placeholder="or paste west,south,east,north" />
         </div>
+
+        <!--
+          Task 38, item 3. "can we put the scripting part only below the
+          viewport part, and leave the entire right tab running all the
+          way down, just looks cleaner".
+
+          The log was a <footer> across the whole width of the page, and
+          the form pane stopped above it. It is now the last child of this
+          same left column, which is the whole of the change: the form
+          pane is the other column of <main>, <main> now reaches the
+          bottom of the window, and a column of a grid stretches, so the
+          form runs the full height without a rule of its own saying so.
+
+          Moved, not copied. There is exactly one element with id="log" in
+          this document, so log() still writes to the one place the owner
+          reads, and nothing else in app.js knows or cares where it sits.
+        -->
+        <div id="log" class="log"></div>
       </section>
 
       <section class="form-pane">
@@ -253,10 +271,6 @@
         </fieldset>
       </div>
     </div>
-
-    <footer>
-      <div id="log" class="log"></div>
-    </footer>
 
     <script src="vendor/leaflet.js"></script>
     <script src="app.js"></script>
