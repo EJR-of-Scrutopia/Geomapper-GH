@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -60,6 +61,99 @@ REQUEST_BBOX = BBox.parse("-3.30,51.37,-3.26,51.41")
 def _tile(tile_id="r00_c00"):
     bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
     return Tile(tile_id=tile_id, row=0, col=0, core_bbox=bbox, query_bbox=bbox)
+
+
+# --- a faithful stand-in for overturemaps 0.20.0 -----------------------
+#
+# 0.19.0 and 0.20.0 differ in two ways that both reach the owner's package,
+# and the venv holds 0.20.0 while the copy PATH resolves today is 0.19.0.
+# A stub written for convenience rather than from the real thing would
+# prove nothing about either, so this is built from what 0.20.0 was
+# observed doing on this machine, and test_live_smoke.py drives the real
+# 0.20.0 to keep this honest.
+
+# A real name from the benchmark extent. U+0177 has no cp1252 mapping,
+# which is the whole problem.
+WELSH_NAME = "Tŷ Hafan"
+
+
+class OvertureCli0200(FakeRunner):
+    """What overturemaps 0.20.0 does, as opposed to 0.19.0.
+
+    1. It writes a "<--output>.state" sidecar every time --output is given.
+       Its own state.get_state_path is Path(f"{output_path}.state") and
+       there is no flag to suppress it. 0.19.0 writes no sidecar at all,
+       which is why nothing in this suite caught it before.
+    2. It writes the GeoJSON with a bare open(path, "w"), so it encodes in
+       the process locale codepage. Under cp1252 a Welsh name kills it part
+       way through with UnicodeEncodeError, leaving a truncated file and a
+       non-zero exit. PYTHONUTF8=1 in the child environment prevents it.
+
+    The encoding is decided from the env this runner is actually handed,
+    exactly as a real child decides it from the env it is actually given,
+    so no test here can pass by the stub simply being kinder than the CLI.
+    """
+
+    def __init__(self, locale_codepage="cp1252", **kwargs):
+        super().__init__(**kwargs)
+        self.locale_codepage = locale_codepage
+        self.environments = []
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        environment = kwargs.get("env") or {}
+        self.environments.append(environment)
+
+        output = Path(command[command.index("--output") + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        # Written whatever happens to the data below.
+        output.with_name(output.name + ".state").write_text(
+            '{"last_release":"2026-07-23.0","theme":"base","type":"place"}',
+            encoding="utf-8",
+        )
+
+        if self._returncode != 0:
+            return FakeCompleted(self._returncode, stderr=self._stderr)
+
+        # ensure_ascii=False is load-bearing, not tidiness. The real CLI
+        # builds its properties with orjson.dumps(...).decode(), and orjson
+        # does NOT escape non-ASCII: the raw y-circumflex reaches the file
+        # write, which is why the write is what explodes. Python's json
+        # defaults to ensure_ascii=True, so a stub left on the default emits
+        # six ASCII characters, encodes cleanly in cp1252, and quietly
+        # proves the opposite of what it claims. That is exactly the
+        # "stub more permissive than the real thing" failure this project
+        # keeps producing, and this stub fell into it once already before
+        # test_the_stub_really_does_fail_without_utf8_mode caught it.
+        payload = json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": None,
+                        "properties": {"id": "f1", "name": WELSH_NAME},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        encoding = "utf-8" if environment.get("PYTHONUTF8") == "1" else self.locale_codepage
+        try:
+            output.write_text(payload, encoding=encoding)
+        except UnicodeEncodeError as exc:
+            # The real failure shape: a truncated file on disk and a
+            # non-zero exit carrying the traceback's last line.
+            output.write_bytes(payload[: exc.start].encode(encoding, "ignore"))
+            return FakeCompleted(
+                1,
+                stderr=(
+                    f"UnicodeEncodeError: 'charmap' codec can't encode character "
+                    f"{ascii(WELSH_NAME[1])} in position {exc.start}: character "
+                    f"maps to <undefined>"
+                ),
+            )
+        return FakeCompleted(0)
 
 
 def _source(runner, types=("water",)):
@@ -748,3 +842,143 @@ def test_the_cli_is_invoked_with_no_console_window(tmp_path):
         assert calls[0]["creationflags"] == subprocess.CREATE_NO_WINDOW
     else:
         assert "creationflags" not in calls[0]
+
+
+# --- overturemaps 0.20.0, finding A: Welsh names ------------------------
+
+
+def test_the_stub_really_does_fail_without_utf8_mode(tmp_path):
+    # Guard on every test below it. If this passes, the stub is a stub that
+    # cannot fail, and everything asserting the fix works would be asserting
+    # nothing. Calls the runner directly with an environment that has no
+    # PYTHONUTF8, which is what a child inherited before this fix.
+    runner = OvertureCli0200()
+    target = tmp_path / "place.geojson"
+    result = runner(
+        ["overturemaps", "download", "--type", "place", "--output", str(target)],
+        env={},
+    )
+    assert result.returncode == 1
+    # The real traceback names the character as a Python escape rather than
+    # as itself, because that is what a repr in a traceback looks like:
+    #   UnicodeEncodeError: 'charmap' codec can't encode character
+    #   '\u0177' in position 443: character maps to <undefined>
+    assert "charmap" in result.stderr
+    assert "\\u0177" in result.stderr
+    assert target.stat().st_size < len(WELSH_NAME.encode("utf-8")) + 200, (
+        "expected the truncated file a real crash leaves, not a whole one"
+    )
+
+
+def test_a_welsh_name_no_longer_kills_the_download(tmp_path):
+    # Finding A end to end through the real _download and the real
+    # run_hidden: the only thing standing between this and the failure
+    # above is procutil.child_environment putting PYTHONUTF8 in the child's
+    # environment.
+    runner = OvertureCli0200()
+    _source(runner).fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    written = (tmp_path / "water.geojson").read_text(encoding="utf-8")
+    assert WELSH_NAME in written, "the Welsh name did not survive the download"
+
+
+def test_the_cli_is_handed_an_environment_that_forces_utf8(tmp_path):
+    runner = OvertureCli0200()
+    _source(runner).fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert runner.environments[0].get("PYTHONUTF8") == "1"
+    # Not a bare one-key dict: env REPLACES the child's environment, so
+    # stripping PATH would stop the CLI starting at all.
+    assert len(runner.environments[0]) > 1
+
+
+# --- overturemaps 0.20.0, finding B: the .state sidecar -----------------
+
+
+def _sidecars(directory):
+    return sorted(p.name for p in directory.rglob("*.state"))
+
+
+def test_the_state_sidecar_is_removed_after_a_successful_download(tmp_path):
+    runner = OvertureCli0200()
+    _source(runner).fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert (tmp_path / "water.geojson").exists()
+    assert _sidecars(tmp_path) == [], "0.20.0's .state sidecar survived a clean run"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["water.geojson"]
+
+
+def test_the_state_sidecar_is_removed_when_the_cli_fails(tmp_path):
+    # The failure path matters as much as the success path: the sidecar is
+    # written before the CLI decides how it is going to end, so a run that
+    # raises would otherwise leave one behind with no real output beside it,
+    # and the next resume would merge it.
+    runner = OvertureCli0200(returncode=1, stderr="release not found")
+    with pytest.raises(OvertureError):
+        _source(runner).fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    assert _sidecars(tmp_path) == [], "0.20.0's .state sidecar survived a failed run"
+
+
+def test_the_state_sidecar_is_removed_when_the_cli_writes_nothing(tmp_path):
+    class SilentButStateful(OvertureCli0200):
+        def __call__(self, command, **kwargs):
+            self.commands.append(command)
+            output = Path(command[command.index("--output") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.with_name(output.name + ".state").write_text("{}", encoding="utf-8")
+            return FakeCompleted(0)
+
+    with pytest.raises(OvertureError, match="wrote nothing"):
+        _source(SilentButStateful()).fetch(
+            REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+        )
+    assert _sidecars(tmp_path) == []
+
+
+def test_a_state_sidecar_from_an_earlier_run_is_removed_on_a_resume(tmp_path):
+    # _download cleans up the sidecar it creates, but _download does not run
+    # at all for a type already on disk, which is exactly what a resume is.
+    # A sidecar written by an unfixed version would otherwise sit there
+    # forever, because nothing else ever looks at it again.
+    (tmp_path / "water.geojson").write_text(
+        '{"type":"FeatureCollection","features":[]}', encoding="utf-8"
+    )
+    (tmp_path / "water.geojson.part.state").write_text("{}", encoding="utf-8")
+
+    runner = OvertureCli0200()
+    _source(runner).fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    assert runner.commands == [], "the resume should not have re-downloaded anything"
+    assert _sidecars(tmp_path) == [], "the earlier run's sidecar survived the resume"
+
+
+def test_a_state_sidecar_never_becomes_a_merged_layer(tmp_path):
+    # The end of the failure path, asserted on merge()'s real output rather
+    # than on the cleanup's own bookkeeping. Without the fix this writes a
+    # second file called "<stem>_water.geojson.part.geojson" into the
+    # package root: 43 bytes of empty FeatureCollection, named like a layer
+    # Grasshopper should read, and not declared by possible_outputs() so the
+    # stale-output sweep never removes it either.
+    work = tmp_path / "work"
+    source = _source(OvertureCli0200())
+    source.fetch(REQUEST_BBOX, [_tile()], work, NullProgress())
+
+    parts = sorted(p for p in work.rglob("*") if p.is_file())
+    outputs = source.merge(parts, tmp_path / "out", "Barry_2026-08-03")
+
+    assert [p.name for p in outputs] == ["Barry_2026-08-03_water.geojson"]
+    assert not any(".part" in p.name for p in outputs), (
+        f"a .state sidecar reached the package as a merged layer: "
+        f"{[p.name for p in outputs]}"
+    )
+
+
+def test_the_sidecar_cleanup_only_names_files_this_source_could_produce(tmp_path):
+    # The same closed-list property the superseded-layout sweep has: mapgen
+    # owns this scratch directory, but the cleanup still refuses to remove
+    # anything it cannot name in advance.
+    bystander = tmp_path / "someone_elses.state"
+    bystander.write_text("keep me", encoding="utf-8")
+
+    _source(OvertureCli0200(), types=("water",)).fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+    )
+    assert bystander.exists()

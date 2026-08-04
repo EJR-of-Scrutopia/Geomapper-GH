@@ -91,6 +91,46 @@ class OvertureError(RuntimeError):
     """Raised when the overturemaps CLI is missing or fails."""
 
 
+def _temp_download_path(output_path: Path) -> Path:
+    """The .part path the CLI is pointed at before a clean exit renames it.
+
+    One function rather than the expression repeated at each site, because
+    _state_sidecar below has to derive from exactly the same path, and two
+    independently-written versions of "the temp name" that drift apart
+    would leave a sidecar nobody deletes.
+    """
+    return output_path.with_suffix(".geojson.part")
+
+
+def _state_sidecar(download_path: Path) -> Path:
+    """The .state file overturemaps 0.20.0 writes beside its --output.
+
+    Its own state.get_state_path is literally Path(f"{output_path}.state"),
+    so pointing the CLI at "water.geojson.part" produces
+    "water.geojson.part.state". It is written unconditionally whenever
+    --output is given; there is no flag to turn it off, so it has to be
+    cleaned up after the fact.
+
+    Left alone it reaches the finished package. package.py's
+    _existing_output_files skips a file whose suffix is ".part", and the
+    sidecar's suffix is ".state", so it survives that filter and is handed
+    to merge() with everything else. merge() groups by file stem, and this
+    file's stem is "water.geojson.part", so it becomes a merged output
+    called "<stem>_water.geojson.part.geojson" sitting in the package root
+    beside the real layers: 43 bytes of empty FeatureCollection, named like
+    something Grasshopper should read, and not declared by
+    possible_outputs() so the stale-output sweep never removes it either.
+    Reproduced against 0.20.0 before this was written.
+
+    Deliberately solved here rather than by teaching package.py to filter
+    ".state": the shape of this filename is a fact about a third-party CLI,
+    and package.py is the one module in this project that knows nothing
+    about any individual source. 0.19.0 writes no sidecar at all, which is
+    why nothing caught this until 0.20.0 appeared in the venv.
+    """
+    return download_path.with_name(download_path.name + ".state")
+
+
 class OvertureSource:
     id = "overture"
     display_name = "Overture Maps"
@@ -237,7 +277,15 @@ class OvertureSource:
         # it is for package.py's own stale-output sweep: only a directory
         # named exactly after a type this source fetches, inside this
         # source's own fingerprinted scratch tree, is ever removed.
-        self._remove_superseded_tile_layout(work_dir)
+        #
+        # The same sweep also removes a .state sidecar an earlier run left
+        # behind (see _state_sidecar). _download cleans up the one IT
+        # creates, but _download does not run at all for a type that is
+        # already on disk, which is the whole point of a resume, so a
+        # sidecar written by an unfixed version would survive into merge()
+        # and put a junk <stem>_<type>.geojson.part.geojson in the package.
+        # Reproduced on that exact resume path before this line was added.
+        self._remove_earlier_version_debris(work_dir)
 
         paths: list[Path] = []
         for overture_type in self.types:
@@ -266,16 +314,31 @@ class OvertureSource:
             paths.append(output_path)
         return paths
 
-    def _remove_superseded_tile_layout(self, work_dir: Path) -> None:
-        """Remove any <work_dir>/<type>/ directory the per-tile layout left.
+    def _remove_earlier_version_debris(self, work_dir: Path) -> None:
+        """Remove what an earlier version of mapgen, or of the overturemaps
+        CLI, can leave in this work directory for a resume to trip over.
 
-        See the comment at the call site in fetch() for why this exists and
-        why it is a defect fix rather than a migration.
+        Two things, both of which reach merge() otherwise. See the comment
+        at the call site in fetch() for why this is a defect fix rather
+        than a migration, and _state_sidecar for what the sidecar is.
+
+        Both are driven off self.types, a closed list, rather than globbing:
+        nothing is removed whose name this source could not itself have
+        produced. self.types alone is enough rather than a union with
+        DEFAULT_OVERTURE_TYPES the way possible_outputs does it, because
+        naming.tiling_fingerprint hashes the resolved overture_types, so a
+        narrowed selection lands in its own work directory and can never
+        meet a wider selection's leftovers here. possible_outputs faces the
+        opposite situation and genuinely does need the union: it names
+        files in the PACKAGE ROOT, which is shared across selections.
         """
         for overture_type in self.types:
             legacy_dir = work_dir / overture_type
             if legacy_dir.is_dir():
                 best_effort_rmtree(legacy_dir)
+            _state_sidecar(
+                _temp_download_path(work_dir / f"{overture_type}.geojson")
+            ).unlink(missing_ok=True)
 
     def _download(self, bbox: BBox, overture_type: str, output_path: Path) -> None:
         executable = self._find("overturemaps")
@@ -292,8 +355,13 @@ class OvertureSource:
         # cleanly. Untouched by Task 23: one whole-extent file is a much
         # bigger thing to half-write than one tile was, so the risk this
         # guards against is if anything larger now, not smaller.
-        temp_path = output_path.with_suffix(".geojson.part")
+        temp_path = _temp_download_path(output_path)
+        state_sidecar = _state_sidecar(temp_path)
         temp_path.unlink(missing_ok=True)
+        # Cleared before as well as after: a sidecar left by a previous
+        # attempt that was killed outright, between the CLI writing it and
+        # this function returning, would otherwise still be sitting there.
+        state_sidecar.unlink(missing_ok=True)
         command = [
             executable,
             "download",
@@ -314,20 +382,29 @@ class OvertureSource:
         # mapgen.procutil. Far fewer windows than before Task 23 (one per
         # type rather than one per tile per type), which is a reason the
         # owner meets this less often, not a reason to stop hiding them.
-        result = run_hidden(command, runner=self._runner)
-        if result.returncode != 0:
-            temp_path.unlink(missing_ok=True)
-            detail = (result.stderr or result.stdout or "").strip()
-            raise OvertureError(
-                f"overturemaps failed for type {overture_type}: {detail}"
-            )
+        # try/finally, not a tidy-up after the happy path: 0.20.0 writes the
+        # sidecar before this function decides whether the download counts,
+        # so every way out of here has to remove it. A non-zero exit and a
+        # clean exit that wrote nothing both raise below, and either would
+        # otherwise leave the sidecar behind for merge() to find on the next
+        # resume, having left no real output to go with it.
+        try:
+            result = run_hidden(command, runner=self._runner)
+            if result.returncode != 0:
+                temp_path.unlink(missing_ok=True)
+                detail = (result.stderr or result.stdout or "").strip()
+                raise OvertureError(
+                    f"overturemaps failed for type {overture_type}: {detail}"
+                )
 
-        if not temp_path.exists():
-            raise OvertureError(
-                f"overturemaps exited cleanly but wrote nothing for type "
-                f"{overture_type}."
-            )
-        temp_path.replace(output_path)
+            if not temp_path.exists():
+                raise OvertureError(
+                    f"overturemaps exited cleanly but wrote nothing for type "
+                    f"{overture_type}."
+                )
+            temp_path.replace(output_path)
+        finally:
+            state_sidecar.unlink(missing_ok=True)
 
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
         # Grouped by the file's own stem, which IS the type now that fetch()
