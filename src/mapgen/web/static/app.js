@@ -481,16 +481,74 @@ function renderTileLegend() {
 // principle, miss no events (the server holds the full history) but is
 // still worth not depending on.
 //
-// tile_done/tile_skipped alone only ever reaches "active", never "done":
-// Overture emits one such event per (tile, type), so a tile is not
-// finished when the first one arrives (see the brief). "done" is reached
-// two ways instead: every SELECTED source has reported its own
-// source_done (package.py emits this once a source's whole fetch+merge
-// pass, complete or a tolerated partial, is over), which is the strong,
-// mid-run signal; or the job has stopped running at all (job.state left
-// "running"), which is the closing signal for a run that ended before
-// every source got a source_done of its own, a stopped or a hard-failed
-// run in particular.
+// --- when a tile is done, Task 36 item 6 --------------------------------
+//
+// This used to settle a tile only once EVERY selected source had emitted
+// source_done, or the job had stopped. That was a blunt stand-in for a
+// real rule and it was put there for a real reason: Overture emits one
+// event per tile PER TYPE, and an earlier version made a tile look
+// finished after the first of eight. The consequence was what the owner
+// saw on their first real survey, which is that the whole grid went
+// green at once at the very end, and a grid that only tells you a run
+// has finished is telling you the one thing you already know.
+//
+// The honest rule is per tile and per source: a tile is DONE when every
+// selected source has finished with THAT TILE, not when every source has
+// finished with everything. A source has finished with a tile when
+// either of these is true, and they are different strengths of the same
+// claim:
+//
+//   it emitted source_done       it is finished with everything, so with
+//                                this tile. package.py emits this once a
+//                                source's whole fetch+merge pass is over.
+//   it emitted an outcome for    tile_done, tile_skipped or tile_failed
+//   this tile, unqualified       naming this tile of the plan, with no
+//                                field saying it is one PART of that
+//                                source's work for the tile.
+//
+// The qualifier is what keeps Overture honest, and it is a field on the
+// events rather than a source id hardcoded here: every Overture tile
+// event carries overture_type, because it is one type's worth of one
+// tile, and the browser is never told how many types are in play (the
+// selection is composed server-side from the categories). So Overture's
+// per-tile events can never complete a tile and only its source_done
+// can, which is exactly the behaviour the old rule was protecting.
+//
+// The other awkward shapes, and what this does with each:
+//
+//   elevation reports "whole-area", which is not a tile of the plan at
+//   all, so it never reaches this bookkeeping and only elevation's own
+//   source_done completes a tile for it. That is honest: a single
+//   whole-extent download has no per-tile signal to report, which is the
+//   same argument the fractions below already make for it, and it is
+//   also what keeps Overture's decision NOT to adopt that convention
+//   (see OvertureSource.fetch) meaning what it says.
+//
+//   a resume skips tiles, and package.py emits tile_skipped per source
+//   for every tile its state.json already records as ok, before that
+//   source's fetch is called. Those are unqualified, so a tile already
+//   on disk for every layer is done in the first seconds of a resume
+//   rather than at the end of it. That is the biggest single improvement
+//   here for the way the owner actually works.
+//
+//   a tile no source has said anything about is pending, and a tile some
+//   but not all of them have reported is active. "Active" is still
+//   reached by any per-tile event including a qualified one, so an
+//   Overture-only run still lights up from its first type, as it did.
+//
+// What this does NOT fix, and the report says so plainly: sources are
+// fetched in the order the request lists them, which is osm, overture,
+// elevation, and the last two have no per-tile granularity at all. In a
+// three-layer run every tile therefore still becomes done within a
+// second or two of the end, because that is genuinely when the last
+// layer covering it lands. The rule is right; the ordering is what
+// limits what it can show. An OpenStreetMap-only run, an elevation-only
+// run and every resume all now move tile by tile.
+//
+// The second way to "done" is unchanged: the job has stopped running at
+// all (job.state left "running"), which is the closing signal for a run
+// that ended before every source got a source_done of its own, a stopped
+// or a hard-failed run in particular.
 //
 // "failed" was sticky, and Task 31 stopped it being so, because Task 30
 // made a later event for a failed tile mean something it could not mean
@@ -598,6 +656,12 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
   const skippedTiles = new Map(); // source id -> Set of plan tile ids
   const subdividedTiles = new Map(); // plan tile id -> { pieces, depth }
   const liveFailures = new Map(); // failureKey(source, tile_id) -> record
+  // Task 36, item 6. Plan tiles any source has said anything at all
+  // about, and, per source, the plan tiles that source has FINISHED with.
+  // The first decides pending from active, the second decides done. See
+  // the rule written out above this function.
+  const touchedTiles = new Set();
+  const reportedTiles = new Map(); // source id -> Set of plan tile ids
   let phase = null; // { kind, source } for the status line, Task 36 item 5
 
   const setFor = (bucket, source) => {
@@ -613,7 +677,18 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
         liveFailures.set(failureKey(event.source, event.tile_id), failureRecord(event));
       } else if (event.event === "tile_done" || event.event === "tile_skipped") {
         liveFailures.delete(failureKey(event.source, event.tile_id));
-        if (state.get(event.tile_id) === "pending") state.set(event.tile_id, "active");
+        // Something happened to this tile. Enough for "active", never
+        // enough on its own for "done": a qualified Overture event is
+        // one type of eight and says nothing about the other seven.
+        touchedTiles.add(event.tile_id);
+      }
+      // And this is the stronger claim: a source that has emitted an
+      // outcome for this tile of the plan, with no field saying it is
+      // one part of that source's work for it, has finished with it. See
+      // reportsPartOfTile below for what the qualifier is and why it is
+      // read off the event rather than hardcoded per source id.
+      if (event.source && TILE_OUTCOME_EVENTS.has(event.event) && !reportsPartOfTile(event)) {
+        setFor(reportedTiles, event.source).add(event.tile_id);
       }
       // Counted per (tile, source), never per event, which is the whole
       // Overture problem: eight events for one tile are one tile's worth
@@ -667,9 +742,27 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
     }
   }
 
-  const everySourceFinished =
-    sourceIds.length > 0 && sourceIds.every((id) => finishedSources.has(id));
-  if (everySourceFinished || !jobRunning) {
+  // Per tile, per source. A source has finished with a tile if it has
+  // finished with everything, or if it has reported that tile in full.
+  const hasFinishedWith = (sourceId, tileId) =>
+    finishedSources.has(sourceId) || (reportedTiles.get(sourceId) || EMPTY_TILE_SET).has(tileId);
+
+  for (const tileId of state.keys()) {
+    // sourceIds.length > 0 guards the vacuous case: [].every() is true,
+    // and a summary asked for with no selected sources at all must not
+    // read as a finished run.
+    if (sourceIds.length > 0 && sourceIds.every((id) => hasFinishedWith(id, tileId))) {
+      state.set(tileId, "done");
+    } else if (touchedTiles.has(tileId) || sourceIds.some((id) => hasFinishedWith(id, tileId))) {
+      state.set(tileId, "active");
+    }
+  }
+
+  // The closing signal, unchanged: a run that has left "running" settles
+  // whatever it reached. A stopped run's half-finished tiles are as
+  // finished as they are ever going to be, and leaving them orange
+  // against a bar that has stopped moving would read as still working.
+  if (!jobRunning) {
     for (const [tileId, value] of state) {
       if (value === "active") state.set(tileId, "done");
     }
@@ -819,6 +912,51 @@ function subdivisionRecord(event) {
     pieces: Number.isFinite(pieces) && pieces > 0 ? pieces : 0,
     depth: Number.isFinite(depth) && depth > 0 ? depth : 0,
   };
+}
+
+// --- what a source's own event claims about a tile, Task 36 item 6 ------
+
+// The three events that are an OUTCOME for a tile, as opposed to
+// something happening to it on the way (tile_subdivided, tile_retrying).
+// tile_failed is one of them: a source that failed a tile has finished
+// with that tile, it will not attempt it again in this pass, and the
+// failure ledger is what decides the colour afterwards.
+const TILE_OUTCOME_EVENTS = new Set(["tile_done", "tile_skipped", "tile_failed"]);
+
+// Allocated once rather than per tile per poll: hasFinishedWith asks for
+// this on every (tile, source) pair a source has said nothing about, and
+// on a 72-tile three-layer run that is a couple of hundred empty Sets a
+// second for no reason.
+const EMPTY_TILE_SET = new Set();
+
+// Whether this event is one PART of its source's work for the tile,
+// rather than the whole of it.
+//
+// Read off a field the server actually sets, not from a list of source
+// ids: OvertureSource stamps overture_type on every tile event it emits,
+// because each one is one type's whole-extent download reported across
+// the plan's tiles, and there are eight of them in a default run. The
+// browser is never told how many, since the type selection is composed
+// server-side from the categories, so an Overture event can never be the
+// last word on a tile and only its source_done can be.
+//
+// A source id list here would have been shorter and would have been the
+// wrong thing: it would say "Overture is special" when what is actually
+// true is "an event that names a part is not an outcome for the whole",
+// and the next source that downloads a tile in pieces would have to
+// remember to add itself to a list in a browser file. The field is
+// already in the stream; this reads it.
+//
+// package.py's own resume skips are emitted by package.py and carry no
+// overture_type even for Overture, which is right and deliberate: they
+// come from state.json recording that tile as ok for that source, which
+// is a claim about the whole of that source's work for it.
+const PART_OF_TILE_FIELDS = ["overture_type"];
+
+function reportsPartOfTile(event) {
+  return PART_OF_TILE_FIELDS.some(
+    (field) => event[field] !== undefined && event[field] !== null && event[field] !== ""
+  );
 }
 
 // A tile with no source on the event is keyed under the empty string

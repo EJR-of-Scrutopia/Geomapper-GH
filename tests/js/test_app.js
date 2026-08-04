@@ -3401,6 +3401,231 @@ function ok(condition, message) {
     ok(result.get("r00_c00") === "done", `expected done, got ${result.get("r00_c00")}`);
   });
 
+  // =======================================================================
+  // Task 36, item 6: tiles go green one at a time, as each one is
+  // finished, rather than all at once at the end of the run. A tile is
+  // done when every SELECTED SOURCE has finished with THAT TILE, not when
+  // every source has finished with everything.
+  // =======================================================================
+
+  await test("a tile its only layer has finished is green while the rest of the run goes on", async () => {
+    // The owner's own report: "the tiles turn orange one by one, great
+    // showing that its in progress. but they dont individual turn green
+    // either, just at the end it goes green."
+    const { sandbox } = await bootedSandbox();
+    const result = sandbox.classifyTiles(
+      ["r00_c00", "r00_c01", "r00_c02"],
+      ["osm"],
+      [
+        { event: "tile_done", source: "osm", tile_id: "r00_c00" },
+        { event: "tile_skipped", source: "osm", tile_id: "r00_c01" },
+      ],
+      true
+    );
+    ok(result.get("r00_c00") === "done", `a finished tile is done, got ${result.get("r00_c00")}`);
+    ok(result.get("r00_c01") === "done", `a skipped tile is done too, got ${result.get("r00_c01")}`);
+    ok(
+      result.get("r00_c02") === "pending",
+      `and the ones still to come are not, got ${result.get("r00_c02")}`
+    );
+  });
+
+  await test("one of two layers finishing a tile is not enough to call it done", async () => {
+    // The caution the old blunt rule existed to honour, and the thing
+    // this must not lose: a tile short of a layer the owner asked for is
+    // not a finished tile.
+    const { sandbox } = await bootedSandbox();
+    const result = sandbox.classifyTiles(
+      ["r00_c00"],
+      ["osm", "overture"],
+      [{ event: "tile_done", source: "osm", tile_id: "r00_c00" }],
+      true
+    );
+    ok(result.get("r00_c00") === "active", `expected active, got ${result.get("r00_c00")}`);
+  });
+
+  await test("all eight of Overture's types for a tile still do not finish it", async () => {
+    // Overture reports per tile AND per type, and the browser is never
+    // told how many types are in play, so no number of its own events
+    // can be the last word on a tile. Eight is the default selection's
+    // count, which is what the owner's real run had.
+    const { sandbox } = await bootedSandbox();
+    const types = ["building", "water", "land", "land_use", "segment", "connector", "place", "infrastructure"];
+    const result = sandbox.classifyTiles(
+      ["r00_c00"],
+      ["overture"],
+      types.map((overtureType) => ({
+        event: "tile_done",
+        source: "overture",
+        tile_id: "r00_c00",
+        overture_type: overtureType,
+      })),
+      true
+    );
+    ok(
+      result.get("r00_c00") === "active",
+      `expected active until source_done, got ${result.get("r00_c00")}`
+    );
+  });
+
+  await test("an elevation-only run has nothing to say per tile until its layer lands", async () => {
+    // ElevationSource reports one event for the whole extent, under
+    // tile_id "whole-area", which is not a tile of the plan. There is no
+    // partial per-tile signal to read and inventing one would be a grid
+    // that moved because time passed. So the grid waits, and settles at
+    // source_done, which is the moment every tile genuinely does have its
+    // elevation.
+    const { sandbox } = await bootedSandbox();
+    const tileIds = ["r00_c00", "r00_c01"];
+    const landing = { event: "tile_done", source: "elevation", tile_id: "whole-area" };
+    const midRun = sandbox.classifyTiles(tileIds, ["elevation"], [landing], true);
+    for (const tileId of tileIds) {
+      ok(
+        midRun.get(tileId) === "pending",
+        `expected pending while the one download runs, got ${tileId} = ${midRun.get(tileId)}`
+      );
+    }
+    const finished = sandbox.classifyTiles(
+      tileIds,
+      ["elevation"],
+      [landing, { event: "source_done", source: "elevation" }],
+      true
+    );
+    for (const tileId of tileIds) {
+      ok(
+        finished.get(tileId) === "done",
+        `expected done at source_done, got ${tileId} = ${finished.get(tileId)}`
+      );
+    }
+  });
+
+  await test("a resume greens the tiles already on disk in its first seconds", async () => {
+    // The shape the owner actually meets: Stop, then Download again over
+    // the same extent. package.py emits tile_skipped per source for every
+    // tile its state.json already records as ok, BEFORE that source's
+    // fetch is called, and those events are unqualified even for Overture
+    // because they come from state.json rather than from a type's
+    // download. So a tile already on disk for every layer is done at
+    // once, with no source_done anywhere in the stream yet.
+    const { sandbox } = await bootedSandbox();
+    const events = [];
+    for (const source of ["osm", "overture"]) {
+      events.push({ event: "tile_skipped", source, tile_id: "r00_c00" });
+    }
+    // r00_c01 is one of the tiles the stop caught: only OpenStreetMap's
+    // turn has come round to it so far.
+    events.push({ event: "tile_skipped", source: "osm", tile_id: "r00_c01" });
+    const result = sandbox.classifyTiles(["r00_c00", "r00_c01"], ["osm", "overture"], events, true);
+    ok(
+      result.get("r00_c00") === "done",
+      `a tile every layer already has is done, got ${result.get("r00_c00")}`
+    );
+    ok(
+      result.get("r00_c01") === "active",
+      `a tile still short of a layer is not, got ${result.get("r00_c01")}`
+    );
+  });
+
+  await test("a layer that has finished has finished with every tile", async () => {
+    // source_done is the whole-source form of the same claim, and it is
+    // what makes a mixed run work: OpenStreetMap reports tile by tile,
+    // Overture cannot, so a tile becomes done the moment the layer that
+    // could only speak for all of them says so.
+    const { sandbox } = await bootedSandbox();
+    const events = [
+      { event: "tile_done", source: "osm", tile_id: "r00_c00" },
+      { event: "tile_done", source: "overture", tile_id: "r00_c00", overture_type: "building" },
+      { event: "tile_done", source: "overture", tile_id: "r00_c01", overture_type: "building" },
+      { event: "source_done", source: "overture" },
+    ];
+    const result = sandbox.classifyTiles(["r00_c00", "r00_c01"], ["osm", "overture"], events, true);
+    ok(
+      result.get("r00_c00") === "done",
+      `both layers have finished this tile, got ${result.get("r00_c00")}`
+    );
+    ok(
+      result.get("r00_c01") === "active",
+      `OpenStreetMap has not reached this one, got ${result.get("r00_c01")}`
+    );
+  });
+
+  await test("a tile a layer failed is finished with by that layer, and still red", async () => {
+    // A failed tile will not be attempted again in this pass, so the
+    // layer HAS finished with it. The ledger is what decides the colour,
+    // and it still says failed, which is the point: red must not be
+    // reachable only by a tile that is also unfinished.
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00"],
+      ["osm"],
+      [
+        {
+          event: "tile_failed",
+          source: "osm",
+          tile_id: "r00_c00",
+          kind: "timeout",
+          reason: "timed out.",
+          retried: 1,
+        },
+      ],
+      true
+    );
+    ok(
+      summary.tileStates.get("r00_c00") === "failed",
+      `expected failed, got ${summary.tileStates.get("r00_c00")}`
+    );
+  });
+
+  await test("a tile whose failure the verify pass withdrew is finished, not left pending", async () => {
+    // The other half of the line above, and the one that proves a
+    // tile_failed really is an OUTCOME rather than merely a colour: the
+    // verify pass is the only event that reports the reverse correction,
+    // a tile recorded failed whose file was on disk after all, and it
+    // arrives with no tile_done of its own to announce it. If a failure
+    // did not count as that source finishing with the tile, this tile
+    // would have nothing to its name at all and would sit pending on a
+    // grid the server has already declared complete.
+    const { sandbox } = await bootedSandbox();
+    const summary = sandbox.summariseJob(
+      ["r00_c00"],
+      ["osm"],
+      [
+        {
+          event: "tile_failed",
+          source: "osm",
+          tile_id: "r00_c00",
+          kind: "no_output",
+          reason: "no file was written.",
+          retried: 0,
+        },
+        { event: "verify_done", phase: "after_fetch", failures: [] },
+      ],
+      true
+    );
+    ok(
+      summary.tileStates.get("r00_c00") === "done",
+      `expected done once the failure was withdrawn, got ${summary.tileStates.get("r00_c00")}`
+    );
+    ok(summary.tileFailures.length === 0, "expected no live reason left");
+  });
+
+  await test("a summary asked for with no layers selected finishes nothing", async () => {
+    // [].every() is true, so without its own guard this would read every
+    // tile of a run with no selected sources as done.
+    const { sandbox } = await bootedSandbox();
+    const result = sandbox.classifyTiles(
+      ["r00_c00"],
+      [],
+      [{ event: "tile_done", source: "osm", tile_id: "r00_c00" }],
+      true
+    );
+    ok(result.get("r00_c00") === "active", `expected active, got ${result.get("r00_c00")}`);
+  });
+
+  // The same rule as it actually reaches the map is checked further down,
+  // beside the progress bar's own tests, because it needs the job
+  // sandbox those tests build.
+
   await test(
     "classifyTiles: a failed tile is visibly distinct from one that is merely unfinished",
     async () => {
@@ -4515,6 +4740,36 @@ function ok(condition, message) {
     ok(
       sandbox.document.getElementById("progress").hidden === true,
       "expected the previous run's full bar cleared, not left claiming this one is finished"
+    );
+  });
+
+  await test("a run of one layer greens its grid rectangle by rectangle, not at the end", async () => {
+    // Task 36, item 6, as it actually reaches the map: the pure function
+    // tested further up is only half the claim, and the gap this file
+    // exists to close is exactly the half where nothing ever painted a
+    // rectangle. The job is still running when this is read.
+    const tileIds = tileIdsUpTo(4);
+    const { sandbox } = await jobSandbox({
+      tileIds,
+      sources: [TWO_SOURCES[0]],
+      sourceSeconds: [{ id: "osm", seconds_estimate: 144 }],
+      polls: [
+        {
+          state: "running",
+          events: tileIds.slice(0, 2).map((tileId) => ({ event: "tile_done", source: "osm", tile_id: tileId })),
+        },
+      ],
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(900);
+    const rects = gridRectangles(sandbox, tileIds);
+    ok(
+      rects[0].options.fillColor === "#2f5d4f" && rects[1].options.fillColor === "#2f5d4f",
+      `expected the first two tiles green mid-run, got ${rects[0].options.fillColor} and ${rects[1].options.fillColor}`
+    );
+    ok(
+      rects[2].options.fillColor === "#9c9686" && rects[3].options.fillColor === "#9c9686",
+      `expected the untouched two still pending, got ${rects[2].options.fillColor} and ${rects[3].options.fillColor}`
     );
   });
 
