@@ -499,6 +499,15 @@ class OsmSource:
         tile as pending, not ok and not failed. The quarters that did
         land stay on disk, and the next run resumes into the subdivision
         rather than starting it again.
+
+        Resuming an unfinished subdivision does re-ask for the whole tile
+        first, and gets told it is too dense a second time, because that
+        is how this function learns the tile needs splitting at all. One
+        request, about two seconds, paid once per interrupted tile: the
+        alternative is a note on disk recording that a tile was split
+        before, which is a second source of truth about the same fact and
+        would go stale the moment the ground did. Everything expensive,
+        the quarters themselves, is still skipped.
         """
         try:
             self._download_tile(tile, output_path)
