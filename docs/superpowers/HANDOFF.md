@@ -173,16 +173,25 @@ disease, and the whole-branch review found a third. Assume there are more.
 3. **Urbano.** `Urbano.Core.dll` and `ProjectSetup.dll` exist nowhere on this
    machine, so `tools/UrbanoBridge` has never run against a real install and
    `_project_setting.json` is untested as an actual Urbano input. Task 2's
-   gate is still open.
-4. **The Barry package.** `C:\Users\Param\Surveys\Vale-of-Glamorgan\2026-08-03_Barry`
-   is a real interrupted download holding 20 complete OSM tiles, 34 Overture
-   files, zero `.part` files and no `survey.json`, which is exactly the state
-   resume exists for. Resume it with the **CLI, not the browser**, repeating
-   the original parameters plus `--date 2026-08-03` explicitly, because the
-   web UI never sends a date and so only lands on that folder if run on the
-   same day. Nothing needs deleting first. Its 34 Overture files are orphaned
-   by Task 23's layout change and will be swept and refetched, which is faster
-   than resuming them would have been.
+   gate is narrowed but not closed, see below.
+
+   **Urbano IS installed and the bridge was looking for the wrong files.**
+   Urbano 2.2.1.2 sits at
+   `AppData\Roaming\McNeel\Rhinoceros\packages\8.0\Urbano2\2.2.1.2\` and ships
+   exactly one assembly, `Urbano.SiteAnalysis.gha` (17.3 MB). `Urbano.Core.dll`
+   and `ProjectSetup.dll`, the two files the bridge searches for, exist nowhere
+   on this machine. The `.gha` is a genuine .NET assembly
+   (`Urbano.SiteAnalysis, Version=2.2.1.0`) and contains both `ProjectSetup`
+   and `Urbano.Core` as names inside it. Nothing was ever missing; the
+   filenames were wrong.
+
+   Caveat from the same inspection: the string `project_setting` appears
+   nowhere in that assembly, so fixing the lookup does not by itself prove
+   mapgen's output format is what Urbano consumes.
+4. **The Barry package is abandoned deliberately.** The owner has said to drop
+   it and download a fresh one from the interface instead, so the resume
+   instructions that used to be here no longer apply. The folder can be
+   deleted whenever they like.
 5. **The push.** `git push origin feat/phase1 main` from
    `C:\Users\Param\mapgen-phase1`.
 6. **Scratch directories to delete by hand**, since the permission layer
