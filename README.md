@@ -142,6 +142,16 @@ the URL, so nothing else on the machine can drive it. On the page:
   rectangle. A viewport capture is a snapshot, not a binding: panning or
   zooming afterwards leaves the rectangle where it is, and pressing the
   button again captures the new view.
+- However it was set, the rectangle can then be adjusted rather than
+  redrawn. It carries four corner handles: drag one to resize, keeping
+  the opposite corner where it is, or drag anywhere inside the rectangle
+  to move the whole thing. Either way the estimate and the tile grid
+  follow when you let go, not while you are dragging, and a drag that
+  would leave the box with no area at all is refused and leaves the
+  extent as it was. Escape puts back a rectangle you are part way
+  through moving. While a download is running the handles come off and
+  the extent cannot be edited, since the run has already been told what
+  to fetch; they come back when it ends.
 - Region and Site fill in on their own: picking a place from the search
   results uses that result's own name, and drawing or pasting a rectangle
   reverse-geocodes its centre. Both stay ordinary editable text fields, and
@@ -211,6 +221,13 @@ the URL, so nothing else on the machine can drive it. On the page:
   The same request also draws the actual tiling as rectangles on the map,
   from the server's own tile geometry rather than a client-side guess, so
   what you see is the grid the pipeline is really about to use.
+- The log sits under the map, at the foot of the map's own column, so the
+  form pane beside it runs the full height of the window. The line
+  directly above it is a divider: drag it up to give the log more height
+  and the map less, down for the reverse. Neither can be crushed to
+  nothing, and the split you choose is remembered for as long as that
+  launch of the server lives, so it survives reloading the page but not
+  yet restarting mapgen.
 - The download runs with a live per-tile log, and the tile grid shades each
   rectangle as it goes: not started, in progress, done, or failed, the last
   one drawn distinctly since it is the one worth noticing before deciding
@@ -238,15 +255,18 @@ the URL, so nothing else on the machine can drive it. On the page:
   explanation, because it does not need one.
 - A progress bar on the strip directly under the map, to the right of the
   tile legend, answers the other question, how much longer. Beside it, one
-  short line says what is happening now: downloading a named layer,
-  checking the files, writing the package. It is derived from the same
+  short line says what is happening now and which package it is going
+  into: the tile being worked and the layer working it (`osm r02_c05`),
+  or the layer's own name while a layer that downloads the whole extent
+  at once is running, then checking the files and writing the package,
+  followed by the survey folder's own name. It is derived from the same
   progress events the grid
   is, weighted by what each layer's own estimate says it costs, so a
   finished OpenStreetMap pass reads as the large majority of the run it
   actually is. The countdown starts from the estimate and switches to the
-  run's own measured rate once there is enough finished work to measure,
-  and it says which of the two it is using. Nothing is reported to the
-  second, because nothing here is accurate to the second. A run that
+  run's own measured rate once there is enough finished work to measure.
+  Nothing is reported to the second, because nothing here is accurate to
+  the second. A run that
   passes its estimate says so rather than sitting at zero, a tile that
   needed splitting is called out as having made the run longer, and a
   stopped run settles at the percentage it actually reached rather than
