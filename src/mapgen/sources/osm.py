@@ -57,17 +57,18 @@ from mapgen.geo import BBox, Tile, extent_metres, split_tile_into_quarters
 from mapgen.jobs import CancelToken
 from mapgen.merge import merge_osm_xml
 from mapgen.sources.base import (
-    FAILURE_NOT_AUTHORISED,
     FAILURE_NODE_CAP,
-    FAILURE_RATE_LIMITED,
-    FAILURE_REFUSED,
-    FAILURE_SERVICE_ERROR,
-    FAILURE_TIMEOUT,
     FAILURE_UNKNOWN,
-    FAILURE_UNREACHABLE,
     Estimate,
     ProgressSink,
     TileFailure,
+    # Re-exported, not merely imported: Task 30 wrote both of these here,
+    # Task 32 moved them into base.py so elevation and Overture classify
+    # from the same code rather than from a second copy, and every
+    # existing importer of mapgen.sources.osm keeps working unchanged.
+    classify_status_failure,
+    classify_transport_failure,
+    parse_retry_after,
 )
 
 DEFAULT_OVERPASS_URLS = [
@@ -232,48 +233,6 @@ class OsmTileFetchError(OsmDownloadError):
         self.failures = list(failures)
 
 
-def classify_transport_failure(exc: BaseException) -> tuple[str, str]:
-    """Why a request never produced a response at all, as (kind, phrase).
-
-    Classified by exception TYPE, never by the text of the exception, and
-    the phrase is composed here rather than taken from str(exc). Both of
-    those are the same decision: a requests exception's own message
-    embeds the URL it was called with, and a URL is where an API key
-    lives. OSM's endpoints carry no key today, but "today" is exactly the
-    assumption mapgen.sources.elevation's redaction history says not to
-    build on, and a reason assembled from a closed vocabulary cannot leak
-    one however this module is later reused.
-
-    An unrecognised exception contributes its class name and nothing
-    else. A class name is not a traceback and cannot carry a query
-    string, and "the request failed with ConnectionResetError" is at
-    least a fact the owner can quote at someone.
-    """
-    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)):
-        return FAILURE_TIMEOUT, "did not answer in time"
-    if isinstance(exc, (requests.exceptions.ConnectionError, ConnectionError, OSError)):
-        return FAILURE_UNREACHABLE, "could not be reached"
-    return FAILURE_UNKNOWN, f"failed with {type(exc).__name__}"
-
-
-def classify_status_failure(status_code: int) -> tuple[str, str]:
-    """Why a response was not usable, as (kind, phrase).
-
-    The split that matters is not 4xx against 5xx, it is "a retry could
-    plausibly fix this" against "a retry will get the same answer four
-    times". 429 sits on the 4xx side of the HTTP line and the retryable
-    side of this one, which is the whole reason this returns a kind
-    rather than letting package.py look at the number.
-    """
-    if status_code == 429:
-        return FAILURE_RATE_LIMITED, f"asked mapgen to slow down (HTTP {status_code})"
-    if status_code in (401, 403):
-        return FAILURE_NOT_AUTHORISED, f"refused the request as not allowed (HTTP {status_code})"
-    if status_code >= 500:
-        return FAILURE_SERVICE_ERROR, f"answered HTTP {status_code}"
-    return FAILURE_REFUSED, f"rejected the request (HTTP {status_code})"
-
-
 def build_overpass_query(
     bbox: BBox, timeout_seconds: int, categories: Sequence[str] | None = None
 ) -> str:
@@ -308,13 +267,17 @@ def build_overpass_query(
 def retry_delay_seconds(
     response_headers: Mapping[str, str] | None, attempt: int
 ) -> float:
-    if response_headers:
-        raw = response_headers.get("Retry-After")
-        if raw:
-            try:
-                return float(raw)
-            except ValueError:
-                pass
+    """How long to wait before this tile's next attempt.
+
+    The header parse moved to mapgen.sources.base.parse_retry_after in
+    Task 32, so elevation reads the same header the same way rather than
+    growing a second, subtly different parser. What this function decides
+    is unchanged: a service that named a delay gets that delay, and
+    anything else gets exponential backoff capped at a minute.
+    """
+    asked_for = parse_retry_after(response_headers)
+    if asked_for is not None:
+        return asked_for
     return float(min(60, 2**attempt))
 
 

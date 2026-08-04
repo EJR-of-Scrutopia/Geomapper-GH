@@ -1,16 +1,24 @@
 import pytest
+import requests
 
 from mapgen.geo import BBox, Tile
 from mapgen.sources.base import (
+    FAILURE_TIMEOUT,
+    FAILURE_UNKNOWN,
+    FAILURE_UNREACHABLE,
     DuplicateSourceError,
     Estimate,
     NullProgress,
     UnknownSourceError,
     available_sources,
+    classify_status_failure,
+    classify_transport_failure,
     clear_registry,
     get_source,
+    parse_retry_after,
     register,
 )
+from mapgen.sources.osm import retry_delay_seconds
 
 
 class FakeSource:
@@ -126,3 +134,83 @@ def test_registry_isolation_proves_clear_registry_runs():
     source = FakeSource(id="unique_id_only_in_this_test")
     register(source)
     assert available_sources() == [source]
+
+
+# --- Task 32: one classifier, shared by all three sources ------------------
+#
+# Task 30 wrote classify_transport_failure and classify_status_failure in
+# osm.py, because OSM was the only source that produced a per-tile reason.
+# Task 32 gave elevation and Overture the same need. Two copies of "what
+# does a 429 mean" is how one of them quietly stops matching the retry
+# policy that reads the answer, so there is one copy and it lives beside
+# the vocabulary it returns.
+
+
+def test_the_classifiers_are_still_importable_from_osm():
+    # Moving them must not break an importer. The re-export in osm.py is
+    # what keeps mapgen.sources.osm.classify_status_failure working, and
+    # it must be the SAME function, not a second definition that has
+    # drifted.
+    from mapgen.sources import osm
+    from mapgen.sources import base
+
+    assert osm.classify_status_failure is base.classify_status_failure
+    assert osm.classify_transport_failure is base.classify_transport_failure
+
+
+def test_a_rate_limit_is_retryable_and_an_unauthorised_request_is_not():
+    # The split the whole retry policy rests on, asserted at the one place
+    # that decides it. 429 is a 4xx and is retryable; 401 is a 4xx and is
+    # never retryable, which is elevation's most common failure by a wide
+    # margin.
+    from mapgen.package import RETRYABLE_FAILURE_KINDS
+
+    rate_limited, _ = classify_status_failure(429)
+    unauthorised, _ = classify_status_failure(401)
+    forbidden, _ = classify_status_failure(403)
+    server_error, _ = classify_status_failure(503)
+    bad_request, _ = classify_status_failure(400)
+
+    assert rate_limited in RETRYABLE_FAILURE_KINDS
+    assert server_error in RETRYABLE_FAILURE_KINDS
+    assert unauthorised not in RETRYABLE_FAILURE_KINDS
+    assert forbidden not in RETRYABLE_FAILURE_KINDS
+    assert bad_request not in RETRYABLE_FAILURE_KINDS
+
+
+def test_a_transport_failure_is_classified_by_type_never_by_its_message():
+    # The message is where a URL lives and a URL is where an API key
+    # lives. A classifier shared by the keyed source cannot read one.
+    secret_bearing = requests.exceptions.ConnectionError(
+        "Max retries exceeded with url: https://x/?API_Key=sk-secret"
+    )
+    kind, phrase = classify_transport_failure(secret_bearing)
+
+    assert kind == FAILURE_UNREACHABLE
+    assert "sk-secret" not in phrase
+    assert "API_Key" not in phrase
+    assert "http" not in phrase.lower()
+
+    timed_out, phrase = classify_transport_failure(requests.exceptions.Timeout("..."))
+    assert timed_out == FAILURE_TIMEOUT
+
+    unrecognised, phrase = classify_transport_failure(ValueError("boom"))
+    assert unrecognised == FAILURE_UNKNOWN
+    assert "ValueError" in phrase
+
+
+def test_parse_retry_after_reads_the_seconds_form_and_nothing_else():
+    assert parse_retry_after({"Retry-After": "42"}) == pytest.approx(42.0)
+    assert parse_retry_after({"Retry-After": "0.5"}) == pytest.approx(0.5)
+    # The HTTP-date form is deliberately not parsed: the caller's own
+    # backoff is a better answer than a date read against the wrong clock.
+    assert parse_retry_after({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}) is None
+    assert parse_retry_after({}) is None
+    assert parse_retry_after(None) is None
+
+
+def test_a_negative_retry_after_can_never_reach_time_sleep():
+    # time.sleep(-5) raises ValueError, so a malformed header used to be
+    # able to end a whole run through osm.py's retry_delay_seconds.
+    assert parse_retry_after({"Retry-After": "-5"}) == 0.0
+    assert retry_delay_seconds({"Retry-After": "-5"}, attempt=1) == 0.0

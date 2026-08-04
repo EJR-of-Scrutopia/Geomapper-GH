@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Mapping, Protocol, Sequence, runtime_checkable
+
+import requests
 
 from mapgen.geo import BBox, Tile
 from mapgen.jobs import CancelToken
@@ -46,6 +48,93 @@ FAILURE_NO_OUTPUT = "no_output"
 FAILURE_UNKNOWN = "unknown"
 
 
+def classify_transport_failure(exc: BaseException) -> tuple[str, str]:
+    """Why a request never produced a response at all, as (kind, phrase).
+
+    Classified by exception TYPE, never by the text of the exception, and
+    the phrase is composed here rather than taken from str(exc). Both of
+    those are the same decision: a requests exception's own message
+    embeds the URL it was called with, and a URL is where an API key
+    lives. OSM's endpoints carry no key, but elevation's carry one on
+    every single request, and a classifier shared by both cannot be
+    allowed to depend on which of them called it.
+
+    An unrecognised exception contributes its class name and nothing
+    else. A class name is not a traceback and cannot carry a query
+    string, and "the request failed with ConnectionResetError" is at
+    least a fact the owner can quote at someone.
+
+    Lives here, in the module that already owns the failure vocabulary,
+    rather than in osm.py where Task 30 first wrote it. Task 32 gave
+    elevation the same need, and two sources classifying the same
+    transport failures from two separately maintained copies is how one
+    of them quietly stops matching the vocabulary the retry policy reads.
+    osm.py re-exports both of these so every existing importer is
+    unaffected.
+    """
+    if isinstance(exc, (requests.exceptions.Timeout, TimeoutError)):
+        return FAILURE_TIMEOUT, "did not answer in time"
+    if isinstance(exc, (requests.exceptions.ConnectionError, ConnectionError, OSError)):
+        return FAILURE_UNREACHABLE, "could not be reached"
+    return FAILURE_UNKNOWN, f"failed with {type(exc).__name__}"
+
+
+def classify_status_failure(status_code: int) -> tuple[str, str]:
+    """Why a response was not usable, as (kind, phrase).
+
+    The split that matters is not 4xx against 5xx, it is "a retry could
+    plausibly fix this" against "a retry will get the same answer four
+    times". 429 sits on the 4xx side of the HTTP line and the retryable
+    side of this one, which is the whole reason this returns a kind
+    rather than letting package.py look at the number.
+
+    401 and 403 are the pair this exists for as much as any: elevation is
+    the one keyed source in this project, a wrong or expired key answers
+    401 on every attempt, and retrying it wastes the owner's own quota
+    while delaying the honest error.
+    """
+    if status_code == 429:
+        return FAILURE_RATE_LIMITED, f"asked mapgen to slow down (HTTP {status_code})"
+    if status_code in (401, 403):
+        return FAILURE_NOT_AUTHORISED, f"refused the request as not allowed (HTTP {status_code})"
+    if status_code >= 500:
+        return FAILURE_SERVICE_ERROR, f"answered HTTP {status_code}"
+    return FAILURE_REFUSED, f"rejected the request (HTTP {status_code})"
+
+
+def parse_retry_after(headers: Mapping[str, str] | None) -> float | None:
+    """The seconds a service asked to be left alone for, or None.
+
+    One parser, shared, because two of them would eventually disagree
+    about the same header. osm.py's retry_delay_seconds calls it for its
+    own per-request backoff (which has honoured Retry-After since long
+    before Task 32) and elevation attaches the result to its failure
+    record so package.py's retry pass can wait it out rather than
+    ignoring an instruction the service gave in writing.
+
+    None for an absent header and for the HTTP-date form, which this
+    deliberately does not parse: the delta-seconds form is what every
+    service in play here sends, and a caller that gets None falls back on
+    its own generic backoff, which is a better answer than a date parsed
+    against a clock that may not agree with the server's.
+
+    Never negative. A malformed "Retry-After: -5" used to reach
+    time.sleep(-5) through retry_delay_seconds, which raises ValueError
+    and would take the whole run down over a bad header. Floored at zero
+    instead, which is the same as "do not wait".
+    """
+    if not headers:
+        return None
+    raw = headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, seconds)
+
+
 @dataclass(frozen=True)
 class TileFailure:
     """One tile, one source, one reason it is not here.
@@ -71,11 +160,31 @@ class TileFailure:
     tile_id: str
     kind: str
     reason: str
+    # How long the service asked to be left alone for, in seconds, when
+    # it said so in a Retry-After header (Task 32). None means it did not
+    # say, which is the ordinary case and every case before this field
+    # existed.
+    #
+    # Set only by a source whose OWN retry has not already waited it out.
+    # OsmSource deliberately leaves it None: its per-request loop honours
+    # Retry-After between its four attempts (see retry_delay_seconds), so
+    # by the time a tile reaches package.py the wait has already been
+    # served, and attaching it here would have the outer pass serve it a
+    # second time. ElevationSource sets it, because elevation makes one
+    # request and has no inner loop to wait in.
+    retry_after_seconds: float | None = None
 
     def to_record(self) -> dict[str, str]:
         """The plain-dict form that reaches survey.json and the progress
         event stream. One shape in both places, so a reader of the file
         and a reader of the live event stream never have to learn two.
+
+        retry_after_seconds is deliberately NOT in it. It is a fact about
+        how this run should behave next, not about what happened, and
+        package.py's ledger keeps it separately for exactly that reason;
+        putting it here would add a mostly-null field to every record in
+        every survey.json to serve one decision made seconds later in the
+        same process.
         """
         return {
             "source": self.source,
