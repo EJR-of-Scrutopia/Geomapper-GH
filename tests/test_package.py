@@ -3400,10 +3400,13 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # not there for the download. complete and stopped describe that
     # download and nothing else; so do tiles, sources and both timestamps.
     #
-    # Two blocks are the exception rather than one since task 35: `bridge`,
-    # and `project_setting`, which is what this command now produces whether
-    # or not the bridge itself is working. Everything else is still read and
-    # never written.
+    # Three blocks are the exception rather than one, and each was added by
+    # the task that made this command produce something: `bridge`;
+    # `project_setting` (task 35), which mapgen now writes whether or not the
+    # bridge is working; and `elevation_grid` (task 39), the DEM converted
+    # into the format Urbano reads terrain from, which every package
+    # downloaded before that task is missing. Everything else is still read
+    # and never written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
     before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
@@ -3413,7 +3416,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     after = json.loads((root / "survey.json").read_text(encoding="utf-8"))
     assert after["complete"] is False
     assert after["stopped"] is True
-    for changed in ("bridge", "project_setting"):
+    for changed in ("bridge", "project_setting", "elevation_grid"):
         before.pop(changed, None)
         after.pop(changed, None)
     assert after == before
@@ -5095,3 +5098,196 @@ def test_a_stop_at_the_very_end_still_leaves_a_project_setting(tmp_path):
     assert result.survey["bridge"]["attempted"] is False, "the stop skipped the bridge, as ruled"
     assert result.survey["project_setting"]["written"] is True
     assert _project_setting(result)["Layers"] == ["osm"]
+
+
+# --------------------------------------------------------------------------
+# The elevation grid (task 39): the DEM in the only format Urbano reads
+# terrain in.
+# --------------------------------------------------------------------------
+
+# The bounds the real Barry DEM in tests/data was downloaded for. A grid built
+# for any other extent covers none of it and is correctly refused, which is
+# what makes the refusal test below a real one.
+DEM_BBOX = BBox.parse("-3.276,51.393,-3.268,51.398")
+REAL_DEM = Path(__file__).resolve().parent / "data" / "Barry-Full_2026-08-04.tif"
+
+
+class RealDemStubSource(UrbanoReadableStubSource):
+    """A stub that leaves a real OpenTopography DEM in the package.
+
+    Copied byte for byte from tests/data rather than synthesised, so the
+    conversion under test is the conversion the owner's own packages get.
+    """
+
+    def __init__(self, source_id="stub", dem=REAL_DEM, **kwargs):
+        super().__init__(source_id=source_id, suffixes=(".osm",), **kwargs)
+        self._dem = Path(dem)
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        target = out_dir / f"{stem}.tif"
+        target.write_bytes(self._dem.read_bytes())
+        return outputs + [target]
+
+
+def test_a_run_with_a_dem_writes_the_egrid_beside_it(tmp_path):
+    """The whole of task 39 in one test. Before it, a package's terrain was
+    a GeoTIFF, which is a file no Urbano component can open: the field it
+    would have to be named in goes straight to a protobuf deserialiser.
+    """
+    register(RealDemStubSource())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    written = result.paths.root / f"{result.paths.stem}.egrid"
+    assert written.is_file()
+    record = result.survey["elevation_grid"]
+    assert record["written"] is True
+    assert record["file"] == written.name
+    assert record["nodes"] == 12432
+    assert record["covered"] == 3763
+    assert record["error"] is None
+
+
+def test_the_egrid_is_what_the_project_setting_names_and_never_the_raster(tmp_path):
+    """The ordering the two steps depend on. resolve_data_files reads the
+    layer list off the disk, so the .egrid has to exist before the project
+    setting is written or the setting says this package has no terrain.
+    """
+    register(RealDemStubSource())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    setting = _project_setting(result)
+    assert "elevation" in setting["Layers"]
+    assert setting["ElevationFilePath"] == str(
+        result.paths.root / f"{result.paths.stem}.egrid"
+    )
+    # And never the raster, which is still in the folder and still named in
+    # survey.json's sources.
+    assert (result.paths.root / f"{result.paths.stem}.tif").is_file()
+    assert not setting["ElevationFilePath"].endswith(".tif")
+
+
+def test_a_dem_that_cannot_be_converted_costs_the_package_nothing(tmp_path):
+    """A conversion failure is recorded and the run finishes. Losing a real
+    survey's OSM and Overture data because a raster could not be read would
+    be the mistake task 20 already fixed once for the bridge.
+    """
+
+    class BadDemStub(UrbanoReadableStubSource):
+        def merge(self, parts, out_dir, stem):
+            outputs = super().merge(parts, out_dir, stem)
+            target = out_dir / f"{stem}.tif"
+            target.write_bytes(b'{"type": "FeatureCollection"}')
+            return outputs + [target]
+
+    register(BadDemStub())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    assert result.complete is True
+    record = result.survey["elevation_grid"]
+    assert record["written"] is False
+    assert "byte order mark" in record["error"]
+    assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
+    # The rest of the package is untouched, and the project setting says so
+    # rather than claiming a layer it has not got.
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+    assert result.survey["project_setting"]["written"] is True
+    assert "elevation" not in _project_setting(result)["Layers"]
+
+
+def test_a_run_with_no_dem_at_all_says_nothing_went_wrong(tmp_path):
+    """`written` false with a null error is "this package has no DEM", which
+    is a different statement from "the DEM could not be converted" and has to
+    read differently in survey.json.
+    """
+    register(UrbanoReadableStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record == {"written": False, "file": None, "nodes": None, "error": None}
+
+
+def test_an_egrid_left_by_a_previous_attempt_goes_when_the_dem_does(tmp_path):
+    """Staleness is this step's own job. The stale-output sweep only ever
+    deletes names a source's possible_outputs declares, and the .egrid is
+    deliberately not one of them (package.py's _bridge_input_file reads the
+    same list to choose the file it hands the C# bridge as its TIFF path).
+    So an .egrid describing a DEM the package no longer holds is removed
+    here, on every run and on every `mapgen bridge`.
+    """
+    register(UrbanoReadableStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    stale = result.paths.root / f"{result.paths.stem}.egrid"
+    stale.write_bytes(b"a previous attempt's grid")
+
+    payload = bridge_package(
+        result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0)
+    )
+
+    assert not stale.exists()
+    assert payload["elevation_grid"]["written"] is False
+    assert payload["elevation_grid"]["error"] is None
+
+
+def test_mapgen_bridge_converts_the_dem_of_a_package_already_on_disk(tmp_path):
+    """The reason this matters: every package the owner already has was
+    downloaded before mapgen could write a .egrid, so every one of them has
+    a DEM Urbano cannot open. This fixes them in place, with no download.
+    """
+    register(RealDemStubSource())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+    written = result.paths.root / f"{result.paths.stem}.egrid"
+    written.unlink()
+
+    payload = bridge_package(
+        result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0)
+    )
+
+    assert written.is_file()
+    assert payload["elevation_grid"]["written"] is True
+    assert payload["elevation_grid"]["nodes"] == 12432
+
+
+def test_the_egrid_is_written_before_the_project_setting(tmp_path):
+    """The ordering, pinned through the events rather than by reading the
+    source, so reversing the two calls fails here.
+    """
+    register(RealDemStubSource())
+    log = EventLog()
+    run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False), progress=log)
+    names = [event["event"] for event in log.snapshot()]
+    assert names.index("elevation_grid_written") < names.index("project_setting_written")
+
+
+def test_the_progress_events_name_the_file_and_how_much_of_it_has_data(tmp_path):
+    """The browser and the terminal both read these. `covered` is well under
+    `nodes` on a coastal survey, because the DEM is smaller than the padded
+    extent Urbano's own grid geometry asks for, and that is worth being able
+    to see without opening Grasshopper.
+    """
+    register(RealDemStubSource())
+    log = EventLog()
+    result = run_survey(
+        _request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False), progress=log
+    )
+    written = [e for e in log.snapshot() if e["event"] == "elevation_grid_written"]
+    assert len(written) == 1
+    assert written[0]["file"] == f"{result.paths.stem}.egrid"
+    assert written[0]["nodes"] == 12432
+    assert written[0]["covered"] == 3763
+
+
+def test_the_egrid_a_run_writes_is_the_grid_it_says_it_is(tmp_path):
+    """A run's .egrid, decoded by the test suite's own protobuf reader, is
+    the grid mapgen says it is. This is the end to end shape check; the
+    comparison against Urbano's own serialiser is in tests/test_egrid.py.
+    """
+    from tests.test_egrid import decode
+
+    register(RealDemStubSource())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+    grid = decode((result.paths.root / f"{result.paths.stem}.egrid").read_bytes())
+    assert (grid.nx, grid.ny) == (112, 111)
+    assert len(grid.heights) == 12432
+    assert 400_000 < grid.x0 < 500_000
+    assert 5_600_000 < grid.y0 < 5_800_000

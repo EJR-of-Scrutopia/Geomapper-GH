@@ -671,7 +671,26 @@ function summariseJob(tileIds, sourceIds, events, jobRunning, sourceSeconds) {
 
   for (const event of events || []) {
     const nextPhase = PHASE_FOR_EVENT[event.event];
-    if (nextPhase) phase = { kind: nextPhase, source: event.source || "" };
+    if (nextPhase) {
+      phase = {
+        kind: nextPhase,
+        source: event.source || "",
+        // Task 38, item 5: which tile this event is about, and only when
+        // it is the WHOLE of a tile of the plan. The two exclusions are
+        // the ones this file already draws everywhere else: "whole-area"
+        // is elevation's one event for the whole extent and is not a tile
+        // at all (state.has says so), and an event carrying overture_type
+        // is one type's share of a tile rather than work on that tile, so
+        // naming it would say the run is on one square when it is
+        // downloading the whole extent. Both fall back to the layer's own
+        // name, which is what the owner asked for during a whole-extent
+        // layer.
+        tile:
+          event.tile_id && state.has(event.tile_id) && !reportsPartOfTile(event)
+            ? event.tile_id
+            : "",
+      };
+    }
     if (event.tile_id && state.has(event.tile_id)) {
       if (event.event === "tile_failed") {
         liveFailures.set(failureKey(event.source, event.tile_id), failureRecord(event));
@@ -874,16 +893,45 @@ const PHASE_FOR_EVENT = {
 // Short, and short on purpose: this has one line on a strip it shares
 // with the tile legend, and a sentence here would push the map up, which
 // is the one thing the owner asked this move not to do.
+//
+// Task 38, item 5: "so that it just says which tile its doing and what
+// package its downloading". Where there is a tile of the plan being
+// worked, the line is that tile, by the same short id the log and the
+// tooltips use: "osm r02_c05" is what the owner asked for, and the layer
+// id beside a tile id reads as one address rather than a sentence. Where
+// there is not, because the layer downloads the whole extent at once,
+// the layer's own name is the true thing to say and the line says that
+// instead.
 const PHASE_WORDS = {
   starting: () => "Starting",
-  downloading: (source) => `Downloading ${sourceLabel(source)}`.trim(),
+  downloading: (source, tile) =>
+    tile ? `${source} ${tile}`.trim() : `Downloading ${sourceLabel(source)}`.trim(),
   "finished-source": (source) => `Finished ${sourceLabel(source)}`.trim(),
-  retrying: (source) => `Retrying ${sourceLabel(source)}`.trim(),
+  // A retry names its tile too, and for the same reason: a run that has
+  // gone back for one square should say which square.
+  retrying: (source, tile) =>
+    tile ? `Retrying ${source} ${tile}`.trim() : `Retrying ${sourceLabel(source)}`.trim(),
   checking: () => "Checking the files",
   bridge: () => "Writing the Urbano bridge",
   setting: () => "Writing the project setting",
   finishing: () => "Writing the package",
 };
+
+// The package this run is building, as its own name rather than the whole
+// path: the folder is <output root>/<region>/<date>_<site>, and the last
+// segment is the one part that says which survey this is. Everything
+// before it is the same for every run the owner makes, and this line has
+// one row of a shared strip to work in.
+//
+// Both separators, because the path is composed server-side by pathlib on
+// Windows and arrives with backslashes, and because nothing here should
+// depend on which platform the server is running on.
+function packageStem(path) {
+  const trimmed = String(path || "").replace(/[\\/]+$/, "");
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]/);
+  return parts[parts.length - 1] || "";
+}
 
 // The name the owner picked the layer by, from GET /api/sources, not an
 // id invented here: "OpenStreetMap" is what the checklist says and what
@@ -897,7 +945,7 @@ function sourceLabel(sourceId) {
 function phaseLabel(phase) {
   if (!phase) return "Starting";
   const words = PHASE_WORDS[phase.kind];
-  return words ? words(phase.source) : "";
+  return words ? words(phase.source, phase.tile || "") : "";
 }
 
 // pieces and depth, read once and defaulted, for the same reason
@@ -1096,7 +1144,18 @@ function remainingLabel({
     elapsedSeconds >= COUNTDOWN_CROSSOVER_SECONDS
   ) {
     const remaining = (elapsedSeconds / fractionFetched) * fractionLeft;
-    return { text: `${formatRemaining(remaining)} left, from the rate so far`, note, branch: "measured" };
+    // Task 38, item 5: "then the time '1 minute left' instead of
+    // additional text after that time like in the screen shot". The
+    // branch this came from used to be spelled out here, ", from the rate
+    // so far" against ", from the estimate". It is the routine suffix the
+    // owner asked to lose and nothing else went with it: the branch is
+    // still returned, still decided by the same crossover, and still what
+    // the tests read. What the honesty rules actually ask for survives in
+    // full, because they are about the NUMBER: formatRemaining still
+    // refuses to say anything finer than a minute, and the two branches
+    // below still refuse to count down to zero or to invent a figure
+    // there is no evidence for.
+    return { text: `${formatRemaining(remaining)} left`, note, branch: "measured" };
   }
 
   if (!(staticSeconds > 0)) {
@@ -1113,9 +1172,14 @@ function remainingLabel({
     // Never "0 seconds remaining" against a job that is still going. The
     // true thing to say is that the estimate has been passed, and the
     // grid and the log are what say how far along it actually is.
-    return { text: "Taking longer than the estimate. Still running.", note, branch: "overrun" };
+    //
+    // "Still running." went with the routine suffixes above, and only
+    // that: the line beside this one now names the tile being worked, so
+    // a second sentence saying the run is still going would be the same
+    // fact twice on a strip with room for neither.
+    return { text: "Taking longer than the estimate.", note, branch: "overrun" };
   }
-  return { text: `${formatRemaining(remaining)} left, from the estimate`, note, branch: "estimate" };
+  return { text: `${formatRemaining(remaining)} left`, note, branch: "estimate" };
 }
 
 // Starts with no grid and the legend hidden. Set explicitly here rather
@@ -2083,9 +2147,21 @@ function formatGeometryLine(geometry) {
   return `${area} km² · ${geometry.tiles} ${tileWord} (${geometry.rows} x ${geometry.cols})`;
 }
 
+// The exact folder the last successful estimate said this run would
+// create, kept for the same reason lastSizing below is kept: the estimate
+// response is rendered and thrown away, and the progress line needs the
+// package's own name out of it once a job is running. The preview element
+// is not read back instead, because a page whose estimate has since been
+// replaced would answer with a different survey's folder.
+let lastFolder = "";
+
 function hideFolderPreview() {
   $("folder-preview").hidden = true;
   $("folder-preview-path").textContent = "";
+  // And with it the name the progress line would quote. Every caller of
+  // this is a case where there is no folder this run would create: no
+  // extent, no names yet, or an estimate that failed.
+  lastFolder = "";
 }
 
 // Task 27: what the last successful estimate said, kept because two
@@ -2223,6 +2299,11 @@ async function refreshEstimate() {
     if (data.folder) {
       $("folder-preview-path").textContent = data.folder;
       $("folder-preview").hidden = false;
+      // The same one string the preview shows, kept for the progress line
+      // to take the package's own name out of (Task 38, item 5). One
+      // source, so the line under the map and the line above Download can
+      // never name two different folders for one run.
+      lastFolder = data.folder;
     } else {
       hideFolderPreview();
     }
@@ -2894,6 +2975,13 @@ let activeJobSourceIds = [];
 // describing the job already in flight.
 let activeJobSeconds = 0;
 let activeJobSourceSeconds = {};
+// And the same reasoning again for the folder this job is building, whose
+// name the progress line quotes: snapshotted at the press, so drawing a
+// new extent while a download runs cannot rename the package the line is
+// reporting on. The server has no answer of its own to use instead until
+// the run is over: JobRecord.result_root is only set once run_survey has
+// returned (see web/server.py), so a running job's status carries null.
+let activeJobFolder = "";
 let jobStartedAt = 0;
 
 function hideProgress() {
@@ -2910,6 +2998,20 @@ function hideProgress() {
 // Set here rather than left to index.html's own hidden attribute, the
 // same reasoning clearTileGrid and closeSettingsPanel already document.
 hideProgress();
+
+// What is being worked on, and which package it is going into. Task 38,
+// item 5: "so that it just says which tile its doing and what package
+// its downloading".
+//
+// The two are joined by the same separator the estimate line already
+// uses, and either half can be missing without leaving a stray divider:
+// there is no package name until an estimate has produced a folder, and
+// there is no phase to name in the moment between the job starting and
+// its first event.
+function progressStatusLine(phase, job) {
+  const folder = activeJobFolder || (job && job.result_root) || "";
+  return [phaseLabel(phase), packageStem(folder)].filter(Boolean).join(" · ");
+}
 
 // Draws the bar and its line of copy from the summary, the job's own
 // state, and the clock. Split from the poll loop so the whole of it is
@@ -2928,7 +3030,17 @@ function renderProgress(summary, job, elapsedSeconds) {
   // failed says so in the line beside this one, and repeating it here in
   // fewer words would be two labels for one fact on a strip with room
   // for neither.
-  $("progress-status").textContent = job.state === "running" ? phaseLabel(summary.phase) : "";
+  //
+  // Task 38, item 5: and the package this run is building, after it. The
+  // owner's own word order ("which tile its doing and what package its
+  // downloading") and also the order this strip needs: .progress-status
+  // is the line that gives up its width first on a narrow window, and it
+  // ellipsises from the END, so the tile, which changes every few
+  // seconds, has to come before the folder name, which does not change
+  // at all. The other way round and the first thing lost is the only
+  // thing moving.
+  $("progress-status").textContent =
+    job.state === "running" ? progressStatusLine(summary.phase, job) : "";
 
   let note = "";
   if (job.state === "running") {
@@ -2940,7 +3052,16 @@ function renderProgress(summary, job, elapsedSeconds) {
       staticSeconds: activeJobSeconds,
       subdivisions: summary.subdivisions,
     });
-    $("progress-text").textContent = `${percent}% done, ${label.text}`;
+    // Task 38, item 5. This read "72% done, less than a minute left, from
+    // the rate so far", and the owner asked for the time and nothing
+    // after it. The percentage went with the suffix rather than being
+    // kept, because it is the one thing on this strip that is already
+    // drawn: the bar is 140px of exactly that number, immediately to the
+    // left, and aria-valuenow carries it for a screen reader. A run that
+    // has ENDED still spells it out below, where there is no longer a
+    // moving bar to read it off and where Task 22's difference between
+    // stopping at 68% and failing at 68% lives.
+    $("progress-text").textContent = label.text;
     note = label.note;
   } else if (job.state === "done") {
     // Forced to 100 from the job's own state rather than from the
@@ -2987,6 +3108,7 @@ $("download").addEventListener("click", async () => {
     activeJobSourceIds = requestPayload.sources;
     activeJobSeconds = lastSizing && lastSizing.seconds > 0 ? lastSizing.seconds : 0;
     activeJobSourceSeconds = (lastSizing && lastSizing.sourceSeconds) || {};
+    activeJobFolder = lastFolder;
     // Started before the first poll rather than at the first event: a run
     // whose first tile takes half a minute has genuinely been running for
     // half a minute, and elapsed time that only starts counting once

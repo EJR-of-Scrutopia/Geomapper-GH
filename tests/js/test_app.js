@@ -4325,7 +4325,11 @@ function ok(condition, message) {
     });
     ok(label.branch === "estimate", `expected the estimate branch, got ${label.branch}`);
     ok(label.text.includes("about 3 min"), `expected 155s to read as about 3 min, got ${label.text}`);
-    ok(label.text.includes("from the estimate"), `expected the copy to say which branch it is on, got ${label.text}`);
+    // Task 38, item 5: "then the time '1 minute left' instead of
+    // additional text after that time". The branch is still decided, and
+    // still returned for anything that needs it; it is no longer read
+    // out at the owner every 700ms.
+    ok(label.text === "about 3 min left", `expected the time and nothing after it, got ${label.text}`);
   });
 
   await test("countdown: the crossover needs both enough work and enough clock", async () => {

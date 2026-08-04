@@ -1611,3 +1611,124 @@ def test_a_whole_layer_failure_is_one_terminal_line_not_one_per_tile(
     assert "HTTP 401" in captured.err
     # The four per-tile lines are gone, not merely joined by a summary.
     assert "collects-failures r00_c00" not in captured.err
+
+
+# --------------------------------------------------------------------------
+# The terrain line (task 39).
+# --------------------------------------------------------------------------
+
+
+def _terrain(name="S_2026-08-01.egrid", nodes=12432, covered=3763):
+    return {
+        "written": True, "file": name, "nodes": nodes, "covered": covered,
+        "error": None,
+    }
+
+
+def _survey_result(tmp_path, **survey):
+    payload = {
+        "bridge": {"attempted": False, "ok": None, "error": None},
+        "project_setting": _written(),
+    }
+    payload.update(survey)
+    return _FakeSurveyResult(
+        paths=_FakePaths(
+            root=tmp_path, project_setting=tmp_path / "S_2026-08-01_project_setting.json"
+        ),
+        complete=True,
+        survey=payload,
+    )
+
+
+def test_survey_summary_names_the_terrain_file_and_how_much_of_it_has_data(
+    tmp_path, capsys, monkeypatch
+):
+    """The DEM is smaller than the extent Urbano's own grid geometry asks
+    for, so a coastal survey's grid is a third full. Saying so in the
+    terminal is the difference between "terrain looks patchy in Grasshopper,
+    is mapgen broken" and "yes, that is the DEM's coverage".
+    """
+    monkeypatch.setattr(
+        "mapgen.cli.run_survey",
+        lambda *a, **k: _survey_result(tmp_path, elevation_grid=_terrain()),
+    )
+    assert main(_survey_args(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "Urbano terrain: S_2026-08-01.egrid" in out
+    assert "3763 of 12432 grid points have height data" in out
+
+
+def test_survey_summary_says_when_the_terrain_could_not_be_written(
+    tmp_path, capsys, monkeypatch
+):
+    """The case that most needs a sentence: the folder looks complete, the
+    `.tif` is in it, and the only other symptom is Import Terrain saying it
+    found no elevation data.
+    """
+    reason = "Barry_2026-08-01.tif uses TIFF predictor 2."
+    monkeypatch.setattr(
+        "mapgen.cli.run_survey",
+        lambda *a, **k: _survey_result(
+            tmp_path,
+            elevation_grid={
+                "written": False, "file": None, "nodes": None, "error": reason,
+            },
+        ),
+    )
+    assert main(_survey_args(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert "Urbano terrain: not written, so Import Terrain will find none." in out
+    assert reason in out
+
+
+def test_survey_summary_says_nothing_about_terrain_when_there_is_no_dem(
+    tmp_path, capsys, monkeypatch
+):
+    """An OSM only run has nothing to report here, and a line on every one
+    of them saying so would be noise. _empty_layer_lines already covers a
+    layer that was requested and arrived empty.
+    """
+    monkeypatch.setattr(
+        "mapgen.cli.run_survey",
+        lambda *a, **k: _survey_result(
+            tmp_path,
+            elevation_grid={
+                "written": False, "file": None, "nodes": None, "error": None,
+            },
+        ),
+    )
+    assert main(_survey_args(tmp_path)) == 0
+    assert "Urbano terrain" not in capsys.readouterr().out
+
+
+def test_a_package_written_before_terrain_existed_is_not_guessed_at(
+    tmp_path, capsys, monkeypatch
+):
+    """No block at all, which every package written before task 39 has. Said
+    by saying nothing, rather than by claiming either outcome.
+    """
+    monkeypatch.setattr(
+        "mapgen.cli.run_survey", lambda *a, **k: _survey_result(tmp_path)
+    )
+    assert main(_survey_args(tmp_path)) == 0
+    assert "Urbano terrain" not in capsys.readouterr().out
+
+
+def test_bridge_summary_names_the_terrain_file_too(tmp_path, capsys, monkeypatch):
+    """`mapgen bridge` and `mapgen survey` say the same thing about the same
+    file, which is why both read the same function.
+    """
+    package = tmp_path / "2026-08-01_S"
+    package.mkdir(parents=True)
+    monkeypatch.setattr(
+        "mapgen.cli.bridge_package",
+        lambda *a, **k: {
+            "bridge": {"attempted": True, "ok": False, "error": "no"},
+            "project_setting": _written(),
+            "elevation_grid": _terrain(),
+        },
+    )
+    assert main(["bridge", str(package)]) == 0
+    out = capsys.readouterr().out
+    assert "Urbano terrain: S_2026-08-01.egrid" in out
+    assert "3763 of 12432 grid points have height data" in out

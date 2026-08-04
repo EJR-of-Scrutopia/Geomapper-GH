@@ -300,6 +300,37 @@ def _empty_layer_lines(survey: dict) -> list[str]:
     return lines
 
 
+def _elevation_grid_lines(survey: dict) -> list[str]:
+    """What to say about the terrain file, which is the one Urbano reads
+    elevation from and the one no mapgen package had until task 39.
+
+    Silent when the package has no DEM at all, because a run that asked for
+    no elevation layer has nothing to report here and a line saying so on
+    every OSM-only run would be noise. `_empty_layer_lines` already says
+    when a REQUESTED layer arrived empty.
+
+    Never silent about a failure. A DEM that is there and could not be
+    converted is exactly the case where the owner needs the sentence, since
+    the folder looks complete and Grasshopper will say only that there is no
+    elevation data.
+
+    Shared by `mapgen survey` and `mapgen bridge`, like its neighbour, so
+    the two say the same thing about the same file.
+    """
+    record = survey.get("elevation_grid") or {}
+    if record.get("written"):
+        nodes = record.get("nodes")
+        covered = record.get("covered")
+        line = f"Urbano terrain: {record.get('file')}"
+        if isinstance(nodes, int) and isinstance(covered, int) and nodes:
+            line += f", {covered} of {nodes} grid points have height data"
+        return [line]
+    error = record.get("error")
+    if error:
+        return [f"Urbano terrain: not written, so Import Terrain will find none. {error}"]
+    return []
+
+
 def _project_setting_lines(survey: dict) -> list[str]:
     """What to say about the one file Urbano 2 is pointed at.
 
@@ -333,6 +364,8 @@ def command_survey(args: argparse.Namespace) -> int:
     result = run_survey(_request_from_args(args), progress=ConsoleProgress())
     print(f"\nPackage: {result.paths.root}")
     for line in _empty_layer_lines(result.survey):
+        print(line)
+    for line in _elevation_grid_lines(result.survey):
         print(line)
     for line in _project_setting_lines(result.survey):
         print(line)
@@ -403,6 +436,8 @@ def command_bridge(args: argparse.Namespace) -> int:
     """
     payload = bridge_package(args.package_dir, progress=ConsoleProgress())
     print(f"\nPackage: {args.package_dir}")
+    for line in _elevation_grid_lines(payload):
+        print(line)
     for line in _project_setting_lines(payload):
         print(line)
     bridge = payload.get("bridge") or {}

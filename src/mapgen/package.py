@@ -17,6 +17,11 @@ from typing import Mapping, Sequence
 from mapgen import __version__
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
 from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
+from mapgen.egrid import (
+    ElevationGridError,
+    elevation_grid_path,
+    write_elevation_grid,
+)
 from mapgen.elevation_models import DEFAULT_DEMTYPE, validate_demtype
 from mapgen.fsutil import (
     atomic_write_text,
@@ -58,6 +63,7 @@ from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
     LAYER_ORDER,
     ProjectSettingError,
+    project_zone,
     resolve_data_files,
     write_project_setting,
 )
@@ -947,6 +953,13 @@ def run_survey(
         # AFTER the bridge step, never before, so that when both write the
         # file mapgen's is the one that survives. See _write_project_setting_
         # step for why that is the right way round.
+        # Task 39. Before the project setting, never after: the setting's
+        # layer list is resolved off the disk, so the .egrid has to be there
+        # for `elevation` to be in it. After the sweep, so that a previous
+        # attempt's .egrid is gone before this one writes its own.
+        elevation_grid = _write_elevation_grid_step(
+            bbox=request.bbox, root=paths.root, stem=paths.stem, sink=sink
+        )
         project_setting = _write_project_setting_step(
             bbox=request.bbox, root=paths.root, stem=paths.stem, sink=sink
         )
@@ -971,6 +984,7 @@ def run_survey(
             }
         ),
         project_setting,
+        elevation_grid,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -1076,6 +1090,86 @@ def _run_bridge_step(
         return False, error
     sink.emit("bridge_done")
     return True, None
+
+
+def _write_elevation_grid_step(
+    bbox: BBox, root: Path, stem: str, sink: ProgressSink
+) -> dict[str, object]:
+    """Convert this package's DEM into `<stem>.egrid`, reported as a record.
+
+    Task 39, and the last data gap between a mapgen package and Urbano.
+    Urbano's elevation field is a protobuf `ElevationGrid` and every one of
+    the seven components that reads it deserialises it as one, so a GeoTIFF
+    beside it is a file nothing in Urbano can open. This writes the file
+    those components want, out of the DEM mapgen already has.
+
+    The ONLY place in mapgen that calls write_elevation_grid, for the same
+    reason _run_bridge_step and _write_project_setting_step are each the only
+    caller of theirs: two call sites would have to be kept agreeing forever
+    about which failures are survivable and which events are emitted.
+
+    Runs BEFORE _write_project_setting_step in both of its callers, and that
+    ordering is load bearing rather than incidental. mapgen.urbano.
+    resolve_data_files reads the layer list off the disk, so the `.egrid`
+    has to already be there for `elevation` to appear in the project setting
+    at all; reversed, every package would get a setting that says it has no
+    terrain and a `.egrid` sitting next to it unused.
+
+    **Staleness is this step's own job, not the stale-output sweep's.** The
+    sweep only ever deletes names a source's `possible_outputs` declares,
+    and `<stem>.egrid` is deliberately not one of them: `possible_outputs` is
+    documented as what `merge()` writes, ElevationSource.merge writes only
+    the `.tif`, and package.py's `_bridge_input_file` reads the same list to
+    pick the file it hands the C# bridge as `--elevation-tiff-path`. Naming
+    the `.egrid` there would eventually hand a protobuf to a flag that wants
+    a raster. So instead: no DEM in the package means any `.egrid` beside it
+    is removed here, which covers more ground than the sweep does anyway,
+    since the sweep never runs on an incomplete package or on `mapgen bridge`
+    and this runs on both.
+
+    A failure costs the package nothing. It is recorded here, in survey.json
+    and through the sink, and the run finishes: a package without terrain is
+    exactly the package the owner has had all along, and losing a real
+    survey's data because a DEM could not be converted would be the mistake
+    task 20 already fixed once.
+    """
+    target = elevation_grid_path(root, stem)
+    tiff = Path(root) / f"{stem}.tif"
+    if not tiff.is_file():
+        # No DEM, so no terrain, and no leftover from a previous attempt
+        # either: an .egrid describing a DEM this package no longer holds is
+        # a file the owner would read straight into Grasshopper.
+        removed = target.exists()
+        target.unlink(missing_ok=True)
+        if removed:
+            sink.emit("elevation_grid_removed", file=target.name)
+        return {"written": False, "file": None, "nodes": None, "error": None}
+
+    sink.emit("elevation_grid_started")
+    try:
+        grid = write_elevation_grid(tiff, bbox, project_zone(bbox), target)
+    except (ElevationGridError, OSError) as exc:
+        error = str(exc)
+        # Never left half converted. A previous run's .egrid describing a
+        # different DEM would be worse than none, and a partially written one
+        # is a component that throws on the owner's canvas.
+        target.unlink(missing_ok=True)
+        sink.emit("elevation_grid_failed", error=error)
+        return {"written": False, "file": None, "nodes": None, "error": error}
+    covered = grid.real_count
+    sink.emit(
+        "elevation_grid_written",
+        file=target.name,
+        nodes=len(grid.heights),
+        covered=covered,
+    )
+    return {
+        "written": True,
+        "file": target.name,
+        "nodes": len(grid.heights),
+        "covered": covered,
+        "error": None,
+    }
 
 
 def _write_project_setting_step(
@@ -1428,6 +1522,14 @@ def bridge_package(
     # here by mapgen itself rather than by whether the bridge can be made to
     # work, which is why this runs unconditionally after the bridge attempt
     # rather than only when it succeeded.
+    # Task 39, and the same reasoning as the project setting one line down:
+    # every package the owner already has was downloaded before mapgen could
+    # write a .egrid, so every one of them has a DEM Urbano cannot open. This
+    # converts it in place, with no download, and it runs FIRST so that the
+    # project setting written next can see the file and name the layer.
+    payload["elevation_grid"] = _write_elevation_grid_step(
+        bbox=bbox, root=root, stem=stem, sink=sink
+    )
     payload["project_setting"] = _write_project_setting_step(
         bbox=bbox, root=root, stem=stem, sink=sink
     )
@@ -2412,11 +2514,15 @@ def _build_survey_json(
     verified=None,
     retries=None,
     project_setting=None,
+    elevation_grid=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
     project_setting = project_setting or {
         "written": False, "file": None, "layers": [], "error": None,
+    }
+    elevation_grid = elevation_grid or {
+        "written": False, "file": None, "nodes": None, "error": None,
     }
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
@@ -2561,6 +2667,15 @@ def _build_survey_json(
         # Urbano's four data files in it is the honest outcome rather than a
         # file describing nothing.
         "project_setting": project_setting,
+        # Task 39. The DEM in Urbano's own format, which is the only format
+        # any Urbano component will read elevation in. `written` false with a
+        # null `error` means this package simply has no DEM to convert;
+        # `written` false WITH an error means it had one and the conversion
+        # refused, and the sentence says which part of the file it refused
+        # over. `covered` is how many of the grid's nodes the DEM could
+        # actually answer for, which on a coastal survey is well under all of
+        # them and is worth being able to see without opening Grasshopper.
+        "elevation_grid": elevation_grid,
         "started_at": started_at,
         "finished_at": _now(),
     }
