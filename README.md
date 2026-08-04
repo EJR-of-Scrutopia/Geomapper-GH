@@ -370,7 +370,14 @@ name. It refuses, in one plain line, if the folder is not there, if there is
 no `survey.json` in it (that package needs the survey running again, which
 resumes from whatever is already on disk, not this), if the `survey.json`
 cannot be read, or if a merged file the bridge needs is missing from the
-package root, naming the file. Nothing but the `bridge` block of
+package root, naming the file. One exception, for the case you will actually
+meet: a package whose `<stem>.tif` is missing **and** whose `tiles` record
+every elevation tile as `failed` is bridged without elevation, exactly as the
+download itself would have. That is the package positively stating the layer
+was attempted and did not arrive, which is different from a file having been
+moved or deleted, or the wrong folder being passed, all of which are still
+refused. Elevation is the only layer with an API key, so it is the only one
+that fails this way routinely. Nothing but the `bridge` block of
 `survey.json` is written: `complete` and `stopped` describe the download,
 which this command was not present for. It exits 0 on a bridge that
 succeeded and 1 on one that ran and failed, unlike `mapgen survey`, which
@@ -379,6 +386,13 @@ exits 0 for the same bridge failure because it still delivered its data.
 `mapgen survey` exits 0 on a complete package and 1 if any tile failed
 (`--force` continues past a failed tile instead of stopping, and marks the
 package incomplete in `survey.json` rather than pretending it finished).
+Either way it prints which tiles it could not get, for which layer, and why,
+and every run now attempts every tile: a tile that fails no longer ends its
+layer, and one whose failure a retry could plausibly fix (a timeout, a rate
+limit, a 5xx) is tried once more later in the same run, after the rest of the
+extent has been fetched. Without `--force` a run that is still short when
+that is done exits 1 with the same account, and `survey.json` is written
+before it does, so the folder explains itself.
 `plan`, `download`, `merge` and `urbano-package` still exist as command
 names, for muscle memory, but they are aliases for `survey`/`estimate` with
 the current flag set, not the old script's flags: `--output-dir`, `--tile-id`
@@ -414,10 +428,18 @@ Each file:
 
 - **`<stem>.osm`**: every OSM node, way and relation in the extent, tiles
   merged and deduplicated by id, highest version wins at a seam. This is the
-  file the Urbano bridge reads for OSM geometry.
+  file the Urbano bridge reads for OSM geometry. **It is absent when the
+  extent genuinely contained nothing**, over open water for instance, or
+  under a category selection nothing on that ground matches: mapgen writes
+  no empty file to stand in for data that was never there, and `survey.json`
+  says so through an empty `merged_files` and a `features_merged` of zero.
+  A tile that came back empty is still an `ok` tile; empty and failed are
+  different things throughout.
 - **`<stem>_<type>.geojson`**: one GeoJSON FeatureCollection per Overture
   type the completed request asked for, each fetched in a single request
   over the whole extent, so there are no tile seams in it to deduplicate.
+  A type that returned no features over this extent gets no file, for the
+  same reason `<stem>.osm` can be absent.
   A complete run also sweeps
   away any merged file an earlier, differently-scoped attempt left in the
   root, so the folder matches `survey.json` rather than accumulating types
@@ -469,8 +491,10 @@ Fields, as actually written:
 | `extent_km` | Width and height of that bbox in kilometres. |
 | `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. Always the tiling that was requested: a tile too dense for one request is split inside its own tile (see "Limits worth knowing about") and the plan itself never changes. |
 | `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
-| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), for Overture `types` (the actual Overture types fetched), and for elevation `demtype` (the DEM model the package actually holds, with `licence` and `attribution` beside it being that model's own). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
-| `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"`/`"pending"` status per source. `"pending"` means the source never got a turn on that tile at all, most often because a Stop request landed first; it is a different, more honest claim than `"failed"`, which means a real attempt came up short. |
+| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `merged_files` (the files this layer actually left in the package root, empty if it left none), `features_merged` (how many features or OSM elements went into them, absent for elevation, whose output is a raster rather than a feature collection), `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), for Overture `types` (the actual Overture types fetched), and for elevation `demtype` (the DEM model the package actually holds, with `licence` and `attribution` beside it being that model's own). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
+| `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"`/`"pending"` status per source. Why a tile is `"failed"` is in `tile_failures` below, not here, so this row keeps the shape every earlier package already has. `"pending"` means the source never got a turn on that tile at all, most often because a Stop request landed first; it is a different, more honest claim than `"failed"`, which means a real attempt came up short. |
+| `tile_failures` | One entry per tile that is still missing when the run ends: `source`, `tile_id`, `kind`, `reason` and `retried`. Empty on an ordinary run. `reason` is a plain sentence written for a person, never a traceback and never a URL. `kind` is the fixed vocabulary the retry decision is made on: `timeout`, `unreachable`, `rate_limited` and `service_error` are retried once, automatically, later in the same run; `not_authorised`, `refused`, `node_cap`, `no_output` and `unknown` are not, because asking again gets the same answer. `retried` says whether that second attempt happened. **A layer that found nothing is not in here.** An extent with no buildings in it produces no file and no failure; the empty `merged_files` in its `sources` entry is what explains that. |
+| `verified` | What the end-of-run check found: `checked`, `ok`, `failed`, `pending`, and `corrections`. Every planned tile of every fetched layer is reconciled against what is genuinely on disk before the run is declared finished. `corrections` is normally empty, and when it is not it is the important part: it lists tiles this run had recorded as downloaded that had no file behind them, and which have been put right rather than left to be believed. |
 | `complete` | `true` only if every requested source downloaded and merged every tile successfully. Says nothing about the Urbano bridge, which is a separate concern, recorded next. |
 | `stopped` | `true` only when a Stop request is the reason `complete` is `false`, never for an ordinary tile failure and never alongside `complete: true`. Distinguishes the two ways a package can be short: `complete: false, stopped: true` is exactly as far as you asked it to go and is safe to hand to Grasshopper as is; `complete: false, stopped: false` means something failed. Re-running the same extent resumes either way. A Stop that lands after every tile has already finished leaves `complete: true, stopped: false`: nothing about the data is short, so this field has nothing to report and the run is reported as done. The only trace such a run leaves is `bridge.attempted: false`, below, and `mapgen bridge` is how you get those files without downloading the extent again. |
 | `bridge` | `attempted`, `ok` and `error`: whether the Urbano bridge ran, whether it succeeded, and a plain sentence if not. `ok` is `null` if the bridge step was skipped entirely, which any run you stopped does, on purpose: `attempted` is `false` and `ok` is `null` the same as `--skip-bridge`, since starting another external process after a Stop request works against stopping promptly. That holds even when the Stop landed too late to cost you any data, so a `complete: true` package with `bridge.attempted: false` and no `--skip-bridge` is a run you stopped right at the end. Two more fields appear only once `mapgen bridge` has been run over the package afterwards, and are described in the row below. |
