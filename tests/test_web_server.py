@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 
+from mapgen.config import load_config
 from mapgen.folderpicker import RESULT_MARKER, choose_directory, dialog_is_open
 from mapgen.geo import BBox
 from mapgen.geocode import GeocodeError, GeocodeQueueFullError, GeocodeResult, ReverseResult
@@ -62,6 +63,21 @@ class StubSource:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("merged", encoding="utf-8")
         return [out]
+
+
+class WritesNothingSource(StubSource):
+    """fetch() returns cleanly and writes nothing at all.
+
+    The one way to reach a job that is neither done, nor stopped, nor
+    raised: complete: false with no exception anywhere. See review
+    finding N4.
+    """
+
+    id = "writes-nothing"
+    display_name = "Writes Nothing"
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        return []
 
 
 class BlockingSource:
@@ -1196,6 +1212,69 @@ def test_a_leaking_elevation_failure_never_surfaces_the_key_through_a_real_job(t
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_a_job_that_neither_finished_nor_stopped_is_reported_as_failed(server, tmp_path):
+    # Review finding N4: JobManager's ordinary failure branch, the one
+    # that is not an exception, never executed in any test. It is reached
+    # by a source whose fetch() returns cleanly having written nothing, so
+    # run_survey comes back complete: false and stopped: false without
+    # anything raising. Its own message is what the browser shows the
+    # owner, and it points at the file that says which tiles are short.
+    register(WritesNothingSource())
+    status, payload = _post(
+        server,
+        "/api/jobs",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["writes-nothing"],
+            "run_bridge": False,
+        },
+    )
+    assert status == 202
+    final = _wait_for_state(server, payload["id"])
+    assert final["state"] == "failed", "neither done nor stopped must read as failed"
+    assert final["error"] == "Some tiles failed. See survey.json."
+
+
+def test_an_unknown_api_path_is_a_404_on_every_method(server):
+    # Review finding N5. The GET branch never executed at all, and
+    # mutation M18 showed the same for POST: adding a second alias for
+    # the folder dialog changed nothing any test observed. A route this
+    # server does not have must not be answered by whichever handler
+    # happens to sit last in the chain.
+    for method in ("GET", "POST", "PUT"):
+        request = urllib.request.Request(
+            f"{server}/api/not-a-real-route?token={TOKEN}",
+            data=b"{}" if method != "GET" else None,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(request, timeout=10)
+        assert excinfo.value.code == 404, f"{method} /api/not-a-real-route"
+        body = json.loads(excinfo.value.read().decode("utf-8"))
+        assert body["error"] == "Unknown endpoint."
+
+
+def test_config_put_ignores_a_dunder_rather_than_dropping_the_connection(
+    server, tmp_path, monkeypatch
+):
+    # Review finding N12. The guard was hasattr(current, key), which is
+    # true for __class__, __init__ and every other dunder a dataclass
+    # instance carries, so {"__class__": "x"} reached setattr and raised
+    # TypeError inside the handler thread: the connection was dropped
+    # rather than any status being sent.
+    monkeypatch.setattr("mapgen.config.CONFIG_PATH", tmp_path / "config.json")
+    status, payload = _put(server, "/api/config", {"__class__": "x", "tile_size_m": 1500.0})
+    assert status == 200
+    assert payload["tile_size_m"] == 1500.0
+    # And the config on disk is a config, not whatever that would have
+    # turned the dataclass into.
+    assert load_config(tmp_path / "config.json").tile_size_m == 1500.0
 
 
 def test_config_put_with_invalid_json_returns_400(server, tmp_path, monkeypatch):
@@ -2436,15 +2515,30 @@ def test_config_get_reports_the_default_model_for_a_config_that_has_never_had_on
 
 
 class StubFolderPicker:
-    """Returns a canned answer, or raises a canned error, per call."""
+    """Returns a canned answer, or raises a canned error, per call.
+
+    The signature is choose_directory's, all three parameters, not just
+    the one the route happens to pass today (review finding N13). A
+    double that accepts less than the real function is the shape that has
+    caught this project out repeatedly: the day the route starts passing
+    a timeout, a one-argument stub would raise TypeError and look like a
+    route bug, and a stub that swallowed **kwargs would accept a call the
+    real function's signature would too while nobody checked the value.
+    Recording what it was actually given is what makes the second case
+    testable at all.
+    """
 
     def __init__(self):
         self.result = "C:\\Surveys"
         self.error = None
         self.calls = []
+        self.timeouts = []
+        self.runners = []
 
-    def __call__(self, initial_dir=None):
+    def __call__(self, initial_dir=None, timeout_seconds=None, runner=None):
         self.calls.append(initial_dir)
+        self.timeouts.append(timeout_seconds)
+        self.runners.append(runner)
         if self.error is not None:
             raise self.error
         return self.result
@@ -2504,6 +2598,22 @@ def test_folder_dialog_opens_where_the_field_currently_points(picker_server):
     base, picker = picker_server
     _post(base, "/api/folder-dialog", {"initial": "C:\\Users\\Param\\Surveys"})
     assert picker.calls == ["C:\\Users\\Param\\Surveys"]
+
+
+def test_the_route_lets_the_picker_choose_its_own_timeout(picker_server):
+    # Review finding N13, the half of it that is checkable. The route
+    # passes one positional argument, so the dialog's 120 second timeout
+    # is choose_directory's own default rather than a number this module
+    # decides. Pinned because the stub now has the real signature: if the
+    # route ever starts passing a timeout, this says so out loud instead
+    # of the change going unnoticed by a stub that could not have seen it.
+    base, picker = picker_server
+    _post(base, "/api/folder-dialog", {})
+    assert picker.timeouts == [None], (
+        "the route passed a timeout of its own; the picker's default is "
+        "meant to be the single place that number lives"
+    )
+    assert picker.runners == [None]
 
 
 def test_a_missing_or_unusable_initial_directory_is_simply_not_passed(picker_server):

@@ -35,7 +35,18 @@ import sys
 
 # getattr rather than a bare attribute: CREATE_NO_WINDOW only exists in
 # subprocess on Windows, so naming it directly would raise AttributeError at
-# import time on any other platform, which the test suite and CI both are.
+# import time on any other platform.
+#
+# That used to end "...which the test suite and CI both are". Review
+# finding N10: there is no CI. There is no .github/ in this repository and
+# nothing else runs this suite anywhere, and the suite runs on Windows
+# here, where the flag does exist. So the non-Windows branch in
+# hidden_process_kwargs below is not covered by anything and cannot be
+# without a machine this project does not have. The getattr stays, because
+# it costs nothing and the day someone opens this on a Mac an
+# AttributeError at import time would be a poor welcome, but it is
+# insurance against an untested platform rather than something the suite
+# is exercising.
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 

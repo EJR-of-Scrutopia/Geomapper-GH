@@ -3624,6 +3624,35 @@ function ok(condition, message) {
     ok(none.note === "", `expected no note without a subdivision, got ${JSON.stringify(none.note)}`);
   });
 
+  await test("countdown: with no estimate yet it says so rather than guessing", async () => {
+    // Review finding N7: remainingLabel's "unknown" branch never
+    // executed. It is reached whenever the snapshotted estimate is 0,
+    // which is what a geometry-only estimate leaves behind, and the
+    // honest answer there is that the number is not known yet rather
+    // than a countdown from nothing.
+    const { sandbox } = await bootedSandbox();
+    const label = sandbox.remainingLabel({
+      ...RUNNING_RUN,
+      staticSeconds: 0,
+      fractionDone: 0.05,
+      fractionFetched: 0.05,
+      elapsedSeconds: 5,
+    });
+    ok(label.branch === "unknown", `expected the unknown branch, got ${label.branch}`);
+    ok(/working out/i.test(label.text), `got ${label.text}`);
+    ok(!/\d/.test(label.text), `expected no number invented, got ${label.text}`);
+  });
+
+  await test("countdown: a non-positive remainder never reads as a negative time", async () => {
+    // formatRemaining's own guard, also never executed. Reachable
+    // through the measured branch when the projection lands at or below
+    // zero on a run that is still going.
+    const { sandbox } = await bootedSandbox();
+    ok(sandbox.formatRemaining(0) === "less than a minute");
+    ok(sandbox.formatRemaining(-30) === "less than a minute");
+    ok(sandbox.formatRemaining(NaN) === "less than a minute");
+  });
+
   await test("countdown: nothing is ever reported to the second", async () => {
     // The estimate under this is +/- 20% at best and one measured
     // Overture call came back at 28.48s against a 4.51s to 4.66s norm.
@@ -3663,7 +3692,7 @@ function ok(condition, message) {
   // Boots a sandbox with a real estimate and a job whose status replies
   // are handed out one per poll, so a test can walk a run through as many
   // states as it needs without touching app.js's own timers.
-  async function jobSandbox({ tileIds, polls, sources = TWO_SOURCES, sourceSeconds, cancelReply }) {
+  async function jobSandbox({ tileIds, polls, sources = TWO_SOURCES, sourceSeconds, cancelReply, startReply }) {
     let pollIndex = 0;
     const { sandbox, fetchCalls } = await bootedSandbox((url, options) => {
       const method = (options.method || "GET").toUpperCase();
@@ -3695,7 +3724,12 @@ function ok(condition, message) {
           ]),
         });
       }
-      if (url.pathname === "/api/jobs" && method === "POST") return jsonResponse(202, { id: "job1" });
+      if (url.pathname === "/api/jobs" && method === "POST") {
+        // startReply lets a test have the server refuse the job, which is
+        // how the Download handler's own catch gets exercised at all
+        // (review finding N7).
+        return startReply ? startReply() : jsonResponse(202, { id: "job1" });
+      }
       if (url.pathname === "/api/jobs/job1") {
         // The last reply repeats once a test runs out of them, and a
         // test that supplies none at all (the slider tests, which never
@@ -3861,6 +3895,30 @@ function ok(condition, message) {
     } finally {
       process.off("unhandledRejection", onRejection);
     }
+  });
+
+  await test("a Download the server refuses shows the reason instead of nothing", async () => {
+    // Review finding N7: the Download handler's own catch never
+    // executed, so neither a 409 from a busy server nor a 400 from
+    // /api/jobs had ever been shown to reach the screen.
+    const { sandbox } = await jobSandbox({
+      tileIds: tileIdsUpTo(4),
+      polls: [{ state: "running", events: [] }],
+      startReply: () =>
+        jsonResponse(409, {
+          error: "A download is already running. Wait for it to finish or cancel it.",
+        }),
+    });
+    sandbox.document.getElementById("download").fire("click");
+    await flush(20);
+    const box = sandbox.document.getElementById("estimate");
+    const shown = box.textContent || box.innerHTML;
+    ok(/already running/i.test(shown), `expected the server's own reason, got: ${shown}`);
+    ok(/error/.test(box.className), `expected the error styling, got ${box.className}`);
+    ok(
+      sandbox.document.getElementById("progress").hidden === true,
+      "a job that never started must not raise a progress bar"
+    );
   });
 
   await test("a stopped run settles the bar at what it reached, not at 100%", async () => {

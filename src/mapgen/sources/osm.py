@@ -346,7 +346,7 @@ class OsmSource:
         request did not restrict anything.
         """
         use_overpass = self.use_overpass or (osm_tag_clauses(categories) is not None)
-        return OsmSource(
+        return type(self)(
             session=self.session,
             overpass_urls=self.overpass_urls,
             osm_api_url=self.osm_api_url,
@@ -513,8 +513,13 @@ class OsmSource:
         Resuming an unfinished subdivision does re-ask for the whole tile
         first, and gets told it is too dense a second time, because that
         is how this function learns the tile needs splitting at all. One
-        request, about two seconds, paid once per interrupted tile: the
-        alternative is a note on disk recording that a tile was split
+        request per ANCESTOR LEVEL of the piece that was interrupted, so
+        up to two at MAX_SUBDIVISION_DEPTH = 2: the plan tile is re-asked
+        and told it is too dense, and so is the quarter that was mid-split
+        when the stop landed. About two seconds each (review finding N9;
+        this said "one request, about two seconds, paid once per
+        interrupted tile", which is the depth-1 case and not the cap).
+        The alternative is a note on disk recording that a tile was split
         before, which is a second source of truth about the same fact and
         would go stale the moment the ground did. Everything expensive,
         the quarters themselves, is still skipped.

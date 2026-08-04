@@ -691,7 +691,16 @@ def make_handler(
 
             current = load_config()
             for key, value in payload.items():
-                if hasattr(current, key):
+                # Review finding N12: hasattr alone is true for __class__,
+                # __init__ and every other dunder a dataclass instance
+                # carries, so {"__class__": "x"} reached setattr and raised
+                # TypeError inside this handler thread, which drops the
+                # connection rather than answering anything at all.
+                # Restricted to the dataclass's own declared fields, which
+                # is what this route always meant by "a config key": a name
+                # that is not one is ignored exactly as an unknown key
+                # already was, rather than being half-accepted.
+                if key in current.__dataclass_fields__:
                     setattr(current, key, value)
             save_config(current)
             return self._send_json(200, current.__dict__)

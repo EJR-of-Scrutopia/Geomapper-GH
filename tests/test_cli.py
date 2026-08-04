@@ -396,6 +396,29 @@ def test_categories_command_lists_every_leaf_id(capsys):
         assert category_id in out, f"expected {category_id!r} to be listed"
 
 
+def test_sources_command_lists_every_source_with_its_licence(capsys):
+    # Review finding N6: command_sources never executed in any test, and
+    # it is the command that prints each source's licence, which is the
+    # thing this project is most careful about everywhere else. Read off
+    # the registry rather than a hand-listed expectation, so a fourth
+    # source in phase 2 is covered by this without anyone remembering.
+    from mapgen.package import register_default_sources
+    from mapgen.sources.base import available_sources
+
+    register_default_sources()
+    exit_code = main(["sources"])
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    sources = available_sources()
+    assert sources, "the registry was empty, so this proved nothing"
+    for source in sources:
+        assert source.id in out, f"expected {source.id!r} to be listed"
+        assert source.display_name in out
+        assert source.licence in out, f"{source.id} was listed without its licence"
+        if source.requires_api_key:
+            assert "needs an API key" in out
+
+
 def test_category_flag_reaches_the_survey_request(tmp_path):
     exit_code = main(
         [

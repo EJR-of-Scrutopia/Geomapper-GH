@@ -233,6 +233,18 @@ def test_configure_with_an_empty_type_list_produces_a_source_that_fetches_nothin
     assert paths == []
 
 
+def test_configure_keeps_the_subclass_it_was_called_on():
+    # Review finding N1: see the OSM test of the same name for why a
+    # discarded subclass is a test-passes-for-the-wrong-reason trap
+    # rather than a live defect.
+    class Subclassed(OvertureSource):
+        pass
+
+    configured = Subclassed(types=["water"]).configure(["building"])
+    assert type(configured) is Subclassed
+    assert configured.types == ["building"]
+
+
 def test_layer_filenames_map_the_three_phase_one_layers():
     assert LAYER_FILENAMES == {
         "water": "water.geojson",

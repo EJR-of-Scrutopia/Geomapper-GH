@@ -64,11 +64,17 @@ def test_run_hidden_forwards_extra_kwargs():
     assert kwargs["errors"] == "replace"
 
 
-def test_hidden_process_kwargs_is_empty_off_windows():
+def test_hidden_process_kwargs_matches_this_platform():
+    # Review finding N10: this was named ..._is_empty_off_windows and,
+    # on the only machine that runs this suite, took its win32 arm and
+    # checked the opposite of its own name. Renamed to say what it
+    # actually does. The non-Windows arm below is unreachable here and is
+    # kept as the statement of intent for a platform this project has no
+    # machine to run on, not as something being exercised.
     kwargs = hidden_process_kwargs()
     if sys.platform == "win32":
         assert kwargs == {"creationflags": subprocess.CREATE_NO_WINDOW}
-    else:
+    else:  # pragma: no cover - no non-Windows machine runs this suite
         assert kwargs == {}
 
 

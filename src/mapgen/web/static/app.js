@@ -1958,10 +1958,20 @@ function renderCategories(groups) {
 // same row of dots in a type="password" field, which is what convinced
 // the owner a save that had genuinely worked had not. The persistence
 // itself was never broken (see mapgen.config, unchanged by this fix); the
-// field just gave no honest signal either way. This never echoes the key
-// itself, only whether one is present in the saved config, matching the
-// redaction discipline mapgen.sources.elevation already applies to this
-// exact value everywhere else it could ever reach a log or a response.
+// field just gave no honest signal either way. This function never echoes
+// the key itself, only whether one is present in the saved config.
+//
+// It used to add "matching the redaction discipline mapgen.sources.
+// elevation already applies to this exact value everywhere else it could
+// ever reach a log or a response". Review finding N11: that is not true
+// of the page as a whole and the claim reads as though it were.
+// renderApiKeys twelve lines below writes the real key into the DOM as
+// value="...", because it is an editable field and has to, and GET
+// /api/config returns it in the response body. Both are loopback-only and
+// token gated and both predate this branch, so this is a comment that
+// overclaimed rather than a leak; elevation.py's redaction is about the
+// key reaching a LOG or an ERROR MESSAGE, which is a different question
+// from a field the owner is meant to be able to edit.
 function apiKeyStatusMarkup(hasSavedKey) {
   return hasSavedKey
     ? '<span class="api-key-status saved">Key saved</span>'

@@ -660,6 +660,20 @@ def test_configure_names_the_model_the_request_actually_asked_for():
     assert configured.display_name == "Elevation (OpenTopography EU_DTM)"
 
 
+def test_configure_keeps_the_subclass_it_was_called_on():
+    # Review finding N1, and this is the source the reviewer was actually
+    # bitten by: their first attempt at reproducing I8 subclassed
+    # ElevationSource to make fetch() raise, configure() replaced it with
+    # a plain ElevationSource, and the "double" made a real request to
+    # OpenTopography with the saved key.
+    class Subclassed(ElevationSource):
+        pass
+
+    configured = Subclassed(api_key="k").configure("EU_DTM")
+    assert type(configured) is Subclassed
+    assert configured.demtype == "EU_DTM"
+
+
 def test_configure_never_mutates_the_registered_instance():
     # The reason OvertureSource.configure exists at all: /api/estimate has
     # no busy-guard, so it can be polled while a job using a different

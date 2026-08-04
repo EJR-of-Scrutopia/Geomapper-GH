@@ -91,6 +91,30 @@ def test_overpass_query_contains_the_bbox_in_south_west_north_east_order():
     assert "[out:xml][timeout:180]" in query
 
 
+def test_an_empty_selection_filters_on_a_tag_no_data_carries():
+    # Review finding N3. This branch is unreachable from the CLI and the
+    # browser (Task 21 refuses an empty selection at SurveyRequest
+    # construction, and every leaf category has a tag clause) but it is
+    # reachable from a direct Python caller, which the README documents,
+    # and it was untested: mutation M25 replaced the clause with the
+    # unfiltered query and the whole suite stayed green. That mutation is
+    # exactly the "select nothing becomes select everything" failure this
+    # branch's own docstring says it prevents, which is the one thing a
+    # test here must catch.
+    bbox = BBox.parse("-3.29,51.38,-3.28,51.39")
+    query = build_overpass_query(bbox, 180, categories=[])
+    assert 'nwr["mapgen:none"="true"]' in query
+    # The unfiltered form, which is what "select nothing" must never
+    # silently become.
+    unfiltered = build_overpass_query(bbox, 180, categories=None)
+    assert query != unfiltered
+    for element in ("node(", "way(", "relation("):
+        assert element not in query, (
+            f"an empty selection produced the unfiltered {element}...) query, "
+            f"which asks for everything"
+        )
+
+
 def test_fetch_writes_one_file_per_tile(tmp_path):
     source = _source([FakeResponse()])
     paths = source.fetch(
@@ -483,6 +507,23 @@ def test_configure_returns_a_fresh_instance_with_the_given_categories(tmp_path):
     assert configured is not original
     assert configured.categories == ["buildings"]
     assert original.categories is None, "configure() must not mutate the original instance"
+
+
+def test_configure_keeps_the_subclass_it_was_called_on():
+    # Review finding N1. configure() constructed OsmSource by name, so a
+    # subclass was silently replaced by a plain OsmSource. Nothing was
+    # broken by it today, and that is exactly why it is worth pinning: a
+    # future test that builds a double the obvious way, by subclassing the
+    # real source to make fetch() raise, would have had its double thrown
+    # away here and exercised the REAL source instead, then passed for
+    # that reason. The reviewer hit this writing their own reproduction
+    # and made a live request to OpenTopography with the saved key.
+    class Subclassed(OsmSource):
+        pass
+
+    configured = Subclassed().configure(["buildings"])
+    assert type(configured) is Subclassed
+    assert configured.categories == ["buildings"]
 
 
 def test_configure_preserves_transport_settings():

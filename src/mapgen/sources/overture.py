@@ -416,7 +416,7 @@ class OvertureSource:
         selects, while package.py uses the returned copy for the actual
         estimate/fetch/merge work.
         """
-        return OvertureSource(
+        return type(self)(
             types=types, release=self.release, runner=self._runner, executable_finder=self._find
         )
 

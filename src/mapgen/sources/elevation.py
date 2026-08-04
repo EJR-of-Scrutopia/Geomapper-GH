@@ -473,7 +473,7 @@ class ElevationSource:
         exactly which one it is, which is what `mapgen estimate` prints
         beside the licence.
         """
-        configured = ElevationSource(
+        configured = type(self)(
             api_key=self._api_key,
             demtype=demtype,
             session=self.session,
