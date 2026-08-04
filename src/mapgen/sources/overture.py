@@ -28,9 +28,20 @@ duplicate data. The counts match exactly because geo.build_tiles clamps every
 tile's query_bbox to the parent extent on all four sides, so the tiled union
 covers exactly the parent bbox and never more. Per-call cost is dominated by
 fixed overhead (process spawn, parquet metadata read, connection setup), not
-data volume: a 10 km x 14 km bbox returning 89,722 features and 55 MB still
+data volume: a large bbox returning 89,722 features and 55 MB still
 completed in one call in 43.73s, so a single call scales to real survey
 extents comfortably.
+
+That 55 MB is `building` over the owner's own Barry extent
+(-3.3400,51.3600,-3.1000,51.5000), which is 16.66 x 15.58 km, not the
+10 x 14 km this paragraph used to attribute it to. The two were
+conflated when it was written. Re-measured on 2026-08-04 (Task 25):
+55,420,672 bytes there, and 25,863,193 bytes in 5.41s for the same type
+over the 10.41 x 13.91 km bbox. The conclusion is unaffected and if
+anything understated. The 43.73s is left as recorded rather than
+replaced, because it was a real reading on a real day and this source
+has been seen to vary sixfold on the same query. It is not a cost
+anchor, and none of the constants below were fitted from it.
 """
 
 from __future__ import annotations
