@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -43,9 +44,34 @@ WINDOWLESS_LOG_PATH = Path.home() / ".mapgen" / "ui.log"
 
 
 class ConsoleProgress:
+    """One whole line per event on stdout, from any number of threads.
+
+    The lock is not decoration, and it is not defensive habit either. Since
+    Task 24 OvertureSource.fetch downloads its types concurrently and emits
+    tile_done/tile_skipped from up to eight worker threads at once, and
+    print() writes the text and the line ending as two separate calls on
+    sys.stdout with nothing holding them together. A second thread landing
+    between the two is what puts two events on one line and a stray blank
+    line after them. During a survey this event stream is the whole of what
+    a command line run shows the owner, so garbling it costs them the only
+    view they have of a download that takes minutes.
+
+    Checked rather than assumed for the other two sinks this project ships
+    before this was written: EventLog (mapgen.jobs), which is what the
+    browser path uses, appends under its own lock and was already safe;
+    NullProgress holds no state at all. Those three are every ProgressSink
+    in production, and a source emitting from threads is now a thing this
+    project does, so any fourth has to be checked the same way.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
     def emit(self, event: str, **fields: object) -> None:
         detail = " ".join(f"{key}={value}" for key, value in fields.items())
-        print(f"[{event}] {detail}".rstrip(), flush=True)
+        line = f"[{event}] {detail}".rstrip()
+        with self._lock:
+            print(line, flush=True)
 
 
 def _parse_bbox(value: str) -> BBox:

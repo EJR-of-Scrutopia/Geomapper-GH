@@ -732,3 +732,73 @@ def test_report_windowless_failure_swallows_a_failing_message_box(capsys):
     # Must not raise: a message box failing must never mask the original
     # error or blow up a failure-reporting path with a second exception.
     cli._report_windowless_failure(RuntimeError("original problem"), message_box=failing_message_box)
+
+
+# --- Task 24: ConsoleProgress is now written to from several threads ----
+
+
+class _RecordingLock:
+    """A lock that records that it was actually taken.
+
+    Deliberately not a stress test. This project has already written one
+    of those, many threads against an unguarded shared list, and it passed
+    against the broken code because the interleaving it hoped to observe
+    never happened to occur. Asserting that the write went out with the
+    lock held is a fact about the code, not about the scheduler, so it
+    fails for the stated reason every time or not at all.
+    """
+
+    def __init__(self):
+        self.acquisitions = 0
+        self.held = False
+
+    def __enter__(self):
+        self.acquisitions += 1
+        self.held = True
+        return self
+
+    def __exit__(self, *exc_info):
+        self.held = False
+        return False
+
+
+class _HeldWhenWritten:
+    def __init__(self, lock):
+        self._lock = lock
+        self.writes = []
+
+    def write(self, text):
+        self.writes.append((text, self._lock.held))
+        return len(text)
+
+    def flush(self):
+        return None
+
+
+def test_console_progress_writes_every_event_with_its_lock_held(monkeypatch):
+    # OvertureSource.fetch emits from up to eight worker threads at once
+    # (Task 24). print() writes the text and the line ending as two
+    # separate calls on sys.stdout, so without this lock a second thread
+    # can land between them and put two events on one line.
+    progress = cli.ConsoleProgress()
+    lock = _RecordingLock()
+    progress._lock = lock
+    stream = _HeldWhenWritten(lock)
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    progress.emit("tile_done", source="overture", tile_id="r00_c00")
+    progress.emit("tile_done", source="overture", tile_id="r00_c01")
+
+    assert lock.acquisitions == 2
+    assert stream.writes, "nothing was written at all"
+    assert all(held for _text, held in stream.writes), (
+        f"a write went out with the lock released: {stream.writes}"
+    )
+
+
+def test_console_progress_still_prints_one_readable_line_per_event(capsys):
+    # The lock must not have changed what the owner actually reads.
+    progress = cli.ConsoleProgress()
+    progress.emit("tile_done", source="overture", tile_id="r00_c00")
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["[tile_done] source=overture tile_id=r00_c00"]
