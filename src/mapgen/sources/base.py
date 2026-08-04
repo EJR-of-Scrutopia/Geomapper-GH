@@ -98,7 +98,16 @@ class LayerSource(Protocol):
     tile loop for OsmSource, the type loop for OvertureSource (Task 23:
     it was the (tile, type) loop while Overture was still tiled), so a
     request already in flight is always allowed to finish and be kept,
-    never interrupted mid-request. A source that omits the parameter
+    never interrupted mid-request. A source that runs its units
+    concurrently checks in two places instead of one, before submitting
+    each unit and again at the start of each worker, and what a stop can
+    then skip is only what has not started: OvertureSource since Task 24
+    downloads up to eight types at once, so a stop landing once every
+    selected type is already in flight skips nothing and its fetch()
+    returns normally, leaving package.py's own checkpoint after the source
+    to end the run. That is this same convention applied honestly, not a
+    hole in it, but it does mean a stop costs more downloading than it
+    used to. A source that omits the parameter
     entirely, including every stub in this project's own test suite, is
     still called exactly as before and still works: it is simply not
     interruptible mid-fetch, and the next checkpoint (between sources, or

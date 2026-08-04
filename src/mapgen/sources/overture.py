@@ -2,7 +2,18 @@
 
 Downloads run through the overturemaps CLI, which handles the cloud-hosted
 parquet release. Each type is fetched once, over the whole request bbox, and
-merged into one GeoJSON per type.
+merged into one GeoJSON per type. Up to MAX_CONCURRENT_TYPE_DOWNLOADS of
+those fetches run at the same time (Task 24): they are independent network
+reads that spend nearly all of their time waiting, and running the eight
+default types together took the same 168,020,582 bytes from 59.98s and
+61.88s down to 17.75s and 17.77s on this machine. See that constant for
+the full measurement and for why eight is where it stops.
+
+Not parallelised across sources, and specifically not for OSM. OSM tiles hit
+a shared public API with its own rate limits, and pointing many concurrent
+requests at it is a good way to get the owner throttled part way through a
+survey. Overture is a read of cloud-hosted parquet with no such etiquette
+problem, which is why it and not OSM got this.
 
 Not tiled, unlike OsmSource (Task 23). OSM is tiled because the OSM map API
 has a hard 50,000-node cap per request, and the whole node-cap retry ladder
@@ -24,6 +35,7 @@ extents comfortably.
 
 from __future__ import annotations
 
+import concurrent.futures
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,7 +43,7 @@ from typing import Callable, Sequence
 
 from mapgen.fsutil import best_effort_rmtree, ensure_dir
 from mapgen.geo import BBox, Tile, extent_metres
-from mapgen.jobs import CancelToken
+from mapgen.jobs import Cancelled, CancelToken
 from mapgen.merge import merge_geojson
 from mapgen.procutil import run_hidden
 from mapgen.sources.base import Estimate, ProgressSink
@@ -86,6 +98,41 @@ SECONDS_PER_TYPE_PER_SQ_KM = 0.28
 BASE_BYTES_PER_TYPE = 2_230_000
 BYTES_PER_TYPE_PER_SQ_KM = 172_000
 
+# How many type downloads run at once (Task 24).
+#
+# Threads rather than processes: every one of these is a subprocess.run
+# blocked on a network read for essentially its whole life, so the GIL is
+# released throughout and processes would buy nothing but their own spawn
+# cost on top.
+#
+# Eight, from measurement rather than taste. Taken on this machine through
+# this same fetch(), against the live release, using overturemaps 0.20.0
+# from the venv, over the owner's real Barry extent
+# (-3.3400,51.3600,-3.1000,51.5000, roughly 10 km x 14 km), all eight
+# default types, A and B alternated back to back so neither gets a
+# different network from the other:
+#
+#     one at a time     59.98s, 61.88s
+#     eight at a time   17.75s, 17.77s
+#
+# 168,020,582 bytes on every single run at both settings, so nothing is
+# being skipped to go faster. About 3.4x.
+#
+# Eight is where it stops, but not quite for the reason it looks like from
+# the wall clock. Under eight-way every individual download gets SLOWER,
+# not merely overlapped: `segment` takes 8.7s to 10.6s on its own and
+# 16.2s to 17.7s alongside seven others, and `place` goes from 5.3s to
+# 8.2s. Total throughput is what improved, from about 2.8 MB/s to about
+# 9.4 MB/s, which is the shape of a link running out of bandwidth rather
+# than of requests waiting on latency. More concurrency has nothing left
+# to win here: it would divide the same bandwidth into more pieces.
+#
+# It is a CAP and not simply "however many types were asked for" because
+# --overture-type takes any string and is repeatable, so a caller can name
+# far more than the default eight. Without a ceiling, one request would
+# launch an unbounded number of CLI processes at once.
+MAX_CONCURRENT_TYPE_DOWNLOADS = 8
+
 
 class OvertureError(RuntimeError):
     """Raised when the overturemaps CLI is missing or fails."""
@@ -129,6 +176,33 @@ def _state_sidecar(download_path: Path) -> Path:
     why nothing caught this until 0.20.0 appeared in the venv.
     """
     return download_path.with_name(download_path.name + ".state")
+
+
+def _combined_failure(failures: dict[str, BaseException]) -> BaseException:
+    """One exception for however many types failed in the same pool.
+
+    A single failure is re-raised exactly as it came out, so the message
+    the owner reads for the ordinary case is character for character the
+    one this source has always raised ("overturemaps failed for type
+    segment: ...") and nothing downstream that matches on it changes.
+
+    More than one is the case a pool creates and a sequential loop never
+    could, and it is the reason this function exists rather than the
+    caller simply re-raising whichever future it happened to inspect
+    first. Six types failing and one type failing are very different
+    situations, most likely a dead network against one bad type name, and
+    a report that names only the first gives the owner no way to tell
+    them apart. Every type is named, and every type's own detail is
+    carried, since the detail is usually the CLI's stderr and that is what
+    says which of the two it was.
+    """
+    if len(failures) == 1:
+        return next(iter(failures.values()))
+    names = ", ".join(failures)
+    detail = "; ".join(f"{name}: {exc}" for name, exc in failures.items())
+    return OvertureError(
+        f"overturemaps failed for {len(failures)} types ({names}). {detail}"
+    )
 
 
 class OvertureSource:
@@ -231,7 +305,8 @@ class OvertureSource:
         progress: ProgressSink,
         cancel: CancelToken | None = None,
     ) -> list[Path]:
-        """One download per type, over the whole request bbox.
+        """One download per type, over the whole request bbox, up to
+        MAX_CONCURRENT_TYPE_DOWNLOADS of them at once.
 
         bbox, not each tile's query_bbox: this source is not tiled (see the
         module docstring for the measurements). tiles is still used, for
@@ -255,6 +330,22 @@ class OvertureSource:
         tile_skipped, and settles active -> done only once every selected
         source has emitted source_done, so emitting per tile per type does
         not make a tile look finished after the first of eight types.
+
+        Those emissions now leave several worker threads at once, which is
+        the part of Task 24 with the least visible failure mode: nothing
+        crashes when two threads write a half line each, the owner simply
+        reads nonsense. Every ProgressSink in production was checked
+        against that (see download_one below) and ConsoleProgress was
+        fixed in the same task.
+
+        The returned list is in the order the caller asked for the types,
+        which under a pool is emphatically not the order they finished in.
+        merge() groups these by stem and package.py rebuilds the list from
+        disk anyway, so nothing downstream currently depends on the order;
+        that is exactly why it is worth pinning, because a return value
+        whose order is decided by whichever download the network happened
+        to finish first is a landmine for whoever next writes code that
+        does depend on it.
         """
         # Debris from the superseded per-tile layout, swept once, up front,
         # before anything is downloaded or read (Task 23). Not migration:
@@ -285,17 +376,42 @@ class OvertureSource:
         # sidecar written by an unfixed version would survive into merge()
         # and put a junk <stem>_<type>.geojson.part.geojson in the package.
         # Reproduced on that exact resume path before this line was added.
+        # Deliberately before the pool, on this one thread, and it has to
+        # stay there. Each type's own sidecar has a distinct name, so the
+        # per-download cleanup in _download cannot collide across threads;
+        # this sweep does not, because it walks every type in the selection
+        # and would race with a worker that had already started writing its
+        # own .part and sidecar. Nothing here is worth parallelising in any
+        # case: it is a handful of unlink calls against a directory that is
+        # normally empty.
         self._remove_earlier_version_debris(work_dir)
 
-        paths: list[Path] = []
-        for overture_type in self.types:
-            # Checked before each type's download, which is now the finest
-            # unit of paid-for work this source has. Coarser than the old
-            # (tile, type) checkpoint in name only: a stop now lands within
-            # one download instead of within one of sixteen downloads of
-            # the same data, so it arrives sooner in wall-clock terms, not
-            # later. An in-flight download is still always allowed to
-            # finish and be kept, per the LayerSource cancel convention.
+        # Deduplicated, and in the order asked for. Duplicates are only
+        # reachable through --overture-type, which is repeatable and takes
+        # any string, so `--overture-type water --overture-type water` is a
+        # thing the owner can type. Sequentially that was harmless: the
+        # second pass found the first pass's file already on disk and
+        # skipped it. Concurrently it is not, because both copies would
+        # race for the same water.geojson.part, and the first thing
+        # _download does with that path is unlink it, so one thread would
+        # delete the other's half-written download and both would then
+        # rename over the same output. Collapsed here rather than in
+        # self.types, which stays exactly as the caller configured it,
+        # since possible_outputs and _remove_earlier_version_debris both
+        # read it and neither cares about duplicates.
+        work_types = list(dict.fromkeys(self.types))
+        if not work_types:
+            # Not merely an optimisation: ThreadPoolExecutor(max_workers=0)
+            # raises, and an empty selection is a real, deliberate request
+            # (see __init__ on types=[]).
+            return []
+
+        def download_one(overture_type: str) -> Path:
+            # Checked again here, at the start of the worker, and not only
+            # before submission: a type still queued behind the cap when a
+            # stop lands is skipped rather than run. A download already in
+            # flight is never interrupted, per the LayerSource cancel
+            # convention.
             if cancel is not None:
                 cancel.raise_if_cancelled()
             output_path = work_dir / f"{overture_type}.geojson"
@@ -304,6 +420,12 @@ class OvertureSource:
             else:
                 self._download(bbox, overture_type, output_path)
                 event = "tile_done"
+            # Emitted from this worker thread, so every ProgressSink in
+            # production has to be safe to call concurrently. Checked, not
+            # assumed: EventLog appends under its own lock, NullProgress
+            # holds no state, and ConsoleProgress was given a lock in this
+            # same task because print() writes the text and the newline
+            # separately and two threads could split them apart.
             for tile in tiles:
                 progress.emit(
                     event,
@@ -311,8 +433,68 @@ class OvertureSource:
                     tile_id=tile.tile_id,
                     overture_type=overture_type,
                 )
-            paths.append(output_path)
-        return paths
+            return output_path
+
+        downloaded: dict[str, Path] = {}
+        failures: dict[str, BaseException] = {}
+        cancelled: Cancelled | None = None
+        futures: dict[str, concurrent.futures.Future] = {}
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(MAX_CONCURRENT_TYPE_DOWNLOADS, len(work_types)),
+            thread_name_prefix="mapgen-overture",
+        ) as pool:
+            for overture_type in work_types:
+                if cancel is not None:
+                    try:
+                        cancel.raise_if_cancelled()
+                    except Cancelled as exc:
+                        cancelled = exc
+                        break
+                futures[overture_type] = pool.submit(download_one, overture_type)
+
+            # Drained in full before anything is raised, which is the whole
+            # point: seven types that succeeded have real files on disk and
+            # a hundred and sixty megabytes of paid-for network behind
+            # them, and an eighth that failed is not a reason to abandon
+            # them. Same principle as the Urbano bridge fix in Task 20 and
+            # the stop path in Task 22. Their files stay where they are
+            # either way, and package.py rebuilds the part list from disk
+            # rather than from this return value (see its own comment at
+            # the fetch call site), so a raise below costs nothing that was
+            # already earned.
+            for overture_type, future in futures.items():
+                try:
+                    downloaded[overture_type] = future.result()
+                except Cancelled as exc:
+                    if cancelled is None:
+                        cancelled = exc
+                except Exception as exc:
+                    # Broad on purpose: whatever a worker raised, an
+                    # OvertureError or an OSError from the filesystem, this
+                    # loop's job is to finish inspecting the other seven
+                    # futures before any of it comes back out. Narrowing it
+                    # would let an unexpected type escape mid-drain and
+                    # abandon the futures after it. BaseException is
+                    # deliberately NOT caught: a KeyboardInterrupt should
+                    # end the run, not be filed as a type that failed.
+                    failures[overture_type] = exc
+
+        if failures:
+            raise _combined_failure(failures)
+        if cancelled is not None:
+            # A genuine download failure is reported ahead of a stop, on
+            # purpose. A stop is the owner's own decision and they already
+            # know about it; a download that broke is news, and swallowing
+            # it inside a Cancelled would leave package.py marking the
+            # affected tiles pending and the owner with no idea a type is
+            # missing for a reason that will still be there next time.
+            raise cancelled
+
+        # In the order the caller asked for the types, never completion
+        # order, which under a pool is whatever the network decided. See
+        # the module docstring.
+        return [downloaded[t] for t in work_types if t in downloaded]
 
     def _remove_earlier_version_debris(self, work_dir: Path) -> None:
         """Remove what an earlier version of mapgen, or of the overturemaps

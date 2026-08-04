@@ -1,14 +1,18 @@
+import concurrent.futures
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
 from mapgen.geo import BBox, Tile
 from mapgen.jobs import CancelToken, Cancelled
+from mapgen.sources import overture as overture_module
 from mapgen.sources.base import NullProgress
 from mapgen.sources.overture import (
     DEFAULT_OVERTURE_TYPES,
     LAYER_FILENAMES,
+    MAX_CONCURRENT_TYPE_DOWNLOADS,
     OvertureError,
     OvertureSource,
 )
@@ -22,15 +26,26 @@ class FakeCompleted:
 
 
 class FakeRunner:
-    """Records commands and writes a stub GeoJSON at the requested output path."""
+    """Records commands and writes a stub GeoJSON at the requested output path.
+
+    The lock is not superstition. Since Task 24 this runner is called from
+    up to eight worker threads at once, and a test double that records its
+    own calls unreliably is the fastest way to a test that passes or fails
+    for reasons having nothing to do with the code under test.
+    """
 
     def __init__(self, returncode=0, stderr=""):
         self.commands = []
+        self.lock = threading.Lock()
         self._returncode = returncode
         self._stderr = stderr
 
+    def record(self, command):
+        with self.lock:
+            self.commands.append(command)
+
     def __call__(self, command, **kwargs):
-        self.commands.append(command)
+        self.record(command)
         if self._returncode == 0:
             output = command[command.index("--output") + 1]
             with open(output, "w", encoding="utf-8") as handle:
@@ -100,7 +115,7 @@ class OvertureCli0200(FakeRunner):
         self.environments = []
 
     def __call__(self, command, **kwargs):
-        self.commands.append(command)
+        self.record(command)
         environment = kwargs.get("env") or {}
         self.environments.append(environment)
 
@@ -282,13 +297,66 @@ def test_fetch_stops_before_the_first_request_when_already_cancelled(tmp_path):
     assert runner.commands == []
 
 
-def test_fetch_stops_before_the_next_type_once_cancelled_mid_loop(tmp_path):
-    # Task 23: the checkpoint is now between types rather than between
-    # (tile, type) pairs, because a type is downloaded exactly once. This
-    # proves a stop landing right after the first type's download never
-    # starts the second type's, and that the first type's file is kept,
-    # which is the LayerSource cancel convention: an in-flight request
-    # always finishes and is never thrown away.
+def test_a_type_still_queued_behind_the_cap_is_skipped_when_a_stop_lands(tmp_path):
+    # Was test_fetch_stops_before_the_next_type_once_cancelled_mid_loop,
+    # which cancelled from inside the first type's runner and asserted the
+    # second type never ran. That assertion is no longer true and cannot be
+    # made true: with two types and a cap of eight, BOTH are submitted and
+    # running before either one finishes, so a stop raised by the first has
+    # nothing left to prevent. See the test below, which pins that changed
+    # behaviour deliberately rather than leaving it as a silent deletion.
+    #
+    # What survives, and what this covers instead, is the case a pool
+    # genuinely has: more types asked for than the cap allows, so some are
+    # queued. A stop landing while the first eight run must skip the queued
+    # ones rather than run them, which is what the check at the top of each
+    # worker is for.
+    #
+    # Deterministic, not a race the test hopes to win. Every one of the
+    # first eight workers waits at the same barrier, and the barrier's own
+    # action cancels the token when it trips, which is before ANY waiter is
+    # released and therefore before any thread can finish its task and pull
+    # a queued one. Twelve types, eight downloads, every time.
+    token = CancelToken()
+    cap = MAX_CONCURRENT_TYPE_DOWNLOADS
+    all_started = threading.Barrier(cap, token.cancel, 30)
+    types = tuple(f"type{index:02d}" for index in range(cap + 4))
+
+    class BarrierRunner(FakeRunner):
+        def __call__(self, command, **kwargs):
+            all_started.wait()
+            return super().__call__(command, **kwargs)
+
+    runner = BarrierRunner()
+    with pytest.raises(Cancelled):
+        _source(runner, types=types).fetch(
+            REQUEST_BBOX, [_tile()], tmp_path, NullProgress(), cancel=token
+        )
+
+    assert len(runner.commands) == cap, (
+        f"expected exactly the {cap} in-flight downloads, got "
+        f"{len(runner.commands)}"
+    )
+    # The in-flight ones finished and were kept, per the cancel convention.
+    for name in types[:cap]:
+        assert (tmp_path / f"{name}.geojson").exists(), f"{name} was thrown away"
+    # The queued ones were never started.
+    for name in types[cap:]:
+        assert not (tmp_path / f"{name}.geojson").exists(), f"{name} ran anyway"
+
+
+def test_a_stop_with_every_selected_type_already_in_flight_lets_them_all_finish(tmp_path):
+    # The behaviour change the test above replaced, stated outright so it
+    # is a decision on the record rather than something a reader has to
+    # infer from a missing test. The default selection is eight types and
+    # the cap is eight, so on the owner's ordinary run every type is in
+    # flight within milliseconds of fetch() starting. From that moment a
+    # Stop cannot skip any of them: fetch() runs to completion and returns
+    # normally, and it is package.py's own checkpoint after the source that
+    # ends the run. That is the LayerSource cancel convention applied
+    # honestly rather than a hole in it, but it does mean a stop now costs
+    # the owner the whole Overture download rather than the remainder of
+    # one type, which is the trade this task makes.
     token = CancelToken()
     inner = FakeRunner()
 
@@ -298,13 +366,13 @@ def test_fetch_stops_before_the_next_type_once_cancelled_mid_loop(tmp_path):
         return result
 
     source = _source(cancelling_runner, types=("water", "building"))
-    tiles = [_tile("r00_c00"), _tile("r00_c01")]
-    with pytest.raises(Cancelled):
-        source.fetch(REQUEST_BBOX, tiles, tmp_path, NullProgress(), cancel=token)
+    paths = source.fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, NullProgress(), cancel=token
+    )
 
-    assert len(inner.commands) == 1, "expected only the in-flight type's request"
-    assert (tmp_path / "water.geojson").exists()
-    assert not (tmp_path / "building.geojson").exists()
+    assert len(inner.commands) == 2
+    assert paths == [tmp_path / "water.geojson", tmp_path / "building.geojson"]
+    assert token.is_cancelled() is True
 
 
 def test_fetch_writes_one_flat_file_per_type_not_a_file_per_tile(tmp_path):
@@ -370,7 +438,7 @@ def test_fetch_leaves_no_partial_file_when_the_cli_fails(tmp_path):
 def test_fetch_fails_loudly_when_the_cli_exits_cleanly_without_writing(tmp_path):
     class SilentRunner(FakeRunner):
         def __call__(self, command, **kwargs):
-            self.commands.append(command)
+            self.record(command)
             return FakeCompleted(0)
 
     with pytest.raises(OvertureError, match="wrote nothing"):
@@ -420,11 +488,18 @@ def test_fetch_omits_release_when_not_configured(tmp_path):
 
 
 class RecordingProgress:
+    """Task 24: emitted into from several worker threads at once, so it
+    keeps its own lock rather than trusting that list.append happens to be
+    atomic. Event ORDER is not asserted anywhere against this double, and
+    must not be: under a pool it is whatever the network decided."""
+
     def __init__(self):
         self.events = []
+        self.lock = threading.Lock()
 
     def emit(self, event, **fields):
-        self.events.append((event, fields))
+        with self.lock:
+            self.events.append((event, fields))
 
 
 def test_fetch_emits_tile_done_for_every_tile_for_every_type(tmp_path):
@@ -533,7 +608,7 @@ class FailingWriter(FakeRunner):
     """Runner that writes a partial file then fails, simulating a CLI crash."""
 
     def __call__(self, command, **kwargs):
-        self.commands.append(command)
+        self.record(command)
         output = command[command.index("--output") + 1]
         with open(output, "w", encoding="utf-8") as handle:
             json.dump(
@@ -567,7 +642,7 @@ class SameFeatureEveryCall(FakeRunner):
     stopped deduplicating would show up as a duplicated feature."""
 
     def __call__(self, command, **kwargs):
-        self.commands.append(command)
+        self.record(command)
         if self._returncode == 0:
             output = command[command.index("--output") + 1]
             with open(output, "w", encoding="utf-8") as handle:
@@ -920,7 +995,7 @@ def test_the_state_sidecar_is_removed_when_the_cli_fails(tmp_path):
 def test_the_state_sidecar_is_removed_when_the_cli_writes_nothing(tmp_path):
     class SilentButStateful(OvertureCli0200):
         def __call__(self, command, **kwargs):
-            self.commands.append(command)
+            self.record(command)
             output = Path(command[command.index("--output") + 1])
             output.parent.mkdir(parents=True, exist_ok=True)
             output.with_name(output.name + ".state").write_text("{}", encoding="utf-8")
@@ -982,3 +1057,292 @@ def test_the_sidecar_cleanup_only_names_files_this_source_could_produce(tmp_path
         REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
     )
     assert bystander.exists()
+
+
+# --- Task 24: the types download concurrently --------------------------
+#
+# Deliberately no stress tests here. This project has already written one,
+# many threads against an unguarded shared list, and it passed against the
+# broken code because the corruption it hoped to observe never happened to
+# occur. Every test below asserts something about what was called, in what
+# order, or with what argument, so it fails for its stated reason every
+# time or not at all. Where concurrency itself has to be proved it is
+# proved with a barrier, which can only trip if the overlap is real and
+# times out with a clear message if it is not.
+
+
+def test_the_cap_is_eight_and_is_a_named_module_constant():
+    # Named and reachable, not buried in a call. The number is justified
+    # from measurement in the constant's own comment: eight default types,
+    # and eight-way already reaches the floor set by the slowest download.
+    assert overture_module.MAX_CONCURRENT_TYPE_DOWNLOADS == 8
+
+
+def _recording_pool(monkeypatch):
+    captured = {}
+    real = concurrent.futures.ThreadPoolExecutor
+
+    def recording(*args, **kwargs):
+        captured["max_workers"] = kwargs.get("max_workers")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", recording)
+    return captured
+
+
+def test_the_pool_is_capped_at_the_module_constant_however_many_types_are_asked_for(
+    tmp_path, monkeypatch
+):
+    # --overture-type is repeatable and takes any string, so a caller can
+    # name far more than the default eight. Without the cap that is an
+    # unbounded number of CLI processes launched at once.
+    captured = _recording_pool(monkeypatch)
+    types = tuple(f"type{index:02d}" for index in range(12))
+    _source(FakeRunner(), types=types).fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+    )
+    assert captured["max_workers"] == MAX_CONCURRENT_TYPE_DOWNLOADS
+
+
+def test_the_pool_never_starts_more_threads_than_there_are_types(tmp_path, monkeypatch):
+    # The other side of the same min(): a two-type request must not stand
+    # up eight threads to do two things.
+    captured = _recording_pool(monkeypatch)
+    _source(FakeRunner(), types=("water", "building")).fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+    )
+    assert captured["max_workers"] == 2
+
+
+def test_the_eight_default_types_really_do_download_at_the_same_time(tmp_path):
+    # The claim the whole task rests on, checked rather than assumed. The
+    # barrier can only trip if all eight downloads are genuinely in flight
+    # at the same instant; sequential code never trips it and fails on the
+    # timeout instead of passing by luck.
+    barrier = threading.Barrier(len(DEFAULT_OVERTURE_TYPES), timeout=30)
+    inside = []
+    lock = threading.Lock()
+
+    class BarrierRunner(FakeRunner):
+        def __call__(self, command, **kwargs):
+            barrier.wait()
+            with lock:
+                inside.append(command[command.index("--type") + 1])
+            return super().__call__(command, **kwargs)
+
+    source = _source(BarrierRunner(), types=tuple(DEFAULT_OVERTURE_TYPES))
+    try:
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(
+            f"the eight types did not overlap, so they are not running "
+            f"concurrently: {exc}"
+        )
+    assert sorted(inside) == sorted(DEFAULT_OVERTURE_TYPES)
+
+
+def test_progress_is_emitted_from_the_worker_threads_not_the_calling_one(tmp_path):
+    # This is the fact that makes ProgressSink thread safety load bearing,
+    # so it is pinned rather than left to be re-derived by whoever next
+    # writes a sink. ConsoleProgress was given a lock in this same task
+    # because of it; EventLog already had one; NullProgress holds no state.
+    class ThreadRecordingProgress:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.threads = set()
+
+        def emit(self, event, **fields):
+            with self.lock:
+                self.threads.add(threading.current_thread().name)
+
+    progress = ThreadRecordingProgress()
+    _source(FakeRunner(), types=("water", "building")).fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, progress
+    )
+
+    assert progress.threads, "nothing was emitted at all"
+    assert threading.current_thread().name not in progress.threads
+    assert all(name.startswith("mapgen-overture") for name in progress.threads), (
+        f"emitted from something other than this source's own pool: "
+        f"{progress.threads}"
+    )
+
+
+def test_fetch_returns_paths_in_the_requested_order_not_completion_order(tmp_path):
+    # The first type asked for is deliberately made to finish LAST: its
+    # download does not begin until the second type has already emitted,
+    # which is that worker's final act before its future resolves. A fetch
+    # that built its result from completion order comes back reversed here.
+    #
+    # Requested order, not alphabetical order. Alphabetical would be stable
+    # too, but requested order is what the sequential loop returned before
+    # this change, so nothing downstream shifts by a single element.
+    building_emitted = threading.Event()
+    waited = []
+
+    class GateOnBuilding(RecordingProgress):
+        def emit(self, event, **fields):
+            super().emit(event, **fields)
+            if fields.get("overture_type") == "building":
+                building_emitted.set()
+
+    class WaterWaitsForBuilding(FakeRunner):
+        def __call__(self, command, **kwargs):
+            if command[command.index("--type") + 1] == "water":
+                waited.append(building_emitted.wait(timeout=30))
+            return super().__call__(command, **kwargs)
+
+    source = _source(WaterWaitsForBuilding(), types=("water", "building"))
+    paths = source.fetch(REQUEST_BBOX, [_tile()], tmp_path, GateOnBuilding())
+
+    assert waited == [True], (
+        "building never finished ahead of water, so this proved nothing "
+        "about ordering"
+    )
+    assert paths == [tmp_path / "water.geojson", tmp_path / "building.geojson"]
+
+
+def test_a_type_named_twice_is_downloaded_once_rather_than_raced_for(tmp_path):
+    # --overture-type is repeatable and nothing upstream deduplicates it,
+    # so two --overture-type water flags reach here as ["water", "water"].
+    # Sequentially that was harmless: the second pass found the first
+    # pass's file and skipped it. Concurrently both copies would go for the
+    # same water.geojson.part, and the first thing _download does with that
+    # path is unlink it, so one thread would delete the other's
+    # half-written download and both would rename over the same output.
+    runner = FakeRunner()
+    paths = _source(runner, types=("water", "water", "building")).fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+    )
+    fetched = sorted(
+        command[command.index("--type") + 1] for command in runner.commands
+    )
+    assert fetched == ["building", "water"]
+    assert paths == [tmp_path / "water.geojson", tmp_path / "building.geojson"]
+
+
+def test_the_debris_sweep_finishes_before_any_download_starts(tmp_path):
+    # The sidecar cleanup inside _download is per type and every name is
+    # distinct, so that one cannot race. This sweep is different: it walks
+    # the WHOLE selection, so running it alongside the workers would mean
+    # unlinking one type's sidecar while another type's download was busy
+    # creating it. Observed from inside a download rather than read off the
+    # source, since "it is written above the pool" is exactly the kind of
+    # thing a later edit moves without noticing.
+    legacy = tmp_path / "water"
+    legacy.mkdir()
+    (legacy / "r00_c00.geojson").write_text("{}", encoding="utf-8")
+    stale_sidecar = tmp_path / "building.geojson.part.state"
+    stale_sidecar.write_text("{}", encoding="utf-8")
+
+    seen = []
+    lock = threading.Lock()
+
+    class ObservingRunner(FakeRunner):
+        def __call__(self, command, **kwargs):
+            with lock:
+                seen.append((legacy.exists(), stale_sidecar.exists()))
+            return super().__call__(command, **kwargs)
+
+    _source(ObservingRunner(), types=("water", "building")).fetch(
+        REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+    )
+
+    assert len(seen) == 2, "expected both types to have been downloaded"
+    assert seen == [(False, False), (False, False)], (
+        f"a download started while earlier-version debris was still on "
+        f"disk: {seen}"
+    )
+
+
+# --- Task 24: one type failing must not throw the others away ----------
+
+
+class _FailingTypes(FakeRunner):
+    """Fails for the named types, succeeds for every other one."""
+
+    def __init__(self, bad, **kwargs):
+        super().__init__(**kwargs)
+        self.bad = set(bad)
+
+    def __call__(self, command, **kwargs):
+        overture_type = command[command.index("--type") + 1]
+        if overture_type in self.bad:
+            self.record(command)
+            return FakeCompleted(1, stderr=f"no data for {overture_type}")
+        return super().__call__(command, **kwargs)
+
+
+def test_a_failing_type_does_not_discard_the_types_that_succeeded(tmp_path):
+    # The same principle as the Urbano bridge fix in Task 20 and the stop
+    # path in Task 22: work that is paid for is never thrown away because
+    # a parallel step failed. On the owner's real extent the seven that
+    # worked are most of 168 MB of downloaded data.
+    runner = _FailingTypes(bad={"segment"})
+    source = _source(runner, types=("building", "segment", "water"))
+    with pytest.raises(OvertureError, match="no data for segment"):
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    assert len(runner.commands) == 3, (
+        "the pool was not drained: a failure cancelled the other types "
+        "instead of letting them finish"
+    )
+    assert (tmp_path / "building.geojson").exists()
+    assert (tmp_path / "water.geojson").exists()
+    assert not (tmp_path / "segment.geojson").exists()
+
+
+def test_every_failing_type_is_named_not_only_the_first(tmp_path):
+    # Six types failing and one type failing are very different
+    # situations, most likely a dead network against one bad type name,
+    # and a report naming only whichever future was inspected first gives
+    # the owner no way to tell them apart.
+    runner = _FailingTypes(bad={"segment", "connector", "water"})
+    source = _source(runner, types=("building", "segment", "connector", "water"))
+    with pytest.raises(OvertureError) as excinfo:
+        source.fetch(REQUEST_BBOX, [_tile()], tmp_path, NullProgress())
+
+    message = str(excinfo.value)
+    assert "3 types" in message
+    for name in ("segment", "connector", "water"):
+        assert name in message, f"{name} failed and was not named: {message}"
+        assert f"no data for {name}" in message, (
+            f"{name}'s own detail was dropped, which is what says whether "
+            f"this was a dead network or a bad type name: {message}"
+        )
+    assert "building" not in message, "a type that succeeded was blamed"
+
+
+def test_a_single_failure_still_reads_exactly_as_it_always_did(tmp_path):
+    # Aggregating several failures must not have changed the message for
+    # the ordinary case of one.
+    runner = FakeRunner(returncode=1, stderr="release not found")
+    with pytest.raises(OvertureError) as excinfo:
+        _source(runner, types=("water",)).fetch(
+            REQUEST_BBOX, [_tile()], tmp_path, NullProgress()
+        )
+    assert str(excinfo.value) == (
+        "overturemaps failed for type water: release not found"
+    )
+
+
+def test_a_real_failure_is_reported_rather_than_swallowed_by_a_stop(tmp_path):
+    # A stop is the owner's own decision and they already know about it. A
+    # download that broke is news, and reporting the stop instead would
+    # leave package.py marking the tiles pending and the owner with no idea
+    # a type is missing for a reason that will still be there next run.
+    token = CancelToken()
+    cap = MAX_CONCURRENT_TYPE_DOWNLOADS
+    all_started = threading.Barrier(cap, token.cancel, 30)
+    types = tuple(f"type{index:02d}" for index in range(cap + 2))
+
+    class BarrierRunner(_FailingTypes):
+        def __call__(self, command, **kwargs):
+            all_started.wait()
+            return super().__call__(command, **kwargs)
+
+    runner = BarrierRunner(bad={"type03"})
+    with pytest.raises(OvertureError, match="no data for type03"):
+        _source(runner, types=types).fetch(
+            REQUEST_BBOX, [_tile()], tmp_path, NullProgress(), cancel=token
+        )

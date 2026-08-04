@@ -1,4 +1,5 @@
 import json
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -22,7 +23,12 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.osm import OsmSource
-from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES, OvertureError, OvertureSource
+from mapgen.sources.overture import (
+    DEFAULT_OVERTURE_TYPES,
+    MAX_CONCURRENT_TYPE_DOWNLOADS,
+    OvertureError,
+    OvertureSource,
+)
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
@@ -1466,9 +1472,15 @@ class _FakeOvertureRunner:
 
     def __init__(self):
         self.commands: list[list[str]] = []
+        # Task 24: OvertureSource.fetch calls this from up to eight worker
+        # threads at once, and a double that records its own calls
+        # unreliably is the fastest route to a test that fails for reasons
+        # having nothing to do with the code under test.
+        self.lock = threading.Lock()
 
     def __call__(self, command, **kwargs):
-        self.commands.append(command)
+        with self.lock:
+            self.commands.append(command)
         output = Path(command[command.index("--output") + 1])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
@@ -1476,27 +1488,47 @@ class _FakeOvertureRunner:
 
 
 def test_a_stop_mid_overture_keeps_finished_types_marks_tiles_pending_and_resumes(tmp_path):
-    # Task 22's stop path, driven through the REAL OvertureSource on its new
-    # type loop rather than through a stub that could be more forgiving than
-    # the real thing. The checkpoint moved from (tile, type) to type in Task
-    # 23, and every rule Task 22 established has to survive that move: a
-    # type already downloaded is kept and merged, a tile the stop never
-    # reached reads "pending" and not "failed", and no tile_failed event is
-    # emitted for it.
+    # Task 22's stop path, driven through the REAL OvertureSource rather
+    # than through a stub that could be more forgiving than the real thing.
+    #
+    # Task 24 changed the mechanism this test needs, not the rules it
+    # asserts. It used to cancel from inside the first of two types'
+    # downloads and expect the second never to run. Two types with a cap of
+    # eight are both in flight before either of them finishes, so a stop
+    # raised by the first has nothing left to prevent, and keeping the old
+    # shape would only have been possible by asserting something that had
+    # stopped being true. What a pool genuinely has instead is types QUEUED
+    # behind its cap, so this asks for one more type than the cap allows
+    # and stops while the first eight are in flight. The ninth is the one
+    # the stop is able to skip.
+    #
+    # Every Task 22 rule below is asserted exactly as before: the types in
+    # flight are kept and merged, a tile the stop never reached reads
+    # "pending" and not "failed", no tile_failed event is emitted for it,
+    # and the run resumes onto precisely the type that was missed.
+    #
+    # Deterministic rather than hopeful. The barrier's own action cancels
+    # the token the instant all eight in-flight downloads have arrived at
+    # it, which is before any waiter is released and therefore before any
+    # worker can return and pull the queued ninth off the executor.
     token = CancelToken()
     inner = _FakeOvertureRunner()
+    cap = MAX_CONCURRENT_TYPE_DOWNLOADS
+    all_started = threading.Barrier(cap, token.cancel, 30)
+    # "address" is a real Overture type outside the default eight, which is
+    # exactly what --overture-type exists to reach.
+    types = tuple(DEFAULT_OVERTURE_TYPES) + ("address",)
 
     def cancelling_runner(command, **kwargs):
-        result = inner(command, **kwargs)
-        token.cancel()
-        return result
+        all_started.wait()
+        return inner(command, **kwargs)
 
     register(OvertureSource(runner=cancelling_runner, executable_finder=lambda _n: "overturemaps"))
     log = EventLog()
     request = _request(
         tmp_path,
         source_ids=("overture",),
-        overture_types=("water", "building"),
+        overture_types=types,
         run_bridge_step=False,
         keep_work=True,
     )
@@ -1504,15 +1536,19 @@ def test_a_stop_mid_overture_keeps_finished_types_marks_tiles_pending_and_resume
 
     assert result.stopped is True
     assert result.complete is False
-    assert len(inner.commands) == 1, (
-        f"the stop should have landed after the first type's download, got "
-        f"{len(inner.commands)} calls"
+    assert len(inner.commands) == cap, (
+        f"the stop should have landed with exactly the {cap} in-flight "
+        f"downloads running, got {len(inner.commands)} calls"
     )
 
-    # The in-flight type finished and was kept, per the cancel convention.
+    # The in-flight types finished and were kept, per the cancel convention.
     overture_work = result.paths.work_dir / "raw" / "overture"
-    assert (overture_work / "water.geojson").exists()
-    assert not (overture_work / "building.geojson").exists()
+    for overture_type in types[:cap]:
+        assert (overture_work / f"{overture_type}.geojson").exists(), (
+            f"{overture_type} was in flight when the stop landed and was "
+            f"thrown away"
+        )
+    assert not (overture_work / "address.geojson").exists()
     assert (result.paths.root / f"{result.paths.stem}_water.geojson").exists()
 
     # Task 22's rule, unchanged: never reached is pending, not failed.
@@ -1524,8 +1560,8 @@ def test_a_stop_mid_overture_keeps_finished_types_marks_tiles_pending_and_resume
     )
     assert [e for e in log.events if e["event"] == "tile_failed"] == []
 
-    # And it genuinely resumes: the kept type is skipped, only the missing
-    # one is fetched, and the package completes.
+    # And it genuinely resumes: the kept types are skipped, only the
+    # missing one is fetched, and the package completes.
     resume_runner = _FakeOvertureRunner()
     clear_registry()
     register(OvertureSource(runner=resume_runner, executable_finder=lambda _n: "overturemaps"))
@@ -1534,7 +1570,7 @@ def test_a_stop_mid_overture_keeps_finished_types_marks_tiles_pending_and_resume
     assert resumed.complete is True
     assert resumed.paths.root == result.paths.root
     fetched = {cmd[cmd.index("--type") + 1] for cmd in resume_runner.commands}
-    assert fetched == {"building"}, (
+    assert fetched == {"address"}, (
         f"the resume should have refetched only the missing type, got {fetched}"
     )
 
