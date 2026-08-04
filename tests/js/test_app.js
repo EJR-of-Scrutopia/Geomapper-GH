@@ -3698,6 +3698,74 @@ function ok(condition, message) {
     ok(/4 tiles/.test(cost.textContent), `expected the tile count alongside it, got ${cost.textContent}`);
   });
 
+  await test(
+    "an estimate that lands after the slider has moved on is not filed under the new size",
+    async () => {
+      // The slider can be moved while a request for the previous
+      // position is still in flight, which a number field you commit
+      // with Enter or a blur could not do nearly as easily. Reading the
+      // field back when the reply arrives would label the old size's
+      // tile count and time as this size's, which is the exact stale
+      // number the "Working out the time at this size" line exists to
+      // refuse to show.
+      let resolveEstimate;
+      const pending = new Promise((resolve) => {
+        resolveEstimate = resolve;
+      });
+      let estimateCalls = 0;
+      const { sandbox } = await bootedSandbox((url, options) => {
+        const method = (options.method || "GET").toUpperCase();
+        if (url.pathname === "/api/config" && method === "PUT") return jsonResponse(200, DEFAULT_CONFIG);
+        if (url.pathname === "/api/estimate") {
+          estimateCalls += 1;
+          const body = {
+            tiles: 9,
+            rows: 3,
+            cols: 3,
+            extent_km: { width: 1, height: 1 },
+            bytes_estimate: 1000,
+            seconds_estimate: 175,
+            warnings: [],
+            folder: "C:\\out",
+            sources: [{ id: "osm", seconds_estimate: 175 }],
+          };
+          // The first call (the settled 2000 m one) answers at once; the
+          // one the drag to 4000 fires is held open.
+          return estimateCalls === 1 ? jsonResponse(200, body) : pending;
+        }
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      await flush(10);
+      setField(sandbox, "region", "South Wales");
+      setField(sandbox, "site", "Barry");
+      await flush(10);
+
+      dragTileSize(sandbox, 4000);
+      await flush(600); // the 4000 m request is now in flight and held
+      dragTileSize(sandbox, 6000); // the owner keeps going
+      resolveEstimate(
+        jsonResponse(200, {
+          tiles: 9,
+          rows: 3,
+          cols: 3,
+          extent_km: { width: 1, height: 1 },
+          bytes_estimate: 1000,
+          seconds_estimate: 175,
+          warnings: [],
+          folder: "C:\\out",
+          sources: [{ id: "osm", seconds_estimate: 175 }],
+        })
+      );
+      await flush(10);
+      const cost = sandbox.document.getElementById("tile-size-cost").textContent;
+      ok(
+        /working out/i.test(cost),
+        `expected the 4000 m answer not to be claimed for 6000 m, got ${cost}`
+      );
+    }
+  );
+
   await test("the slider's sentence changes with position and states no risk figure", async () => {
     const { sandbox } = await bootedSandbox();
     const small = sandbox.tileSizeTrade(500);

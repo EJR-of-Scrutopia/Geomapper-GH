@@ -978,14 +978,20 @@ function hideFolderPreview() {
 // time, since it is answered without ever consulting a source.
 let lastSizing = null;
 
-function recordSizing(tiles, seconds, sources) {
+// tileSizeM is passed in, captured before the request went out, never
+// re-read from the field here. The field is a slider now, and the owner
+// can move it while a request for the previous position is still in
+// flight: reading it back at this point would file the old size's answer
+// under the new size's name, which is precisely the stale number
+// tileSizeCost exists to refuse to show.
+function recordSizing(tileSizeM, tiles, seconds, sources) {
   const sourceSeconds = {};
   for (const source of sources || []) {
     const value = Number(source.seconds_estimate);
     if (source.id && Number.isFinite(value)) sourceSeconds[source.id] = value;
   }
   lastSizing = {
-    tileSizeM: parseFloat($("tile-size").value),
+    tileSizeM,
     tiles,
     seconds: Number.isFinite(Number(seconds)) ? Number(seconds) : 0,
     sourceSeconds,
@@ -1013,6 +1019,11 @@ function showEstimateError(message) {
 
 async function refreshEstimate() {
   const missing = missingFieldsMessage();
+  // Read once, up front, and used both for the request and for recording
+  // what came back. The slider can move while this request is in flight,
+  // so reading the field again after the await would describe the answer
+  // by a size it was never asked about.
+  const requestedTileSizeM = parseFloat($("tile-size").value);
 
   if (!bbox) {
     $("estimate").className = "estimate";
@@ -1039,13 +1050,13 @@ async function refreshEstimate() {
         method: "POST",
         body: JSON.stringify({
           bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
-          tile_size_m: parseFloat($("tile-size").value),
+          tile_size_m: requestedTileSizeM,
           overlap_m: parseFloat($("overlap").value),
         }),
       });
       $("estimate").innerHTML = `${formatGeometryLine(geometry)}<br />${escapeHtml(missing)}`;
       renderTileGrid(geometry.tile_grid);
-      recordSizing(geometry.tiles, 0, []);
+      recordSizing(requestedTileSizeM, geometry.tiles, 0, []);
     } catch (error) {
       // A genuine problem with the extent or tiling itself (an absurd
       // tiling, a zero-area box that slipped through some other path, a
@@ -1098,7 +1109,7 @@ async function refreshEstimate() {
     // with a path it already knows is broken, with nothing on screen to
     // explain why.
     persistFieldSettings();
-    recordSizing(data.tiles, data.seconds_estimate, data.sources);
+    recordSizing(requestedTileSizeM, data.tiles, data.seconds_estimate, data.sources);
   } catch (error) {
     showEstimateError(error.message);
   }
