@@ -2642,6 +2642,73 @@ function ok(condition, message) {
     );
   });
 
+  await test(
+    "changing the theme repaints the rectangles already on the map",
+    async () => {
+      // Review finding I3. repaintTileGridTheme's loop body had never run
+      // in any test: V8 block coverage put it at count 0, and renaming
+      // rect.setStyle inside it left all 151 checks green. In a browser
+      // that rename is a TypeError, and because the theme handler calls
+      // this BEFORE persistConfig, the symptom is not a crash the owner
+      // would report: the theme visibly changes and then silently fails
+      // to save, every time, once a grid is on the map.
+      //
+      // So this asserts both halves: the rectangles genuinely restyle,
+      // and the setting genuinely reaches the server afterwards.
+      const { fetchCalls, sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/extent") {
+          return jsonResponse(200, {
+            tiles: 2,
+            rows: 1,
+            cols: 2,
+            extent_km: { width: 1, height: 1 },
+            tile_grid: [
+              { tile_id: "r00_c00", west: -3.3, south: 51.4, east: -3.29, north: 51.41 },
+              { tile_id: "r00_c01", west: -3.29, south: 51.4, east: -3.28, north: 51.41 },
+            ],
+          });
+        }
+        if (url.pathname === "/api/config") return jsonResponse(200, DEFAULT_CONFIG);
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.30,51.40,-3.28,51.41");
+      await flush(10);
+
+      // The two tile rectangles are the ones created after setBBox's own,
+      // and they must genuinely be on the map for this to be the real
+      // path rather than a loop over nothing (the gap that hid the bug).
+      const tiles = sandbox.L._rectangles.slice(-2);
+      ok(tiles.length === 2, "expected two tile rectangles to have been drawn");
+      // One of them is moved off "pending" first, so the repaint has to
+      // read each rectangle's own CURRENT state rather than repainting
+      // everything one colour: a loop that ignored tileState would pass a
+      // grid where every tile happens to be pending.
+      sandbox.paintTileStates(new Map([["r00_c01", "failed"]]));
+      const lightPending = tiles[0].options.fillColor;
+      const lightFailed = tiles[1].options.fillColor;
+      ok(
+        lightPending === "#9c9686" && lightFailed === "#8c3b2e",
+        `expected the light palette first, got ${lightPending} and ${lightFailed}`
+      );
+
+      fetchCalls.length = 0;
+      setField(sandbox, "theme", "dark");
+      await flush(10);
+
+      ok(
+        tiles[0].options.fillColor === "#6b6656",
+        `expected the pending tile repainted dark, got ${tiles[0].options.fillColor}`
+      );
+      ok(
+        tiles[1].options.fillColor === "#e0685a",
+        `expected the FAILED tile repainted dark in its own colour, got ${tiles[1].options.fillColor}`
+      );
+      const putCall = fetchCalls.find((c) => (c.options.method || "").toUpperCase() === "PUT");
+      ok(putCall, "expected the theme to still be persisted after the repaint");
+      ok(JSON.parse(putCall.options.body).theme === "dark");
+    }
+  );
+
   // =======================================================================
   // Task 22: the tile grid drawn on the map from /api/extent's and
   // /api/estimate's own tile_grid, never recomputed client-side.
