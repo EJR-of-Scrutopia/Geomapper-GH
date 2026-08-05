@@ -40,25 +40,37 @@ because by that point both requests have actually been made and answered.
 
 `HttpByteSource` (`cog.py`) already classifies every transport and status
 failure it meets, through the exact same `classify_transport_failure`/
-`classify_status_failure` this module also uses, but folds the result into
-a plain `CogError` sentence rather than an attribute the error carries.
-`_classify_cog_error` below reads that same closed, tested vocabulary back
-out of the sentence: an "(HTTP nnn)" is re-classified through
-`classify_status_failure` (so a 429's retryability, and any future change
-to that function's own mapping, is inherited rather than duplicated), and
-the two transport phrases (`"did not answer in time"`, `"could not be
-reached"`) are matched literally, because they are this project's own
-fixed strings, pinned by `test_sources_base.py`, not a third party
-service's wording that could be reworded without warning. Anything else,
-including a protocol violation `HttpByteSource` itself refuses on (a 200 to
-a range request, a mismatched Content-Range, a short body), comes back
-`FAILURE_UNKNOWN`, the safe default for a shape this function was not told
-how to read.
+`classify_status_failure` this module also uses. `CogError.status_code`
+(cog.py) is how that classification reaches here structurally: set on
+every raise site that actually saw an HTTP status (a 200 answered to a
+range request, or any other non-206 status after `HttpByteSource`'s own
+retry), left None everywhere else (a short body, a mismatched
+Content-Range, a transport exception). `_classify_cog_error` below reads
+that attribute directly and calls `classify_status_failure` itself when it
+is set, which is correct for every status that function recognises, not
+only the ones whose rendered phrase happens to carry the status in a
+parenthesis a regex could find; an earlier version of this function tried
+exactly that regex and missed `classify_status_failure`'s own >=500 branch
+(`"answered HTTP {code}"`, no parentheses, unlike its 429/401/403/else
+siblings), silently reporting every real 5xx as unrecognised and
+defeating the retry policy `RETRYABLE_FAILURE_KINDS` exists to drive.
+
+A `CogError` with no status (transport-shaped) is matched on its two
+fixed phrases (`"did not answer in time"`, `"could not be reached"`)
+literally, because they are this project's own closed, tested strings,
+pinned by `test_sources_base.py`, not a third party service's wording that
+could be reworded without warning. Anything else, including a protocol
+violation `HttpByteSource` itself refuses on with no status at all (a
+mismatched Content-Range, a short body), comes back `FAILURE_UNKNOWN`
+with a FIXED phrase, never the raw `CogError` text: the full, already
+URL-safe detail still reaches the owner through the raised exception
+itself (`fetch()` re-raises every `CogError` unwrapped), the same
+separation of "reason" from "exception message" `elevation.py`'s own
+`_record_tile_failures` keeps.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Sequence
 
@@ -150,25 +162,32 @@ class LidarWalesError(RuntimeError):
     """
 
 
-_HTTP_STATUS_RE = re.compile(r"\(HTTP (\d+)\)")
-
-
 def _classify_cog_error(exc: CogError) -> tuple[str, str]:
     """The (kind, phrase) an HttpByteSource's own CogError implies.
 
     See the module docstring's "Failure classification without a raw
-    exception in hand" section for why this reads cog.py's own sentence
-    back out rather than needing a new channel added to CogError.
+    exception in hand" section. `exc.status_code` is read directly and
+    handed to `classify_status_failure` when set, never re-derived from
+    `exc`'s own rendered message: a status this module was told about
+    structurally cannot go stale the way a pattern matched against that
+    message's English could.
+
+    The fallback phrase is fixed, never `str(exc)`: `exc` is still the
+    exception fetch() re-raises unwrapped, so the full detail is not lost,
+    only kept out of the `reason` string survey.json and the tile_failed
+    event carry, matching every other source's own rule that `reason` is
+    composed from the fixed vocabulary and nothing read off a caught
+    exception's own text.
     """
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        return classify_status_failure(status_code)
     message = str(exc)
-    status_match = _HTTP_STATUS_RE.search(message)
-    if status_match:
-        return classify_status_failure(int(status_match.group(1)))
     if "did not answer in time" in message:
         return FAILURE_TIMEOUT, "did not answer in time"
     if "could not be reached" in message:
         return FAILURE_UNREACHABLE, "could not be reached"
-    return FAILURE_UNKNOWN, f"could not be read: {message}"
+    return FAILURE_UNKNOWN, "could not be read"
 
 
 def _padded_bng_extent(bbox: BBox, grid) -> tuple[float, float, float, float]:

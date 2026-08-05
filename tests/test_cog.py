@@ -267,13 +267,17 @@ class _RangeSession:
     `mode` picks which server this is: an honest one, one that ignores
     Range and streams the whole file, one that answers 206 without saying
     which bytes it sent, one that sends fewer bytes than it was asked
-    for, one that times out, and one that times out only on the first
-    attempt.
+    for, one that times out, one that times out only on the first
+    attempt, and one that answers a fixed bad status on every attempt
+    (`persistent_status`, paired with `status_code`) rather than only the
+    first, for a test that needs the failure to survive HttpByteSource's
+    own single retry and actually reach the caller as a CogError.
     """
 
-    def __init__(self, data: bytes, mode: str = "honest") -> None:
+    def __init__(self, data: bytes, mode: str = "honest", status_code: int | None = None) -> None:
         self.data = data
         self.mode = mode
+        self.status_code = status_code
         self.calls: list[str] = []
         self.responses: list[_FakeResponse] = []
 
@@ -291,6 +295,8 @@ class _RangeSession:
             raise requests.exceptions.Timeout("the fake server stalled")
         if self.mode == "server_error" and len(self.calls) == 1:
             return _FakeResponse(503, {}, b"")
+        if self.mode == "persistent_status":
+            return _FakeResponse(self.status_code, {}, b"")
         start, end = header.removeprefix("bytes=").split("-")
         first, last = int(start), int(end)
         body = self.data[first:last + 1]
@@ -789,6 +795,51 @@ def test_range_ignoring_server_is_refused(fake_200_source):
     # a key lives, and this project's failure sentences never carry one.
     assert "://" not in message
     assert "secret" not in message
+    # The 200 this branch refuses is a real HTTP status it saw, and a
+    # caller (mapgen.sources.lidar_wales._classify_cog_error) reads this
+    # attribute rather than parsing it back out of the sentence above.
+    assert refusal.value.status_code == 200
+
+
+# --- CogError.status_code: set on every raise site that actually saw an
+# HTTP status, left None on every other refusal (a short body, a mismatched
+# Content-Range, a transport exception). Added because a caller that needs
+# to know WHICH status this was, to decide whether the failure is
+# retryable, must not have to re-derive it from the English sentence: an
+# earlier attempt at exactly that, in mapgen.sources.lidar_wales, matched
+# "(HTTP nnn)" in the rendered text and missed classify_status_failure's
+# own >=500 branch, whose phrase does not parenthesise the code the way its
+# 429/401/403/else siblings do.
+
+
+def test_cog_error_carries_the_status_code_for_every_non_206_answer():
+    built = _make_cog([(8, 8, _grid(8, 8, lambda x, y: 1.0))])
+    for status in (500, 503, 429, 401):
+        session = _RangeSession(built.data, mode="persistent_status", status_code=status)
+        source = HttpByteSource("https://example.invalid/wales.tif", session=session)
+        with pytest.raises(CogError) as excinfo:
+            source.read(0, 16)
+        assert excinfo.value.status_code == status
+
+
+def test_cog_error_leaves_status_code_none_for_a_short_body_or_a_timeout():
+    built = _make_cog([(8, 8, _grid(8, 8, lambda x, y: 1.0))])
+
+    short = HttpByteSource(
+        "https://example.invalid/wales.tif",
+        session=_RangeSession(built.data, mode="short_body"),
+    )
+    with pytest.raises(CogError) as short_refusal:
+        short.read(0, 16)
+    assert short_refusal.value.status_code is None
+
+    stalled = HttpByteSource(
+        "https://example.invalid/wales.tif",
+        session=_RangeSession(built.data, mode="timeout"),
+    )
+    with pytest.raises(CogError) as timeout_refusal:
+        stalled.read(0, 16)
+    assert timeout_refusal.value.status_code is None
 
 
 def test_a_range_answered_without_content_range_or_short_is_refused():

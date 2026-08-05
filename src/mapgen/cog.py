@@ -251,7 +251,26 @@ class CogError(ValueError):
     is one. Every message names the file and the specific value that was
     not readable, and never the URL it came from: a URL is where a key
     lives, and this project's failure sentences do not carry one.
+
+    `status_code` is set by `HttpByteSource` on every raise site where it
+    actually saw an HTTP status (a 200 answered to a range request, or any
+    other non-206 status after its own retry), and left None everywhere
+    else (a short body, a Content-Range mismatch, a transport exception).
+    It exists so a caller that needs to know WHICH status this was, to
+    decide whether the failure is retryable, does not have to parse that
+    back out of the message this class already renders in English:
+    `mapgen.sources.lidar_wales._classify_cog_error` is the reason it was
+    added, having previously tried to recover the status by matching
+    "(HTTP nnn)" in the rendered sentence, which missed `classify_status_
+    failure`'s own >=500 branch (`"answered HTTP {code}"`, no parentheses,
+    unlike its 429/401/403/else siblings) and silently misclassified every
+    5xx as unrecognised. A structural attribute cannot go stale the way a
+    regex against this class's own prose can.
     """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @runtime_checkable
@@ -387,7 +406,8 @@ class HttpByteSource:
                             f"The server holding {self.name} answered a range "
                             f"request with the whole file (HTTP 200). mapgen "
                             f"reads this raster in pieces and will not "
-                            f"download all of it."
+                            f"download all of it.",
+                            status_code=status,
                         )
                     if status != 206:
                         kind, phrase = classify_status_failure(status)
@@ -395,7 +415,8 @@ class HttpByteSource:
                             continue
                         raise CogError(
                             f"The server holding {self.name} {phrase} for the "
-                            f"{length} byte range mapgen asked for."
+                            f"{length} byte range mapgen asked for.",
+                            status_code=status,
                         )
                     answered = getattr(response, "headers", None) or {}
                     self._accept_range(

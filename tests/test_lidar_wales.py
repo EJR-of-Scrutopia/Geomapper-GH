@@ -37,7 +37,10 @@ from mapgen.package import get_source, register_default_sources
 from mapgen.sources.base import (
     FAILURE_NO_OUTPUT,
     FAILURE_RATE_LIMITED,
+    FAILURE_SERVICE_ERROR,
     FAILURE_TIMEOUT,
+    FAILURE_UNKNOWN,
+    RETRYABLE_FAILURE_KINDS,
     NullProgress,
 )
 from mapgen.sources.lidar_wales import (
@@ -195,6 +198,37 @@ class _TimesOutOnUrlSession(_UrlRoutedSession):
         start, end = header.removeprefix("bytes=").split("-")
         first, last = int(start), int(end)
         body = data[first : last + 1]
+        return _FakeResponse(
+            206, {"Content-Range": f"bytes {first}-{last}/{len(data)}"}, body
+        )
+
+
+class _ShortBodyOnUrlSession(_UrlRoutedSession):
+    """Answers every request to `target_url` one byte short of what was
+    asked for, persistently: `HttpByteSource.read` has no retry for this
+    failure at all (it is a content-length mismatch, not a transport or
+    status failure), so a single short answer is already enough to raise,
+    but persistent for the same defensive reason every other fake session
+    in this file is. This is the fallthrough case `_classify_cog_error`
+    has no status_code and no recognised transport phrase for: the
+    CogError it produces carries `status_code is None` and a message
+    shaped nothing like "did not answer in time" or "could not be
+    reached", which is exactly the shape FAILURE_UNKNOWN exists for.
+    """
+
+    def __init__(self, blobs: dict[str, bytes], target_url: str) -> None:
+        super().__init__(blobs)
+        self._target_url = target_url
+
+    def get(self, url, headers=None, timeout=None, stream=False):
+        self.calls.append(url)
+        data = self.blobs[url]
+        header = (headers or {}).get("Range", "")
+        start, end = header.removeprefix("bytes=").split("-")
+        first, last = int(start), int(end)
+        body = data[first : last + 1]
+        if url == self._target_url:
+            body = body[: max(0, len(body) - 1)]
         return _FakeResponse(
             206, {"Content-Range": f"bytes {first}-{last}/{len(data)}"}, body
         )
@@ -467,6 +501,101 @@ def test_fetch_classifies_a_rate_limited_dtm_response_and_never_leaks_a_url(tmp_
         assert "http" not in failure.reason.lower().replace("(http 429)", "")
         assert LidarWalesSource.DTM_URL not in failure.reason
     assert LidarWalesSource.DTM_URL not in str(excinfo.value)
+
+
+def test_fetch_classifies_a_500_as_service_error_and_it_is_retryable(tmp_path, ostn15_fixture_grid):
+    # classify_status_failure's own >=500 branch returns "answered HTTP
+    # {code}", with no parentheses around the number, unlike its
+    # 429/401/403/else siblings. A classifier that tried to recover the
+    # status by pattern-matching that rendered sentence would miss this
+    # one specifically, report FAILURE_UNKNOWN, and defeat the retry
+    # policy: FAILURE_UNKNOWN is not in RETRYABLE_FAILURE_KINDS, so
+    # package.py would never retry a transient 500 the shared vocabulary
+    # explicitly designed as retryable.
+    cache_dir = tmp_path / "cache"
+    _seed_cache(cache_dir, ostn15_fixture_grid)
+    dtm_bytes, dsm_bytes = _flat_mosaics(NEAR_TP06_BBOX, ostn15_fixture_grid, 1.0, 2.0)
+
+    session = _StatusThenRoutedSession(
+        {LidarWalesSource.DTM_URL: dtm_bytes, LidarWalesSource.DSM_URL: dsm_bytes},
+        LidarWalesSource.DTM_URL,
+        500,
+    )
+    source = LidarWalesSource(session=session, ostn15_cache_dir=cache_dir)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(Exception) as excinfo:
+        source.fetch(NEAR_TP06_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    failure = source.tile_failures[0]
+    assert failure.kind == FAILURE_SERVICE_ERROR
+    assert failure.kind in RETRYABLE_FAILURE_KINDS
+    assert "500" in failure.reason
+    assert LidarWalesSource.DTM_URL not in failure.reason
+    assert LidarWalesSource.DTM_URL not in str(excinfo.value)
+
+
+def test_fetch_classifies_a_503_as_service_error(tmp_path, ostn15_fixture_grid):
+    cache_dir = tmp_path / "cache"
+    _seed_cache(cache_dir, ostn15_fixture_grid)
+    dtm_bytes, dsm_bytes = _flat_mosaics(NEAR_TP06_BBOX, ostn15_fixture_grid, 1.0, 2.0)
+
+    session = _StatusThenRoutedSession(
+        {LidarWalesSource.DTM_URL: dtm_bytes, LidarWalesSource.DSM_URL: dsm_bytes},
+        LidarWalesSource.DSM_URL,
+        503,
+    )
+    source = LidarWalesSource(session=session, ostn15_cache_dir=cache_dir)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(Exception) as excinfo:
+        source.fetch(NEAR_TP06_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    failure = source.tile_failures[0]
+    assert failure.kind == FAILURE_SERVICE_ERROR
+    assert failure.kind in RETRYABLE_FAILURE_KINDS
+    assert "503" in failure.reason
+    assert LidarWalesSource.DSM_URL not in failure.reason
+    assert LidarWalesSource.DSM_URL not in str(excinfo.value)
+
+
+def test_fetch_classifies_an_unrecognised_cogerror_with_a_fixed_sentence(tmp_path, ostn15_fixture_grid):
+    # The fallthrough: a CogError with no status_code and no recognised
+    # transport phrase (here, a short-body content-length mismatch, which
+    # HttpByteSource never retries at all). The reason must be the FIXED
+    # phrase, never the raw CogError text: the raw message names byte
+    # counts and could, in a differently shaped failure, name more than
+    # that, and survey.json/the tile_failed event are files and streams
+    # that outlive the run.
+    cache_dir = tmp_path / "cache"
+    _seed_cache(cache_dir, ostn15_fixture_grid)
+    dtm_bytes, dsm_bytes = _flat_mosaics(NEAR_TP06_BBOX, ostn15_fixture_grid, 1.0, 2.0)
+
+    session = _ShortBodyOnUrlSession(
+        {LidarWalesSource.DTM_URL: dtm_bytes, LidarWalesSource.DSM_URL: dsm_bytes},
+        LidarWalesSource.DTM_URL,
+    )
+    source = LidarWalesSource(session=session, ostn15_cache_dir=cache_dir)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(Exception) as excinfo:
+        source.fetch(NEAR_TP06_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    failure = source.tile_failures[0]
+    assert failure.kind == FAILURE_UNKNOWN
+    assert failure.reason == "Failed to download Welsh LiDAR: could not be read."
+    # The raw CogError's own vocabulary ("bytes", "asked for", "short")
+    # must not have leaked into the fixed reason, even though it is fine
+    # in the exception itself.
+    assert "bytes" not in failure.reason
+    assert "sent" not in failure.reason
+    assert LidarWalesSource.DTM_URL not in failure.reason
 
 
 def test_fetch_classifies_a_dsm_timeout_and_never_leaks_a_url(tmp_path, ostn15_fixture_grid):
