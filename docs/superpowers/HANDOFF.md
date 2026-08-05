@@ -1,4 +1,4 @@
-# mapgen handoff, updated 2026-08-04 (second revision)
+# mapgen handoff, updated 2026-08-05
 
 Read this first when resuming. It is tracked in git deliberately, because the
 detailed ledger is not.
@@ -9,13 +9,13 @@ detailed ledger is not.
 - Main worktree: `.../VS code/Rhino Plugins/mapgen`, branch `main`
 - Remote: `https://github.com/EJR-of-Scrutopia/Geomapper-GH.git`
 - **The first push happened.** Both remote branches sit at `3748225`.
-  `feat/phase1` is now **45 commits ahead** of the remote and `main` is 1
+  `feat/phase1` is now **121 commits ahead** of the remote and `main` is 1
   ahead. The permission layer denies `git push` from the assistant's shells,
   so the owner runs it.
 - Run tests: `.venv\Scripts\python.exe -m pytest -q` and
   `node tests/js/test_app.js`. Add `-m live` for the network tests.
-- Last known green: **807 Python (3 deselected `live`), 3 live under `-m live`,
-  151 Node**. Use the venv python, not the system one, or every import fails.
+- Last known green: **1242 Python (4 deselected `live`), 4 live under `-m live`,
+  273 Node**. Use the venv python, not the system one, or every import fails.
 
 ## The ledger, and why it matters
 
@@ -35,15 +35,46 @@ survives the Urbano bridge failing. The final whole-branch review's two
 Criticals and two Importants are closed and were mutation-verified; see the
 ledger for the detail, which is no longer repeated here.
 
-Since then, tasks 21 to 28 landed, followed by a second whole-branch review
-whose 1 Critical and 9 Important findings are being fixed at the time of
-writing. Check `git log` and the ledger for where that finished.
+Since then, tasks 21 to 39 landed across three review cycles: a whole-branch
+review after task 28 (1 Critical, 10 Important, all fixed), and a second after
+task 39 (0 Critical, 2 Important, 15 of 17 Minors fixed, the rest deferred
+with reasons in `review-fixes-29-39-report.md`). The per-task sections below
+stop at task 28; tasks 29 to 39 are summarised right after this paragraph, and
+the gitignored ledger holds the full detail of everything.
+
+**Tasks 29 to 39, one line each.** 29: `mapgen bridge <dir>` runs the Urbano
+step over an existing package. 30: end-of-run verify, per-tile failure reasons,
+bounded retry, no fabricated empty output. 31: red tiles explain themselves;
+the destination moved beside Download. 32: retry reaches every layer through
+one shared classifier. 33: the console compacts long list fields. 34: Urbano
+inspected properly at last (9,221 types; two earlier wrong conclusions about
+it corrected, method note in the Urbano section below). 35: **mapgen writes
+the Urbano project setting natively**; `utm.py` matches Urbano's own
+projection to 1e-9 m. 36: six interface fixes including per-tile green and the
+boot-time Download gate. 37: the protobuf crash was `ElevationFilePath`
+holding a GeoTIFF; the field now only ever names a real `.egrid`; our OSM XML
+was always fine. 38: five interface adjustments plus three fix rounds ending
+with two sinks (`setBBox`, `renderTileGrid`) that make "a running job's
+display cannot be destroyed from the form" true by construction. 39: **native
+`.egrid` terrain writer** (`geotiff.py`, `egrid.py`), proven bit-identical
+against Urbano's own grid builder, with orientation checks that fail on
+deliberately flipped controls.
+
+**The owner's Grasshopper canvas renders**: streets by OSM tag, buildings
+coloured by building tag, from a mapgen package end to end. Terrain awaited
+their next test at the time of writing.
 
 Every task was verified by the coordinator directly, by running the code, not
-by relaying the implementer's report. Every one of the eight found either a
-real defect the implementer's own summary described inaccurately, or an error
-in the coordinator's brief that the implementer was right to push back on, so
+by relaying the implementer's report. Nearly every task found either a real
+defect the implementer's own summary described inaccurately, or an error in
+the coordinator's brief that the implementer was right to push back on, so
 **do not skip the independent verification step in either direction**.
+
+Known accepted debris: commit `aa8ff29` carries a captured mid-mutation
+`app.js` and fails the Node suite at that commit (HEAD is correct); a
+parallel-work `git add -A` swept files across two commits. Documented, not
+rewritten. Standing policy since: implementers sharing a tree commit with
+explicit paths only.
 
 ### Task 21, phase A repairs (`69166c8`)
 
