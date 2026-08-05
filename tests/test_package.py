@@ -1467,6 +1467,44 @@ def test_skipping_the_bridge_records_that_it_was_never_attempted(tmp_path):
     assert payload["bridge"] == {"attempted": False, "ok": None, "error": None}
 
 
+def test_an_unforced_run_that_is_ending_short_never_starts_the_bridge(tmp_path):
+    """Task 30's third condition on bridge_attempted, and the one nothing
+    was asserting: dropping `and not unrecoverable` passed the whole suite.
+
+    This run is about to raise. Before task 30 it raised from inside the
+    source loop and never reached the bridge at all, so starting an
+    external process on data mapgen is in the middle of refusing to stand
+    behind would be a new behaviour rather than a preserved one.
+
+    survey.json is written before the raise, deliberately, which is what
+    makes the record readable here at all.
+    """
+    # A source that gives a per-tile ACCOUNT, so the run defers its
+    # decision, retries, and reaches the bridge step still short. A source
+    # that fails as a whole re-raises from inside the loop and never gets
+    # this far, which is the shape this condition is preserving.
+    _register_flaky_osm(_FlakyOsmSession(failures_by_tile={"r01_c01": 99}))
+    runner = FakeBridgeRunner(returncode=0)
+
+    with pytest.raises(IncompleteSurveyError):
+        run_survey(
+            _osm_only_request(tmp_path, run_bridge_step=True), bridge_runner=runner
+        )
+
+    payload = json.loads(
+        (
+            tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront" / "survey.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert payload["complete"] is False
+    assert payload["stopped"] is False, "this run failed, it was not stopped"
+    # Not attempted, and recorded the honest way rather than as a
+    # fabricated failure: the same shape --skip-bridge produces.
+    assert payload["bridge"] == {"attempted": False, "ok": None, "error": None}
+    # And no process was started, which is the half survey.json cannot say.
+    assert runner.calls == []
+
+
 def test_a_bridge_failure_still_correctly_attributes_the_osm_endpoint_used(tmp_path):
     # Ties Task 20 findings 1 and 4 together. Before finding 1 was fixed,
     # the only way a survey.json was ever produced for a real osm run on
@@ -3395,6 +3433,32 @@ def test_a_second_bridge_run_still_reports_the_download_not_the_previous_one(tmp
     }
 
 
+def test_a_package_whose_record_has_no_bridge_block_gets_a_null_during_download(tmp_path):
+    """README promises a null here rather than a fabricated false, and this
+    is the shape that produces one: a package old enough that its
+    survey.json never carried a bridge block at all, which is exactly what
+    is sitting on the owner's disk.
+
+    There is nothing for during_download to keep, and `false` would claim a
+    download-time attempt that nothing witnessed. The distinction is the
+    whole reason the field is nullable.
+    """
+    register_default_sources()
+    root = _package_on_disk(tmp_path)
+    payload = json.loads((root / "survey.json").read_text(encoding="utf-8"))
+    del payload["bridge"]
+    (root / "survey.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    updated = bridge_package(root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    assert updated["bridge"]["during_download"] is None
+    assert updated["bridge"]["attempted"] is True
+    assert updated["bridge"]["ok"] is True
+    assert updated["bridge"]["ran_at"]
+    # And it survives the trip to disk, which is where a reader meets it.
+    assert _bridge_block(root)["during_download"] is None
+
+
 def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_path):
     # survey.json is the package's record of ITSELF, and this command was
     # not there for the download. complete and stopped describe that
@@ -3813,6 +3877,41 @@ def test_a_tile_over_the_node_cap_subdivides_and_is_never_retried(tmp_path):
     assert {record["kind"] for record in failures} == {"node_cap"}
     assert all("smaller extent" in record["reason"] for record in failures)
     assert _events_named(log, "tile_subdivided") != []
+
+
+def test_a_stop_never_starts_the_retry_pass_at_all(tmp_path):
+    """Stop must not start a retry, on a control this project's brief calls
+    load-bearing, and until now that was asserted nowhere.
+
+    The distinction from the test below is where the stop lands. There it
+    arrives once the retry is already going and the interruption is what is
+    being watched; here it arrives during the FIRST pass, with retryable
+    failures already on the books, and the whole second pass must not
+    happen. The event log is what says so: not merely no request made, but
+    no retry announced and no retry reported as done.
+
+    retry_done is the assertion that bites. _retry_failed_tiles has its own
+    cancellation guard, so removing the outer gate still stops the retry at
+    the first source it looks at; what it leaves behind is a retry_done
+    saying a pass ran and recovered nothing, on a run that was told not to
+    start one.
+    """
+    session = _FlakyOsmSession(failures_by_tile={"r00_c00": 99})
+    _register_flaky_osm(session)
+    token = CancelToken()
+    sink = _CancellingSink(token, stop_on="tile_failed")
+
+    result = run_survey(_osm_only_request(tmp_path), progress=sink, cancel=token)
+
+    assert result.stopped is True
+    assert result.complete is False
+    # A retryable failure really is on the books, so this is not passing by
+    # having nothing to retry in the first place.
+    assert {r["kind"] for r in result.survey["tile_failures"]} == {"service_error"}
+    assert _events_named(sink, "tile_retrying") == []
+    assert _events_named(sink, "retry_done") == []
+    assert result.survey["retries"] == []
+    assert session.requests_by_tile["r00_c00"] == 4, "the failed tile was asked again"
 
 
 def test_a_stop_interrupts_the_retry_pass_as_promptly_as_the_first_attempt(tmp_path):
