@@ -290,15 +290,11 @@ Welsh sites.
 
 ## Then
 
-- Phase 2 spec, layers in this order: NRW LiDAR through DataMapWales, OS Open
-  data, constraints and designations, geology and land cover.
-- **Verify the phase 2 research before building on it.** The claims that NRW
-  LiDAR is 25cm to 2m under OGL covering about 70 percent of Wales, and that
-  Dwr Cymru will not sell sewer GIS at any price, came from research in
-  session and no test can check them.
-- Property and planning records were judged a separate tool: address-keyed
-  rather than geometry-keyed. EPC bulk data, Land Registry INSPIRE polygons,
-  council tax bands. No national Welsh planning feed exists.
+Phase 2 is specced, approved by the owner, and verified: read
+`docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md` (revised after
+the task-zero verification pass; evidence in `phase2-task-zero-report.md`
+beside the ledger). Next action: write the phase 2 implementation plan from
+that spec, then build item 1, Wales LiDAR.
 
 ## Standing constraints
 
