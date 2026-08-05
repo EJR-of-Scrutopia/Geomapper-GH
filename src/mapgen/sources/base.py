@@ -113,6 +113,29 @@ def classify_transport_failure(exc: BaseException) -> tuple[str, str]:
     string, and "the request failed with ConnectionResetError" is at
     least a fact the owner can quote at someone.
 
+    **That last branch is only ever reached from OUTSIDE requests**, and
+    it is worth writing down rather than leaving to be rediscovered:
+    `requests.exceptions.RequestException` subclasses `OSError`, so the
+    clause above absorbs every exception the library can raise, including
+    the ones that are not connection failures at all. TooManyRedirects,
+    HTTPError, ChunkedEncodingError, ContentDecodingError and InvalidURL
+    all come back as "could not be reached", and are therefore retried
+    once.
+
+    That is deliberate now that it has been looked at, rather than
+    merely tolerated. A truncated or badly-encoded body is exactly what a
+    second attempt fixes, and the retry budget is one extra pass, so the
+    cost of the ones that will not recover is one request each. The price
+    is the sentence: a service that answered with a redirect loop is
+    described to the owner as unreachable. Narrowing the clause would buy
+    a more accurate sentence for those and lose the retry for the
+    truncated body, which is the failure this project actually meets on a
+    home link, so the sentence is the thing that gives.
+
+    test_sources_base.py pins the whole mapping, so a future reorder of
+    these clauses is a failing assertion rather than a silent change to
+    which failures are retried.
+
     Lives here, in the module that already owns the failure vocabulary,
     rather than in osm.py where Task 30 first wrote it. Task 32 gave
     elevation the same need, and two sources classifying the same

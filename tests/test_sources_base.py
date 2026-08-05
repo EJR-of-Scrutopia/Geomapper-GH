@@ -6,6 +6,7 @@ from mapgen.sources.base import (
     FAILURE_TIMEOUT,
     FAILURE_UNKNOWN,
     FAILURE_UNREACHABLE,
+    RETRYABLE_FAILURE_KINDS,
     DuplicateSourceError,
     Estimate,
     NullProgress,
@@ -232,6 +233,44 @@ def test_an_unrecognised_exception_contributes_its_class_name_and_nothing_else()
     unrecognised, phrase = classify_transport_failure(ValueError("boom"))
     assert unrecognised == FAILURE_UNKNOWN
     assert phrase == "failed with ValueError"
+
+
+def test_every_requests_exception_lands_on_a_kind_this_project_chose():
+    """The unknown branch is unreachable for anything requests can raise,
+    and that is a fact about the library rather than about this function:
+    RequestException subclasses OSError, so the clause above absorbs the
+    lot, including the ones that are not connection failures.
+
+    Pinned rather than left to be rediscovered. The consequence is which
+    failures get a second attempt, decided by RETRYABLE_FAILURE_KINDS off
+    these kinds, so a reorder of those isinstance clauses would quietly
+    change the retry policy for five exception types at once. Here it is a
+    failing assertion instead.
+    """
+    assert issubclass(requests.exceptions.RequestException, OSError)
+
+    # Not connection failures, and described as one anyway: a second
+    # attempt is what fixes a truncated body, and one wasted request is
+    # what the rest cost. See classify_transport_failure on why the
+    # sentence is what gives rather than the retry.
+    answered_but_unusable = [
+        requests.exceptions.TooManyRedirects("looped"),
+        requests.exceptions.ChunkedEncodingError("cut short"),
+        requests.exceptions.ContentDecodingError("bad gzip"),
+        requests.exceptions.HTTPError("raised for status"),
+        requests.exceptions.InvalidURL("no host"),
+    ]
+    for exc in answered_but_unusable:
+        kind, phrase = classify_transport_failure(exc)
+        assert (kind, phrase) == (FAILURE_UNREACHABLE, "could not be reached")
+        assert kind in RETRYABLE_FAILURE_KINDS
+
+    # And the timeout clause still wins over it, which is the ordering
+    # that matters: ReadTimeout is a RequestException too.
+    assert classify_transport_failure(requests.exceptions.ReadTimeout("slow")) == (
+        FAILURE_TIMEOUT,
+        "did not answer in time",
+    )
 
 
 def test_parse_retry_after_reads_the_seconds_form_and_nothing_else():
