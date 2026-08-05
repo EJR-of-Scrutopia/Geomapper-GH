@@ -133,8 +133,15 @@ def test_a_multi_tile_window_round_trips_exactly(tmp_path):
     write_bng_geotiff(path, window)
 
     reader = CogReader.open(FileByteSource(path))
+    assert reader.epsg == 27700
+    assert reader.pixel_is_area is True
+
     got = reader.read_window(*_safe_bounds(window))
     assert _values_equal(got.values, window.values)
+    assert got.e_origin == window.e_origin
+    assert got.n_top == window.n_top
+    assert got.pixel_size == window.pixel_size
+    assert got.pixel_height == window.pixel_height
     assert got.width == width
     assert got.height == height
 
