@@ -39,9 +39,10 @@ the value is what its `TryGetElevation` returned, printed round trippably,
 and `tests/test_geotiff.py` asserts mapgen reproduces it to the last bit of
 a single precision float rather than approximately.
 
-`urbano_grid_barry.txt` and `urbano_grid_porthcawl.txt` are the same
+`urbano_grid_barry.egrid` and `urbano_grid_porthcawl.egrid` are the same
 assembly's `ElevationExtensions.BuildElevationGridFromTiff` on the same two
 files, with the padding and options `ProjectSettingComponent` uses when it
-writes a `.egrid`: the header it produced, and every one of its heights.
-`tests/test_egrid.py` builds the same grid in Python and compares the two
-value by value.
+writes a `.egrid`, serialised by Urbano's own protobuf writer and kept as
+the bytes it produced rather than as text. `tests/test_egrid.py` decodes
+them with its own protobuf reader, builds the same grid in Python, and
+compares the two both byte by byte and value by value.

@@ -34,11 +34,17 @@ Two consequences run through this module:
     `FileNameStr`.
   * Naming a layer commits Urbano to having it. An elevation layer with no
     `<stem>.egrid` beside it sends Urbano to the USGS 3DEP service, which is
-    United States only, and it reports the failure on the component. Since
-    task 37 this cannot arise from a mapgen package: `elevation` is listed
-    only when a `.egrid` is genuinely there, and mapgen does not produce
-    one, so on this route a UK package is a clean no-download pass-through
-    with no orange warning on the component.
+    United States only, and it reports the failure on the component. This
+    cannot arise from a mapgen package, because `elevation` is listed only
+    when a `.egrid` is genuinely there. Since task 39 it is genuinely there
+    whenever the package holds a DEM: mapgen writes the `.egrid` itself,
+    before this module is asked which layers the folder has, on every run
+    and on every `mapgen bridge`. So a UK package with terrain names the
+    layer AND has the file, which is still a clean no-download
+    pass-through with no orange warning on the component, and one without
+    terrain names no layer and sends Urbano nowhere. Task 37 reached the
+    same outcome by the opposite mechanism, mapgen having no `.egrid` to
+    name; that is no longer why.
 
 **Casting the text straight into a ProjectSettingParam**, which is what the
 Deserialize Project Setting component does, and what every Import component

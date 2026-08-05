@@ -195,15 +195,30 @@ def test_the_grid_is_the_one_urbano_would_have_built(case):
 
 @pytest.mark.parametrize("case", [BARRY, PORTHCAWL], ids=["barry", "porthcawl"])
 def test_the_bytes_are_the_bytes_urbano_writes(case):
-    """The same file, to the byte, except for the last bits of the doubles
-    the projection produces.
+    """The same file, to the byte, except for the last bits of a handful of
+    the doubles the projection produces.
 
     A value comparison cannot catch a packed repeated field, a field written
     in the wrong order, or an int written as a fixed32; a byte comparison
-    catches all three. The tolerance is stated as a COUNT of differing bytes
-    and a region rather than as "close enough": every difference has to be
-    inside the six doubles of the header, and the 111,888 and 233,039 bytes
-    of heights have to match exactly.
+    catches all three, which is why this exists alongside the value
+    comparison rather than instead of it.
+
+    The tolerance is a COUNT and nothing else, and it is worth being exact
+    about what that count is, because it is easy to read this test as
+    stricter than it is. `doubles` is the set of double-sized slots that
+    differ ANYWHERE in the file, header and heights alike; the assertion
+    bounds how many of them there are, not where they sit. It does not say
+    the heights match exactly, and today they do not: measured against the
+    checked-in fixtures, Barry differs in three doubles, all of them in the
+    header, and Porthcawl in four, three in the header and one height at
+    byte 136,342. Five is the bound, so there is a slot of slack in it.
+
+    That is the intended strength. A wrong wire format moves thousands of
+    bytes, not four, so this catches every structural error it was written
+    for; the last-bit disagreements it tolerates are the projection's own
+    nanometre of residual arriving at a pixel edge, and the value comparison
+    below is what bounds those to something meaningful (1e-6 on every
+    height, with NaN matched as NaN).
     """
     _tif, reference, _bbox = case
     theirs = reference.read_bytes()
