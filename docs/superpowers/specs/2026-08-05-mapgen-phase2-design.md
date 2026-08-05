@@ -4,6 +4,25 @@ Design spec, distilled from three design conversations with the owner on
 2026-08-04 and 2026-08-05, after phase 1 reached Grasshopper end to end
 (streets, buildings and terrain rendering from a mapgen package).
 
+**Revised 2026-08-05 after task zero.** Every claim below was checked against
+primary sources; the full evidence with quotes, URLs and dates is in the task
+zero report beside the ledger. The material corrections: OS Data Hub Premium
+is OUT (its End User terms forbid commercial exploitation and explicitly name
+planning applications as not permitted, so it cannot feed client
+deliverables), which also defers the replacement mechanism, whose only
+consumer it was; Wales LiDAR is honestly 1m, not 25cm (the 25cm that exists
+is ten 2011 tiles in one corner of Cardiff), so fine contour intervals are
+interpolated and labelled as such; Welsh orthophotography is cut (the portal
+holds an index of flights, not imagery, and the imagery itself is
+public-sector only); Sentinel-2 got simpler (Earth Search plus the public
+sentinel-cogs bucket, verified working with no account and no key); BGS
+boreholes are promoted (fully open including commercial use, with a modern
+API) while 1:50k mapping is demoted to view-only pending written
+confirmation; PlanIt is confirmed for all three home councils but rate
+limited to one search a minute and explicitly not to be load-bearing, and
+planning application drawings must not be packaged (consultation use only
+under CDPA s.47; the structured list and links are fine).
+
 ## The problem, in the owner's framing
 
 OSM gives geometry without context: buildings with no heights and no plot
@@ -39,13 +58,13 @@ affordable premium tier, packaged the same way phase 1 packages OSM.
 | 1 | NRW LiDAR via DataMapWales (Wales), EA National LiDAR Programme (England), Scottish Remote Sensing Portal | terrain (upgrades `.egrid`), contours, building heights | download APIs, per-nation | open (OGL), verify per portal |
 | 2 | HM Land Registry INSPIRE Index Polygons | property boundaries | per-local-authority download, monthly refresh | open + required attribution; indicative not legal |
 | 3 | OS Open Roads + OS OpenMap Local + Boundary-Line + Open Greenspace + Open UPRN | roads with names/class, functional sites, admin boundaries, addresses | OS Data Hub OpenData plan | open |
-| 4 | OS Data Hub **Premium** (MasterMap Topography, Building Height Attribute) | kerb-level topo, measured heights; per-category **replacement** of OSM | API, key in settings, monthly free credit | premium; credit terms to verify |
+| 4 | ~~OS Data Hub Premium~~ CUT by task zero: End User terms allow view, 24h cache and personal non-commercial print only, and forbid extraction and commercial exploitation. A paid OS data licence is a procurement decision outside this spec. Measured heights come from LiDAR DSM-DTM instead. | | | |
 | 5 | DataMapWales constraints + Cadw | flood, SSSI/SAC, conservation areas, ancient woodland, listed buildings, monuments | OGC APIs / WFS | open, verify each layer |
 | 6 | planning.data.gov.uk | designations as data, England only | API | open |
 | 7 | PlanIt aggregator | planning applications by location, decisions, portal links | API | open aggregator; per-council PDF fetch is best-effort |
 | 8 | BGS geology | 1:625k open now; 1:50k view; borehole scans | WMS/WFS + downloads | tiered; verify current 1:50k terms |
 | 9 | Sentinel-2 | context imagery, land cover | open API | fully open |
-| 10 | Welsh Government aerial (DataMapWales) | site orthophotos | WMS | licence unknown, verify before promising |
+| 10 | ~~Welsh Government aerial~~ CUT by task zero: the portal layer is an index of what was flown, view-only, and the imagery is APGB, which NRW states may not be re-used by third parties. Site orthos are a commercial purchase when a job justifies one. | | | |
 
 ## Architecture
 
@@ -69,10 +88,9 @@ each category and why (tier, coverage, licence).
   become a `height` tag on existing building ways; designations become their
   own tagged geometry.
 - **Replacement**: a source substitutes the OSM base for a category.
-  MasterMap topography replaces OSM roads/buildings when present and
-  licensed, because two geometric truths of one street are worse than either.
-  Replacement is recorded per category in `survey.json` and visible in the
-  tier list before download.
+  DEFERRED by task zero: MasterMap was its only phase 2 consumer and is cut,
+  so the machinery is not built speculatively. The resolver records fusion
+  winners only; replacement returns if and when a source that needs it does.
 
 ### Contours are generated, not downloaded
 
@@ -124,17 +142,25 @@ Anything the pass cannot confirm gets cut or demoted, not assumed. Phase 1's
 standing rule applies: claims from memory are hypotheses until checked, and
 this project has paid for forgetting that several times.
 
-## Build order after task zero
+## Build order after task zero (revised)
 
-1. LiDAR source (Wales + England backends) with contours + heights + egrid
-   upgrade. One source, three of the owner's asks.
-2. INSPIRE boundaries as tagged curves, shared-edge deduplication included.
-3. OS Open pack (roads, OpenMap Local, UPRN) and the resolver + tier list UI.
-4. DataMapWales constraints + Cadw + planning.data.gov.uk.
-5. OS Data Hub Premium with per-category replacement.
-6. Sentinel-2 + orthos where licensed.
-7. PlanIt planning history + the precision pull preset.
-8. BGS non-commercial.
+1. Wales LiDAR (whole-Wales 1m COG mosaics over plain HTTPS, OGL): contours,
+   DSM-DTM building heights, egrid upgrade. Nearly trivial by task zero's
+   reading, and three of the owner's asks in one source.
+2. INSPIRE boundaries as tagged curves, shared-edge deduplication, both
+   required attribution statements carried per feature.
+3. OS Open pack (roads, OpenMap Local, UPRN) and the resolver + tier list UI
+   (fusion only).
+4. DataMapWales constraints + Cadw + planning.data.gov.uk (England).
+5. Sentinel-2 via Earth Search + the public sentinel-cogs bucket: no account,
+   no key, verified live during task zero.
+6. England LiDAR: separate task, needs its own route investigation first
+   (discovery WFS is open; bulk raster download is a browser job with no
+   documented API).
+7. PlanIt planning history (non-load-bearing, 1 req/min, structured list and
+   links only, no packaged drawings) + the precision pull preset.
+8. BGS boreholes (open, commercial use permitted, OGC API); 1:50k mapping
+   only as view-layer WMS unless written confirmation arrives.
 
 Standing constraints carry over unchanged: no new third-party dependencies,
 no build step, token-gated routes, keys never logged, licences and
