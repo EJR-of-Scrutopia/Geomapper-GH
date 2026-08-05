@@ -77,7 +77,14 @@ from typing import Sequence
 import requests
 
 from mapgen.bng import BngError, ensure_ostn15, load_ostn15, to_bng
-from mapgen.cog import CogError, CogReader, FileByteSource, HttpByteSource, MAX_WINDOW_PIXELS
+from mapgen.cog import (
+    CogError,
+    CogReader,
+    FileByteSource,
+    HttpByteSource,
+    MAX_WINDOW_PIXELS,
+    read_full_window,
+)
 from mapgen.contours import write_contour_files
 from mapgen.egrid import PAD_METRES
 from mapgen.fsutil import atomic_write_bytes
@@ -216,27 +223,6 @@ def _all_nodata(values) -> bool:
     for the full scan.
     """
     return not any(value == value for value in values)
-
-
-def _full_bounds(level, origin_e: float, origin_n: float) -> tuple[float, float, float, float]:
-    """A query rectangle guaranteed to read back a packaged raster whole.
-
-    Matches test_geotiff_write.py's own `_safe_bounds` technique: querying
-    the true outer edge (`origin_e + width * pixel_size`) risks
-    `CogReader._geometry`'s `ceil` landing one pixel high when that product
-    does not divide back to an exact integer in floating point, which would
-    ask `read_window` for one more column or row than the file actually
-    has. Insetting the far corner by half a pixel keeps the same
-    floor/ceil arithmetic clear of that edge by a margin many orders of
-    magnitude bigger than any rounding noise, without changing which
-    pixels come back. The near corner (`origin_e`, `origin_n`) needs no
-    inset: it is exactly where `_geometry`'s `floor` already lands.
-    """
-    e_min = origin_e
-    e_max = origin_e + (level.width - 0.5) * level.pixel_size
-    n_max = origin_n
-    n_min = origin_n - (level.height - 0.5) * level.pixel_height
-    return e_min, n_min, e_max, n_max
 
 
 class LidarWalesSource:
@@ -502,9 +488,7 @@ class LidarWalesSource:
         grid = load_ostn15(cache_dir=self._ostn15_cache_dir) if dtm_part is not None else None
         if dtm_part is not None and grid is not None:
             reader = CogReader.open(FileByteSource(dtm_part))
-            level = reader.levels[0]
-            bounds = _full_bounds(level, reader.origin_e, reader.origin_n)
-            window = reader.read_window(*bounds)
+            window = read_full_window(reader)
             written.extend(write_contour_files(window, out_dir, stem, grid))
         else:
             for name in contour_names:

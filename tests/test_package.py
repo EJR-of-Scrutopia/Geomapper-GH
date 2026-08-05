@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 import requests
 
+from mapgen.bng import BngError
 from mapgen.geo import BBox, build_tiles
+from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken, EventLog, JobState
 from mapgen.naming import PathTooLongError, build_package_paths, tiling_fingerprint
 from mapgen.package import (
@@ -38,6 +40,12 @@ from mapgen.sources.overture import (
     MAX_CONCURRENT_TYPE_DOWNLOADS,
     OvertureError,
     OvertureSource,
+)
+from tests.test_heights import (
+    _BOX_BNG,
+    _constant_window,
+    _write_single_building_osm,
+    _zero_shift_grid,
 )
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
@@ -3503,13 +3511,14 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # not there for the download. complete and stopped describe that
     # download and nothing else; so do tiles, sources and both timestamps.
     #
-    # Three blocks are the exception rather than one, and each was added by
+    # Four blocks are the exception rather than one, and each was added by
     # the task that made this command produce something: `bridge`;
     # `project_setting` (task 35), which mapgen now writes whether or not the
-    # bridge is working; and `elevation_grid` (task 39), the DEM converted
+    # bridge is working; `elevation_grid` (task 39), the DEM converted
     # into the format Urbano reads terrain from, which every package
-    # downloaded before that task is missing. Everything else is still read
-    # and never written.
+    # downloaded before that task is missing; and `lidar_heights` (task 7),
+    # which re-runs the same fusion the download itself may already have
+    # done. Everything else is still read and never written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
     before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
@@ -3519,7 +3528,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     after = json.loads((root / "survey.json").read_text(encoding="utf-8"))
     assert after["complete"] is False
     assert after["stopped"] is True
-    for changed in ("bridge", "project_setting", "elevation_grid"):
+    for changed in ("bridge", "project_setting", "elevation_grid", "lidar_heights"):
         before.pop(changed, None)
         after.pop(changed, None)
     assert after == before
@@ -3535,14 +3544,17 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
 
     # The project setting is written after the bridge attempt and regardless
     # of it, which is exactly what run_survey does, so the two commands go
-    # on emitting the same vocabulary in the same order (task 35).
+    # on emitting the same vocabulary in the same order (task 35). The
+    # heights fusion runs first of all (task 7): this package has no
+    # packaged LiDAR rasters, so it is skipped rather than attempted.
     assert [e["event"] for e in log.events] == [
+        "heights_fusion_skipped",
         "bridge_started",
         "bridge_failed",
         "project_setting_started",
         "project_setting_written",
     ]
-    assert "exit code 1" in log.events[1]["error"]
+    assert "exit code 1" in log.events[2]["error"]
 
 
 def test_a_stop_that_landed_at_the_very_end_can_have_its_urbano_files_afterwards(tmp_path):
@@ -5635,3 +5647,153 @@ def test_a_failed_conversion_is_announced_and_not_only_written_down(tmp_path):
     assert len(failed) == 1
     assert "byte order mark" in failed[0]["error"]
     assert not any(e["event"] == "elevation_grid_written" for e in log.snapshot())
+
+
+# --------------------------------------------------------------------------
+# Task 7: DSM-minus-DTM building heights fused into <stem>.osm.
+#
+# Geometry reused straight from tests/test_heights.py (_BOX_BNG,
+# _constant_window, _write_single_building_osm, _zero_shift_grid) rather
+# than a second copy of it: one BNG rectangle and one constant pair of
+# windows, known to produce an exact 6.0 m height, is what both suites
+# need proven against. mapgen.package.load_ostn15 is monkeypatched to
+# return the same zero-shift grid directly, per the brief's own rule that
+# this task's tests touch no network: ensure_ostn15 is never reached.
+# --------------------------------------------------------------------------
+
+
+class LidarHeightsStubSource(StubSource):
+    """Writes a real `.osm` (one flat-roofed, 6.0 m building) and real
+    packaged LiDAR rasters beside it: the exact three files
+    `_fuse_heights_step` looks for, so a run through `run_survey` and
+    `bridge_package` exercises the real `fuse_building_heights` rather
+    than a stand-in for it.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dsm_path = out_dir / f"{stem}_lidar_dsm.tif"
+        write_bng_geotiff(dtm_path, _constant_window(100.0))
+        write_bng_geotiff(dsm_path, _constant_window(106.0))
+        return [osm_path, dtm_path, dsm_path]
+
+
+def test_the_heights_step_writes_the_expected_height_and_shape(tmp_path, monkeypatch):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(LidarHeightsStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["lidar_heights"] == {
+        "written": 1, "buildings": 1, "kept_existing": 0, "no_data": 0, "error": None,
+    }
+    osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    assert 'k="height" v="6.0"' in osm_text
+    assert 'k="source:height" v="Welsh Government LiDAR' in osm_text
+
+
+def test_the_heights_step_is_skipped_when_no_lidar_is_packaged(tmp_path):
+    """The ordinary case: a survey that never selected lidar_wales at all.
+    Not a failure, so no OSTN15 grid is ever asked for.
+    """
+    register(StubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["lidar_heights"] == {
+        "written": None, "buildings": None, "kept_existing": None,
+        "no_data": None, "error": None,
+    }
+
+
+def test_the_heights_step_is_skipped_when_only_the_rasters_are_missing(tmp_path):
+    """All three files are required; two of three is the same as none."""
+
+    class OsmOnlyStubSource(UrbanoReadableStubSource):
+        pass
+
+    register(OsmOnlyStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+    assert result.survey["lidar_heights"]["written"] is None
+
+
+def test_a_heights_failure_is_recorded_and_the_survey_still_finishes(tmp_path, monkeypatch):
+    """The same ruling task 20 made for the bridge and task 39 made for the
+    elevation grid: a building left flat because this step could not run
+    costs the package nothing else.
+    """
+    import mapgen.package as package_module
+
+    def _boom():
+        raise BngError("no OSTN15 grid for you")
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: None)
+    monkeypatch.setattr(package_module, "ensure_ostn15", _boom)
+    register(LidarHeightsStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.complete is True
+    record = result.survey["lidar_heights"]
+    assert record == {
+        "written": None, "buildings": None, "kept_existing": None,
+        "no_data": None, "error": "no OSTN15 grid for you",
+    }
+    names = [e["event"] for e in log.snapshot()]
+    assert names.index("heights_fusion_started") < names.index("heights_fusion_failed")
+    # The rest of the package is untouched by this step's own failure.
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+
+
+def test_the_heights_step_runs_before_the_bridge_step(tmp_path, monkeypatch):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(LidarHeightsStubSource())
+    log = EventLog()
+
+    run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        progress=log,
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+
+    names = [e["event"] for e in log.snapshot()]
+    assert names.index("heights_fusion_written") < names.index("bridge_started")
+
+
+def test_bridge_package_re_runs_fusion_idempotently(tmp_path, monkeypatch):
+    """The reason this matters: every package the owner already has was
+    downloaded before this task existed, so every one of them has flat
+    buildings a plain re-bridge should now be able to fix in place. A
+    package the DOWNLOAD already fused must not be re-fused into duplicate
+    tags either, which is the idempotence half of this same test.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(LidarHeightsStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    downloaded = result.survey["lidar_heights"]
+    assert downloaded["written"] == 1
+    assert downloaded["kept_existing"] == 0
+
+    payload = bridge_package(
+        result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0)
+    )
+
+    rebridged = payload["lidar_heights"]
+    assert rebridged["written"] == 0
+    assert rebridged["kept_existing"] >= 1
+    assert rebridged["buildings"] == downloaded["buildings"]
+    # The file itself agrees: still exactly one height tag, not two.
+    osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    assert osm_text.count('k="height" v="6.0"') == 1

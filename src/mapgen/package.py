@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from mapgen import __version__
+from mapgen.bng import BngError, ensure_ostn15, load_ostn15
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
 from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
+from mapgen.cog import CogError, CogReader, FileByteSource, read_full_window
 from mapgen.egrid import (
     ElevationGridError,
     elevation_grid_path,
@@ -30,6 +32,7 @@ from mapgen.fsutil import (
     work_dir_scope,
 )
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
+from mapgen.heights import HeightsError, fuse_building_heights
 from mapgen.jobs import FAILED, OK, PENDING, CancelToken, Cancelled, JobState
 from mapgen.merge import assert_inputs_present
 from mapgen.naming import (
@@ -891,6 +894,19 @@ def run_survey(
             produced.update(layer.resolve() for layer in layer_files)
             _sweep_stale_outputs(produced, paths, sink)
 
+        # Task 7. BEFORE the bridge, unconditionally, exactly like the
+        # elevation grid and project setting steps below: the bridge
+        # converts <stem>.osm into Urbano's own formats, so the heights
+        # this writes into it have to already be there when that happens,
+        # never after. Gated only on the three files it needs already
+        # being in the package (see _fuse_heights_step's own docstring),
+        # not on `stopped` or `unrecoverable`: a run that stopped after
+        # both the osm and lidar_wales sources had genuinely finished has
+        # a real .osm and real rasters sitting in the folder, and there is
+        # no reason to leave that building data flat just because a later
+        # source in the same run never got its turn.
+        lidar_heights = _fuse_heights_step(root=paths.root, stem=paths.stem, sink=sink)
+
         # Urbano is one product of a survey among several (the OSM/Overture/
         # elevation data on disk are the others). A missing or failing
         # Urbano install must not destroy those: the failure is recorded
@@ -994,6 +1010,7 @@ def run_survey(
         ),
         project_setting,
         elevation_grid,
+        lidar_heights,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -1206,6 +1223,102 @@ def _write_elevation_grid_step(
         file=target.name,
         nodes=len(grid.heights),
         covered=covered,
+    )
+
+
+def _heights_record(
+    written: int | None = None,
+    buildings: int | None = None,
+    kept_existing: int | None = None,
+    no_data: int | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    """survey.json's `lidar_heights` block, in ONE shape whatever happened,
+    following `_elevation_grid_record`'s own ruling exactly: five keys,
+    always, so a reader can index any of them on a package this step never
+    ran on (no LiDAR, no error) the same way it does on one it fused.
+
+    `relations_skipped` is deliberately not one of the five: it is
+    `HeightsRecord`'s own bookkeeping for `heights.py`'s tests, not
+    something a reader of survey.json was ever asked to see, and the
+    brief's own record shape names exactly these five keys.
+    """
+    return {
+        "written": written,
+        "buildings": buildings,
+        "kept_existing": kept_existing,
+        "no_data": no_data,
+        "error": error,
+    }
+
+
+def _fuse_heights_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, object]:
+    """Write DSM-minus-DTM building heights into `<stem>.osm`, reported as
+    a record, in the same one-shape-whatever-happened style as
+    `_write_elevation_grid_step`.
+
+    Runs only when all three files it needs are already in the package:
+    `<stem>.osm` (OsmSource.merge), `<stem>_lidar_dtm.tif` and
+    `<stem>_lidar_dsm.tif` (LidarWalesSource.merge). Any other combination,
+    including the ordinary case of a survey that never selected the
+    `lidar_wales` source at all, records the all-None shape and emits
+    `heights_fusion_skipped` rather than being treated as a failure: a
+    package with no Welsh LiDAR selected is not a package that tried to
+    fuse heights and could not.
+
+    The ONLY place in mapgen that calls `fuse_building_heights`, for the
+    same reason `_run_bridge_step` is the only caller of `run_bridge`: two
+    call sites would have to be kept agreeing forever about which
+    failures are survivable and which events are emitted. Runs BEFORE
+    `_run_bridge_step` in both of its own callers (`run_survey` and
+    `bridge_package`): the bridge converts `<stem>.osm` into Urbano's own
+    formats, so the heights have to already be written into it, exactly
+    the ordering `_write_elevation_grid_step` already keeps ahead of
+    `_write_project_setting_step` for the same kind of reason.
+
+    OSTN15 is read cache-only first (`load_ostn15`) and only fetched
+    (`ensure_ostn15`) if that misses: `lidar_wales`'s own fetch() already
+    downloaded and cached one for this package, on every ordinary run, so
+    the fetch path exists only for `mapgen bridge` on a package moved to a
+    machine that has never run a survey. A failure anywhere on this path,
+    an unreadable raster, a network failure fetching OSTN15, a malformed
+    `.osm`, is caught here and recorded rather than raised: a building
+    left flat is exactly the package the owner already had, and losing the
+    survey's real data over this step would be the mistake Task 20 already
+    fixed once for the bridge.
+    """
+    osm_path = Path(root) / f"{stem}.osm"
+    dtm_path = Path(root) / f"{stem}_lidar_dtm.tif"
+    dsm_path = Path(root) / f"{stem}_lidar_dsm.tif"
+    if not (osm_path.is_file() and dtm_path.is_file() and dsm_path.is_file()):
+        sink.emit("heights_fusion_skipped")
+        return _heights_record()
+
+    sink.emit("heights_fusion_started")
+    try:
+        grid = load_ostn15()
+        if grid is None:
+            grid = ensure_ostn15()
+        dtm_window = read_full_window(CogReader.open(FileByteSource(dtm_path)))
+        dsm_window = read_full_window(CogReader.open(FileByteSource(dsm_path)))
+        record = fuse_building_heights(osm_path, dtm_window, dsm_window, grid)
+    except (HeightsError, CogError, BngError, OSError) as exc:
+        error = str(exc)
+        sink.emit("heights_fusion_failed", error=error)
+        return _heights_record(error=error)
+
+    sink.emit(
+        "heights_fusion_written",
+        written=record.written,
+        buildings=record.buildings,
+        kept_existing=record.kept_existing,
+        no_data=record.no_data,
+    )
+    return _heights_record(
+        written=record.written,
+        buildings=record.buildings,
+        kept_existing=record.kept_existing,
+        no_data=record.no_data,
     )
 
 
@@ -1532,6 +1645,16 @@ def bridge_package(
             f"Run the survey again over the same extent to fetch what is missing, "
             f"then run this again."
         )
+
+    # Task 7. BEFORE the bridge, unconditionally, same as run_survey's own
+    # ordering and for the same reason: the bridge converts <stem>.osm into
+    # Urbano's own formats, so any height this can still add has to be in
+    # the file before that conversion runs. This is also what proves
+    # idempotence on a package the download already fused: a second run
+    # here finds every touched way already carrying `height` and reports
+    # `written: 0`, `kept_existing` at least as large as the download's own
+    # `written` count, never re-adding a tag that is already there.
+    payload["lidar_heights"] = _fuse_heights_step(root=root, stem=stem, sink=sink)
 
     ok, error = _run_bridge_step(
         bbox=bbox,
@@ -2673,6 +2796,7 @@ def _build_survey_json(
     retries=None,
     project_setting=None,
     elevation_grid=None,
+    lidar_heights=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
@@ -2682,6 +2806,10 @@ def _build_survey_json(
     elevation_grid = elevation_grid or {
         "written": False, "file": None, "nodes": None, "covered": None,
         "error": None,
+    }
+    lidar_heights = lidar_heights or {
+        "written": None, "buildings": None, "kept_existing": None,
+        "no_data": None, "error": None,
     }
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
@@ -2835,6 +2963,14 @@ def _build_survey_json(
         # actually answer for, which on a coastal survey is well under all of
         # them and is worth being able to see without opening Grasshopper.
         "elevation_grid": elevation_grid,
+        # Task 7. `written` is None, not 0 or False, on a package this step
+        # never ran on at all (no `.osm`, or no Welsh LiDAR selected):
+        # `int | None` throughout, matching the brief's own record shape, so
+        # a reader can tell "nothing to fuse" apart from "fused, and found
+        # zero buildings to touch" (`written: 0`). `error` is one plain
+        # sentence when the step ran and could not finish; every OTHER
+        # layer's own data is untouched either way, per Task 20's ruling.
+        "lidar_heights": lidar_heights,
         "started_at": started_at,
         "finished_at": _now(),
     }

@@ -1057,6 +1057,38 @@ class CogReader:
             values[target:target + (x1 - x0)] = block[source:source + (x1 - x0)]
 
 
+def read_full_window(reader: CogReader) -> BngWindow:
+    """The whole raster at its finest level, as one BngWindow.
+
+    For reading back a small raster this project itself wrote (a packaged
+    LiDAR tile, Task 6; a synthetic fixture in a test) without already
+    holding the BngWindow it was written from. `levels[0]` is always the
+    finest level (see `CogReader.open`'s own sort), which for anything
+    `geotiff_write.py` produced is the only level there is, since that
+    writer never emits overviews.
+
+    Promoted out of `mapgen.sources.lidar_wales._full_bounds` (Task 7),
+    which read a packaged DTM back this same way to build contours; Task
+    7's own height fusion needed the identical read and would otherwise
+    have been a second copy of it. Both call sites now share this one.
+
+    The far corner is inset by half a pixel rather than queried at the
+    raster's true outer edge, matching test_geotiff_write.py's own
+    `_safe_bounds`: querying the exact edge risks `CogReader._geometry`'s
+    own `ceil` rounding a division up by one pixel when `width *
+    pixel_size` does not land back on an exact integer in floating point,
+    which would ask `read_window` for one column or row more than the
+    file actually has. The near corner needs no inset: it is exactly
+    where `_geometry`'s `floor` already lands.
+    """
+    level = reader.levels[0]
+    e_min = reader.origin_e
+    e_max = reader.origin_e + (level.width - 0.5) * level.pixel_size
+    n_max = reader.origin_n
+    n_min = reader.origin_n - (level.height - 0.5) * level.pixel_height
+    return reader.read_window(e_min, n_min, e_max, n_max)
+
+
 def _blank_nodata(block: array, nodata: float) -> None:
     """Every nodata sample in a decoded tile, turned into NaN.
 
