@@ -536,6 +536,42 @@ def test_a_dem_that_covers_none_of_the_extent_is_refused_not_written(tmp_path):
     assert not target.exists()
 
 
+def test_the_egrid_goes_through_the_atomic_writer_and_never_over_a_good_one(
+    tmp_path, monkeypatch
+):
+    """A half written protobuf is a file Urbano opens and throws on, and the
+    owner's next Grasshopper session is the wrong place to find that out.
+
+    The division of labour: test_fsutil.py owns what atomic_write_bytes
+    guarantees, and this owns that this write is the one making the
+    guarantee. Replacing it here with a plain write_bytes passed the whole
+    suite, so nothing was holding that half.
+
+    Asserted through the consequence. A write that fails must leave whatever
+    was on disk before it untouched, and the only way to make one fail on
+    demand is to stand in front of the writer. A plain write_bytes both
+    misses the stand-in and destroys the previous file, so it fails here
+    twice over.
+    """
+    import mapgen.egrid as egrid_module
+
+    tif, _reference, bbox = BARRY
+    target = tmp_path / "out.egrid"
+    previous = b"a previous run's perfectly good grid"
+    target.write_bytes(previous)
+
+    def refuse(_path, _payload):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(egrid_module, "atomic_write_bytes", refuse)
+
+    with pytest.raises(OSError, match="disk is full"):
+        write_elevation_grid(tif, bbox, project_zone(bbox), target)
+
+    assert target.read_bytes() == previous
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.egrid"]
+
+
 def test_a_file_that_is_not_a_dem_is_refused_with_the_readers_own_sentence(tmp_path):
     source = tmp_path / "notadem.tif"
     source.write_bytes(b"{\"type\": \"FeatureCollection\"}")

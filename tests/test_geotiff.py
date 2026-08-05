@@ -59,6 +59,7 @@ def build_tiff(
     rows_per_strip=None,
     big_endian=False,
     magic=42,
+    model_transformation=None,
 ) -> bytes:
     """A minimal single strip (or single tile) GeoTIFF, little endian.
 
@@ -103,6 +104,8 @@ def build_tiff(
         entries.append((339, 3, [sample_format]))
     entries.append((33550, 12, [scale[0], scale[1], 0.0]))
     entries.append((33922, 12, list(tiepoint)))
+    if model_transformation is not None:
+        entries.append((34264, 12, list(model_transformation)))
     if geokeys:
         keys = [1, 1, 0, 3]
         keys += [1024, 0, 1, model_type]
@@ -354,6 +357,17 @@ def test_a_big_endian_dem_is_read_forwards(tmp_path):
     assert list(dem.heights) == [0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23]
 
 
+def test_a_big_endian_tiled_dem_is_read_forwards_too(tmp_path):
+    """The strip reader and the tile reader byteswap in two separate places,
+    and only the strip one was covered. Both real DEMs are little-endian
+    tiled, so the tiled path is the one that matters in practice and its
+    big-endian variant was the branch nothing would ever meet before an
+    owner did.
+    """
+    dem = read_dem(write(tmp_path, values=RAMP, tile=(8, 8), big_endian=True))
+    assert list(dem.heights) == [0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23]
+
+
 def test_signed_sixteen_bit_samples_read_as_heights(tmp_path):
     dem = read_dem(
         write(tmp_path, values=[[1.0, 2.0], [3.0, 4.0]], bits=16, sample_format=2)
@@ -567,6 +581,75 @@ def test_lzw_that_never_starts_with_a_clear_code_is_refused(tmp_path):
 
     with pytest.raises(GeoTiffError, match="clear code"):
         _lzw_decode(b"\x00\x00\x00\x00", 16)
+
+
+def _lzw_stream(codes, width=9):
+    """TIFF LZW codes packed most significant bit first, which is the half
+    of the format that differs from GIF's and the half a decoder is easiest
+    to get subtly wrong.
+    """
+    value = 0
+    bits = 0
+    for code in codes:
+        value = (value << width) | code
+        bits += width
+    pad = -bits % 8
+    return (value << pad).to_bytes((bits + pad) // 8, "big")
+
+
+def test_lzw_that_unpacks_short_is_refused_rather_than_used(tmp_path):
+    """The named safety property of _lzw_decode, and the one nothing
+    exercised. A wrong early-change rule decodes the first few hundred bytes
+    correctly and then produces noise, which reaches a Grasshopper canvas as
+    terrain rather than as an error.
+
+    This stream is perfectly well formed: clear code, two literals, end of
+    information. It is simply shorter than the tile it claims to fill, and
+    that is the whole point, because a decoder that went wrong halfway is
+    indistinguishable from this from the inside.
+
+    _decompress' own outer length check is separately covered and would also
+    refuse the file; this is the LZW-specific one the docstring is about,
+    and it is the one that names LZW when it refuses.
+    """
+    from mapgen.geotiff import _lzw_decode
+
+    stream = _lzw_stream([256, ord("A"), ord("B"), 257])
+    assert _lzw_decode(stream, 2) == b"AB", "the stream itself must be valid"
+
+    with pytest.raises(GeoTiffError, match="truncated or corrupt") as excinfo:
+        _lzw_decode(stream, 64)
+    assert "2 bytes where 64 were needed" in str(excinfo.value)
+
+
+def test_a_model_transformation_is_refused_by_name_and_not_generically(tmp_path):
+    """A rotated DEM read as an unrotated one is the silent geometry-shifting
+    error this module exists to avoid, so the file that would cause it gets
+    the sentence that says so.
+
+    Refused either way: one branch below, the generic "no pixel scale and
+    tie point" message catches the same file. What the specific branch buys
+    is the owner knowing WHY, which on a placement failure is the whole of
+    the useful information.
+    """
+    body = build_tiff(
+        values=RAMP,
+        model_transformation=[
+            0.001, 0.0, 0.0, -3.0,
+            0.0, -0.001, 0.0, 51.5,
+            0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    )
+    # Blank the tie point tag, so placement falls through to the
+    # transformation exactly as it would on a file that only ever had one.
+    body = body.replace(struct.pack("<H", 33922), struct.pack("<H", 65000), 1)
+    path = tmp_path / "rotated.tif"
+    path.write_bytes(body)
+
+    with pytest.raises(GeoTiffError, match="ModelTransformation") as excinfo:
+        read_dem(path)
+    assert "neither does Urbano" in str(excinfo.value)
 
 
 def test_a_raster_larger_than_the_limit_is_refused_before_it_is_read(tmp_path):
