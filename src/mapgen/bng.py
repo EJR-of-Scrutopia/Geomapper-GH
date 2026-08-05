@@ -7,13 +7,14 @@ Mercator projection from GRS80 onto a grid whose true origin is 49 N 2 W,
 producing what OS calls "pseudo-grid" coordinates, and then a small shift
 grid (OSTN15) that nudges those coordinates onto the real National Grid to
 correct for the fact that Great Britain's geodetic realisation predates
-GRS80 and does not sit on it exactly. This module is the first half only.
-The shift grid is a separate concern (see mapgen's Task 2 for that stage and
-for the survey-grade validation against OS's own station test vectors); this
-module's own tests pin internal consistency, namely that the true origin
-projects to the false origin and that forward and inverse agree with each
-other to a fraction of a millimetre, not agreement with OS to survey
-accuracy.
+GRS80 and does not sit on it exactly. `tm_forward`/`tm_inverse` below are
+the projection half alone, and their own tests pin internal consistency,
+namely that the true origin projects to the false origin and that forward
+and inverse agree with each other to a fraction of a millimetre, not
+agreement with OS to survey accuracy. `to_bng`/`from_bng`, further down,
+are the projection plus OSTN15 together, and it is those two that OS's own
+station test vectors validate to survey accuracy (2 mm); see "The second
+half: OSTN15" below.
 
 Deliberately not built on `mapgen.utm`, even though both are Transverse
 Mercator. `utm.py`'s whole reason to exist is to reproduce Urbano's own
@@ -28,11 +29,59 @@ Great Britain", transcribed with the guide's own term names (I, II, III,
 IIIA, IV, V, VI for the forward projection and VII through XIIA for the
 inverse) so the code can be read directly against the PDF rather than against
 some other transverse Mercator's derivation.
+
+## The second half: OSTN15
+
+`to_bng`/`from_bng` below layer OSTN15 on top of `tm_forward`/`tm_inverse`,
+which is the small, spatially varying correction that turns the pseudo-grid
+above into the real British National Grid: a shift grid of east/north
+corrections at every 1 km node of a 701 by 1251 rectangle (0 to 700 km
+east, 0 to 1250 km north), bilinearly interpolated between the four nodes
+around a point. The nodes come from Ordnance Survey's own developers pack
+(`OSTN15_URL`), a 41 MB CSV of one row per node; that pack is downloaded
+once, parsed once, and cached from then on as a 7 MB binary
+(`ensure_ostn15`/`load_ostn15`), because 876,951 lines of text is not
+something a survey run should pay to parse twice.
+
+The geoid height shift column in that CSV is skipped entirely: mapgen's
+LiDAR heights are already Ordnance Datum Newlyn orthometric, so there is
+no ellipsoidal height anywhere in this pipeline for OSGM15 to correct.
+
+Some nodes near the coast and offshore carry OS's own datum flag 16,
+"outside transformation area": OS extrapolates a numeric shift there but
+does not stand behind it as OSTN15 proper. This module treats a flag 16
+node exactly like a node the file never mentioned at all (both end up NaN
+in the cached grid), so `OutsideOstn15Error` only has to check for one
+thing, an absent corner, to cover both cases.
+
+Licence. The pack's own release notice,
+`OSGM15_Notice_of_release_for_developers.pdf`, announces the OSGM02 to
+OSGM15 and OSTN02 to OSTN15 updates but states no licence terms itself;
+the operative sentence is in the pack's own
+`Transformations_and_OSGM15_User_Guide.pdf`: "All three transformation
+models are licensed to users pursuant to the terms of the Open Source
+Initiative BSD Licence." Software incorporating the transformation must
+carry the pack's own attribution: "Copyright and database rights Ordnance
+Survey Limited 2016, Crown copyright and database rights Land & Property
+Services 2016 and/or Ordnance Survey Ireland, 2016. All rights reserved."
 """
 
 from __future__ import annotations
 
+import array
+import io
 import math
+import struct
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Iterable
+
+import requests
+
+from mapgen.config import CONFIG_PATH
+from mapgen.fsutil import atomic_write_bytes
 
 # GRS80 ellipsoid, which is what OSTN15's input frame (ETRS89) is defined on.
 _A = 6378137.0
@@ -96,9 +145,9 @@ def tm_forward(latitude: float, longitude: float) -> tuple[float, float]:
     "Pseudo" because this is GRS80 Transverse Mercator on the National Grid's
     own origin and false coordinates, not the National Grid itself: the
     small OSTN15 correction that makes it the National Grid is layered on
-    top of this in mapgen's Task 2, not here. This function alone is what OS
-    calls the "cartesian coordinates" step of the pseudo-grid, its I through
-    VI terms exactly as the guide states them.
+    top of this by `to_bng`, further down, not here. This function alone is
+    what OS calls the "cartesian coordinates" step of the pseudo-grid, its
+    I through VI terms exactly as the guide states them.
     """
     if not (math.isfinite(latitude) and math.isfinite(longitude)):
         raise BngError(
@@ -134,7 +183,7 @@ def tm_forward(latitude: float, longitude: float) -> tuple[float, float]:
     if not (math.isfinite(easting) and math.isfinite(northing)):
         # Unreachable for any input that got past the guard above, and
         # checked anyway: a coordinate this module cannot vouch for is a
-        # failure to report, not a value to hand on to Task 2's shift grid.
+        # failure to report, not a value to hand on to OSTN15's shift grid.
         raise BngError(
             f"Projecting latitude {latitude}, longitude {longitude} did not "
             f"produce a real coordinate."
@@ -158,8 +207,16 @@ def tm_inverse(easting: float, northing: float) -> tuple[float, float]:
         )
 
     lat_prime = (northing - _N0) / (_A * _F0) + _LAT0
-    while abs(northing - _N0 - _meridional_arc(lat_prime)) >= 1e-5:
-        lat_prime += (northing - _N0 - _meridional_arc(lat_prime)) / (_A * _F0)
+    # Capped at 10, the same Newton bound utm.py's own _angular_distance
+    # uses, as a backstop rather than a budget: this fixed-point map's
+    # contraction ratio is under 0.007 everywhere on the ellipsoid, so it
+    # is within 1e-5 m of the true latitude in 2 or 3 rounds for any real
+    # input, and the cap is never actually reached.
+    for _ in range(10):
+        residual = northing - _N0 - _meridional_arc(lat_prime)
+        if abs(residual) < 1e-5:
+            break
+        lat_prime += residual / (_A * _F0)
 
     sin_lat = math.sin(lat_prime)
     nu, rho, eta2 = _nu_rho_eta2(sin_lat)
@@ -187,3 +244,320 @@ def tm_inverse(easting: float, northing: float) -> tuple[float, float]:
             f"produce a real coordinate."
         )
     return latitude, longitude
+
+
+# --------------------------------------------------------------------------
+# OSTN15: the shift grid, its cache, and the public to_bng/from_bng pair.
+# --------------------------------------------------------------------------
+
+OSTN15_URL = "https://www.ordnancesurvey.co.uk/documents/resources/OSTN15-OSGM15-DevelopersPack.zip"
+
+# The one file this module reads out of the pack. The pack also carries an
+# Ireland/Northern Ireland geoid pair, four PDFs and OS's own test input and
+# output files; none of those are needed at runtime, only at fixture-build
+# time (see tests/fixtures/ostn15/make_fixture.py).
+_DATA_FILE_NAME = "OSTN15_OSGM15_DataFile.txt"
+
+# Confirmed against the pack's own header line rather than trusted from
+# memory: Point_ID, the node's own pseudo-grid position (not a
+# measurement), the two horizontal shifts this module uses, a geoid
+# height shift this module has no use for, and the datum flag.
+_EXPECTED_COLUMNS = (
+    "Point_ID",
+    "ETRS89_Easting",
+    "ETRS89_Northing",
+    "ETRS89_OSGB36_EShift",
+    "ETRS89_OSGB36_NShift",
+    "ETRS89_ODN_HeightShift",
+    "Height_Datum_Flag",
+)
+
+# OS's own datum flag for "outside transformation area" (see the module
+# docstring): a node with this flag carries a number but not OS's backing,
+# and is dropped exactly like a node the file never mentioned.
+_OUTSIDE_DATUM_FLAG = 16
+
+# The grid rectangle: 701 nodes east (0 to 700 km) by 1251 nodes north
+# (0 to 1250 km), 1 km apart.
+_GRID_COLS = 701
+_GRID_ROWS = 1251
+_NODE_COUNT = _GRID_COLS * _GRID_ROWS
+_GRID_SPACING_M = 1000.0
+
+_CACHE_FILENAME = "ostn15_shifts.bin"
+_CACHE_MAGIC = b"OSTN15\x00\x01"
+
+_DOWNLOAD_TIMEOUT_SECONDS = 120.0
+
+# from_bng's iteration: OS's own published method for inverting a
+# transform that has no closed form (see from_bng's own docstring).
+_FROM_BNG_TOLERANCE_M = 1e-4
+_FROM_BNG_MAX_ROUNDS = 10
+
+
+class OutsideOstn15Error(BngError):
+    """Raised when a point has no OSTN15 shift to give it.
+
+    Either it lies beyond the 701 by 1251 node rectangle altogether, or
+    one of the four nodes around it is a node OS itself flagged "outside
+    transformation area" (see the module docstring). Both look identical
+    by the time shift_at sees them: a missing corner, not a bad number to
+    catch downstream.
+    """
+
+
+def _bilinear(sw: float, se: float, nw: float, ne: float, t: float, u: float) -> float:
+    """OS's own bilinear form over the four nodes enclosing a point.
+
+    `t` and `u` are the point's fractional position between the south-west
+    node and the next one east and north respectively, each in [0, 1).
+    Named after compass corners rather than S0..S3 (OS's own test output
+    column names) because this function is one bilinear interpolation
+    used twice, for east shift and north shift both, and the corner it is
+    reading from at each call site is what a reader needs to check against
+    the grid, not which column OS happened to print it in.
+    """
+    return (
+        (1.0 - t) * (1.0 - u) * sw
+        + t * (1.0 - u) * se
+        + (1.0 - t) * u * nw
+        + t * u * ne
+    )
+
+
+class Ostn15Grid:
+    """A loaded OSTN15 shift grid, backed by one flat array.
+
+    The array always covers the full 701 by 1251 rectangle, regardless of
+    how much of it is actually populated: the real cache (parsed from OS's
+    41 MB data file, finite almost everywhere) and a test fixture slice
+    (NaN everywhere except a handful of named blocks, see
+    tests/fixtures/ostn15/make_fixture.py) are built to the same shape on
+    purpose, so shift_at treats them identically and code under test
+    cannot tell which one it was handed.
+    """
+
+    def __init__(self, shifts: array.array) -> None:
+        if len(shifts) != _NODE_COUNT * 2:
+            raise BngError(
+                "An OSTN15 grid must hold exactly one east/north shift pair "
+                "for every node of the 701 by 1251 rectangle."
+            )
+        self._shifts = shifts
+
+    def _node(self, col: int, row: int) -> tuple[float, float] | None:
+        if not (0 <= col < _GRID_COLS and 0 <= row < _GRID_ROWS):
+            return None
+        index = (row * _GRID_COLS + col) * 2
+        east, north = self._shifts[index], self._shifts[index + 1]
+        if not (math.isfinite(east) and math.isfinite(north)):
+            return None
+        return east, north
+
+    def shift_at(self, easting: float, northing: float) -> tuple[float, float]:
+        """The (east, north) OSTN15 shift at a pseudo-grid point, in metres.
+
+        Bilinear over the 2 by 2 nodes enclosing the point, in OS's own
+        south-west/south-east/north-east/north-west order, verified
+        against OS's own published intermediate values (RecNoS0..S3 in
+        OSTN15_OSGM15_TestOutput_ETRStoOSGB.txt) rather than assumed:
+        S0 is the south-west node, S1 south-east, S2 north-east, S3
+        north-west, and the same ordering is how tests/fixtures/ostn15's
+        stations were reproduced by hand to build this module's own
+        tests.
+        """
+        col0 = math.floor(easting / _GRID_SPACING_M)
+        row0 = math.floor(northing / _GRID_SPACING_M)
+        t = easting / _GRID_SPACING_M - col0
+        u = northing / _GRID_SPACING_M - row0
+        sw = self._node(col0, row0)
+        se = self._node(col0 + 1, row0)
+        ne = self._node(col0 + 1, row0 + 1)
+        nw = self._node(col0, row0 + 1)
+        if sw is None or se is None or ne is None or nw is None:
+            raise OutsideOstn15Error(
+                "This coordinate has no OSTN15 shift: it falls outside the "
+                "grid's 701 by 1251 node rectangle, or one of the nodes "
+                "around it is outside OS's own transformation area."
+            )
+        east_shift = _bilinear(sw[0], se[0], nw[0], ne[0], t, u)
+        north_shift = _bilinear(sw[1], se[1], nw[1], ne[1], t, u)
+        return east_shift, north_shift
+
+
+def _parse_data_file(lines: Iterable[str]) -> Ostn15Grid:
+    """OSTN15's data file, as text, into an Ostn15Grid.
+
+    One record per 1 km node: Point_ID, the node's own pseudo-grid
+    easting and northing (not a measurement; it names which node this
+    row is), the east and north shift, a geoid height shift this parser
+    never reads (see the module docstring), and the datum flag. The
+    column order is checked against the file's own header rather than
+    trusted, so a future repackaging that reorders columns fails loudly
+    here instead of silently swapping east and north.
+
+    Works equally on the real 876,951-line file and on a handful of
+    synthetic lines (see test_cache_roundtrip): every node this iterable
+    does not mention starts, and stays, NaN.
+    """
+    iterator = iter(lines)
+    header = next(iterator).rstrip("\n").split(",")
+    if tuple(header[:7]) != _EXPECTED_COLUMNS:
+        raise BngError(
+            "The OSTN15 data file's columns are not in the order this "
+            "parser expects."
+        )
+
+    shifts = array.array("f", (float("nan") for _ in range(_NODE_COUNT * 2)))
+    for line in iterator:
+        if not line.strip():
+            continue
+        fields = line.rstrip("\n").split(",")
+        col = round(float(fields[1]) / _GRID_SPACING_M)
+        row = round(float(fields[2]) / _GRID_SPACING_M)
+        if not (0 <= col < _GRID_COLS and 0 <= row < _GRID_ROWS):
+            raise BngError(
+                "The OSTN15 data file names a node outside the expected "
+                "701 by 1251 rectangle."
+            )
+        if int(fields[6]) == _OUTSIDE_DATUM_FLAG:
+            continue  # Left as NaN: outside the transformation area.
+        index = (row * _GRID_COLS + col) * 2
+        shifts[index] = float(fields[3])
+        shifts[index + 1] = float(fields[4])
+    return Ostn15Grid(shifts)
+
+
+def _cache_path(cache_dir: Path | None) -> Path:
+    # CONFIG_PATH.parent rather than a second `Path.home() / ".mapgen"`:
+    # config.py already owns this directory's location, and mapgen only
+    # gets to change that in one place if nothing else re-derives it.
+    return (cache_dir if cache_dir is not None else CONFIG_PATH.parent) / _CACHE_FILENAME
+
+
+def _to_little_endian(shifts: array.array) -> array.array:
+    if sys.byteorder == "little":
+        return shifts
+    swapped = array.array("f", shifts)
+    swapped.byteswap()
+    return swapped
+
+
+def _write_cache(path: Path, grid: Ostn15Grid) -> None:
+    body = _to_little_endian(grid._shifts).tobytes()
+    header = _CACHE_MAGIC + struct.pack("<Q", _NODE_COUNT)
+    atomic_write_bytes(path, header + body)
+
+
+def _read_cache(path: Path) -> Ostn15Grid:
+    data = path.read_bytes()
+    if len(data) < 16:
+        raise BngError("The OSTN15 shift-grid cache is too short to be valid.")
+    magic, count = struct.unpack_from("<8sQ", data, 0)
+    expected_length = 16 + count * 2 * 4
+    if magic != _CACHE_MAGIC or count != _NODE_COUNT or len(data) != expected_length:
+        raise BngError("The OSTN15 shift-grid cache is not in the expected format.")
+    shifts = array.array("f")
+    shifts.frombytes(data[16:])
+    if sys.byteorder != "little":
+        shifts.byteswap()
+    return Ostn15Grid(shifts)
+
+
+def load_ostn15(cache_dir: Path | None = None) -> Ostn15Grid | None:
+    """The cached OSTN15 grid, or None if it has never been fetched.
+
+    Never touches the network. Split out from ensure_ostn15 so a caller
+    that only wants to know whether a grid is already on disk, or a test
+    proving a download never happened, does not have to hand in a session
+    at all.
+    """
+    path = _cache_path(cache_dir)
+    if not path.exists():
+        return None
+    return _read_cache(path)
+
+
+def _download_and_parse(session: object) -> Ostn15Grid:
+    """The developers pack, streamed to a temp file, extracted, parsed.
+
+    Everything about the URL stays out of any message this raises: a
+    connection failure's own text from `requests` can carry it, and a
+    test asserting on this module's own wording should never end up
+    depending on that string too.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as work_dir:
+            zip_path = Path(work_dir) / "ostn15.zip"
+            with session.get(
+                OSTN15_URL, stream=True, timeout=_DOWNLOAD_TIMEOUT_SECONDS
+            ) as response:
+                response.raise_for_status()
+                with zip_path.open("wb") as handle:
+                    for chunk in response.iter_content(1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+            with zipfile.ZipFile(zip_path) as archive, archive.open(
+                _DATA_FILE_NAME
+            ) as member:
+                return _parse_data_file(io.TextIOWrapper(member, encoding="utf-8"))
+    except requests.RequestException as exc:
+        raise BngError("Failed to download the OSTN15 shift grid.") from exc
+
+
+def ensure_ostn15(
+    cache_dir: Path | None = None, session: object | None = None
+) -> Ostn15Grid:
+    """The OSTN15 grid: from cache if one exists, fetched and cached if not.
+
+    The fetch happens at most once per cache_dir: after this call the 41 MB
+    data file is gone (it lived only in a temp directory) and the 7 MB
+    binary cache is what every later call, in this process or the next
+    one, reads instead.
+    """
+    cached = load_ostn15(cache_dir)
+    if cached is not None:
+        return cached
+    active_session = session if session is not None else requests.Session()
+    grid = _download_and_parse(active_session)
+    _write_cache(_cache_path(cache_dir), grid)
+    return grid
+
+
+def to_bng(latitude: float, longitude: float, grid: Ostn15Grid) -> tuple[float, float]:
+    """ETRS89 latitude/longitude to real British National Grid easting/northing.
+
+    The whole transform in two steps: project to pseudo-grid, then add
+    OSTN15's shift at that pseudo-grid point. Raises OutsideOstn15Error,
+    via grid.shift_at, for a point OSTN15 does not cover.
+    """
+    easting, northing = tm_forward(latitude, longitude)
+    east_shift, north_shift = grid.shift_at(easting, northing)
+    return easting + east_shift, northing + north_shift
+
+
+def from_bng(easting: float, northing: float, grid: Ostn15Grid) -> tuple[float, float]:
+    """British National Grid easting/northing back to ETRS89 latitude/longitude.
+
+    OSTN15 has no closed-form inverse: the shift to subtract depends on
+    the pseudo-grid position, which is the very thing being solved for.
+    OS's own published method is this fixed-point iteration: sample the
+    shift at the current estimate of the pseudo-grid point, subtract it
+    from the real coordinate to get the next estimate, and repeat until
+    it stops moving. It settles to well under a millimetre in 2 rounds
+    for every point OS publishes a test vector for; the cap of 10 is a
+    backstop against a pathological input, not a budget this ever spends.
+    """
+    e_prime, n_prime = easting, northing
+    for _ in range(_FROM_BNG_MAX_ROUNDS):
+        east_shift, north_shift = grid.shift_at(e_prime, n_prime)
+        next_e = easting - east_shift
+        next_n = northing - north_shift
+        converged = (
+            abs(next_e - e_prime) < _FROM_BNG_TOLERANCE_M
+            and abs(next_n - n_prime) < _FROM_BNG_TOLERANCE_M
+        )
+        e_prime, n_prime = next_e, next_n
+        if converged:
+            break
+    return tm_inverse(e_prime, n_prime)

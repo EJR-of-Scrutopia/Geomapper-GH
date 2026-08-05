@@ -1,8 +1,22 @@
 import math
+import zipfile
 
 import pytest
+import requests
 
-from mapgen.bng import BngError, tm_forward, tm_inverse
+import mapgen.bng as bng
+from mapgen.bng import (
+    OSTN15_URL,
+    BngError,
+    OutsideOstn15Error,
+    ensure_ostn15,
+    from_bng,
+    load_ostn15,
+    tm_forward,
+    tm_inverse,
+    to_bng,
+)
+from tests.fixtures.ostn15 import make_fixture
 
 
 def test_tm_forward_true_origin_lands_on_false_origin_scaled():
@@ -51,3 +65,164 @@ def test_tm_inverse_refuses_a_non_finite_input(bad):
         tm_inverse(bad, 100_000.0)
     with pytest.raises(BngError, match="real numbers"):
         tm_inverse(400_000.0, bad)
+
+
+# --------------------------------------------------------------------------
+# OSTN15: the shift grid, the cache, and the public to_bng/from_bng pair.
+#
+# The station vectors are OS's own (see tests/fixtures/ostn15/make_fixture.py
+# for how three of them were picked and reduced to a fixture a few kilobytes
+# in size), not values invented for this test file.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ostn15_fixture_grid():
+    return make_fixture.read_slice()
+
+
+def load_fixture_stations():
+    return make_fixture.read_stations()
+
+
+def test_station_vectors_match_os_expected_output(ostn15_fixture_grid):
+    # The three OS Net stations from OS's own TestInput/TestOutput pair,
+    # run through tm_forward plus the real shift values around them.
+    for station in load_fixture_stations():
+        easting, northing = to_bng(
+            station.etrs_lat, station.etrs_lon, ostn15_fixture_grid
+        )
+        # OS publishes expected E/N to 3 decimal places.
+        assert easting == pytest.approx(station.expected_e, abs=0.002)
+        assert northing == pytest.approx(station.expected_n, abs=0.002)
+
+
+def test_from_bng_inverts_to_bng(ostn15_fixture_grid):
+    for station in load_fixture_stations():
+        easting, northing = to_bng(
+            station.etrs_lat, station.etrs_lon, ostn15_fixture_grid
+        )
+        lat, lon = from_bng(easting, northing, ostn15_fixture_grid)
+        assert lat == pytest.approx(station.etrs_lat, abs=2e-9)
+        assert lon == pytest.approx(station.etrs_lon, abs=2e-9)
+
+
+def test_outside_grid_refuses(ostn15_fixture_grid):
+    with pytest.raises(OutsideOstn15Error):
+        ostn15_fixture_grid.shift_at(-50_000.0, -50_000.0)
+
+
+# A tiny, hand-written excerpt in the data file's own confirmed column
+# order: two nodes on the ground (0,0) and (1000,0), read with a flag that
+# is not 16, plus two more closing the (0,1000)-(1000,1000) corner so
+# shift_at has all four corners it needs for the unit square between them.
+_TINY_EXCERPT = (
+    "Point_ID,ETRS89_Easting,ETRS89_Northing,ETRS89_OSGB36_EShift,"
+    "ETRS89_OSGB36_NShift,ETRS89_ODN_HeightShift,Height_Datum_Flag\n"
+    "1,0,0,90.750,-82.020,55.127,15\n"
+    "2,1000,0,90.764,-82.015,55.108,15\n"
+    "3,0,1000,90.700,-82.100,55.000,15\n"
+    "4,1000,1000,90.800,-82.200,55.200,15\n"
+)
+
+
+def test_cache_roundtrip(tmp_path):
+    # Parse a tiny synthetic data-file excerpt, write the cache, reload it,
+    # and get identical shifts back.
+    grid = bng._parse_data_file(_TINY_EXCERPT.splitlines(keepends=True))
+    cache_path = tmp_path / "ostn15_shifts.bin"
+    bng._write_cache(cache_path, grid)
+    reloaded = bng._read_cache(cache_path)
+
+    for easting, northing in [(0.0, 0.0), (500.0, 500.0), (999.0, 1.0)]:
+        assert reloaded.shift_at(easting, northing) == pytest.approx(
+            grid.shift_at(easting, northing)
+        )
+
+
+def test_ensure_ostn15_never_downloads_when_cache_present(tmp_path):
+    # A session whose get() raises AssertionError proves no network call.
+    grid = bng._parse_data_file(_TINY_EXCERPT.splitlines(keepends=True))
+    bng._write_cache(tmp_path / bng._CACHE_FILENAME, grid)
+
+    class RefusesToConnect:
+        def get(self, *args, **kwargs):
+            raise AssertionError(
+                "ensure_ostn15 must not touch the network when the cache "
+                "is already present"
+            )
+
+    loaded = ensure_ostn15(cache_dir=tmp_path, session=RefusesToConnect())
+    assert loaded.shift_at(500.0, 500.0) == pytest.approx(grid.shift_at(500.0, 500.0))
+
+
+def test_load_ostn15_returns_none_without_touching_the_network(tmp_path):
+    assert load_ostn15(cache_dir=tmp_path) is None
+
+
+def test_flag_16_is_treated_as_outside_even_though_it_carries_a_number(tmp_path):
+    # OS's own "outside transformation area" flag: the row still carries a
+    # real east/north shift (see the module docstring), and this parser
+    # must drop it exactly as if the node had never been mentioned, so
+    # OutsideOstn15Error covers both the same way.
+    excerpt = (
+        "Point_ID,ETRS89_Easting,ETRS89_Northing,ETRS89_OSGB36_EShift,"
+        "ETRS89_OSGB36_NShift,ETRS89_ODN_HeightShift,Height_Datum_Flag\n"
+        "1,0,0,90.750,-82.020,55.127,16\n"
+        "2,1000,0,90.764,-82.015,55.108,1\n"
+        "3,0,1000,90.700,-82.100,55.000,1\n"
+        "4,1000,1000,90.800,-82.200,55.200,1\n"
+    )
+    grid = bng._parse_data_file(excerpt.splitlines(keepends=True))
+    with pytest.raises(OutsideOstn15Error):
+        grid.shift_at(500.0, 500.0)
+
+
+def test_parse_data_file_refuses_an_unexpected_column_order():
+    # The parser's own docstring claims this fails loudly rather than
+    # silently swapping east and north; this is what pins that claim real.
+    bad_header = (
+        "Point_ID,ETRS89_Northing,ETRS89_Easting,ETRS89_OSGB36_EShift,"
+        "ETRS89_OSGB36_NShift,ETRS89_ODN_HeightShift,Height_Datum_Flag\n"
+    )
+    with pytest.raises(BngError):
+        bng._parse_data_file([bad_header])
+
+
+@pytest.mark.live
+def test_to_bng_matches_every_os_published_station(tmp_path):
+    # ensure_ostn15 against the real URL, into a temp dir, then every
+    # station OS itself publishes an answer for (not just the three
+    # committed in stations.txt), checked to OS's own 2 mm precision.
+    grid = ensure_ostn15(cache_dir=tmp_path)
+
+    session = requests.Session()
+    response = session.get(OSTN15_URL, timeout=120.0)
+    response.raise_for_status()
+    zip_path = tmp_path / "pack_for_test_vectors.zip"
+    zip_path.write_bytes(response.content)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        input_text = archive.read(
+            "OSTN15_OSGM15_TestInput_ETRStoOSGB.txt"
+        ).decode("utf-8")
+        output_text = archive.read(
+            "OSTN15_OSGM15_TestOutput_ETRStoOSGB.txt"
+        ).decode("utf-8")
+
+    inputs = {}
+    for line in input_text.splitlines()[1:]:
+        point_id, lat, lon, _height = line.split(",")
+        inputs[point_id] = (float(lat), float(lon))
+
+    outputs = {}
+    for line in output_text.splitlines()[1:]:
+        fields = line.split(",")
+        outputs[fields[0]] = (float(fields[1]), float(fields[2]))
+
+    assert len(inputs) == 40
+    for point_id, (lat, lon) in inputs.items():
+        easting, northing = to_bng(lat, lon, grid)
+        expected_e, expected_n = outputs[point_id]
+        assert easting == pytest.approx(expected_e, abs=0.002), point_id
+        assert northing == pytest.approx(expected_n, abs=0.002), point_id
