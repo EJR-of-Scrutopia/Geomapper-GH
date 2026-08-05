@@ -973,9 +973,36 @@ let failures = 0;
 let passed = 0;
 const failedNames = [];
 
+// A hung test is a FAILING test, not a stalled run.
+//
+// Two of the extent locks are protected by nothing else. Mutating either of
+// them lets a second job start, this file's own status stub runs out of
+// distinct replies to hand out, and an await inside the test never settles.
+// Without a deadline the whole run simply stopped producing output partway
+// through and never exited: no FAIL line, no summary, no non-zero exit. The
+// suite was not green, which is the important half, but "the run stalled" is
+// read as "this is slow today" long before it is read as "a lock is broken".
+//
+// Fifteen seconds against a slowest real test well under one; the longest
+// wait anywhere in this file is a 900 ms flush. It cannot fire on a slow
+// machine without something being genuinely stuck.
+//
+// The abandoned work is not cancellable from here and is simply left. Every
+// test builds its own sandbox, so it has nothing of the next test's to
+// disturb, and process.exit at the bottom ends the process whatever is
+// still pending.
+const TEST_TIMEOUT_MS = 15000;
+
 async function test(name, fn) {
+  let timer = null;
+  const deadline = new Promise((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`timed out after ${TEST_TIMEOUT_MS} ms without settling`)),
+      TEST_TIMEOUT_MS
+    );
+  });
   try {
-    await fn();
+    await Promise.race([fn(), deadline]);
     passed += 1;
     console.log(`PASS  ${name}`);
   } catch (error) {
@@ -983,6 +1010,8 @@ async function test(name, fn) {
     failedNames.push(name);
     console.log(`FAIL  ${name}`);
     console.log(`      ${error.stack ? error.stack.split("\n").slice(0, 2).join("\n      ") : error}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
