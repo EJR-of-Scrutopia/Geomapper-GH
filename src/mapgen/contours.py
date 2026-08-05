@@ -32,10 +32,21 @@ TERRAIN actually crosses, not the product of levels and cells.
 A corner's state (above a level or not) is always `value > level`, never
 `>=`. This is the one place a level exactly equal to a corner's height is
 decided, and deciding it consistently, the same way everywhere that corner
-is read, is what stops a degenerate zero-length segment or a double-drawn
-edge from appearing at that corner: two cells sharing a corner will always
-agree on which side of the level it falls, because both ask the same
-question of the same stored float.
+is read, is what stops a double-drawn edge: two cells sharing a corner
+will always agree on which side of the level it falls, because both ask
+the same question of the same stored float.
+
+The nudge alone does NOT stop a zero-length segment. A corner exactly on
+the level, with its three neighbours all on the one side, is touched by
+two crossing edges that both interpolate to that same corner, one at
+t=0 and the other at t=1, because interpolating FROM a value that equals
+the level lands exactly there. That is a single cell's own two crossings
+landing on the same point, not a disagreement between cells, so the nudge
+cannot be what prevents it; `_cell_segments` drops any segment whose two
+rounded endpoints coincide before returning it, which is what actually
+keeps this degenerate case out. It is not a rare input either: a level
+that is a round number against LiDAR terrain with an exact-integer flat
+bench (a roof, a road, still water) produces exactly this pattern.
 
 ## The saddle
 
@@ -45,7 +56,10 @@ configuration marching squares cannot resolve from the four corners alone:
 either pair of adjacent crossings is a valid, non-self-crossing choice, and
 they describe two different contours. This module breaks the tie the
 standard way, off the cell's own centre average: whichever diagonal's
-state the average agrees with is read as the connected one.
+state the average agrees with is read as the connected one. The average
+is compared with the same strict `>` as every corner, so an average
+landing exactly on the level reads as not above it, the same nudge applied
+one level up.
 
 ## Joining, closing, simplifying
 
@@ -117,6 +131,19 @@ _COLLINEAR_TOLERANCE_M = 0.05
 Point = tuple[float, float]
 Segment = tuple[Point, Point]
 Polyline = list[Point]
+
+
+def _round_point(point: Point) -> tuple[float, float]:
+    """A point's endpoint identity for both joining and degeneracy checks.
+
+    One micron (see _JOIN_ROUNDING_DECIMALS): far tighter than any real
+    distance between two independently interpolated points meant to be
+    the same crossing, so two genuinely different points never collide
+    here, and two points meant to coincide (the join step's shared
+    endpoints, or a cell's own zero-length crossing, see _cell_segments)
+    always do.
+    """
+    return (round(point[0], _JOIN_ROUNDING_DECIMALS), round(point[1], _JOIN_ROUNDING_DECIMALS))
 
 
 def contour_intervals_for(window: BngWindow) -> list[float]:
@@ -348,15 +375,32 @@ def _cell_segments(
         # implies exactly this pattern). The cell-centre average decides
         # which diagonal's state the middle of the cell agrees with, and
         # that diagonal's two corners are read as connected through it.
+        # The average is compared with the same strict `>`, never `>=`,
+        # as every corner: an average exactly on the level reads as not
+        # above it, consistently with how a corner exactly on the level
+        # does.
         average = (tl + tr + br + bl) / 4.0
         if (average > level) == (tl > level):
             pairs = (("N", "E"), ("S", "W"))
         else:
             pairs = (("N", "W"), ("E", "S"))
-        return [(edges[a], edges[b]) for a, b in pairs]
+        segments = [(edges[a], edges[b]) for a, b in pairs]
+    else:
+        names = list(edges)
+        segments = [(edges[names[0]], edges[names[1]])]
 
-    names = list(edges)
-    return [(edges[names[0]], edges[names[1]])]
+    # A corner sitting exactly on the level, with its neighbours on one
+    # side only, is touched by two crossing edges that both interpolate
+    # to that same corner (one at t=0, the other at t=1): the nudge alone
+    # only guarantees the two cells sharing that corner agree on which
+    # side it falls, not that a single cell's own pair of crossings land
+    # on two DIFFERENT points. Dropped here, at the source, rather than
+    # patched in the join step: a segment whose rounded endpoints coincide
+    # was never a line to begin with.
+    return [
+        segment for segment in segments
+        if _round_point(segment[0]) != _round_point(segment[1])
+    ]
 
 
 def _interp(p1: Point, p2: Point, v1: float, v2: float, level: float) -> Point:
@@ -368,10 +412,6 @@ def _interp(p1: Point, p2: Point, v1: float, v2: float, level: float) -> Point:
 # Joining segments into polylines, closing rings, dropping collinear
 # vertices.
 # --------------------------------------------------------------------------
-
-
-def _round_point(point: Point) -> tuple[float, float]:
-    return (round(point[0], _JOIN_ROUNDING_DECIMALS), round(point[1], _JOIN_ROUNDING_DECIMALS))
 
 
 def _join_segments(segments: list[Segment]) -> list[Polyline]:

@@ -229,6 +229,63 @@ def test_saddle_does_not_self_cross():
     assert not _segments_properly_intersect(a[0], a[-1], b[0], b[-1])
 
 
+def test_isolated_corner_exactly_at_level_produces_no_zero_length_segment():
+    # Review counter-example, verbatim: a single cell whose ONE corner sits
+    # exactly on the tested level while the other three all agree (all
+    # above it). Both edges touching that corner interpolate to the SAME
+    # point (one at t=0, the other at t=1, since one endpoint of each
+    # equals the level exactly), which used to survive as a zero-length
+    # "segment" from (0.0, 1.0) to (0.0, 1.0), because nothing downstream
+    # (the len(chain) > 2 ring guard, _drop_collinear's len < 3 passthrough)
+    # catches a chain that is only ever two points long. Not contrived: a
+    # round-number level against LiDAR terrain with an exact-integer flat
+    # bench (a roof, a road, still water) hits this directly.
+    #
+    # pt_tl=(0,1), pt_tr=(1,1), pt_bl=(0,0), pt_br=(1,0); tl=10.0, tr=15.0,
+    # br=12.0, bl=13.0, level=10.0, admitted by vmin<=level<vmax: 10<=10<15.
+    values = array("f", [10.0, 15.0, 13.0, 12.0])  # row0=[tl,tr], row1=[bl,br]
+    window = BngWindow(
+        e_origin=-0.5, n_top=1.5, pixel_size=1.0, width=2, height=2, values=values,
+    )
+    assert generate_contours(window, 10.0) == []
+
+    # A neighbouring real crossing must still join correctly: stack a
+    # second cell directly above the degenerate one, sharing its corner,
+    # (0.0, 1.0), as the neighbour's own bottom-left corner (also exactly
+    # 10.0, since it is the same grid point in the same window), with a
+    # genuine, non-degenerate crossing of its own.
+    #
+    #   n=2:  tl=5.0   tr=20.0      (upper cell: genuine crossing)
+    #   n=1:  bl=10.0  br=15.0      (shared corner, exactly at level 10)
+    #   n=0:  bl=13.0  br=12.0      (lower cell: the counter-example above)
+    values = array("f", [5.0, 20.0, 10.0, 15.0, 13.0, 12.0])
+    window = BngWindow(
+        e_origin=-0.5, n_top=2.5, pixel_size=1.0, width=2, height=3, values=values,
+    )
+    polylines = generate_contours(window, 10.0)
+
+    for polyline in polylines:
+        for a, b in zip(polyline, polyline[1:]):
+            assert a != b, f"zero-length segment at {a}"
+
+    # The lower (degenerate) cell contributes nothing at all; only the
+    # upper cell's genuine crossing survives, one end exactly at the shared
+    # corner, the other a real interpolated point on its own top edge.
+    assert len(polylines) == 1
+    (polyline,) = polylines
+    assert len(polyline) == 2
+
+    shared_corner = (0.0, 1.0)
+    t = (10.0 - 5.0) / (20.0 - 5.0)
+    genuine_point = (t * 1.0, 2.0)
+
+    ends = {polyline[0], polyline[-1]}
+    assert shared_corner in ends
+    other = next(iter(ends - {shared_corner}))
+    assert other[0] == pytest.approx(genuine_point[0], abs=1e-9)
+    assert other[1] == pytest.approx(genuine_point[1], abs=1e-9)
+
+
 # --------------------------------------------------------------------------
 # Interval policy.
 # --------------------------------------------------------------------------
