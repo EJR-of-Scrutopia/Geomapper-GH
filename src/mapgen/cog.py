@@ -56,9 +56,12 @@ difference, and a Barry window sits 115,050 rows down the mosaic. Using
 level 1's east/west size for its rows puts that window 1.2 m north of its
 own pixels, and level 6 about 16 m. So `CogLevel` and `BngWindow` each
 carry both, and every piece of arithmetic below uses the one belonging to
-its axis. A non-square raster at level 0 is refused outright instead (see
-`_read_placement`), because that anisotropy would be a claim about the
-ground rather than an artefact of rounded dimensions.
+its axis. A non-square raster at level 0 is read honestly rather than
+refused (`_read_placement` takes `scale[0]` and `scale[1]` as they come):
+level 0's own anisotropy is rare on a source mosaic, but it is exactly
+what a packaged raster this project writes from an overview-level window
+looks like (`geotiff_write.py`), and refusing that file back would be
+worse than reading it.
 
 Which anchoring these overviews really use is worth naming as an open
 question. The ratio convention above is what GDAL and rasterio report, and
@@ -507,9 +510,12 @@ class CogLevel:
     index: int
     width: int
     height: int
-    # East to west and north to south separately. They are equal at level
-    # 0 (a non-square source raster is refused, see _read_placement) and
-    # differ at an overview level whenever the two dimension ratios do:
+    # East to west and north to south separately. They usually agree at
+    # level 0 (real source mosaics are square there) but are not assumed
+    # to: _read_placement reads scale[0] and scale[1] as given, honestly,
+    # because a packaged raster written from an overview-level window can
+    # genuinely differ at level 0 too. They differ at an overview level
+    # whenever the two dimension ratios do:
     # 191007/95504 is 1.9999895 while 233000/116500 is exactly 2. One
     # scalar used for both axes puts an overview window metres away from
     # its own pixels, growing with distance from the tie point.
@@ -1250,25 +1256,24 @@ def _read_placement(
             f"{name}'s GeoTIFF pixel scale or tie point is too short to place "
             f"it."
         )
-    if not (scale[0] > 0.0 and scale[1] > 0.0):
+    if not (
+        math.isfinite(scale[0]) and math.isfinite(scale[1])
+        and scale[0] > 0.0 and scale[1] > 0.0
+    ):
         raise CogError(
             f"{name} declares a pixel scale of {scale[0]} by {scale[1]}, which "
             f"is not a size on the ground."
         )
-    # Square pixels at the full resolution, refused rather than read.
-    # Everything downstream of a window quotes ONE resolution for it (the
-    # contour properties, the survey record, the copy the owner reads), so
-    # a raster that is 1 m across and 2 m down would be described by half
-    # of its own scale wherever it went. The overview levels' own small
-    # anisotropy is a different thing and is carried honestly per axis:
-    # it comes from dimensions that did not halve evenly, is bounded by
-    # that rounding, and is not a property of the ground.
-    if abs(scale[0] - scale[1]) > 1e-6 * max(scale[0], scale[1]):
-        raise CogError(
-            f"{name} has pixels {scale[0]} m across and {scale[1]} m down. "
-            f"mapgen reads rasters with square pixels; one resolution is "
-            f"quoted for every window and file that comes out of this one."
-        )
+    # Anisotropy at level 0 is read honestly, not refused. It used to be
+    # refused here on the grounds that everything downstream of a window
+    # quotes one resolution for it; that argument does not survive contact
+    # with a packaged raster written from an overview-level window (Task
+    # 5's geotiff_write.py), where the two axes genuinely differ by more
+    # than a rounding error and refusing the file this project's own
+    # writer produced is a worse failure than reading it. `CogLevel` and
+    # `BngWindow` both carry pixel_size and pixel_height separately for
+    # exactly this reason (see the module docstring), and every piece of
+    # arithmetic downstream already uses the one belonging to its axis.
     return [float(value) for value in scale], [float(value) for value in tie]
 
 

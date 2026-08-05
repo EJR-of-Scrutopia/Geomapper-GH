@@ -495,13 +495,76 @@ def test_overview_pixel_sizes_are_derived_per_axis(tmp_path):
     ) == pytest.approx(1000.0 + 7 * 100 + 3)
 
 
-def test_refuses_a_raster_whose_pixels_are_not_square(tmp_path):
-    # Every window this module returns quotes one resolution, and every
-    # file downstream of it does too, so a raster that is 1 m across and
-    # 2 m down is refused rather than described by half of its own scale.
+def test_an_anisotropic_base_level_is_read_honestly_per_axis(tmp_path):
+    # Level 0 is not assumed square: geotiff_write.py (Task 5) packages a
+    # window read from an overview level, and that window's own pixel_size
+    # and pixel_height genuinely differ, so the file it writes has an
+    # anisotropic ModelPixelScale at what is, for that file, level 0. This
+    # base is 20 x 20 at 1.0 x 2.0 m, with one overview at 10 x 10 (halves
+    # evenly, so its ratio is exactly 2 on both axes): the point is that
+    # the overview derivation multiplies EACH axis by its OWN base scale,
+    # so a code path that mixed the two up (using scale[0] for both) would
+    # give the overview 2.0 x 2.0 instead of the correct 2.0 x 4.0.
+    base = _grid(20, 20, lambda x, y: float(y * 100 + x))
+    over = _grid(10, 10, lambda x, y: float(1000 + y * 100 + x))
+    built = _make_cog(
+        [(20, 20, base), (10, 10, over)], pixel_size=1.0, pixel_size_y=2.0
+    )
+    reader = _reader(tmp_path, built)
+    fine, coarse = reader.levels
+
+    assert fine.pixel_size == pytest.approx(1.0)
+    assert fine.pixel_height == pytest.approx(2.0)
+    assert coarse.pixel_size == pytest.approx(2.0)
+    assert coarse.pixel_height == pytest.approx(4.0)
+
+    corners = (_TIE_E, _TIE_N - 40.0, _TIE_E + 20.0, _TIE_N)
+    finest = reader.read_window(*corners, max_pixels=500)
+    assert (finest.width, finest.height) == (20, 20)
+    assert finest.pixel_size == pytest.approx(1.0)
+    assert finest.pixel_height == pytest.approx(2.0)
+    assert finest.values[0] == pytest.approx(0.0)
+    # Pixel (3, 7) by row/column, addressed in ground metres using the
+    # window's own two axis sizes: wrong if either used the other axis's.
+    assert finest.sample_bng(
+        _TIE_E + 3.5 * 1.0, _TIE_N - 7.5 * 2.0
+    ) == pytest.approx(7 * 100 + 3)
+
+    coarsest = reader.read_window(*corners, max_pixels=150)
+    assert (coarsest.width, coarsest.height) == (10, 10)
+    assert coarsest.pixel_size == pytest.approx(2.0)
+    assert coarsest.pixel_height == pytest.approx(4.0)
+    assert coarsest.values[0] == pytest.approx(1000.0)
+
+
+@pytest.mark.parametrize(
+    "pixel_size, pixel_size_y",
+    [
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (1.0, -2.0),
+        (float("nan"), 1.0),
+        (1.0, float("inf")),
+    ],
+    # `pixel_size_y=0.0` is not in this list: _make_cog's own
+    # `pixel_size_y or pixel_size` falls back to `pixel_size` for a falsy
+    # 0.0, so it cannot express "zero on the second axis" at all. The
+    # check under test treats both axes identically (scale[0] > 0.0 and
+    # scale[1] > 0.0), so zero on the first axis already exercises the
+    # same branch a zero on the second axis would.
+)
+def test_refuses_a_pixel_scale_that_is_not_a_size_on_the_ground(
+    tmp_path, pixel_size, pixel_size_y
+):
     values = _grid(8, 8, lambda x, y: 1.0)
-    with pytest.raises(CogError, match="square"):
-        _reader(tmp_path, _make_cog([(8, 8, values)], pixel_size_y=2.0), "tall.tif")
+    with pytest.raises(CogError, match="not a size on the ground"):
+        _reader(
+            tmp_path,
+            _make_cog(
+                [(8, 8, values)], pixel_size=pixel_size, pixel_size_y=pixel_size_y
+            ),
+            "bad_scale.tif",
+        )
 
 
 def test_edge_tile_padding_is_not_read_as_terrain(tmp_path):

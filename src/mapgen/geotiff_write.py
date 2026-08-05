@@ -20,28 +20,25 @@ resampling step nobody asked for. So this writer emits ONE directory, at
 `window.pixel_size` by `window.pixel_height`, and nothing downstream of it
 in the chain (the next-IFD offset is 0).
 
-## The one thing that constrains a window with pixel_size != pixel_height
+## A window with pixel_size != pixel_height
 
 `BngWindow.pixel_height` exists because an overview level of the real
 mosaic is not quite square: a window read from one carries slightly
 different east/west and north/south pixel sizes (see `cog.py`'s own
 docstring). Both are written into `ModelPixelScale` here, honestly, exactly
-as the window carries them. But `cog.py`'s own `_read_placement` refuses
-ANY file whose `ModelPixelScale` X and Y differ by more than one part in a
-million, on the grounds that a single-resolution file should quote one
-number for everything built from it. That check runs once, against
-whichever directory is first in the file, which for everything this module
-writes is the ONLY directory. A window whose two axes differ by more than
-that tolerance (the real overview ratios in `cog.py`'s docstring run to
-about five parts in a million at the finest overview and much more at
-coarser ones) would therefore be written correctly and then refused on the
-very next read. This is a real, narrow gap between what `BngWindow` can
-carry and what a single classic directory can get back through `cog.py`
-unmodified; it is not something this task can close without touching
-`cog.py`, and every survey extent mapgen actually downloads stays at full
-resolution (see `cog.py`'s `MAX_WINDOW_PIXELS`), so it is not hit in
-practice. Recorded here rather than silently, so the next person who sees
-a `CogError` on a very large packaged raster knows where to look.
+as the window carries them, with no attempt to average or otherwise
+disguise a genuine difference between the two axes.
+
+This used to be narrower than it sounds: `cog.py`'s own `_read_placement`
+refused any file whose `ModelPixelScale` X and Y differed by more than one
+part in a million, so a packaged raster written from a real overview
+window (Task 6 falls to one whenever a padded extent exceeds
+`MAX_WINDOW_PIXELS`, a few kilometres square) would have been written
+correctly here and then refused on the very next read. `_read_placement`
+now reads `scale[0]` and `scale[1]` as given at level 0 rather than
+demanding they agree, precisely so this module's own output is never
+refused by the one parser it exists to satisfy. See `cog.py`'s module
+docstring for the reasoning on the reader side.
 
 ## Nodata and the pad
 

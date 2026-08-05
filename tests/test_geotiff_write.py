@@ -66,14 +66,14 @@ def _safe_bounds(window: BngWindow) -> tuple[float, float, float, float]:
 
     `window.bounds()` puts every corner exactly on a pixel edge, and
     `CogReader._geometry` gets from a corner to a pixel count with a
-    `ceil` of a division. For a pixel size that is not an exact float
-    (this suite's anisotropic test uses one half a part per million off
-    1.0) that division can land a hair above the true integer, and `ceil`
-    then reports one pixel too many. Insetting each corner by half a
-    pixel, onto the centre of the first and last row and column, keeps
-    the same `floor`/`ceil` arithmetic away from that edge by a margin
-    (0.5) many orders of magnitude bigger than the rounding noise it is
-    built to survive, without changing which pixels come back.
+    `ceil` of a division. For a pixel size that does not divide back to an
+    exact integer in floating point, that division can land a hair above
+    the true value, and `ceil` then reports one pixel too many. Insetting
+    each corner by half a pixel, onto the centre of the first and last row
+    and column, keeps the same `floor`/`ceil` arithmetic away from that
+    edge by a margin (0.5) many orders of magnitude bigger than any
+    rounding noise this suite's window sizes could produce, without
+    changing which pixels come back.
     """
     return (
         window.e_origin,
@@ -140,18 +140,19 @@ def test_a_multi_tile_window_round_trips_exactly(tmp_path):
 
 
 def test_pixel_height_different_from_pixel_size_round_trips_both_axes(tmp_path):
-    # cog.py's own _read_placement refuses a ModelPixelScale whose X and Y
-    # differ by more than one part in a million (see geotiff_write.py's
-    # module docstring), so this delta is deliberately small: large enough
-    # to prove pixel_height is not silently written as pixel_size again,
-    # small enough that the file it produces is still one cog.py accepts.
-    width, height = 4, 4
-    values = _grid(width, height, lambda x, y: float(x + y))
+    # A frankly different pair, not a value picked to sneak under some
+    # reader tolerance: cog.py now reads an anisotropic ModelPixelScale
+    # honestly at level 0 (see this module's own docstring), so there is
+    # no boundary to hug here any more, and this is exactly the shape of
+    # window Task 6 packages whenever a padded extent forces read_window
+    # onto an overview level.
+    width, height = 4, 6
+    values = _grid(width, height, lambda x, y: float(y * 10 + x))
     window = BngWindow(
         e_origin=100_000.0,
         n_top=50_000.0,
         pixel_size=1.0,
-        pixel_height=1.0 + 5e-7,
+        pixel_height=2.0,
         width=width,
         height=height,
         values=values,
@@ -162,11 +163,20 @@ def test_pixel_height_different_from_pixel_size_round_trips_both_axes(tmp_path):
     write_bng_geotiff(path, window)
 
     reader = CogReader.open(FileByteSource(path))
+    assert reader.epsg == 27700
     got = reader.read_window(*_safe_bounds(window))
     assert got.pixel_size == window.pixel_size
     assert got.pixel_height == window.pixel_height
     assert got.pixel_size != got.pixel_height
+    assert (got.width, got.height) == (width, height)
     assert _values_equal(got.values, window.values)
+
+    # Row 3, column 2 by construction (value 32). Its northing is
+    # 3.5 pixel_heights south of n_top, not 3.5 pixel_sizes: a writer or
+    # reader that mixed the two axes up would sample the wrong row here.
+    easting = window.e_origin + 2.5 * window.pixel_size
+    northing = window.n_top - 3.5 * window.pixel_height
+    assert got.sample_bng(easting, northing) == pytest.approx(3 * 10 + 2)
 
 
 def test_all_nodata_window_round_trips_to_all_nan(tmp_path):
