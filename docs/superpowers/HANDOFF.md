@@ -293,8 +293,12 @@ Welsh sites.
 Phase 2 is specced, approved by the owner, and verified: read
 `docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md` (revised after
 the task-zero verification pass; evidence in `phase2-task-zero-report.md`
-beside the ledger). Next action: write the phase 2 implementation plan from
-that spec, then build item 1, Wales LiDAR.
+beside the ledger). The implementation plan for build item 1 is written:
+`docs/superpowers/plans/2026-08-05-mapgen-phase2-01-wales-lidar.md`, built
+on a live probe of the actual COG mosaics (BigTIFF, deflate, PixelIsArea,
+nodata -9999, seven levels) and of the OSTN15 developers pack (stable URL,
+OS's own test vectors inside). Next action: execute that plan task by task
+via subagent-driven development, then plan item 2, INSPIRE curves.
 
 ## Standing constraints
 
