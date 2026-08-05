@@ -299,6 +299,29 @@ def test_estimate_seconds_floor_binds_for_a_small_extent(tmp_path, ostn15_fixtur
     assert estimate.seconds_estimate == pytest.approx(SECONDS_FLOOR)
 
 
+def test_seconds_floor_covers_the_measured_whole_fetch_not_just_its_parts():
+    # Task 9's refit. Task 6's live test measured the WHOLE fetch() (both
+    # mosaics opened, both windows read, OSTN15 already cached) at 2.16 s
+    # over the real 400 x 400 m Barry extent (task-6-report.md); this is
+    # a real end-to-end number, not a sum of separately measured parts.
+    #
+    # The 1.3 s floor this replaces was never such a measurement: it was
+    # Task 3's own component arithmetic (two ~0.15 s mosaic opens plus a
+    # 500 x 500 m UNPADDED window's 0.50 s and 0.42 s reads), and
+    # fetch() actually reads a window padded by 2 * egrid.PAD_METRES on
+    # every side, which that arithmetic never accounted for. Pinned as a
+    # plain numeric floor, deliberately not a re-import-and-compare of
+    # SECONDS_FLOOR against itself (the existing
+    # test_estimate_seconds_floor_binds_for_a_small_extent already does
+    # that and would pass unchanged whatever this constant is set to):
+    # this is the one test that fails against the OLD 1.3 s value and
+    # only that value, which is what makes it a real RED/GREEN pin on the
+    # refit rather than a tautology.
+    from mapgen.sources.lidar_wales import SECONDS_FLOOR
+
+    assert SECONDS_FLOOR >= 2.16
+
+
 def test_estimate_with_and_without_a_cached_grid_agree_closely(tmp_path, ostn15_fixture_grid):
     # The BNG-projected estimate and the equirectangular-approximation
     # fallback should not disagree wildly for a small extent well clear of

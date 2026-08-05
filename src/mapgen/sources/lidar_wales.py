@@ -141,13 +141,33 @@ EMPTY_EXTENT_MESSAGE = (
 # allowed to be wrong in).
 BYTES_PER_WINDOW_PIXEL = 3.4
 
-# Opening a mosaic costs 2 requests and about 0.15 s (one byte for size(),
-# then the 16 KB header prefetch); two rasters means two opens, 0.30 s.
-# A 500 x 500 m window measured 0.50 s for the DTM and 0.42 s for the DSM.
-# 0.30 + 0.50 + 0.42 = 1.22 s, and the report that measured it rounds the
-# same arithmetic to "roughly 1.3 s for the DTM and DSM pair at this size",
-# which is the two-significant-figure floor used here.
-SECONDS_FLOOR = 1.3
+# What is being paid for is the padded extent's own two mosaic opens plus
+# two window reads, not a transfer: even the largest byte figure this
+# module has ever measured is a few megabytes, nothing on this link (see
+# BYTES_PER_SECOND_ESTIMATE below). Task 6 (2026-08-05) measured the
+# WHOLE of that, live, end to end, over the real 400 x 400 m Barry extent
+# also used for this module's own live test: 2.16 s, with OSTN15 already
+# cached (so no grid download is folded into this number either); DTM 32
+# requests / 1,544,250 bytes, DSM 32 requests / 1,864,315 bytes.
+#
+# The 1.3 s this replaces was never a measurement of a whole fetch. It
+# was Task 3's own component arithmetic: two ~0.15 s mosaic opens plus a
+# 500 x 500 m window's 0.50 s (DTM) and 0.42 s (DSM) reads, summed. That
+# window was UNPADDED, and fetch() always reads a window padded by
+# 2 * PAD_METRES on every side (see the module docstring), which the
+# component arithmetic had no way to account for because it was never
+# measured against a padded fetch at all. The result under-read a real,
+# ordinary survey's whole fetch by nearly half, and an estimate that
+# under-reads is worse than one that over-reads: a countdown built on it
+# runs out while the download is still going, which reads as a hang (the
+# same asymmetry elevation.py's own SECONDS_FLOOR history records).
+#
+# One machine, one link, one day, ONE live extent: thinner evidence than
+# even Task 3's own two-extent probe. 2.2 is 2.16 rounded to two
+# significant figures and kept as a floor, not restated as the exact
+# figure, since nothing here claims more precision than one measurement
+# can support.
+SECONDS_FLOOR = 2.2
 
 # From the one large-extent measurement available: the 20 x 20 km extent
 # (falls to the 8 m overview level) moved 10,942,384 bytes in 3.24 s, about
@@ -286,7 +306,15 @@ class LidarWalesSource:
         systematically OVERESTIMATED here, in the safe direction, never
         understated. BYTES_PER_WINDOW_PIXEL and BYTES_PER_SECOND_ESTIMATE
         are both documented above with the measurement and the thinness of
-        the evidence behind them; Task 9 refits both from the live test.
+        the evidence behind them; Task 9 refits `SECONDS_FLOOR` from the
+        live test.
+
+        Honest about its own scope and nothing past it: this prices
+        `fetch()` alone, and `merge()`'s own contour generation, which
+        Task 6's live test measured at a further 9.3 s and up to 8.8 MB
+        per contour file on the very same extent, is not in this number
+        at all, so the owner's actual wait for a `lidar_wales` package is
+        longer than whatever this method reports.
         """
         grid = load_ostn15(cache_dir=self._ostn15_cache_dir)
         padded_area_m2 = None
