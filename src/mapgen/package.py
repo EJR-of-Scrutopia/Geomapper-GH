@@ -1173,23 +1173,44 @@ def _write_elevation_grid_step(
 
     Task 8 adds a second, better DEM: `<stem>_lidar_dtm.tif`, LidarWalesSource's
     own 1 m Ordnance Survey terrain model, which answers far more of the
-    grid than COP30 ever will inside its own coverage. The decision, in
-    order:
+    grid than COP30 ever will inside its own coverage. Both rasters are
+    read into memory BEFORE either is committed to, in their own separate
+    failure boundaries, so a problem reading one never costs the answer
+    the other could still give. The degradation ladder this produces,
+    checked in order:
 
-      * The LiDAR DTM is on disk AND an OSTN15 shift grid can be obtained
-        (`load_ostn15`, then `ensure_ostn15` if the cache is empty): sample
-        the DTM first and the OpenTopography tiff second, through
-        `egrid._ChainSampler`, when both rasters are there
-        (`source: "lidar_wales+opentopography"`), or the DTM alone when
-        the tiff is not (`source: "lidar_wales"`).
-      * Otherwise, the phase 1 path, unchanged: the tiff alone if it is
-        there (`source: "opentopography"`), matching every run before this
-        task exactly, including its own refusal wording.
-      * A LiDAR DTM with no usable OSTN15 grid and no tiff to fall back to
-        is a real DEM this step cannot honestly convert, recorded as a
-        failure rather than silently read as "no DEM".
+      * Both the LiDAR DTM and the tiff are on disk, an OSTN15 shift grid
+        can be obtained (`load_ostn15`, then `ensure_ostn15` if the cache
+        is empty), and both rasters read cleanly: sample the DTM first and
+        the tiff second, through `egrid._ChainSampler`
+        (`source: "lidar_wales+opentopography"`).
+      * OSTN15 cannot be obtained, or the DTM is on disk but cannot be
+        read (a review finding: an earlier version of this step read the
+        DTM and the tiff inside the SAME failure boundary, so a corrupt or
+        truncated DTM discarded a perfectly good tiff along with it):
+        fall back to the tiff alone, exactly the phase 1 path, IF the tiff
+        is there and readable (`source: "opentopography"`), announced
+        through `elevation_grid_degraded` when the DTM was genuinely on
+        disk and unreadable rather than simply absent or OSTN15-blocked
+        (the OSTN15 case already existed before this task and is not a
+        new degradation to announce).
+      * The tiff is on disk but cannot be read, and the DTM read cleanly:
+        the symmetric fallback, LiDAR alone (`source: "lidar_wales"`),
+        also announced through `elevation_grid_degraded`.
+      * Nothing left that can answer, whether because neither raster could
+        be read, or the only raster present could not: a real DEM this
+        step cannot honestly convert, recorded as a failure rather than
+        silently read as "no DEM".
       * Neither raster present at all removes any `.egrid` a previous
         attempt left, exactly as phase 1 did.
+
+    `elevation_grid_degraded` is a sink event, not a sixth record key,
+    deliberately: the record describes what WAS written (see
+    `_elevation_grid_record`'s own docstring on why its keys never move),
+    and `written: True` with a degraded source is already a complete,
+    honest answer to that question. The event is a different question,
+    what happened on the way to it, and belongs where every other
+    mid-step happening in this file already lives.
 
     OSTN15 is only ever asked for when the LiDAR DTM is on disk: a survey
     that never selected `lidar_wales` touches neither the cache nor the
@@ -1253,39 +1274,104 @@ def _write_elevation_grid_step(
         except BngError:
             # No cached grid, and the network fetch failed (or this
             # machine has never had a network to fetch one with). Falls
-            # through to the phase 1 tiff path below when there is a tiff
+            # through to the tiff path below when there is a readable tiff
             # to fall back to, and is recorded as a failure, honestly,
-            # when there is not (see the has_lidar_dtm-and-not-has_tiff
-            # branch below): never a crash either way.
+            # when there is not: never a crash either way.
             ostn15_grid = None
+
+    # Each raster is read into memory in its OWN failure boundary, before
+    # either is committed to. A review finding on this task: an earlier
+    # version read the DTM and the tiff inside one shared try block, so a
+    # corrupt or truncated raster on either side discarded whatever the
+    # OTHER side could still have answered with, unannounced. `window`/
+    # `dem` stay `None` on a read failure rather than raising past this
+    # point; `window_error`/`dem_error` carry the reason for the "nothing
+    # left that can answer" message and the degradation events below.
+    window = None
+    window_error: str | None = None
+    if has_lidar_dtm and ostn15_grid is not None:
+        try:
+            window = read_full_window(CogReader.open(FileByteSource(dtm_path)))
+        except (CogError, OSError) as exc:
+            window_error = str(exc)
+
+    dem = None
+    dem_error: str | None = None
+    if has_tiff:
+        try:
+            dem = read_dem(tiff)
+        except (GeoTiffError, OSError) as exc:
+            dem_error = str(exc)
 
     zone = project_zone(bbox)
     sink.emit("elevation_grid_started")
     source: str | None = None
     try:
-        if has_lidar_dtm and ostn15_grid is not None:
-            window = read_full_window(CogReader.open(FileByteSource(dtm_path)))
-            fallback = read_dem(tiff) if has_tiff else None
-            sampler = _ChainSampler(lidar=window, ostn15=ostn15_grid, fallback=fallback)
-            grid = write_elevation_grid_from_sampler(sampler, bbox, zone, target)
-            source = "lidar_wales+opentopography" if has_tiff else "lidar_wales"
-        elif has_tiff:
+        if window is not None and dem is not None:
+            grid = write_elevation_grid_from_sampler(
+                _ChainSampler(lidar=window, ostn15=ostn15_grid, fallback=dem),
+                bbox, zone, target,
+            )
+            source = "lidar_wales+opentopography"
+        elif window is not None:
+            # No tiff at all, OR a tiff that could not be read. Only the
+            # second is a DEGRADATION worth announcing: the first is the
+            # ordinary "LiDAR alone" shape this task always had.
+            if dem_error is not None:
+                sink.emit(
+                    "elevation_grid_degraded",
+                    reason=(
+                        f"{tiff.name} could not be read ({dem_error}), so this "
+                        f"elevation grid uses only the Welsh LiDAR DTM."
+                    ),
+                )
+            grid = write_elevation_grid_from_sampler(
+                _ChainSampler(lidar=window, ostn15=ostn15_grid, fallback=None),
+                bbox, zone, target,
+            )
+            source = "lidar_wales"
+        elif dem is not None:
+            # No usable LiDAR: no DTM at all, OSTN15 unobtainable, or a DTM
+            # that could not be read. Only the last of those three is a
+            # degradation; the other two are the phase 1 path this task
+            # never changes, and OSTN15-unobtainable already existed as a
+            # silent fallback before this fix, so it stays silent here.
+            if window_error is not None:
+                sink.emit(
+                    "elevation_grid_degraded",
+                    reason=(
+                        f"{dtm_path.name} could not be read ({window_error}), "
+                        f"so this elevation grid uses only the OpenTopography "
+                        f"DEM."
+                    ),
+                )
+            # write_elevation_grid, not write_elevation_grid_from_sampler(dem,
+            # ...): this is the one path phase 1 already had before either
+            # LiDAR branch existed, and re-reading the tiff (already proven
+            # readable, a moment ago, above) through the same wrapper every
+            # pre-Task-8 package went through keeps its own refusal wording
+            # (the tiff-named "covers none of this survey's extent" sentence)
+            # identical rather than switching it to the sampler path's
+            # generic one the instant a DTM happens to sit beside it.
             grid = write_elevation_grid(tiff, bbox, zone, target)
             source = "opentopography"
         else:
-            # has_lidar_dtm is True here (the "neither raster" case
-            # returned above) and ostn15_grid is None: a real LiDAR DTM
-            # sits in the package, OSTN15 could not be obtained for it,
-            # and there is no OpenTopography tiff to fall back to. A DEM
-            # this step cannot honestly convert is a failure to report,
-            # not the "no DEM" branch above, and not a silent no-op either.
+            # Nothing left that can answer. Named honestly, per whichever
+            # of the two rasters was actually on disk and why it could not
+            # be used, rather than one sentence pretending both were tried
+            # the same way.
             raise ElevationGridError(
-                f"{dtm_path.name} is on disk, but the OSTN15 shift grid it "
-                f"needs could not be obtained, and this package has no "
-                f"OpenTopography DEM to fall back to, so no elevation grid "
-                f"could be built."
+                _no_usable_raster_message(
+                    tiff=tiff,
+                    dtm_path=dtm_path,
+                    has_tiff=has_tiff,
+                    has_lidar_dtm=has_lidar_dtm,
+                    ostn15_obtained=ostn15_grid is not None,
+                    dem_error=dem_error,
+                    window_error=window_error,
+                )
             )
-    except (ElevationGridError, GeoTiffError, CogError, OSError) as exc:
+    except (ElevationGridError, OSError) as exc:
         error = str(exc)
         # Never left half converted. A previous run's .egrid describing a
         # different DEM would be worse than none, and a partially written one
@@ -1306,6 +1392,56 @@ def _write_elevation_grid_step(
         nodes=len(grid.heights),
         covered=covered,
         source=source,
+    )
+
+
+def _no_usable_raster_message(
+    *,
+    tiff: Path,
+    dtm_path: Path,
+    has_tiff: bool,
+    has_lidar_dtm: bool,
+    ostn15_obtained: bool,
+    dem_error: str | None,
+    window_error: str | None,
+) -> str:
+    """The sentence for `_write_elevation_grid_step`'s "nothing left that
+    can answer" branch: reached only when every raster actually on disk
+    either could not be read, or (the DTM's case) had no usable OSTN15
+    grid to be sampled through.
+
+    Composed rather than a single fixed sentence, because which raster
+    was even attempted differs by combination, and a package with only a
+    tiff on disk that could not be read deserves that tiff's own
+    `GeoTiffError` text verbatim (matching this step's behaviour before
+    this task existed) rather than a sentence about a DTM that was never
+    there to fail.
+    """
+    if has_lidar_dtm and not has_tiff:
+        if not ostn15_obtained:
+            reason = "the OSTN15 shift grid it needs could not be obtained"
+        else:
+            reason = f"it could not be read ({window_error})"
+        return (
+            f"{dtm_path.name} is on disk, but {reason}, and this package has "
+            f"no OpenTopography DEM to fall back to, so no elevation grid "
+            f"could be built."
+        )
+    if has_tiff and not has_lidar_dtm:
+        # The pre-Task-8 shape, verbatim: a tiff, and only a tiff, that
+        # could not be read. `dem_error` IS `read_dem`'s own message, so
+        # this is not paraphrased into a second sentence about it.
+        return dem_error or f"{tiff.name} could not be read."
+    # Both are on disk and neither could be used.
+    dtm_reason = (
+        "the OSTN15 shift grid it needs could not be obtained"
+        if not ostn15_obtained
+        else f"it could not be read ({window_error})"
+    )
+    return (
+        f"Neither raster in this package could be used to build an "
+        f"elevation grid: {dtm_path.name} is on disk, but {dtm_reason}; and "
+        f"{tiff.name} could not be read ({dem_error})."
     )
 
 

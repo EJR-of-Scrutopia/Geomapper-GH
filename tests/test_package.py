@@ -6034,3 +6034,163 @@ def test_the_record_carries_all_six_keys_on_every_branch(tmp_path, monkeypatch, 
 
     record = result.survey["elevation_grid"]
     assert set(record) == {"written", "file", "nodes", "covered", "error", "source"}
+
+
+# --------------------------------------------------------------------------
+# Post-review fix: a raster-read failure on the GOOD source, inside the
+# chain branch, must degrade to the good source rather than discarding it.
+# Before this fix, `read_full_window`/`read_dem` were called unconditionally
+# inside one try block, so a corrupt LiDAR DTM beside a perfectly good tiff
+# (or the symmetric case) aborted the whole step, exactly the degradation
+# already implemented one branch earlier for "OSTN15 unobtainable, tiff
+# present".
+# --------------------------------------------------------------------------
+
+
+class CorruptLidarGoodTiffStubSource(RealDemStubSource):
+    """A good OpenTopography DEM beside a corrupt LiDAR DTM. The good
+    raster should still answer the grid, degraded to the tiff alone.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dtm_path.write_bytes(b"not a tiff at all")
+        return outputs + [dtm_path]
+
+
+class GoodLidarCorruptTiffStubSource(UrbanoReadableStubSource):
+    """A good LiDAR DTM beside a corrupt OpenTopography DEM. The good
+    raster should still answer the grid, degraded to the LiDAR alone.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        write_bng_geotiff(dtm_path, _covering_lidar_window(DEM_BBOX))
+        tiff_path = out_dir / f"{stem}.tif"
+        tiff_path.write_bytes(b"not a tiff at all")
+        return outputs + [dtm_path, tiff_path]
+
+
+class OnlyCorruptLidarStubSource(UrbanoReadableStubSource):
+    """A corrupt LiDAR DTM and no OpenTopography DEM at all: nothing left
+    this step can honestly answer with, so a recorded failure, not a
+    degradation and not a crash.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dtm_path.write_bytes(b"not a tiff at all")
+        return outputs + [dtm_path]
+
+
+class BothRastersCorruptStubSource(UrbanoReadableStubSource):
+    """Both rasters present, both unreadable: still a recorded failure,
+    not a crash, and there is nothing here to degrade to.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dtm_path.write_bytes(b"not a tiff at all")
+        tiff_path = out_dir / f"{stem}.tif"
+        tiff_path.write_bytes(b"also not a tiff")
+        return outputs + [dtm_path, tiff_path]
+
+
+def test_a_corrupt_lidar_dtm_degrades_to_the_tiff_alone_rather_than_failing(
+    tmp_path, monkeypatch
+):
+    """The reviewed finding, fixed: a truncated LiDAR DTM beside a
+    perfectly good OpenTopography DEM must still produce terrain, from
+    the DEM, with the degradation announced through the sink rather than
+    silently swallowed or, worse, discarding the good raster along with
+    the bad one.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(CorruptLidarGoodTiffStubSource())
+    log = EventLog()
+
+    result = run_survey(
+        _request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False), progress=log
+    )
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is True
+    assert record["source"] == "opentopography"
+    assert record["error"] is None
+    degraded = [e for e in log.snapshot() if e["event"] == "elevation_grid_degraded"]
+    assert len(degraded) == 1
+    assert "_lidar_dtm.tif" in degraded[0]["reason"]
+
+
+def test_a_corrupt_tiff_degrades_to_the_lidar_alone_rather_than_failing(
+    tmp_path, monkeypatch
+):
+    """The symmetric case: a corrupt OpenTopography DEM beside a good
+    LiDAR DTM must still produce terrain, from the DTM alone.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(GoodLidarCorruptTiffStubSource())
+    log = EventLog()
+
+    result = run_survey(
+        _request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False), progress=log
+    )
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is True
+    assert record["source"] == "lidar_wales"
+    assert record["error"] is None
+    degraded = [e for e in log.snapshot() if e["event"] == "elevation_grid_degraded"]
+    assert len(degraded) == 1
+    assert f"{result.paths.stem}.tif" in degraded[0]["reason"]
+
+
+def test_a_corrupt_lidar_dtm_with_no_tiff_to_fall_back_to_is_a_recorded_failure(
+    tmp_path, monkeypatch
+):
+    """The boundary the fix must not cross: the only raster present
+    cannot be read, and there is nothing left to degrade to. Recorded
+    honestly, never a crash, and no `.egrid` left behind.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(OnlyCorruptLidarStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is False
+    assert record["source"] is None
+    assert record["error"] is not None
+    assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
+    assert result.complete is True
+
+
+def test_both_rasters_present_but_unreadable_is_a_recorded_failure_not_a_crash(
+    tmp_path, monkeypatch
+):
+    """Requirement 1's other boundary: both rasters exist and neither can
+    be read. Still a recorded failure, not a crash, and no degradation
+    is possible when there is no good raster on either side.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(BothRastersCorruptStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is False
+    assert record["source"] is None
+    assert record["error"] is not None
+    assert result.complete is True
