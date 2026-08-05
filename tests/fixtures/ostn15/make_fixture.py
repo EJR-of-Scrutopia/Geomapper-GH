@@ -49,7 +49,15 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from mapgen.bng import _GRID_COLS, _GRID_ROWS, _NODE_COUNT, Ostn15Grid, tm_forward
+from mapgen.bng import (
+    _EXPECTED_COLUMNS,
+    _GRID_COLS,
+    _GRID_ROWS,
+    _NODE_COUNT,
+    _OUTSIDE_DATUM_FLAG,
+    Ostn15Grid,
+    tm_forward,
+)
 
 _FIXTURE_DIR = Path(__file__).resolve().parent
 _STATIONS_PATH = _FIXTURE_DIR / "stations.txt"
@@ -65,23 +73,10 @@ _CHOSEN_STATIONS = ("TP06", "TP03", "TP40")
 _BLOCK_RADIUS = 1
 _BLOCK_SIZE = 2 * _BLOCK_RADIUS + 1
 
-# The same "outside transformation area" flag bng.py's own parser drops.
-_OUTSIDE_DATUM_FLAG = 16
-
 # Distinct from bng.py's own _CACHE_MAGIC on purpose: this file is a
 # sparse index of named blocks, not a dense 701 by 1251 array, and a stray
 # fixture file should never be mistakable for a real cache.
 _SLICE_MAGIC = b"OSTN15SL"
-
-_EXPECTED_DATA_FILE_COLUMNS = (
-    "Point_ID",
-    "ETRS89_Easting",
-    "ETRS89_Northing",
-    "ETRS89_OSGB36_EShift",
-    "ETRS89_OSGB36_NShift",
-    "ETRS89_ODN_HeightShift",
-    "Height_Datum_Flag",
-)
 
 
 @dataclass(frozen=True)
@@ -205,7 +200,7 @@ def _extract_blocks(
 
     with data_file.open("r", encoding="utf-8") as handle:
         header = handle.readline().rstrip("\n").split(",")
-        if tuple(header[:7]) != _EXPECTED_DATA_FILE_COLUMNS:
+        if tuple(header[:7]) != _EXPECTED_COLUMNS:
             raise ValueError(f"{data_file}'s columns are not in the expected order.")
         remaining = sum(len(v) for v in wanted.values())
         for line in handle:
