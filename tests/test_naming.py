@@ -383,8 +383,16 @@ def test_check_path_length_rejects_long_site_name_pushing_project_setting_over_l
     assert overture_length <= 240, f"Overture path must be under 240 to test new check: {overture_length}"
     assert project_setting_length > 240, f"Project setting path must be over 240 to isolate the new check: {project_setting_length}"
 
+    # source_ids excludes lidar_wales (Task 6) deliberately: this test
+    # isolates project_setting against Overture specifically, and
+    # lidar_wales's own merged 0.25 m contour file is stem-based too, two
+    # characters longer than project_setting's own suffix for the same
+    # stem (see check_path_length's own docstring), which would otherwise
+    # become the candidate this test's assertion is about.
     with pytest.raises(PathTooLongError) as excinfo:
-        check_path_length(paths, ["infrastructure"], limit=240)
+        check_path_length(
+            paths, ["infrastructure"], source_ids=["overture", "osm", "elevation"], limit=240
+        )
     assert str(paths.project_setting) in str(excinfo.value)
 
 
@@ -490,6 +498,70 @@ def test_check_path_length_measures_the_chosen_elevation_models_own_filename(tmp
     # And it names the path that would actually be created, not the one
     # the guard used to assume.
     assert str(longest_path) in str(excinfo.value)
+
+
+# --- Task 6: lidar_wales has two candidates of its own, and both must bind
+# depending on the stem's own length (see check_path_length's own docstring)
+# --------------------------------------------------------------------------
+
+
+def test_check_path_length_ignores_lidar_wales_when_it_is_not_selected(tmp_path):
+    paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
+    raw_path = paths.work_dir / "raw" / "lidar_wales" / "lidar_dtm.tif"
+    limit = len(str(raw_path)) - 1
+
+    with pytest.raises(PathTooLongError):
+        check_path_length(paths, [], source_ids=["lidar_wales"], limit=limit)
+
+    # Not selected: the same limit must not be tripped by a path this job
+    # will never produce.
+    check_path_length(paths, [], source_ids=["osm"], limit=limit)
+
+
+def test_check_path_length_checks_lidar_waless_own_raw_work_file(tmp_path):
+    # Isolated with a short, fixed stem (not one build_package_paths would
+    # derive from a long site name) so the raw candidate, not the
+    # stem-based contour one, is what trips the limit.
+    work_dir = tmp_path / ("x" * 200) / "_work" / FINGERPRINT
+    paths = PackagePaths(
+        root=tmp_path,
+        stem="S",
+        layers_dir=tmp_path / "layers",
+        work_dir=work_dir,
+        survey_json=tmp_path / "survey.json",
+        project_setting=tmp_path / "short.json",
+    )
+    raw_path = work_dir / "raw" / "lidar_wales" / "lidar_dtm.tif"
+    contour_path = tmp_path / "S_contours_0.25m.geojson"
+    raw_length = len(str(raw_path))
+    assert raw_length > len(str(contour_path)), "test setup: the raw candidate must be the longer one here"
+
+    with pytest.raises(PathTooLongError) as excinfo:
+        check_path_length(paths, [], source_ids=["lidar_wales"], limit=raw_length - 1)
+    assert str(raw_path) in str(excinfo.value)
+
+    check_path_length(paths, [], source_ids=["lidar_wales"], limit=raw_length)
+
+
+def test_check_path_length_checks_lidar_waless_own_contour_file_for_a_long_stem(tmp_path):
+    # A realistic long region/site name pushes the merged 0.25 m contour
+    # file's own stem-based path past the raw work file's fixed nesting,
+    # which is exactly the scenario check_path_length's own docstring
+    # names: which of the two candidates binds depends on the stem.
+    long_site = "A" * 40
+    paths = build_package_paths(tmp_path, "R", long_site, date(2026, 8, 1), FINGERPRINT)
+    raw_path = paths.work_dir / "raw" / "lidar_wales" / "lidar_dtm.tif"
+    contour_path = paths.root / f"{paths.stem}_contours_0.25m.geojson"
+    assert len(str(contour_path)) > len(str(raw_path)), (
+        "test setup: the contour candidate must be the longer one here"
+    )
+
+    limit = len(str(contour_path)) - 1
+    with pytest.raises(PathTooLongError) as excinfo:
+        check_path_length(paths, [], source_ids=["lidar_wales"], limit=limit)
+    assert str(contour_path) in str(excinfo.value)
+
+    check_path_length(paths, [], source_ids=["lidar_wales"], limit=len(str(contour_path)))
 
 
 # --- what the 240 character limit does and does not cover ------------------

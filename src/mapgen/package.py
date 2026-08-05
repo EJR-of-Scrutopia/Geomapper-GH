@@ -59,6 +59,7 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.elevation import ElevationSource
+from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
     LAYER_ORDER,
@@ -279,7 +280,8 @@ class SurveyResult:
 
 
 def register_default_sources() -> None:
-    """Register the three phase 1 sources, skipping only a repeat of itself.
+    """Register the phase 1 and phase 2 default sources, skipping only a
+    repeat of itself.
 
     The CLI's main() calls this on every invocation, so a second call within
     the same process, for example a second main() call in one test session,
@@ -292,9 +294,16 @@ def register_default_sources() -> None:
     while a stranger occupying the id still reaches register() and raises
     DuplicateSourceError, which is the loud failure the registry is meant to
     guarantee on a genuine id collision.
+
+    LidarWalesSource (Task 6) joins the tuple the same way ElevationSource
+    did: it is not part of SurveyRequest.source_ids' own default selection
+    (opt-in, like elevation, since it is a large, Wales-only download the
+    owner chooses rather than gets by default), but registering it here is
+    what makes it appear in the web UI's layer checklist at all, since that
+    checklist is registry-driven rather than hard-coded per source.
     """
     by_id = {source.id: source for source in available_sources()}
-    for source in (OsmSource(), OvertureSource(), ElevationSource()):
+    for source in (OsmSource(), OvertureSource(), ElevationSource(), LidarWalesSource()):
         existing = by_id.get(source.id)
         if existing is not None and type(existing) is type(source):
             continue

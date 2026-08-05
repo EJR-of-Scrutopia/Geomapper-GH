@@ -224,6 +224,21 @@ def check_path_length(
     project_setting is always a candidate: it exists for a package
     regardless of which sources it contains, since naming.py builds it
     unconditionally.
+
+    lidar_wales (Task 6) needs TWO candidates of its own, not one, because
+    its longest path is not always the same shape: its raw work file
+    ("raw/lidar_wales/lidar_dtm.tif", the same length as lidar_dsm.tif) is
+    nested under work_dir, which already carries the fingerprint segment
+    every other raw candidate here does, while its merged contour file
+    ("<stem>_contours_0.25m.geojson", the longest of the four fixed
+    interval suffixes this source ever writes) sits directly under root
+    like project_setting, and is actually two characters LONGER than
+    project_setting's own "_project_setting.json" suffix for the same
+    stem. Which of the two is longer depends on the stem's own length (a
+    short region/site name favours the raw candidate's fixed nesting; a
+    long one favours the contour candidate), so both are checked and the
+    existing max-picking loop below settles it, rather than this guard
+    guessing which one binds.
     """
     selected = None if source_ids is None else set(source_ids)
 
@@ -251,6 +266,19 @@ def check_path_length(
             paths.work_dir / "raw" / "elevation" / work_file_name(elevation_demtype)
         )
         candidates.append((_length(elevation_path), elevation_path))
+
+    if selected is None or "lidar_wales" in selected:
+        # "lidar_dtm.tif" and "lidar_dsm.tif" are the same length, so one
+        # raw candidate covers both.
+        lidar_raw_path = paths.work_dir / "raw" / "lidar_wales" / "lidar_dtm.tif"
+        candidates.append((_length(lidar_raw_path), lidar_raw_path))
+        # "_contours_0.25m.geojson" is the longest of the four fixed
+        # interval suffixes (5m/1m/0.5m/0.25m) this source ever writes;
+        # the merged rasters ("_lidar_dtm.tif"/"_lidar_dsm.tif") and the
+        # other three interval files are all shorter, so none of them can
+        # ever be the binding candidate once this one is checked.
+        lidar_contour_path = paths.root / f"{paths.stem}_contours_0.25m.geojson"
+        candidates.append((_length(lidar_contour_path), lidar_contour_path))
 
     length, longest_candidate = candidates[0]
     for candidate_length, candidate_path in candidates[1:]:

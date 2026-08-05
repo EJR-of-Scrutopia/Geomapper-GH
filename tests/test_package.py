@@ -1553,11 +1553,13 @@ def test_merged_osm_output_on_disk_carries_the_package_stem(tmp_path):
     assert result.paths.stem == "Barry-Waterfront_2026-08-01"
 
 
-def test_register_default_sources_registers_the_three_phase_one_sources():
+def test_register_default_sources_registers_the_four_default_sources():
     register_default_sources()
     from mapgen.sources.base import available_sources
 
-    assert sorted(s.id for s in available_sources()) == ["elevation", "osm", "overture"]
+    assert sorted(s.id for s in available_sources()) == [
+        "elevation", "lidar_wales", "osm", "overture",
+    ]
 
 
 def test_register_default_sources_called_twice_is_a_no_op():
@@ -1567,7 +1569,9 @@ def test_register_default_sources_called_twice_is_a_no_op():
     assert get_source("osm") is first_osm
     from mapgen.sources.base import available_sources
 
-    assert sorted(s.id for s in available_sources()) == ["elevation", "osm", "overture"]
+    assert sorted(s.id for s in available_sources()) == [
+        "elevation", "lidar_wales", "osm", "overture",
+    ]
 
 
 def test_register_default_sources_raises_when_a_foreign_object_squats_on_a_default_id():
