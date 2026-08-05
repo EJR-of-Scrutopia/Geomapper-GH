@@ -154,13 +154,14 @@ BYTES_PER_WINDOW_PIXEL = 3.4
 # was Task 3's own component arithmetic: two ~0.15 s mosaic opens plus a
 # 500 x 500 m window's 0.50 s (DTM) and 0.42 s (DSM) reads, summed. That
 # window was UNPADDED, and fetch() always reads a window padded by
-# 2 * PAD_METRES on every side (see the module docstring), which the
-# component arithmetic had no way to account for because it was never
-# measured against a padded fetch at all. The result under-read a real,
-# ordinary survey's whole fetch by nearly half, and an estimate that
-# under-reads is worse than one that over-reads: a countdown built on it
-# runs out while the download is still going, which reads as a hang (the
-# same asymmetry elevation.py's own SECONDS_FLOOR history records).
+# PAD_METRES on every side, 2 * PAD_METRES per axis (see the module
+# docstring), which the component arithmetic had no way to account for
+# because it was never measured against a padded fetch at all. The result
+# under-read a real, ordinary survey's whole fetch by nearly half, and an
+# estimate that under-reads is worse than one that over-reads: a countdown
+# built on it runs out while the download is still going, which reads as
+# a hang (the same asymmetry elevation.py's own SECONDS_FLOOR history
+# records).
 #
 # One machine, one link, one day, ONE live extent: thinner evidence than
 # even Task 3's own two-extent probe. 2.2 is 2.16 rounded to two

@@ -1,8 +1,8 @@
 # mapgen
 
 A site survey data tool for architectural work. Draw an extent on a map, name
-it, and get back a folder of OpenStreetMap, Overture Maps and elevation data
-that Grasshopper and Urbano 2 can read directly.
+it, and get back a folder of OpenStreetMap, Overture Maps, elevation and (in
+Wales) LiDAR data that Grasshopper and Urbano 2 can read directly.
 
 ## What it does
 
@@ -163,8 +163,9 @@ the URL, so nothing else on the machine can drive it. On the page:
   neither is ever overwritten once you have typed into it; if one cannot be
   worked out, the estimate panel says which is missing rather than guessing
   from coordinates.
-- Tick which layers you want (OpenStreetMap, Overture Maps, elevation) and
-  which categories (buildings, roads, broken down into motorway, trunk,
+- Tick which layers you want (OpenStreetMap, Overture Maps, elevation, and
+  Welsh LiDAR where the extent falls inside Wales) and which categories
+  (buildings, roads, broken down into motorway, trunk,
   primary, secondary, residential, service, footpath, cycleway and track,
   water, vegetation and landuse, rail, boundaries, points of interest).
   Categories are ticked by default, matching the everything-selected
@@ -698,6 +699,12 @@ including drawing sheets.
 | Overture Maps | Mixed by theme: Open Database License (ODbL) and CDLA-Permissive-2.0 | (c) Overture Maps Foundation |
 | Copernicus DEM, via OpenTopography | Free for any use, with attribution | (c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH |
 | Welsh LiDAR (`lidar_wales`) | Open Government Licence v3.0 | Contains Welsh Government and Natural Resources Wales information licensed under the Open Government Licence v3.0 |
+| OSTN15 transformation (`bng.py`) | Ordnance Survey, Open Source Initiative BSD Licence | Copyright and database rights Ordnance Survey Limited 2016, Crown copyright and database rights Land & Property Services 2016 and/or Ordnance Survey Ireland, 2016. All rights reserved. |
+
+Every package with a Welsh LiDAR layer or an `.egrid` derived from it carries
+its coordinates through the OSTN15 transformation (`src/mapgen/bng.py`), so
+that row's licence and attribution carry forward too, even though OSTN15
+never appears as a `LayerSource` of its own.
 
 ODbL requires attribution and, if you redistribute the data itself (as
 opposed to a map or drawing derived from it), requires any substantial
@@ -813,10 +820,25 @@ still need a human looking at the page.
 ## Roadmap
 
 Phase 2 adds UK survey-grade layers behind the same `LayerSource` interface
-used by `osm`, `overture` and `elevation`: NRW LiDAR at up to 25 cm via
-DataMapWales (Open Government Licence, and a far better elevation and
-building-height source than Copernicus DEM anywhere in Wales), OS NGD
-buildings and water network, and open drainage data (sewer catchments, storm
-overflow points and treatment works locations; a bulk sewer network dataset
-is not openly available). See `docs/superpowers/specs/` for the full design
-record.
+used by `osm`, `overture` and `elevation`.
+
+**Build item 1, Welsh LiDAR, has shipped.** The `lidar_wales` source packages
+Natural Resources Wales' 1 m DTM and DSM rasters straight from the Welsh
+Government's whole-Wales mosaics (Open Government Licence v3.0), generates
+contours at the interval each extent's own area qualifies for, fuses
+DSM-minus-DTM building heights into the `.osm`, and feeds the `.egrid` from
+that same 1 m DTM with the 30 m OpenTopography DEM as fallback beyond its
+edge. The resolution promise is 1 m, not finer: the 25 cm data in NRW's own
+archive catalogue turned out, on checking, to be ten 2011 quarter-tiles,
+about 2.5 km2, in the Creigiau and Pentyrch corner of north-west Cardiff,
+nowhere near most Welsh sites, so no copy anywhere in this project claims
+25 cm.
+
+Still to come, in build order: INSPIRE Index Polygons as tagged property
+boundary curves next, then an OS Open pack (roads, OpenMap Local, UPRN)
+behind a per-extent tier resolver, DataMapWales constraints and Cadw
+designations together with planning.data.gov.uk for England, Sentinel-2
+context imagery via Earth Search, England LiDAR as its own task (the
+discovery API is open but bulk raster download there has no documented
+route yet), PlanIt planning history, and BGS boreholes. See
+`docs/superpowers/specs/` for the full design record.

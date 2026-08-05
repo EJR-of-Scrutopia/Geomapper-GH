@@ -308,8 +308,9 @@ def test_seconds_floor_covers_the_measured_whole_fetch_not_just_its_parts():
     # The 1.3 s floor this replaces was never such a measurement: it was
     # Task 3's own component arithmetic (two ~0.15 s mosaic opens plus a
     # 500 x 500 m UNPADDED window's 0.50 s and 0.42 s reads), and
-    # fetch() actually reads a window padded by 2 * egrid.PAD_METRES on
-    # every side, which that arithmetic never accounted for. Pinned as a
+    # fetch() actually reads a window padded by egrid.PAD_METRES on every
+    # side (2 * PAD_METRES per axis), which that arithmetic never
+    # accounted for. Pinned as a
     # plain numeric floor, deliberately not a re-import-and-compare of
     # SECONDS_FLOOR against itself (the existing
     # test_estimate_seconds_floor_binds_for_a_small_extent already does

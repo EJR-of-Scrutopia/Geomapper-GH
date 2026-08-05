@@ -9,13 +9,17 @@ detailed ledger is not.
 - Main worktree: `.../VS code/Rhino Plugins/mapgen`, branch `main`
 - Remote: `https://github.com/EJR-of-Scrutopia/Geomapper-GH.git`
 - **The first push happened.** Both remote branches sit at `3748225`.
-  `feat/phase1` is now **121 commits ahead** of the remote and `main` is 1
-  ahead. The permission layer denies `git push` from the assistant's shells,
-  so the owner runs it.
+  `feat/phase1` is now **147 commits ahead** of the remote (as of this fix
+  round's own last commit, 2026-08-05; count with
+  `git rev-list --count origin/feat/phase1..HEAD`) and `main` is 1 ahead.
+  The permission layer denies `git push` from the assistant's shells, so
+  the owner runs it.
 - Run tests: `.venv\Scripts\python.exe -m pytest -q` and
   `node tests/js/test_app.js`. Add `-m live` for the network tests.
-- Last known green: **1242 Python (4 deselected `live`), 4 live under `-m live`,
-  273 Node**. Use the venv python, not the system one, or every import fails.
+- Last known green: **1392 Python (9 deselected `live`), 273 Node**, from
+  this fix round's own full offline run; the 9 live tests were not rerun
+  this pass. Use the venv python, not the system one, or every import
+  fails.
 
 ## The ledger, and why it matters
 
@@ -309,6 +313,16 @@ LiDAR rasters, all four contour files, an `.egrid` whose
 sentences. This is pending the whole-branch review that has closed every
 prior build item before it shipped; nothing here should be treated as
 final until that review runs.
+
+**Watch-items for build item 2 onward, carried from Wales LiDAR's own
+review.** The int16 GDAL_METADATA scale/offset refusal deferred at Task 3
+(`cog.py`) needs to land before any 16-bit mosaic path is pointed at: right
+now a decimetre-scaled 16-bit source would read 10x tall, unrefused.
+Retry-After plumbing through `CogError` deferred at Task 6 pays off once a
+rate-limited OGC source arrives, which INSPIRE and the DataMapWales
+constraints layers both are; and `estimate()` still has no contour-seconds
+term, invisible so far only because Wales LiDAR is the only source that
+generates contours at all.
 
 Next action: plan build item 2, INSPIRE curves, from the phase 2 spec.
 
