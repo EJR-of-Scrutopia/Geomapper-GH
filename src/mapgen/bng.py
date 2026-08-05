@@ -485,6 +485,15 @@ def _download_and_parse(session: object) -> Ostn15Grid:
     connection failure's own text from `requests` can carry it, and a
     test asserting on this module's own wording should never end up
     depending on that string too.
+
+    Every failure on this path becomes a BngError, matching every other
+    failure path in this module (parsing, cache read, grid construction,
+    projection all do the same): a corrupt or truncated download raises
+    `zipfile.BadZipFile`, and a pack that no longer contains the expected
+    member (renamed, or moved, upstream) raises `KeyError` from
+    `archive.open`; a caller catching BngError to report one clean
+    "OSTN15 fetch failed" should not have to also know about two
+    unrelated stdlib exception types to catch the same failure.
     """
     try:
         with tempfile.TemporaryDirectory() as work_dir:
@@ -497,10 +506,20 @@ def _download_and_parse(session: object) -> Ostn15Grid:
                     for chunk in response.iter_content(1024 * 1024):
                         if chunk:
                             handle.write(chunk)
-            with zipfile.ZipFile(zip_path) as archive, archive.open(
-                _DATA_FILE_NAME
-            ) as member:
-                return _parse_data_file(io.TextIOWrapper(member, encoding="utf-8"))
+            try:
+                with zipfile.ZipFile(zip_path) as archive, archive.open(
+                    _DATA_FILE_NAME
+                ) as member:
+                    return _parse_data_file(io.TextIOWrapper(member, encoding="utf-8"))
+            except zipfile.BadZipFile as exc:
+                raise BngError(
+                    "The OSTN15 developers pack download is not a valid zip file."
+                ) from exc
+            except KeyError as exc:
+                raise BngError(
+                    "The OSTN15 developers pack does not contain the expected "
+                    "data file."
+                ) from exc
     except requests.RequestException as exc:
         raise BngError("Failed to download the OSTN15 shift grid.") from exc
 

@@ -1,3 +1,4 @@
+import io
 import math
 import zipfile
 
@@ -154,6 +155,60 @@ def test_ensure_ostn15_never_downloads_when_cache_present(tmp_path):
 
     loaded = ensure_ostn15(cache_dir=tmp_path, session=RefusesToConnect())
     assert loaded.shift_at(500.0, 500.0) == pytest.approx(grid.shift_at(500.0, 500.0))
+
+
+class _FakeDownloadResponse:
+    """Just enough of a `requests.Response` for _download_and_parse: a
+    context manager, a no-op raise_for_status, and iter_content over
+    whatever bytes the test wants served.
+    """
+
+    def __init__(self, content: bytes):
+        self._content = content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size):
+        yield self._content
+
+
+class _FakeDownloadSession:
+    def __init__(self, content: bytes):
+        self._content = content
+
+    def get(self, *args, **kwargs):
+        return _FakeDownloadResponse(self._content)
+
+
+def test_ensure_ostn15_wraps_a_corrupt_zip_as_bngerror(tmp_path):
+    # zipfile.BadZipFile must not escape _download_and_parse as itself:
+    # every other failure path in this module raises BngError, and a
+    # caller catching BngError to report one clean fetch failure should
+    # not also have to know about zipfile's own exception type.
+    session = _FakeDownloadSession(b"this is not a zip file at all")
+    with pytest.raises(BngError):
+        ensure_ostn15(cache_dir=tmp_path, session=session)
+    # No half-written cache from a download that never finished parsing.
+    assert not (tmp_path / bng._CACHE_FILENAME).exists()
+
+
+def test_ensure_ostn15_wraps_a_missing_data_file_as_bngerror(tmp_path):
+    # A real zip, but not carrying OSTN15_OSGM15_DataFile.txt: archive.open
+    # raises KeyError, which must not escape as itself either.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("WRONG_NAME.txt", "not the data file")
+    session = _FakeDownloadSession(buffer.getvalue())
+    with pytest.raises(BngError):
+        ensure_ostn15(cache_dir=tmp_path, session=session)
+    assert not (tmp_path / bng._CACHE_FILENAME).exists()
 
 
 def test_load_ostn15_returns_none_without_touching_the_network(tmp_path):
