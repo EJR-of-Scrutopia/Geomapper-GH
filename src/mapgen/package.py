@@ -1092,6 +1092,35 @@ def _run_bridge_step(
     return True, None
 
 
+def _elevation_grid_record(
+    written: bool = False,
+    file: str | None = None,
+    nodes: int | None = None,
+    covered: int | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    """survey.json's `elevation_grid` block, in ONE shape whatever happened.
+
+    All five keys, always. README's schema table has always described the
+    block as five keys, but `covered` used to be added only on the success
+    branch, so a package with no DEM and a package whose DEM could not be
+    read each carried four. Nothing in mapgen noticed, because cli.py reads
+    the block with .get; a reader following the README and indexing the key
+    got a KeyError on exactly the packages where they most wanted to know.
+
+    A record whose KEYS depend on the outcome is the kind of shape that is
+    only ever found by the reader who trips over it, so the outcome now
+    lives entirely in the values.
+    """
+    return {
+        "written": written,
+        "file": file,
+        "nodes": nodes,
+        "covered": covered,
+        "error": error,
+    }
+
+
 def _write_elevation_grid_step(
     bbox: BBox, root: Path, stem: str, sink: ProgressSink
 ) -> dict[str, object]:
@@ -1143,7 +1172,7 @@ def _write_elevation_grid_step(
         target.unlink(missing_ok=True)
         if removed:
             sink.emit("elevation_grid_removed", file=target.name)
-        return {"written": False, "file": None, "nodes": None, "error": None}
+        return _elevation_grid_record()
 
     sink.emit("elevation_grid_started")
     try:
@@ -1155,7 +1184,7 @@ def _write_elevation_grid_step(
         # is a component that throws on the owner's canvas.
         target.unlink(missing_ok=True)
         sink.emit("elevation_grid_failed", error=error)
-        return {"written": False, "file": None, "nodes": None, "error": error}
+        return _elevation_grid_record(error=error)
     covered = grid.real_count
     sink.emit(
         "elevation_grid_written",
@@ -1163,13 +1192,12 @@ def _write_elevation_grid_step(
         nodes=len(grid.heights),
         covered=covered,
     )
-    return {
-        "written": True,
-        "file": target.name,
-        "nodes": len(grid.heights),
-        "covered": covered,
-        "error": None,
-    }
+    return _elevation_grid_record(
+        written=True,
+        file=target.name,
+        nodes=len(grid.heights),
+        covered=covered,
+    )
 
 
 def _write_project_setting_step(
@@ -2643,7 +2671,8 @@ def _build_survey_json(
         "written": False, "file": None, "layers": [], "error": None,
     }
     elevation_grid = elevation_grid or {
-        "written": False, "file": None, "nodes": None, "error": None,
+        "written": False, "file": None, "nodes": None, "covered": None,
+        "error": None,
     }
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,

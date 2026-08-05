@@ -5236,7 +5236,11 @@ def test_a_dem_that_cannot_be_converted_costs_the_package_nothing(tmp_path):
 
     assert result.complete is True
     record = result.survey["elevation_grid"]
+    # Same five keys as a success and as a package with no DEM at all, so
+    # a reader following README's schema can index any of them.
+    assert set(record) == {"written", "file", "nodes", "covered", "error"}
     assert record["written"] is False
+    assert record["covered"] is None
     assert "byte order mark" in record["error"]
     assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
     # The rest of the package is untouched, and the project setting says so
@@ -5250,12 +5254,19 @@ def test_a_run_with_no_dem_at_all_says_nothing_went_wrong(tmp_path):
     """`written` false with a null error is "this package has no DEM", which
     is a different statement from "the DEM could not be converted" and has to
     read differently in survey.json.
+
+    All five keys, including `covered`, whatever happened. README describes
+    the block as five keys, and a record whose KEYS move with the outcome is
+    one only the reader who trips over it ever finds.
     """
     register(UrbanoReadableStubSource())
     result = run_survey(_request(tmp_path, run_bridge_step=False))
 
     record = result.survey["elevation_grid"]
-    assert record == {"written": False, "file": None, "nodes": None, "error": None}
+    assert record == {
+        "written": False, "file": None, "nodes": None, "covered": None,
+        "error": None,
+    }
 
 
 def test_an_egrid_left_by_a_previous_attempt_goes_when_the_dem_does(tmp_path):
