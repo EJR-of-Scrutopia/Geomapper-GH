@@ -293,12 +293,24 @@ Welsh sites.
 Phase 2 is specced, approved by the owner, and verified: read
 `docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md` (revised after
 the task-zero verification pass; evidence in `phase2-task-zero-report.md`
-beside the ledger). The implementation plan for build item 1 is written:
-`docs/superpowers/plans/2026-08-05-mapgen-phase2-01-wales-lidar.md`, built
-on a live probe of the actual COG mosaics (BigTIFF, deflate, PixelIsArea,
-nodata -9999, seven levels) and of the OSTN15 developers pack (stable URL,
-OS's own test vectors inside). Next action: execute that plan task by task
-via subagent-driven development, then plan item 2, INSPIRE curves.
+beside the ledger).
+
+**Build item 1, Wales LiDAR, is built and proven end to end.**
+`docs/superpowers/plans/2026-08-05-mapgen-phase2-01-wales-lidar.md`'s nine
+tasks are all complete: `lidar_wales` is a registered source delivering
+packaged 1 m DTM/DSM rasters, per-interval contours, DSM-DTM building
+heights fused into the `.osm`, and an `.egrid` fed from LiDAR with the
+30 m DEM as fallback. Task 9's live `run_survey` over a real Barry extent
+(osm, overture, elevation, lidar_wales together) confirms the whole chain
+on disk at once: a fused `height`/`source:height` pair in the `.osm`, both
+LiDAR rasters, all four contour files, an `.egrid` whose
+`elevation_grid.source` reads `"lidar_wales+opentopography"`, and a
+`survey.json` provenance entry carrying the OGL licence and attribution
+sentences. This is pending the whole-branch review that has closed every
+prior build item before it shipped; nothing here should be treated as
+final until that review runs.
+
+Next action: plan build item 2, INSPIRE curves, from the phase 2 spec.
 
 ## Standing constraints
 

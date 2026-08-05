@@ -8,9 +8,12 @@ module was written around. The vocabulary of models, and an honest account
 of what choosing between them actually buys (a surface model or bare earth
 terrain, never a finer resolution), lives in mapgen.elevation_models.
 
-Phase 2 note: NRW LiDAR at 1 m will be a sibling module here, and is a far better
-source than any of them for anywhere in Wales. Nothing OpenTopography's
-global API serves is finer than 30 m.
+Phase 2: `mapgen.sources.lidar_wales` is that sibling module, live since Task
+6, and is a far better source than any of these for anywhere in Wales.
+Nothing OpenTopography's global API serves is finer than 30 m; the Welsh
+mosaics are 1 m. `egrid.py`'s own `_ChainSampler` prefers the LiDAR DTM
+over this module's DEM wherever both cover a node, which is everywhere in
+Wales.
 """
 
 from __future__ import annotations

@@ -493,6 +493,12 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_building.geojson        one file per Overture type
   Barry-Waterfront_2026-08-03_water.geojson           ever fetched into this package
   Barry-Waterfront_2026-08-03.tif                     elevation, only if selected
+  Barry-Waterfront_2026-08-03_lidar_dtm.tif           Welsh 1 m terrain, only if
+  Barry-Waterfront_2026-08-03_lidar_dsm.tif           `lidar_wales` was selected
+  Barry-Waterfront_2026-08-03_contours_5m.geojson     generated from that DTM,
+  Barry-Waterfront_2026-08-03_contours_1m.geojson     one file per interval the
+  Barry-Waterfront_2026-08-03_contours_0.5m.geojson   extent's own area qualifies
+  Barry-Waterfront_2026-08-03_contours_0.25m.geojson  for
   Barry-Waterfront_2026-08-03.egrid                   the same DEM, in the format
                                                       Urbano reads terrain from
   Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here,
@@ -545,14 +551,30 @@ Each file:
   selected and an OpenTopography key was available. Which model it is comes
   from the `--demtype` setting (COP30 by default) and is recorded in
   `survey.json`.
+- **`<stem>_lidar_dtm.tif`, `<stem>_lidar_dsm.tif`**: the Welsh Government's
+  own 1 m bare-earth terrain (DTM) and surface (DSM) models, packaged
+  whenever the `lidar_wales` source is selected and the extent falls inside
+  Wales. `<stem>.egrid` reads the DTM ahead of the 30 m DEM (see below);
+  `lidar_heights` (further down) reads both, to give flat OSM buildings a
+  real `height`.
+- **`<stem>_contours_5m.geojson`, `<stem>_contours_1m.geojson`,
+  `<stem>_contours_0.5m.geojson`, `<stem>_contours_0.25m.geojson`**:
+  generated, not downloaded, from the packaged `_lidar_dtm.tif` at the
+  moment it is packaged, one file per interval the extent's own area
+  qualifies for (5 m always, 1 m under 6 sq km, 0.5 m and 0.25 m under
+  1.5 sq km); an interval the extent does not qualify for gets no file.
+  WGS84 GeoJSON, each feature carrying `elevation`, `interval_m`,
+  `source`, `source_resolution_m` and `interpolated` (`true` below 1 m,
+  since a 1 m raster cannot really resolve a quarter-metre rise, so those
+  two files are honest about being smoothed rather than measured).
 - **`<stem>.egrid`**: a DEM converted into Urbano's own elevation grid,
   which is the only format any Urbano component reads terrain in. When a
-  package also holds `<stem>_lidar_dtm.tif` (the `lidar_wales` source's
-  own 1 m Ordnance Survey terrain model), that DTM answers first and the
-  30 m `<stem>.tif` fills in only where the DTM has no coverage at all,
-  over the sea and beyond the LiDAR mosaic's own edge; `survey.json`'s
-  `elevation_grid.source` says which of the two, or both, actually
-  answered. Derived output, like the `layers/` copies: the `.tif` is the
+  package also holds `<stem>_lidar_dtm.tif` (the `lidar_wales` source's own
+  1 m Welsh Government/Natural Resources Wales terrain model), that DTM
+  answers first and the 30 m `<stem>.tif` fills in only where the DTM has
+  no coverage at all, over the sea and beyond the LiDAR mosaic's own edge;
+  `survey.json`'s `elevation_grid.source` says which of the two, or both,
+  actually answered. Derived output, like the `layers/` copies: the `.tif` is the
   original and stays. Written on every run and by `mapgen bridge`, so a
   package downloaded before this existed gains terrain without being
   downloaded again. If no DEM can be converted the package is finished
@@ -675,6 +697,7 @@ including drawing sheets.
 | OpenStreetMap | Open Database License (ODbL) 1.0 | (c) OpenStreetMap contributors |
 | Overture Maps | Mixed by theme: Open Database License (ODbL) and CDLA-Permissive-2.0 | (c) Overture Maps Foundation |
 | Copernicus DEM, via OpenTopography | Free for any use, with attribution | (c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH |
+| Welsh LiDAR (`lidar_wales`) | Open Government Licence v3.0 | Contains Welsh Government and Natural Resources Wales information licensed under the Open Government Licence v3.0 |
 
 ODbL requires attribution and, if you redistribute the data itself (as
 opposed to a map or drawing derived from it), requires any substantial
