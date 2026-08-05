@@ -2667,6 +2667,41 @@ def test_a_subdivided_tile_is_recorded_ok_like_any_other_tile(tmp_path):
     )
 
 
+def test_a_file_named_for_a_tile_of_another_tiling_is_never_offered_to_merge(tmp_path):
+    """The stale-tiling filter itself, which nothing distinguished: disabling
+    the _TILE_ID_SHAPE exclusion entirely passed the whole suite.
+
+    The two tests that look like they cover it do not. One asserts the
+    opposite direction, that a whole-area file with no tile id in its name is
+    still gathered; the other, the retiling one, is satisfied by the work_dir
+    fingerprint putting the old run's files in a different folder altogether.
+    Neither notices whether this filter is there.
+
+    What it is for: a tile id is only (row, col) and carries no memory of the
+    tile_size_m or overlap_m it was computed under, so r00_c00 of a 2000 m
+    tiling and r00_c00 of a 600 m one are the same string over different
+    ground. Directly on the function, because the whole point is that the
+    layers above it happen to shield it today.
+    """
+    from mapgen.package import _existing_output_files
+
+    source_work = tmp_path / "raw" / "stub"
+    source_work.mkdir(parents=True)
+    for name in ("r00_c00.osm", "r09_c09.osm", "Barry_2026-08-01.tif"):
+        (source_work / name).write_text("data", encoding="utf-8")
+
+    offered = [path.name for path in _existing_output_files(source_work, ["r00_c00"])]
+
+    assert "r00_c00.osm" in offered, "this tiling's own tile"
+    assert "r09_c09.osm" not in offered, (
+        "a tile id from another tiling was offered to merge, under a name "
+        "this tiling would reuse"
+    )
+    # No tile id in the name, so no tiling assumption to be stale. This is
+    # elevation's whole-area DEM and it always belongs.
+    assert "Barry_2026-08-01.tif" in offered
+
+
 def test_the_quarters_of_a_subdivided_tile_never_reach_the_package(tmp_path):
     # _existing_output_files feeds both merge() and the per-tile outcome
     # check. A quarter is real .osm data sitting in the source's work
@@ -5407,6 +5442,40 @@ def test_mapgen_bridge_converts_the_dem_of_a_package_already_on_disk(tmp_path):
     assert written.is_file()
     assert payload["elevation_grid"]["written"] is True
     assert payload["elevation_grid"]["nodes"] == 12432
+
+
+def test_the_egrid_step_finds_the_dem_under_the_name_elevation_declares(tmp_path):
+    """_write_elevation_grid_step reads `<stem>.tif` from a literal of its
+    own, which is a third copy of a filename ElevationSource already states
+    twice, in possible_outputs and in merge.
+
+    _bridge_input_file's docstring gives the rule this file works to: what
+    package.py must not start knowing separately is the sources' filenames,
+    because two copies of that fact drift. Drift here would be silent. The
+    DEM would be sitting in the package, the step would find nothing, and
+    survey.json would report "this package has no DEM" with no error
+    anywhere and no terrain in Grasshopper.
+
+    So the literal is exercised through the source's own declaration rather
+    than compared to it, and a rename on either side fails here.
+    """
+    from mapgen.package import _write_elevation_grid_step
+    from mapgen.sources.elevation import ElevationSource
+
+    stem = "Barry-Waterfront_2026-08-01"
+    names = [str(name) for name in ElevationSource().possible_outputs(stem)]
+    assert len(names) == 1, "elevation declares one output; this assumes which"
+    (tmp_path / names[0]).write_bytes(REAL_DEM.read_bytes())
+
+    record = _write_elevation_grid_step(
+        bbox=DEM_BBOX, root=tmp_path, stem=stem, sink=EventLog()
+    )
+
+    assert record["written"] is True, (
+        "package.py is looking for the DEM under a name ElevationSource does "
+        "not write"
+    )
+    assert (tmp_path / f"{stem}.egrid").is_file()
 
 
 def test_mapgen_bridge_names_the_egrid_it_just_wrote_in_the_project_setting(tmp_path):

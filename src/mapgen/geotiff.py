@@ -262,14 +262,23 @@ class DemRaster:
         precision because Urbano's own sampler returns a `float` and the
         grid it builds is the double widening of that; a `double` here would
         differ from Urbano in the last few digits of every value.
+
+        has_coverage is the ONLY bounds check here, and it is a complete
+        one: it establishes 0 <= column < width - 1 and 0 <= row < height -
+        1, so the floors below are at most width - 2 and height - 2 and all
+        four corners are inside the array. There used to be a second check
+        restating that, and it could not fire. A guard that cannot fire is
+        worse than no guard, because the next person to loosen has_coverage
+        reads it as independent cover when it is only an echo. Loosen
+        has_coverage and this reads past the end of the array, so the
+        boundary is asserted through sample() in test_geotiff.py and fails
+        there rather than in Grasshopper.
         """
         if not self.has_coverage(latitude, longitude):
             return None
         column, row = self.pixel_at(latitude, longitude)
         c0 = math.floor(column)
         r0 = math.floor(row)
-        if c0 < 0 or r0 < 0 or c0 + 1 >= self.width or r0 + 1 >= self.height:
-            return None
         fx = column - c0
         fy = row - r0
         weights = ((1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy)

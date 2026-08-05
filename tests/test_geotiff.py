@@ -418,6 +418,14 @@ def test_the_last_row_and_column_are_outside_coverage(tmp_path):
     assert dem.has_coverage(51.5 - 0.002, -3.0) is False
     assert dem.has_coverage(51.5, -3.0 + 0.003) is False
     assert dem.has_coverage(51.5 - 0.0019, -3.0 + 0.0029) is True
+    # Through sample() as well, and not only through has_coverage. This is
+    # the ONE bounds check the sampler has: it used to be followed by a
+    # second one restating it, which could not fire and which read as
+    # independent cover. Loosening this bound now reads past the end of the
+    # heights array, so the boundary is asserted where the reading happens.
+    assert dem.sample(51.5 - 0.002, -3.0) is None
+    assert dem.sample(51.5, -3.0 + 0.003) is None
+    assert dem.sample(51.5 - 0.0019, -3.0 + 0.0029) is not None
 
 
 def test_a_declared_nodata_value_becomes_a_hole_and_never_a_height(tmp_path):
