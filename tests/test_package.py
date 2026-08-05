@@ -4635,6 +4635,57 @@ def test_a_run_that_only_completed_because_of_a_retry_says_so(tmp_path):
     }
 
 
+def test_a_whole_layer_asked_again_is_one_event_and_the_record_says_so(tmp_path):
+    """Review I2. Elevation downloads the whole extent in one request, so a
+    failure of its is recorded against every planned tile and the retry
+    asks for every planned tile back in a single call.
+
+    Announced per tile, one DEM hiccup is four messages here and seventy
+    two on the owner's own Barry extent, which is exactly the reading task
+    32 already ruled wrong on the failure side of the same run.
+    """
+    session = _FlakyElevationSession(failures=1, status_code=503)
+    _register_elevation(session)
+    log = EventLog()
+
+    result = run_survey(_elevation_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    retrying = _events_named(log, "tile_retrying")
+    assert len(retrying) == 1, "one request asked again is one thing happening"
+    assert retrying[0]["source"] == "elevation"
+    assert retrying[0]["tiles"] == 4
+    # No tile id, the way retry_postponed carries none: stamping this with
+    # one of the four squares would name a square for work spanning the
+    # whole extent.
+    assert "tile_id" not in retrying[0]
+    # survey.json keeps every tile the one request covered, because only
+    # the final verdict can say which of them arrived, and marks them as
+    # the single event they are.
+    retries = result.survey["retries"]
+    assert len(retries) == 4
+    assert all(record["whole_layer"] is True for record in retries)
+
+
+def test_one_tile_asked_again_is_not_dressed_up_as_a_whole_layer(tmp_path):
+    """The other half of the same rule, and the one that would hide which
+    tiles were fragile if it were got wrong. One OSM tile of four coming
+    back on a retry is one tile, and the record has to keep saying so.
+    """
+    session = _FlakyOsmSession(failures_by_tile={"r00_c01": 4})
+    _register_flaky_osm(session)
+    log = EventLog()
+
+    result = run_survey(_osm_only_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    retrying = _events_named(log, "tile_retrying")
+    assert [event["tile_id"] for event in retrying] == ["r00_c01"]
+    retries = result.survey["retries"]
+    assert [record["tile_id"] for record in retries] == ["r00_c01"]
+    assert all(record["whole_layer"] is False for record in retries)
+
+
 def test_a_clean_run_records_no_retries_at_all(tmp_path):
     session = _FlakyElevationSession(failures=0)
     _register_elevation(session)

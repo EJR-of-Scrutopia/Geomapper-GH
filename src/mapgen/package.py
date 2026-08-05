@@ -1723,8 +1723,30 @@ class _FailureLedger:
         return max(asked) if asked else None
 
     def note_retry(
-        self, source_id: str, tile_ids: Sequence[str], pass_number: int
+        self,
+        source_id: str,
+        tile_ids: Sequence[str],
+        pass_number: int,
+        whole_layer: bool = False,
     ) -> None:
+        """One record per tile asked again, each saying whether it was asked
+        on its own account or as one share of a single whole-extent request.
+
+        whole_layer is what stops a reader of survey.json counting seventy
+        two stumbles where one thing stumbled once. Elevation and Overture
+        download the whole extent in one call, so a failure of theirs is
+        recorded against every planned tile and the retry asks for every
+        planned tile back in one request; without this flag the file's only
+        account of that is seventy two entries reading exactly like seventy
+        two separate tiles going wrong.
+
+        The entries stay per tile rather than collapsing to one, because
+        `recovered` is decided per (source, tile_id) against the run's final
+        verdict, and that verdict is the only thing in a position to say
+        which of the tiles one request covered actually arrived. The flag
+        says the entries are one event; it does not throw away which tiles
+        the event was about.
+        """
         for tile_id in tile_ids:
             key = (source_id, tile_id)
             self._retries[key] = self._retries.get(key, 0) + 1
@@ -1736,6 +1758,7 @@ class _FailureLedger:
                     "pass_number": pass_number,
                     "kind": record["kind"],
                     "reason": record["reason"],
+                    "whole_layer": whole_layer,
                 }
             )
 
@@ -1862,6 +1885,66 @@ def describe_tile_failures(
         lines.append(
             f"  {record.get('source')} {record.get('tile_id')}: "
             f"{record.get('reason')}{again}"
+        )
+    return lines
+
+
+def describe_tile_recoveries(records: Sequence[Mapping[str, object]]) -> list[str]:
+    """The account of what arrived only on a second attempt, as plain lines.
+
+    The companion to describe_tile_failures, and it exists for the same
+    reason that one does: a run that completed only because a retry worked
+    is not the same run as one that never stumbled, and this is the only
+    line that says so.
+
+    Task 32 collapsed a whole-layer FAILURE to one sentence naming the
+    layer. This is the same collapse on the recovery side of the same run,
+    which review I2 found had been left uncollapsed: elevation and Overture
+    ask for the whole extent in one request, so one DEM timing out and
+    arriving on the retry was reported as the whole planned tile count
+    recovering. On the owner's own Barry extent that is "72 tiles arrived
+    only on a retry" for one download that stumbled once, which is exactly
+    the reading the failure side had already been fixed to avoid.
+
+    Collapsed on the records' own `whole_layer` rather than on a tile count
+    passed in beside them, unlike describe_tile_failures. The retry pass
+    already made that judgement, on the plan it actually had in front of it,
+    and a second opinion composed here from a number this function was
+    handed is a second opinion that can differ. A record without the field,
+    which is every package written before this, reads as per tile and gets
+    the sentence it has always got.
+
+    A partial recovery is untouched and must be: two OSM tiles of seventy
+    two coming back is two tiles, and saying "the OSM layer" of it would
+    claim seventy more than arrived.
+    """
+    recovered = [record for record in records if record.get("recovered")]
+    if not recovered:
+        return []
+
+    lines: list[str] = []
+    layers: dict[str, int] = {}
+    per_tile: list[Mapping[str, object]] = []
+    for record in recovered:
+        if record.get("whole_layer"):
+            source = str(record.get("source"))
+            layers[source] = layers.get(source, 0) + 1
+        else:
+            per_tile.append(record)
+
+    for source in sorted(layers):
+        tiles = layers[source]
+        noun = "tile" if tiles == 1 else "tiles"
+        lines.append(
+            f"The {source} layer arrived only on a retry, one request "
+            f"covering {tiles} {noun}. See survey.json for what was retried."
+        )
+    if per_tile:
+        noun = "tile" if len(per_tile) == 1 else "tiles"
+        named = ", ".join(sorted({str(record.get("source")) for record in per_tile}))
+        lines.append(
+            f"{len(per_tile)} {noun} arrived only on a retry ({named}). "
+            f"See survey.json for which."
         )
     return lines
 
@@ -2139,19 +2222,57 @@ def _retry_failed_tiles(
                 # these tiles keep the failure they already had.
                 return True
 
-        for tile in retry_tiles:
-            record = ledger.record_for(source_id, tile.tile_id)
+        # Task 32's whole-layer rule, on the recovery side of the same run
+        # (review I2). The failure side already says a layer that failed
+        # identically on every planned tile once, naming the layer, because
+        # seventy two copies of one sentence for one thing that went wrong
+        # once is a misreading rather than a detail. Asking that same layer
+        # again is the same shape and gets the same treatment: one request
+        # is announced once.
+        #
+        # The predicate is describe_tile_failures' predicate, deliberately,
+        # so the two halves of a run cannot disagree about what counts as a
+        # whole layer: every planned tile, all carrying the same reason, and
+        # more than one of them. A partial group is untouched and must be,
+        # since two OSM tiles of seventy two is two tiles and collapsing it
+        # would hide which ones.
+        records = [ledger.record_for(source_id, tile.tile_id) for tile in retry_tiles]
+        whole_layer = (
+            len(retry_tiles) == len(tiles)
+            and len(tiles) > 1
+            and len({(r["kind"], r["reason"]) for r in records}) == 1
+        )
+        if whole_layer:
+            # No tile_id, the way retry_postponed carries none: this event
+            # is about a layer, and stamping it with one of the tiles it
+            # covers would put a single square's name on work spanning the
+            # whole extent. The browser's status line already has the
+            # sentence for an event with no tile on it.
             sink.emit(
                 "tile_retrying",
                 source=source_id,
-                tile_id=tile.tile_id,
+                tiles=len(retry_tiles),
                 pass_number=retry_pass,
                 of=RETRY_PASS_BUDGET,
-                kind=record["kind"],
-                reason=record["reason"],
+                kind=records[0]["kind"],
+                reason=records[0]["reason"],
             )
+        else:
+            for tile, record in zip(retry_tiles, records):
+                sink.emit(
+                    "tile_retrying",
+                    source=source_id,
+                    tile_id=tile.tile_id,
+                    pass_number=retry_pass,
+                    of=RETRY_PASS_BUDGET,
+                    kind=record["kind"],
+                    reason=record["reason"],
+                )
         ledger.note_retry(
-            source_id, [tile.tile_id for tile in retry_tiles], retry_pass
+            source_id,
+            [tile.tile_id for tile in retry_tiles],
+            retry_pass,
+            whole_layer=whole_layer,
         )
 
         fetch_kwargs = {"cancel": token} if _fetch_accepts_cancel(source) else {}

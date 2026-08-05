@@ -1591,6 +1591,33 @@ def test_a_clean_run_says_nothing_about_retries(tmp_path, capsys):
     assert "arrived only on a retry" not in capsys.readouterr().err
 
 
+def test_a_whole_layer_recovery_is_one_terminal_line_not_one_per_tile(
+    tmp_path, capsys
+):
+    # Review I2, and the same sentence task 32 already fixed on the failure
+    # side of the same run. A layer that downloads the whole extent in one
+    # request records its failure against every planned tile, so a single
+    # DEM timing out and arriving on the retry would otherwise print the
+    # whole planned tile count: seventy-two on the owner's own extent, for
+    # one thing that stumbled once.
+    register(
+        _RecoversOnRetrySource(fail_on=("r00_c00", "r00_c01", "r01_c00", "r01_c01"))
+    )
+    exit_code = main(
+        _survey_error_case_args(
+            tmp_path, "recovers-on-retry", tile_size_m=600, overlap_m=50
+        )
+    )
+    assert exit_code == 0, "a run whose retry worked is a complete run"
+    captured = capsys.readouterr()
+    assert (
+        "The recovers-on-retry layer arrived only on a retry, one request "
+        "covering 4 tiles." in captured.err
+    )
+    # The per-tile count is gone, not merely joined by a summary line.
+    assert "4 tiles arrived only on a retry" not in captured.err
+
+
 def test_a_whole_layer_failure_is_one_terminal_line_not_one_per_tile(
     tmp_path, capsys
 ):

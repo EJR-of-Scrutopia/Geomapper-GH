@@ -36,6 +36,7 @@ from mapgen.package import (
     UnbridgeablePackageError,
     bridge_package,
     describe_tile_failures,
+    describe_tile_recoveries,
     estimate_survey,
     register_default_sources,
     run_survey,
@@ -397,19 +398,13 @@ def command_survey(args: argparse.Namespace) -> int:
     # else here would say so. tile_failures is empty for a recovered
     # tile, deliberately, so without this line a fragile run and a clean
     # one print identically.
-    recovered = [
-        record
-        for record in (result.survey.get("retries") or [])
-        if record.get("recovered")
-    ]
-    if recovered:
-        layers = ", ".join(sorted({str(record.get("source")) for record in recovered}))
-        noun = "tile" if len(recovered) == 1 else "tiles"
-        print(
-            f"{len(recovered)} {noun} arrived only on a retry ({layers}). "
-            f"See survey.json for which.",
-            file=sys.stderr,
-        )
+    #
+    # Composed rather than written out here, for the reason the failure
+    # lines above it are: a whole-extent layer recovering is one thing
+    # recovering, not one per planned tile, and the two halves of a run
+    # must not disagree about that (review I2).
+    for line in describe_tile_recoveries(result.survey.get("retries") or []):
+        print(line, file=sys.stderr)
     if not result.complete:
         print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
         return 1
