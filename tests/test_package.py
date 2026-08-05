@@ -3974,6 +3974,61 @@ def test_a_stop_interrupts_the_retry_pass_as_promptly_as_the_first_attempt(tmp_p
     assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
 
 
+def test_the_verify_pass_raises_a_record_to_ok_when_the_file_is_really_there(tmp_path):
+    """The first of the verify pass's three documented rules, and the one no
+    test executed.
+
+    It reads as redundant, because _record_tile_outcomes reaches the same
+    answer first on every path this code can produce today: the retry pass
+    calls it with the retried tiles, and a hard-kill resume is marked ok by
+    the same call when the source skips a tile whose file is present.
+
+    It is not redundant, and that is the whole design of this pass. It is a
+    SECOND opinion, walked over every planned tile from a standing start,
+    believing only the filesystem, which is worth nothing if it can only
+    ever agree downwards. Remove this rule and the pass can lower a record
+    and never raise one, so a state.json that lost a tile to a hard kill
+    stays wrong and the run redownloads ground it already has.
+
+    Directly on the function, because the point is precisely that the layers
+    above it get there first.
+    """
+    from mapgen.jobs import FAILED, OK
+    from mapgen.package import _verify_tiles
+
+    tiles = build_tiles(BBOX, 600.0, 50.0)
+    tile_ids = [tile.tile_id for tile in tiles]
+    source_work = tmp_path / "raw" / "stub"
+    source_work.mkdir(parents=True)
+    for tile_id in tile_ids:
+        (source_work / f"{tile_id}.txt").write_text(tile_id, encoding="utf-8")
+
+    state = JobState(tmp_path / "state.json", tile_ids, ["stub"])
+    for tile_id in tile_ids:
+        state.mark(tile_id, "stub", OK)
+    # One tile the record gave up on, with its file sitting on disk all
+    # along. The file is the thing that decides.
+    state.mark(tile_ids[0], "stub", FAILED)
+
+    verified = _verify_tiles(
+        state,
+        [(StubSource(), source_work)],
+        tiles,
+        tile_ids,
+        _FailureLedger(),
+        EventLog(),
+        "after_fetch",
+    )
+
+    assert state.status(tile_ids[0], "stub") == OK
+    assert verified["failures"] == []
+    assert verified["ok"] == len(tile_ids)
+    assert [
+        (record["tile_id"], record["was"], record["now"])
+        for record in verified["corrections"]
+    ] == [(tile_ids[0], FAILED, OK)]
+
+
 def test_the_verify_pass_corrects_a_recorded_ok_with_no_file_behind_it(tmp_path):
     # The belt to _record_tile_outcomes' braces, on the one thing that
     # function cannot catch: it only ever looks at the tiles the fetch it
