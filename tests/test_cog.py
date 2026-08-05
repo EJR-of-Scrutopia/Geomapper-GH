@@ -62,6 +62,7 @@ def _make_cog(
     *,
     tile_size: int = 16,
     pixel_size: float = 1.0,
+    pixel_size_y: float | None = None,
     tiepoint: tuple[float, float] = (_TIE_E, _TIE_N),
     pixel_is_area: bool = True,
     nodata: float | None = -9999.0,
@@ -73,6 +74,7 @@ def _make_cog(
     bits: int = 32,
     bigtiff: bool = False,
     sparse: tuple = (),
+    pad: float | None = None,
 ) -> _SyntheticCog:
     """A tiled TIFF holding `levels`, each a (width, height, values) triple.
 
@@ -81,9 +83,15 @@ def _make_cog(
     mosaics are. `sparse` names (level, tile index) pairs to write with
     offset 0 and byte count 0, which is how a COG records a tile that is
     entirely nodata.
+
+    `pad` is what fills the part of an edge tile lying beyond the declared
+    image, which TIFF leaves entirely to the producer. It defaults to the
+    nodata sentinel, the friendly case; a test proving the reader honours
+    the image extent rather than the tile grid sets it to a plausible
+    height instead, which is what an unfriendly producer leaves there.
     """
     code = "f" if bits == 32 else "h"
-    fill = 0.0 if nodata is None else nodata
+    fill = (0.0 if nodata is None else nodata) if pad is None else pad
     fill = int(fill) if code == "h" else float(fill)
 
     out = bytearray()
@@ -150,7 +158,9 @@ def _make_cog(
             (339, 3, [sample_format]),
         ]
         if level_index == 0:
-            entries.append((33550, 12, [pixel_size, pixel_size, 0.0]))
+            entries.append(
+                (33550, 12, [pixel_size, pixel_size_y or pixel_size, 0.0])
+            )
             entries.append(
                 (33922, 12, [0.0, 0.0, 0.0, tiepoint[0], tiepoint[1], 0.0])
             )
@@ -288,6 +298,16 @@ class _RangeSession:
             return _FakeResponse(200, {}, self.data)
         if self.mode == "no_content_range":
             return _FakeResponse(206, {}, body)
+        if self.mode == "shifted_range":
+            return _FakeResponse(
+                206,
+                {
+                    "Content-Range": (
+                        f"bytes {first + 8}-{last + 8}/{len(self.data)}"
+                    )
+                },
+                body,
+            )
         if self.mode == "short_body":
             body = body[: max(0, len(body) - 1)]
         return _FakeResponse(
@@ -428,6 +448,82 @@ def test_level_selection_prefers_finest_that_fits_max_pixels(tmp_path):
 
     with pytest.raises(CogError, match="coarsest"):
         reader.read_window(*corners, max_pixels=4)
+
+
+def test_overview_pixel_sizes_are_derived_per_axis(tmp_path):
+    # 21 by 20 halving to 11 by 10: the width ratio is 21/11 = 1.909 and
+    # the height ratio is exactly 2. The real mosaic has the same shape of
+    # disagreement (191007/95504 against 233000/116500) and it is invisible
+    # to any fixture whose dimensions halve evenly, which is why this one
+    # does not. One size used for both axes puts every overview window
+    # metres away from its own pixels, growing with distance from the tie
+    # point.
+    base = _grid(21, 20, lambda x, y: float(y * 100 + x))
+    over = _grid(11, 10, lambda x, y: float(1000 + y * 100 + x))
+    reader = _reader(tmp_path, _make_cog([(21, 20, base), (11, 10, over)]))
+    fine, coarse = reader.levels
+
+    assert fine.pixel_size == pytest.approx(1.0)
+    assert fine.pixel_height == pytest.approx(1.0)
+    assert coarse.pixel_size == pytest.approx(21.0 / 11.0)
+    assert coarse.pixel_height == pytest.approx(2.0)
+    # The point of the fixture: the two really do differ.
+    assert abs(coarse.pixel_size - coarse.pixel_height) > 0.09
+
+    whole = reader.read_window(
+        _TIE_E, _TIE_N - 20.0, _TIE_E + 20.0, _TIE_N, max_pixels=200
+    )
+    assert (whole.width, whole.height) == (11, 10)
+    assert whole.pixel_size == pytest.approx(21.0 / 11.0)
+    assert whole.pixel_height == pytest.approx(2.0)
+    assert whole.values[0] == pytest.approx(1000.0)
+    assert whole.bounds() == pytest.approx(
+        (_TIE_E, _TIE_N - 20.0, _TIE_E + 21.0, _TIE_N)
+    )
+
+    # A strip well south of the tie point, where a row size taken from the
+    # width ratio lands the window 0.55 m north of its own pixels.
+    south = reader.read_window(
+        _TIE_E, _TIE_N - 16.0, _TIE_E + 20.0, _TIE_N - 12.0, max_pixels=50
+    )
+    assert (south.width, south.height) == (11, 2)
+    assert south.n_top == pytest.approx(_TIE_N - 12.0)
+    assert south.values[0] == pytest.approx(1000.0 + 6 * 100)
+    # The centre of overview pixel (3, 7), by the file's own arithmetic.
+    assert south.sample_bng(
+        _TIE_E + 3.5 * (21.0 / 11.0), _TIE_N - 15.0
+    ) == pytest.approx(1000.0 + 7 * 100 + 3)
+
+
+def test_refuses_a_raster_whose_pixels_are_not_square(tmp_path):
+    # Every window this module returns quotes one resolution, and every
+    # file downstream of it does too, so a raster that is 1 m across and
+    # 2 m down is refused rather than described by half of its own scale.
+    values = _grid(8, 8, lambda x, y: 1.0)
+    with pytest.raises(CogError, match="square"):
+        _reader(tmp_path, _make_cog([(8, 8, values)], pixel_size_y=2.0), "tall.tif")
+
+
+def test_edge_tile_padding_is_not_read_as_terrain(tmp_path):
+    # TIFF pads the last tile of a row or column out to the full tile size
+    # and says nothing about what goes in the padding. Here it is a
+    # plausible height rather than the nodata sentinel, which is what an
+    # unfriendly producer leaves; the reader must stop at the image's own
+    # declared extent, not at the tile grid.
+    values = _grid(8, 8, lambda x, y: 5.0)
+    reader = _reader(tmp_path, _make_cog([(8, 8, values)], pad=1234.0))
+
+    window = reader.read_window(_TIE_E, _TIE_N - 12.0, _TIE_E + 12.0, _TIE_N)
+
+    assert (window.width, window.height) == (12, 12)
+    for row in range(12):
+        for column in range(12):
+            got = window.values[row * 12 + column]
+            if row < 8 and column < 8:
+                assert got == pytest.approx(5.0)
+            else:
+                assert math.isnan(got), f"pad at {column},{row} read as {got}"
+    assert window.sample_bng(_TIE_E + 10.0, _TIE_N - 2.0) is None
 
 
 def test_a_window_beyond_the_raster_edge_is_nan_not_a_refusal(tmp_path):
@@ -648,6 +744,24 @@ def test_a_range_answered_without_content_range_or_short_is_refused():
     )
     with pytest.raises(CogError, match="15 bytes"):
         short.read(0, 16)
+
+
+def test_a_shifted_content_range_is_refused():
+    # A proxy or a cache answering 206 with a different range than the one
+    # asked for is the quiet version of the 200 case: the bytes arrive, the
+    # status is right, and the tile decoder is handed somebody else's part
+    # of the file as if it were the slice it computed. Presence of the
+    # header is not agreement with it.
+    built = _make_cog([(8, 8, _grid(8, 8, lambda x, y: 1.0))])
+    session = _RangeSession(built.data, mode="shifted_range")
+    shifted = HttpByteSource("https://example.invalid/wales.tif", session=session)
+
+    with pytest.raises(CogError, match="different bytes") as refusal:
+        shifted.read(64, 32)
+
+    message = str(refusal.value)
+    assert "wales.tif" in message
+    assert "://" not in message
 
 
 def test_a_failed_range_request_is_retried_exactly_once():

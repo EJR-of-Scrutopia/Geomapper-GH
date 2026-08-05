@@ -37,11 +37,40 @@ extent is the full resolution extent, so each level's pixel size is level
 0's scaled by the dimension ratio. That is GDAL's own overview arithmetic
 (`GDALOverviewDataset::GetGeoTransform` multiplies by exactly this ratio),
 and it is not quite a power of two, because 191,007 pixels halve to 95,504
-rather than to 95,503.5: the measured levels are 1, 1.9999895, 3.9999791,
-7.9999581, 15.9999162, 31.9998325 and 63.9889447 metres. The difference
-from the round number is about five millimetres across a 500 m window, and
-the measured number is the one recorded, because every downstream
-`source_resolution_m` quotes it.
+rather than to 95,503.5.
+
+**Per axis, because the two ratios disagree.** Measured on the real DTM:
+
+    level   pixels            east/west     north/south
+    0       191007 x 233000    1.0000000     1.0000000
+    1        95504 x 116500    1.9999895     2.0000000
+    2        47752 x  58250    3.9999791     4.0000000
+    3        23876 x  29125    7.9999581     8.0000000
+    4        11938 x  14563   15.9999162    15.9994507
+    5         5969 x   7282   31.9998325    31.9967042
+    6         2985 x   3641   63.9889447    63.9934084
+
+The columns differ in the seventh digit and the temptation is to carry one
+number. Do not: the error a single scalar makes is the ROW INDEX times the
+difference, and a Barry window sits 115,050 rows down the mosaic. Using
+level 1's east/west size for its rows puts that window 1.2 m north of its
+own pixels, and level 6 about 16 m. So `CogLevel` and `BngWindow` each
+carry both, and every piece of arithmetic below uses the one belonging to
+its axis. A non-square raster at level 0 is refused outright instead (see
+`_read_placement`), because that anisotropy would be a claim about the
+ground rather than an artefact of rounded dimensions.
+
+Which anchoring these overviews really use is worth naming as an open
+question. The ratio convention above is what GDAL and rasterio report, and
+it assumes the overview was stretched onto the full extent. The other
+possibility is that the producer decimated by exactly two with the grid
+anchored at the origin, in which case every level would be an exact power
+of two and the ratio places overview pixels up to about a metre west of
+where they are at Barry. An attempt to settle it by correlating level 1
+against level 0 on real terrain was inconclusive (the control axis, where
+both hypotheses agree, did not return a zero shift, so the method had no
+power). The consequence is bounded and confined to overview levels: it
+does not touch the 1 m path, which is what a site survey uses.
 
 ## PixelIsArea, which phase 1 refused and this must not
 
@@ -366,14 +395,9 @@ class HttpByteSource:
                             f"{length} byte range mapgen asked for."
                         )
                     answered = getattr(response, "headers", None) or {}
-                    if "Content-Range" not in answered:
-                        raise CogError(
-                            f"The server holding {self.name} answered a range "
-                            f"request without saying which bytes it sent, so "
-                            f"what came back cannot be trusted to be the "
-                            f"range that was asked for."
-                        )
-                    self._note_size(answered.get("Content-Range"))
+                    self._accept_range(
+                        answered.get("Content-Range"), start, length
+                    )
                     chunks: list[bytes] = []
                     total = 0
                     for chunk in response.iter_content(_HTTP_CHUNK_BYTES):
@@ -405,17 +429,49 @@ class HttpByteSource:
             self.bytes_fetched += length
             return b"".join(chunks)[:length]
 
-    def _note_size(self, content_range: str | None) -> None:
-        """The file's total length, out of a header it has to send anyway.
+    def _accept_range(
+        self, content_range: str | None, start: int, length: int
+    ) -> None:
+        """Check that the bytes offered are the bytes that were asked for.
 
-        `bytes 0-15/48611310928`. A malformed or starred total leaves the
-        size unknown rather than guessed, and `size` refuses on that.
+        `bytes 0-15/48611310928`. Presence of this header is not agreement
+        with it, and the difference matters: a proxy or a cache that
+        answers 206 with some OTHER part of the file passes every other
+        check in this method, and its bytes are then handed to the tile
+        decoder as the slice the tile index computed. That is a window
+        made of the wrong pixels, with no error anywhere, which is the
+        exact failure this module is built to make impossible.
+
+        The total after the slash is taken while it is here, because it is
+        how `size` learns the file's length without a second request. A
+        starred or malformed total leaves the size unknown rather than
+        guessed, and `size` refuses on that; an unparseable range is
+        refused outright, because a range that cannot be read cannot be
+        checked either.
         """
-        if not content_range or "/" not in content_range:
-            return
-        total = content_range.rsplit("/", 1)[1].strip()
-        if total.isdigit():
-            self._size = int(total)
+        text = (content_range or "").strip()
+        first = last = total = None
+        if text.lower().startswith("bytes "):
+            span, _, tail = text[6:].partition("/")
+            begin, _, end = span.partition("-")
+            if begin.strip().isdigit() and end.strip().isdigit():
+                first, last = int(begin), int(end)
+            if tail.strip().isdigit():
+                total = int(tail)
+        if first is None or last is None:
+            raise CogError(
+                f"The server holding {self.name} answered a range request "
+                f"without saying which bytes it sent, so what came back "
+                f"cannot be trusted to be the range that was asked for."
+            )
+        if first != start or last != start + length - 1:
+            raise CogError(
+                f"The server holding {self.name} answered with different "
+                f"bytes ({first} to {last}) than the {start} to "
+                f"{start + length - 1} range mapgen asked for."
+            )
+        if total is not None:
+            self._size = total
 
 
 @dataclass(frozen=True)
@@ -451,7 +507,14 @@ class CogLevel:
     index: int
     width: int
     height: int
+    # East to west and north to south separately. They are equal at level
+    # 0 (a non-square source raster is refused, see _read_placement) and
+    # differ at an overview level whenever the two dimension ratios do:
+    # 191007/95504 is 1.9999895 while 233000/116500 is exactly 2. One
+    # scalar used for both axes puts an overview window metres away from
+    # its own pixels, growing with distance from the tie point.
     pixel_size: float
+    pixel_height: float
     tile_width: int
     tile_height: int
     tiles_across: int
@@ -476,6 +539,14 @@ class BngWindow:
     RasterPixelIsArea GeoTIFF and read back to the same place.
     `values` is row major, north first, float32, with every nodata pixel
     already NaN.
+
+    `pixel_size` is the east to west size and is the number anything
+    downstream means by "resolution". `pixel_height` is the north to
+    south size, and it is a separate field because an overview level of
+    the real mosaics genuinely has a different one (see `CogLevel`). It
+    defaults to `pixel_size`, so a window built by hand for a square
+    grid, which is every window this project makes outside `read_window`,
+    reads exactly as it did before this field existed.
     """
 
     e_origin: float
@@ -484,12 +555,20 @@ class BngWindow:
     width: int
     height: int
     values: array
+    # Last, and defaulted, only because a dataclass cannot put a
+    # defaulted field before an undefaulted one. Never None after
+    # construction.
+    pixel_height: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.pixel_height is None:
+            object.__setattr__(self, "pixel_height", self.pixel_size)
 
     def bounds(self) -> tuple[float, float, float, float]:
         """(e_min, n_min, e_max, n_max) of the window's outer edges."""
         return (
             self.e_origin,
-            self.n_top - self.height * self.pixel_size,
+            self.n_top - self.height * self.pixel_height,
             self.e_origin + self.width * self.pixel_size,
             self.n_top,
         )
@@ -514,7 +593,7 @@ class BngWindow:
         if self.width < 2 or self.height < 2:
             return None
         column = (easting - self.e_origin) / self.pixel_size - 0.5
-        row = (self.n_top - northing) / self.pixel_size - 0.5
+        row = (self.n_top - northing) / self.pixel_height - 0.5
         if not (math.isfinite(column) and math.isfinite(row)):
             return None
         if column < 0.0 or row < 0.0:
@@ -762,16 +841,18 @@ class CogReader:
             )
             raise CogError(
                 f"{self.name} cannot answer that extent within {max_pixels} "
-                f"pixels: even its coarsest level ({coarsest.pixel_size:g} m) "
-                f"needs {width} by {height}. Ask for a smaller extent."
+                f"pixels: even its coarsest level ({coarsest.pixel_size:g} by "
+                f"{coarsest.pixel_height:g} m) needs {width} by {height}. Ask "
+                f"for a smaller extent."
             )
 
         values = array("f", [math.nan]) * (width * height)
         self._fill(level, col0, row0, width, height, values)
         return BngWindow(
             e_origin=self.origin_e + col0 * level.pixel_size,
-            n_top=self.origin_n - row0 * level.pixel_size,
+            n_top=self.origin_n - row0 * level.pixel_height,
             pixel_size=level.pixel_size,
+            pixel_height=level.pixel_height,
             width=width,
             height=height,
             values=values,
@@ -791,11 +872,10 @@ class CogReader:
         least what was asked for rather than cutting a partial pixel off
         an edge.
         """
-        size = level.pixel_size
-        col0 = math.floor((e_min - self.origin_e) / size)
-        col1 = math.ceil((e_max - self.origin_e) / size)
-        row0 = math.floor((self.origin_n - n_max) / size)
-        row1 = math.ceil((self.origin_n - n_min) / size)
+        col0 = math.floor((e_min - self.origin_e) / level.pixel_size)
+        col1 = math.ceil((e_max - self.origin_e) / level.pixel_size)
+        row0 = math.floor((self.origin_n - n_max) / level.pixel_height)
+        row1 = math.ceil((self.origin_n - n_min) / level.pixel_height)
         return col0, row0, max(1, col1 - col0), max(1, row1 - row0)
 
     def _fill(
@@ -927,14 +1007,23 @@ class CogReader:
         left = tx * tile_w - col0
         top = ty * tile_h - row0
         x0 = max(0, left)
-        x1 = min(width, left + tile_w)
+        # Bounded by the IMAGE, not only by the window and the tile. TIFF
+        # pads the last tile of a row or column out to the full tile size
+        # and says nothing about what goes in the padding: on the real
+        # mosaic that is 105 columns east and 216 rows south of the
+        # declared 191007 by 233000, and whatever the producer left there
+        # is not terrain. Reading it as terrain is silent, plausible and
+        # exactly wrong at the one place a mosaic is most likely to be
+        # sampled, its edge.
+        x1 = min(width, left + tile_w, level.width - col0)
         if x1 <= x0:
             return
+        last_row = min(height, level.height - row0)
         for row in range(tile_h):
             y = top + row
             if y < 0:
                 continue
-            if y >= height:
+            if y >= last_row:
                 break
             source = row * tile_w + (x0 - left)
             target = y * width + x0
@@ -1166,6 +1255,20 @@ def _read_placement(
             f"{name} declares a pixel scale of {scale[0]} by {scale[1]}, which "
             f"is not a size on the ground."
         )
+    # Square pixels at the full resolution, refused rather than read.
+    # Everything downstream of a window quotes ONE resolution for it (the
+    # contour properties, the survey record, the copy the owner reads), so
+    # a raster that is 1 m across and 2 m down would be described by half
+    # of its own scale wherever it went. The overview levels' own small
+    # anisotropy is a different thing and is carried honestly per axis:
+    # it comes from dimensions that did not halve evenly, is bounded by
+    # that rounding, and is not a property of the ground.
+    if abs(scale[0] - scale[1]) > 1e-6 * max(scale[0], scale[1]):
+        raise CogError(
+            f"{name} has pixels {scale[0]} m across and {scale[1]} m down. "
+            f"mapgen reads rasters with square pixels; one resolution is "
+            f"quoted for every window and file that comes out of this one."
+        )
     return [float(value) for value in scale], [float(value) for value in tie]
 
 
@@ -1286,18 +1389,29 @@ def _read_level(
         )
 
     if index == 0:
-        pixel_size = float(scale[0])
+        pixel_size, pixel_height = float(scale[0]), float(scale[1])
     else:
         # No geo tags of their own, by construction: an overview covers
         # the full resolution extent, so its pixel size is level 0's
         # times the dimension ratio, which is what GDAL itself does.
+        #
+        # Per axis, and that is not pedantry. The two ratios disagree
+        # whenever the dimensions did not halve evenly, which on the real
+        # DTM is every level: 191007/95504 is 1.9999895 across while
+        # 233000/116500 is exactly 2 down. Taking the width's answer for
+        # both puts a Barry window on level 1 about 1.2 m north of its own
+        # pixels, and roughly 16 m at level 6, because the error is the
+        # row index times the difference.
         base_width = _one(head, first, _IMAGE_WIDTH, order, name) or width
+        base_height = _one(head, first, _IMAGE_LENGTH, order, name) or height
         pixel_size = float(scale[0]) * base_width / width
+        pixel_height = float(scale[1]) * base_height / height
     return CogLevel(
         index=index,
         width=width,
         height=height,
         pixel_size=pixel_size,
+        pixel_height=pixel_height,
         tile_width=tile_width,
         tile_height=tile_height,
         tiles_across=across,
