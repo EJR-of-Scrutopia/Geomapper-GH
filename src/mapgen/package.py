@@ -21,8 +21,10 @@ from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, v
 from mapgen.cog import CogError, CogReader, FileByteSource, read_full_window
 from mapgen.egrid import (
     ElevationGridError,
+    _ChainSampler,
     elevation_grid_path,
     write_elevation_grid,
+    write_elevation_grid_from_sampler,
 )
 from mapgen.elevation_models import DEFAULT_DEMTYPE, validate_demtype
 from mapgen.fsutil import (
@@ -32,6 +34,7 @@ from mapgen.fsutil import (
     work_dir_scope,
 )
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
+from mapgen.geotiff import GeoTiffError, read_dem
 from mapgen.heights import HeightsError, fuse_building_heights
 from mapgen.jobs import FAILED, OK, PENDING, CancelToken, Cancelled, JobState
 from mapgen.merge import assert_inputs_present
@@ -1124,19 +1127,28 @@ def _elevation_grid_record(
     nodes: int | None = None,
     covered: int | None = None,
     error: str | None = None,
+    source: str | None = None,
 ) -> dict[str, object]:
     """survey.json's `elevation_grid` block, in ONE shape whatever happened.
 
-    All five keys, always. README's schema table has always described the
-    block as five keys, but `covered` used to be added only on the success
-    branch, so a package with no DEM and a package whose DEM could not be
-    read each carried four. Nothing in mapgen noticed, because cli.py reads
-    the block with .get; a reader following the README and indexing the key
-    got a KeyError on exactly the packages where they most wanted to know.
+    All six keys, always. README's schema table has always described the
+    block this way (five keys before Task 8, six since), but `covered`
+    used to be added only on the success branch, so a package with no DEM
+    and a package whose DEM could not be read each carried four. Nothing
+    in mapgen noticed, because cli.py reads the block with .get; a reader
+    following the README and indexing the key got a KeyError on exactly
+    the packages where they most wanted to know.
 
     A record whose KEYS depend on the outcome is the kind of shape that is
     only ever found by the reader who trips over it, so the outcome now
     lives entirely in the values.
+
+    `source` (Task 8) is one of `"lidar_wales+opentopography"`,
+    `"lidar_wales"`, `"opentopography"` or `None`: which raster (or both,
+    LiDAR first) actually answered the grid that was written, `None` on
+    every branch that wrote nothing at all, written or not. It is not
+    derivable from `covered` alone, which counts nodes and says nothing
+    about which sampler answered them.
     """
     return {
         "written": written,
@@ -1144,6 +1156,7 @@ def _elevation_grid_record(
         "nodes": nodes,
         "covered": covered,
         "error": error,
+        "source": source,
     }
 
 
@@ -1158,8 +1171,34 @@ def _write_elevation_grid_step(
     beside it is a file nothing in Urbano can open. This writes the file
     those components want, out of the DEM mapgen already has.
 
-    The ONLY place in mapgen that calls write_elevation_grid, for the same
-    reason _run_bridge_step and _write_project_setting_step are each the only
+    Task 8 adds a second, better DEM: `<stem>_lidar_dtm.tif`, LidarWalesSource's
+    own 1 m Ordnance Survey terrain model, which answers far more of the
+    grid than COP30 ever will inside its own coverage. The decision, in
+    order:
+
+      * The LiDAR DTM is on disk AND an OSTN15 shift grid can be obtained
+        (`load_ostn15`, then `ensure_ostn15` if the cache is empty): sample
+        the DTM first and the OpenTopography tiff second, through
+        `egrid._ChainSampler`, when both rasters are there
+        (`source: "lidar_wales+opentopography"`), or the DTM alone when
+        the tiff is not (`source: "lidar_wales"`).
+      * Otherwise, the phase 1 path, unchanged: the tiff alone if it is
+        there (`source: "opentopography"`), matching every run before this
+        task exactly, including its own refusal wording.
+      * A LiDAR DTM with no usable OSTN15 grid and no tiff to fall back to
+        is a real DEM this step cannot honestly convert, recorded as a
+        failure rather than silently read as "no DEM".
+      * Neither raster present at all removes any `.egrid` a previous
+        attempt left, exactly as phase 1 did.
+
+    OSTN15 is only ever asked for when the LiDAR DTM is on disk: a survey
+    that never selected `lidar_wales` touches neither the cache nor the
+    network here, same as `_fuse_heights_step`'s own reasoning for the
+    same lookup.
+
+    The ONLY place in mapgen that calls write_elevation_grid (or, since
+    Task 8, write_elevation_grid_from_sampler), for the same reason
+    _run_bridge_step and _write_project_setting_step are each the only
     caller of theirs: two call sites would have to be kept agreeing forever
     about which failures are survivable and which events are emitted.
 
@@ -1177,10 +1216,10 @@ def _write_elevation_grid_step(
     the `.tif`, and package.py's `_bridge_input_file` reads the same list to
     pick the file it hands the C# bridge as `--elevation-tiff-path`. Naming
     the `.egrid` there would eventually hand a protobuf to a flag that wants
-    a raster. So instead: no DEM in the package means any `.egrid` beside it
-    is removed here, which covers more ground than the sweep does anyway,
-    since the sweep never runs on an incomplete package or on `mapgen bridge`
-    and this runs on both.
+    a raster. So instead: no DEM of either kind in the package means any
+    `.egrid` beside it is removed here, which covers more ground than the
+    sweep does anyway, since the sweep never runs on an incomplete package
+    or on `mapgen bridge` and this runs on both.
 
     A failure costs the package nothing. It is recorded here, in survey.json
     and through the sink, and the run finishes: a package without terrain is
@@ -1190,20 +1229,63 @@ def _write_elevation_grid_step(
     """
     target = elevation_grid_path(root, stem)
     tiff = Path(root) / f"{stem}.tif"
-    if not tiff.is_file():
-        # No DEM, so no terrain, and no leftover from a previous attempt
-        # either: an .egrid describing a DEM this package no longer holds is
-        # a file the owner would read straight into Grasshopper.
+    dtm_path = Path(root) / f"{stem}_lidar_dtm.tif"
+    has_tiff = tiff.is_file()
+    has_lidar_dtm = dtm_path.is_file()
+
+    if not has_tiff and not has_lidar_dtm:
+        # No DEM of either kind, so no terrain, and no leftover from a
+        # previous attempt either: an .egrid describing a DEM this package
+        # no longer holds is a file the owner would read straight into
+        # Grasshopper.
         removed = target.exists()
         target.unlink(missing_ok=True)
         if removed:
             sink.emit("elevation_grid_removed", file=target.name)
         return _elevation_grid_record()
 
+    ostn15_grid = None
+    if has_lidar_dtm:
+        try:
+            ostn15_grid = load_ostn15()
+            if ostn15_grid is None:
+                ostn15_grid = ensure_ostn15()
+        except BngError:
+            # No cached grid, and the network fetch failed (or this
+            # machine has never had a network to fetch one with). Falls
+            # through to the phase 1 tiff path below when there is a tiff
+            # to fall back to, and is recorded as a failure, honestly,
+            # when there is not (see the has_lidar_dtm-and-not-has_tiff
+            # branch below): never a crash either way.
+            ostn15_grid = None
+
+    zone = project_zone(bbox)
     sink.emit("elevation_grid_started")
+    source: str | None = None
     try:
-        grid = write_elevation_grid(tiff, bbox, project_zone(bbox), target)
-    except (ElevationGridError, OSError) as exc:
+        if has_lidar_dtm and ostn15_grid is not None:
+            window = read_full_window(CogReader.open(FileByteSource(dtm_path)))
+            fallback = read_dem(tiff) if has_tiff else None
+            sampler = _ChainSampler(lidar=window, ostn15=ostn15_grid, fallback=fallback)
+            grid = write_elevation_grid_from_sampler(sampler, bbox, zone, target)
+            source = "lidar_wales+opentopography" if has_tiff else "lidar_wales"
+        elif has_tiff:
+            grid = write_elevation_grid(tiff, bbox, zone, target)
+            source = "opentopography"
+        else:
+            # has_lidar_dtm is True here (the "neither raster" case
+            # returned above) and ostn15_grid is None: a real LiDAR DTM
+            # sits in the package, OSTN15 could not be obtained for it,
+            # and there is no OpenTopography tiff to fall back to. A DEM
+            # this step cannot honestly convert is a failure to report,
+            # not the "no DEM" branch above, and not a silent no-op either.
+            raise ElevationGridError(
+                f"{dtm_path.name} is on disk, but the OSTN15 shift grid it "
+                f"needs could not be obtained, and this package has no "
+                f"OpenTopography DEM to fall back to, so no elevation grid "
+                f"could be built."
+            )
+    except (ElevationGridError, GeoTiffError, CogError, OSError) as exc:
         error = str(exc)
         # Never left half converted. A previous run's .egrid describing a
         # different DEM would be worse than none, and a partially written one
@@ -1223,6 +1305,7 @@ def _write_elevation_grid_step(
         file=target.name,
         nodes=len(grid.heights),
         covered=covered,
+        source=source,
     )
 
 
@@ -2805,7 +2888,7 @@ def _build_survey_json(
     }
     elevation_grid = elevation_grid or {
         "written": False, "file": None, "nodes": None, "covered": None,
-        "error": None,
+        "error": None, "source": None,
     }
     lidar_heights = lidar_heights or {
         "written": None, "buildings": None, "kept_existing": None,
@@ -2962,6 +3045,11 @@ def _build_survey_json(
         # over. `covered` is how many of the grid's nodes the DEM could
         # actually answer for, which on a coastal survey is well under all of
         # them and is worth being able to see without opening Grasshopper.
+        # `source` (Task 8) says which raster actually answered: the Welsh
+        # LiDAR DTM, OpenTopography's own DEM, or both with the LiDAR
+        # preferred, so a reader can tell a Welsh survey's better terrain
+        # apart from the coarser 30 m fallback without diffing `covered`
+        # against a run from before `lidar_wales` was selected.
         "elevation_grid": elevation_grid,
         # Task 7. `written` is None, not 0 or False, on a package this step
         # never ran on at all (no `.osm`, or no Welsh LiDAR selected):

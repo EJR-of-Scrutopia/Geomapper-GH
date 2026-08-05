@@ -1,6 +1,8 @@
 import json
+import math
 import threading
 import time
+from array import array
 from datetime import date
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import pytest
 import requests
 
 from mapgen.bng import BngError
+from mapgen.cog import BngWindow
 from mapgen.geo import BBox, build_tiles
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken, EventLog, JobState
@@ -5402,6 +5405,9 @@ def test_a_run_with_a_dem_writes_the_egrid_beside_it(tmp_path):
     assert record["nodes"] == 12432
     assert record["covered"] == 3763
     assert record["error"] is None
+    # No LiDAR DTM in this package: the phase 1 path, unchanged, and the
+    # source says so explicitly rather than leaving it to be inferred.
+    assert record["source"] == "opentopography"
 
 
 def test_the_egrid_is_what_the_project_setting_names_and_never_the_raster(tmp_path):
@@ -5441,11 +5447,12 @@ def test_a_dem_that_cannot_be_converted_costs_the_package_nothing(tmp_path):
 
     assert result.complete is True
     record = result.survey["elevation_grid"]
-    # Same five keys as a success and as a package with no DEM at all, so
+    # Same six keys as a success and as a package with no DEM at all, so
     # a reader following README's schema can index any of them.
-    assert set(record) == {"written", "file", "nodes", "covered", "error"}
+    assert set(record) == {"written", "file", "nodes", "covered", "error", "source"}
     assert record["written"] is False
     assert record["covered"] is None
+    assert record["source"] is None
     assert "byte order mark" in record["error"]
     assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
     # The rest of the package is untouched, and the project setting says so
@@ -5460,9 +5467,9 @@ def test_a_run_with_no_dem_at_all_says_nothing_went_wrong(tmp_path):
     is a different statement from "the DEM could not be converted" and has to
     read differently in survey.json.
 
-    All five keys, including `covered`, whatever happened. README describes
-    the block as five keys, and a record whose KEYS move with the outcome is
-    one only the reader who trips over it ever finds.
+    All six keys, including `covered` and `source`, whatever happened.
+    README describes the block this way, and a record whose KEYS move with
+    the outcome is one only the reader who trips over it ever finds.
     """
     register(UrbanoReadableStubSource())
     result = run_survey(_request(tmp_path, run_bridge_step=False))
@@ -5470,7 +5477,7 @@ def test_a_run_with_no_dem_at_all_says_nothing_went_wrong(tmp_path):
     record = result.survey["elevation_grid"]
     assert record == {
         "written": False, "file": None, "nodes": None, "covered": None,
-        "error": None,
+        "error": None, "source": None,
     }
 
 
@@ -5797,3 +5804,233 @@ def test_bridge_package_re_runs_fusion_idempotently(tmp_path, monkeypatch):
     # The file itself agrees: still exactly one height tag, not two.
     osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
     assert osm_text.count('k="height" v="6.0"') == 1
+
+
+# --------------------------------------------------------------------------
+# Task 8: feeding the elevation grid from Welsh LiDAR, with the
+# OpenTopography DEM as a fallback, phase 1's grid geometry untouched.
+#
+# mapgen.package.load_ostn15 is monkeypatched to a zero-shift grid
+# throughout (or, for the two fallback tests, to None alongside a raising
+# ensure_ostn15), matching Task 7's own tests above and the brief's rule
+# that this task's tests touch no network.
+# --------------------------------------------------------------------------
+
+
+def _covering_lidar_window(
+    bbox: BBox, *, value: float = 42.0, pixel_size: float = 5.0, pad_metres: float = 100.0
+) -> BngWindow:
+    """A `BngWindow`, real everywhere, big enough to cover the whole of
+    `bbox`'s own padded elevation grid (`egrid.grid_geometry`) with margin
+    to spare.
+
+    The grid's own nodes sit on a rectangle aligned to a UTM zone and this
+    window's on one aligned to the National Grid; the two projections'
+    true origins sit only a degree of longitude apart, so the skew
+    between the two rectangles over an extent this size is centimetres,
+    comfortably inside `pad_metres`. Built from the bbox each test already
+    threads through `_request`, rather than a fixed literal, so a change
+    to DEM_BBOX cannot silently stop this fixture covering it.
+    """
+    from mapgen.bng import tm_forward
+    from mapgen.egrid import grid_geometry
+    from mapgen.urbano import project_zone
+    from mapgen.utm import unproject
+
+    zone = project_zone(bbox)
+    nx, ny, x0, y0, dx, dy = grid_geometry(bbox, zone)
+    corners = [
+        (x0, y0),
+        (x0 + (nx - 1) * dx, y0),
+        (x0, y0 + (ny - 1) * dy),
+        (x0 + (nx - 1) * dx, y0 + (ny - 1) * dy),
+    ]
+    bng_points = [
+        tm_forward(*unproject(easting, northing, zone)) for easting, northing in corners
+    ]
+    eastings = [e for e, _ in bng_points]
+    northings = [n for _, n in bng_points]
+    e_min, e_max = min(eastings) - pad_metres, max(eastings) + pad_metres
+    n_min, n_max = min(northings) - pad_metres, max(northings) + pad_metres
+    width = int(math.ceil((e_max - e_min) / pixel_size))
+    height = int(math.ceil((n_max - n_min) / pixel_size))
+    values = array("f", [value]) * (width * height)
+    return BngWindow(
+        e_origin=e_min, n_top=n_max, pixel_size=pixel_size,
+        width=width, height=height, values=values,
+    )
+
+
+class LidarChainStubSource(RealDemStubSource):
+    """The real OpenTopography DEM (as `RealDemStubSource` already writes)
+    plus a LiDAR DTM covering the whole padded grid: the "both rasters
+    present" branch of Task 8's decision logic.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        write_bng_geotiff(dtm_path, _covering_lidar_window(DEM_BBOX))
+        return outputs + [dtm_path]
+
+
+class LidarOnlyStubSource(UrbanoReadableStubSource):
+    """A LiDAR DTM and no OpenTopography DEM at all: the "LiDAR alone"
+    branch of Task 8's decision logic.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        outputs = super().merge(parts, out_dir, stem)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        write_bng_geotiff(dtm_path, _covering_lidar_window(DEM_BBOX))
+        return outputs + [dtm_path]
+
+
+def test_a_package_with_both_rasters_prefers_lidar_and_reports_the_chain_source(
+    tmp_path, monkeypatch
+):
+    """The whole of Task 8's chain path in one test. A package holding
+    both a Welsh LiDAR DTM and an OpenTopography DEM samples the DTM
+    first, reports the combined source, and its grid covers strictly more
+    of its own 12432 nodes than the COP30-only grid
+    test_a_run_with_a_dem_writes_the_egrid_beside_it measures at 3763,
+    because this fixture's DTM was built wide enough to answer nodes the
+    DEM cannot.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(LidarChainStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is True
+    assert record["source"] == "lidar_wales+opentopography"
+    assert record["nodes"] == 12432
+    assert record["covered"] > 3763, (
+        "the LiDAR DTM fixture was built to answer nodes the COP30 DEM "
+        "cannot; if it stopped doing that this test would stop proving "
+        "anything"
+    )
+
+
+def test_a_package_with_only_lidar_reports_lidar_alone(tmp_path, monkeypatch):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(LidarOnlyStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is True
+    assert record["source"] == "lidar_wales"
+    assert record["covered"] > 0
+    assert not (result.paths.root / f"{result.paths.stem}.tif").exists()
+
+
+def test_bridge_package_rebuilds_the_chain_egrid_the_same_way(tmp_path, monkeypatch):
+    """Bridge parity: whatever a survey wrote, `mapgen bridge` reproduces
+    from the same rasters already on disk, with no re-download, reporting
+    the same source.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(LidarChainStubSource())
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+    downloaded_source = result.survey["elevation_grid"]["source"]
+    assert downloaded_source == "lidar_wales+opentopography"
+    (result.paths.root / f"{result.paths.stem}.egrid").unlink()
+
+    payload = bridge_package(
+        result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0)
+    )
+
+    assert payload["elevation_grid"]["source"] == downloaded_source
+    assert payload["elevation_grid"]["written"] is True
+    assert (result.paths.root / f"{result.paths.stem}.egrid").is_file()
+
+
+def test_lidar_with_unusable_ostn15_falls_back_to_the_tiff_path(tmp_path, monkeypatch):
+    """OSTN15 being obtainable is half of the chain's own precondition.
+    When it is not, and there IS a tiff, the phase 1 path runs exactly as
+    it always has, and nothing crashes.
+    """
+    import mapgen.package as package_module
+
+    def _boom():
+        raise BngError("no OSTN15 for you")
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: None)
+    monkeypatch.setattr(package_module, "ensure_ostn15", _boom)
+    register(LidarChainStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is True
+    assert record["source"] == "opentopography"
+    assert record["covered"] == 3763, "the phase 1 tiff path, unchanged"
+
+
+def test_lidar_with_unusable_ostn15_and_no_tiff_is_a_recorded_failure_not_a_crash(
+    tmp_path, monkeypatch
+):
+    """The one combination Task 8 adds a genuine failure branch for: a
+    real LiDAR DTM sits in the package, OSTN15 cannot be obtained for it,
+    and there is no OpenTopography DEM to fall back to. Reading this as
+    "no DEM" would be dishonest (there IS a DEM sitting right there), and
+    removing a good `.egrid` an earlier attempt left would be worse than
+    either.
+    """
+    import mapgen.package as package_module
+
+    def _boom():
+        raise BngError("no OSTN15 for you")
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: None)
+    monkeypatch.setattr(package_module, "ensure_ostn15", _boom)
+    register(LidarOnlyStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert record["written"] is False
+    assert record["source"] is None
+    assert record["error"] is not None
+    assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
+    assert result.complete is True, "the rest of the package finishes regardless"
+
+
+@pytest.mark.parametrize(
+    "branch_name", ["chain", "tiff_only", "lidar_only", "failure", "removal"]
+)
+def test_the_record_carries_all_six_keys_on_every_branch(tmp_path, monkeypatch, branch_name):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    if branch_name == "chain":
+        register(LidarChainStubSource())
+    elif branch_name == "tiff_only":
+        register(RealDemStubSource())
+    elif branch_name == "lidar_only":
+        register(LidarOnlyStubSource())
+    elif branch_name == "failure":
+        class BadDemStub(UrbanoReadableStubSource):
+            def merge(self, parts, out_dir, stem):
+                outputs = super().merge(parts, out_dir, stem)
+                target = out_dir / f"{stem}.tif"
+                target.write_bytes(b"not a tiff")
+                return outputs + [target]
+
+        register(BadDemStub())
+    else:
+        assert branch_name == "removal"
+        register(UrbanoReadableStubSource())
+
+    result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
+
+    record = result.survey["elevation_grid"]
+    assert set(record) == {"written", "file", "nodes", "covered", "error", "source"}

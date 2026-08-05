@@ -33,19 +33,23 @@ from pathlib import Path
 
 import pytest
 
+from mapgen.bng import BngError
 from mapgen.egrid import (
     ELEVATION_GRID_SUFFIX,
     ElevationGrid,
     ElevationGridError,
+    _ChainSampler,
     build_grid,
     elevation_grid_path,
     encode,
     grid_geometry,
     write_elevation_grid,
+    write_elevation_grid_from_sampler,
 )
 from mapgen.geo import BBox
 from mapgen.geotiff import read_dem
 from mapgen.urbano import project_zone
+from tests.test_heights import _zero_shift_grid
 
 DATA = Path(__file__).resolve().parent / "data"
 
@@ -586,6 +590,119 @@ def test_a_missing_dem_is_refused_rather_than_crashing(tmp_path):
         write_elevation_grid(
             tmp_path / "nothere.tif", bbox, project_zone(bbox), tmp_path / "out.egrid"
         )
+
+
+# --------------------------------------------------------------------------
+# Task 8: the sampler refactor, and the LiDAR-first, DEM-fallback chain.
+# --------------------------------------------------------------------------
+
+
+def test_write_elevation_grid_from_sampler_equals_the_old_path_byte_for_byte(tmp_path):
+    """The refactor's whole contract. `write_elevation_grid` is now a thin
+    wrapper: read the tiff into a `DemRaster`, then delegate here. Feeding
+    that same `DemRaster` in by hand, bypassing the wrapper, has to produce
+    the exact bytes the tiff path always has, to the byte, or the two
+    functions are not actually one code path any more.
+    """
+    tif, _reference, bbox = BARRY
+    zone = project_zone(bbox)
+    via_wrapper = tmp_path / "via_wrapper.egrid"
+    via_sampler = tmp_path / "via_sampler.egrid"
+    write_elevation_grid(tif, bbox, zone, via_wrapper)
+    write_elevation_grid_from_sampler(read_dem(tif), bbox, zone, via_sampler)
+    assert via_sampler.read_bytes() == via_wrapper.read_bytes()
+
+
+def test_a_sampler_that_answers_nothing_is_refused_with_a_generic_sentence(tmp_path):
+    """The tiff wrapper's own refusal names the file
+    (test_a_dem_that_covers_none_of_the_extent_is_refused_not_written,
+    above); the sampler path has no single file to blame, since a
+    `_ChainSampler` speaks for a LiDAR DTM and a DEM at once, so it says so
+    honestly instead of inventing one to name.
+    """
+    tif, _reference, _bbox = BARRY
+    elsewhere = BBox(west=1.0, south=52.0, east=1.008, north=52.005)
+    target = tmp_path / "out.egrid"
+    with pytest.raises(ElevationGridError, match="Nothing under this survey"):
+        write_elevation_grid_from_sampler(
+            read_dem(tif), elsewhere, project_zone(elsewhere), target
+        )
+    assert not target.exists()
+
+
+class _StubSampler:
+    """A minimal `.sample(latitude, longitude, ...)` stand-in for
+    `_ChainSampler`'s own precedence tests: it answers a fixed value, a
+    fixed None, or raises a fixed exception, and it accepts (and ignores)
+    the extra `grid` argument `_ChainSampler` passes to `lidar.sample` but
+    not to `fallback.sample`, so the same stub serves as either half of
+    the chain without needing a real `BngWindow` or `DemRaster` at all.
+    """
+
+    def __init__(self, value: float | None = None, raises: Exception | None = None):
+        self.value = value
+        self.raises = raises
+        self.calls = 0
+
+    def sample(self, latitude: float, longitude: float, *args) -> float | None:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.value
+
+
+def test_chain_sampler_prefers_the_lidar_answer_when_it_has_one():
+    lidar = _StubSampler(value=12.5)
+    fallback = _StubSampler(value=99.0)
+    chain = _ChainSampler(lidar=lidar, ostn15=_zero_shift_grid(), fallback=fallback)
+    assert chain.sample(51.4, -3.27) == 12.5
+    assert fallback.calls == 0, "the DEM must never be consulted once LiDAR answers"
+
+
+def test_chain_sampler_falls_back_when_the_lidar_answers_none():
+    chain = _ChainSampler(
+        lidar=_StubSampler(value=None),
+        ostn15=_zero_shift_grid(),
+        fallback=_StubSampler(value=7.0),
+    )
+    assert chain.sample(51.4, -3.27) == 7.0
+
+
+def test_chain_sampler_stays_a_hole_when_neither_side_answers():
+    chain = _ChainSampler(
+        lidar=_StubSampler(value=None),
+        ostn15=_zero_shift_grid(),
+        fallback=_StubSampler(value=None),
+    )
+    assert chain.sample(51.4, -3.27) is None
+
+
+def test_chain_sampler_with_no_fallback_at_all_stays_a_hole_on_a_lidar_miss():
+    """The "LiDAR alone" case `_write_elevation_grid_step` builds when a
+    package has no OpenTopography DEM: `fallback` is `None` rather than a
+    second sampler, and a node the LiDAR cannot answer stays a hole, the
+    same as if this package had no elevation source at all.
+    """
+    chain = _ChainSampler(lidar=_StubSampler(value=None), ostn15=_zero_shift_grid())
+    assert chain.sample(51.4, -3.27) is None
+
+
+def test_chain_sampler_treats_a_bare_bngerror_as_no_lidar_here():
+    """`BngWindow.sample` catches `OutsideOstn15Error` itself but not the
+    plainer `BngError` its own `to_bng` can still raise for a non-finite
+    input (`bng.tm_forward`'s own guard, verified by reading cog.py's
+    `BngWindow.sample` and bng.py's `to_bng`/`tm_forward` directly: `sample`
+    only wraps the `OutsideOstn15Error` case, so a bare `BngError` from
+    `tm_forward` would otherwise propagate out of it uncaught). This chain
+    catches that too, and treats it exactly like a None answer rather than
+    letting one unsampleable node crash the whole grid.
+    """
+    chain = _ChainSampler(
+        lidar=_StubSampler(raises=BngError("not a real coordinate")),
+        ostn15=_zero_shift_grid(),
+        fallback=_StubSampler(value=3.0),
+    )
+    assert chain.sample(51.4, -3.27) == 3.0
 
 
 @pytest.mark.parametrize(

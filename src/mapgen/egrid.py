@@ -96,6 +96,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from mapgen.bng import BngError, Ostn15Grid
+from mapgen.cog import BngWindow
 from mapgen.fsutil import atomic_write_bytes
 from mapgen.geo import BBox
 from mapgen.geotiff import DemRaster, GeoTiffError, read_dem
@@ -366,12 +368,82 @@ def elevation_grid_path(root: Path, stem: str) -> Path:
     return Path(root) / f"{stem}{ELEVATION_GRID_SUFFIX}"
 
 
-def write_elevation_grid(tiff: Path, bbox: BBox, zone: str, target: Path) -> ElevationGrid:
-    """Convert a DEM GeoTIFF into a `.egrid` beside it. Returns the grid.
+class _NoCoverageError(ElevationGridError):
+    """The `real_count == 0` refusal, tagged so `write_elevation_grid`'s
+    wrapper can restate it with the tiff's own name.
+
+    Task 8 split the one-tiff writer into a sampler-generic builder
+    (`write_elevation_grid_from_sampler`) and a thin tiff wrapper around
+    it (`write_elevation_grid`). Both refuse an all-holes grid, and both
+    have to keep the sentence every test since task 39 already pins:
+    `write_elevation_grid`'s names the tiff, and a sampler has no single
+    file to name (a `_ChainSampler` speaks for a LiDAR DTM and a DEM at
+    once). Rather than two independent copies of the refusal drifting
+    apart, there is one check, in `write_elevation_grid_from_sampler`,
+    and this subclass is how its caller tells "the grid came back empty"
+    apart from any other `ElevationGridError` well enough to restate it
+    honestly, without every other caller of `write_elevation_grid_from_
+    sampler` having to know this type exists: it is still, and is caught
+    as, a plain `ElevationGridError` everywhere else.
+    """
+
+    def __init__(self, node_count: int) -> None:
+        self.node_count = node_count
+        super().__init__(
+            f"Nothing under this survey's {node_count} node elevation grid "
+            f"could be sampled, so writing it would put a hole in "
+            f"Grasshopper where the terrain should be."
+        )
+
+
+def write_elevation_grid_from_sampler(
+    sampler, bbox: BBox, zone: str, target: Path
+) -> ElevationGrid:
+    """Build a grid from anything with `.sample(latitude, longitude) ->
+    float | None` and write it beside `target`. Returns the grid.
+
+    `build_grid`'s own loop already only ever calls `.sample()` (see its
+    docstring), so nothing about the arithmetic changes for a sampler that
+    is not a `DemRaster`: today that is `_ChainSampler`, below, which
+    tries a Welsh LiDAR DTM before falling back to a DEM, but any other
+    object honouring the same one method works identically, including in
+    a test.
+
+    `write_elevation_grid` is this function with one extra step in front,
+    turning a tiff into a `DemRaster` first, which is what makes it a
+    THIN wrapper rather than a second copy: every refusal below this line
+    is written once and read by both callers.
 
     Written atomically, like everything else mapgen puts in a package: a
     half written protobuf is a file Urbano opens and throws on, and the
     owner's next Grasshopper session is the wrong place to find that out.
+
+    Refuses an all-holes grid (`real_count == 0`) exactly as the tiff path
+    always has, via `_NoCoverageError`: an `.egrid` of nothing but holes is
+    worse than none, and Import Terrain would build an empty mesh with no
+    explanation anywhere.
+    """
+    try:
+        grid = build_grid(sampler, bbox, zone)
+    except ProjectionError as exc:
+        raise ElevationGridError(str(exc)) from None
+    if grid.real_count == 0:
+        raise _NoCoverageError(len(grid.heights))
+    atomic_write_bytes(Path(target), encode(grid))
+    return grid
+
+
+def write_elevation_grid(tiff: Path, bbox: BBox, zone: str, target: Path) -> ElevationGrid:
+    """Convert a DEM GeoTIFF into a `.egrid` beside it. Returns the grid.
+
+    A thin wrapper: read the tiff into a `DemRaster`, then delegate to
+    `write_elevation_grid_from_sampler`, which is where the geometry, the
+    refusal and the atomic write all actually live now (Task 8). The one
+    thing this layer still owns is the tiff-specific wording of the
+    all-holes refusal, which every test since task 39 pins to the exact
+    sentence below: `_NoCoverageError` carries the node count back up so
+    this can restate it naming the file, rather than the generic sentence
+    a sampler with no single file to blame gets instead.
 
     Every refusal below the covers arrives here as an ElevationGridError with
     the original sentence in it, so the caller records one kind of failure
@@ -384,15 +456,65 @@ def write_elevation_grid(tiff: Path, bbox: BBox, zone: str, target: Path) -> Ele
     except OSError as exc:
         raise ElevationGridError(f"{Path(tiff).name} could not be read: {exc}") from None
     try:
-        grid = build_grid(dem, bbox, zone)
-    except ProjectionError as exc:
-        raise ElevationGridError(str(exc)) from None
-    if grid.real_count == 0:
+        return write_elevation_grid_from_sampler(dem, bbox, zone, target)
+    except _NoCoverageError as exc:
         raise ElevationGridError(
             f"{Path(tiff).name} covers none of this survey's extent, so every "
-            f"one of the {len(grid.heights)} nodes of the elevation grid would "
+            f"one of the {exc.node_count} nodes of the elevation grid would "
             f"be empty. Writing it would put a hole in Grasshopper where the "
             f"terrain should be."
-        )
-    atomic_write_bytes(Path(target), encode(grid))
-    return grid
+        ) from None
+
+
+@dataclass(frozen=True)
+class _ChainSampler:
+    """Samples a Welsh LiDAR DTM first, and falls back to an
+    OpenTopography DEM, or to a hole, where the LiDAR cannot answer.
+
+    Built by `package.py`'s `_write_elevation_grid_step`, which decides
+    which of a package's rasters exist and hands them here; this class
+    only knows how to combine two things that can each answer `.sample`,
+    not how a package is laid out. `fallback` is `None` for a package
+    that has the LiDAR DTM and no OpenTopography DEM at all (a Welsh
+    survey that never selected `elevation`, or one whose key or quota
+    failed): the chain then has one link, and a node the LiDAR cannot
+    answer stays a hole exactly as it would with no elevation source in
+    the package at all.
+    """
+
+    lidar: BngWindow
+    ostn15: Ostn15Grid
+    fallback: DemRaster | None = None
+
+    def sample(self, latitude: float, longitude: float) -> float | None:
+        """LiDAR first, the DEM second, and never both for the same node.
+
+        `BngWindow.sample` catches `OutsideOstn15Error` itself, for a
+        point beyond OSTN15's own 701 by 1251 node rectangle, but not the
+        plainer `BngError` its own `to_bng` can still raise for a
+        non-finite latitude or longitude (`bng.tm_forward`'s own guard).
+        Every latitude and longitude this chain is ever asked for comes
+        out of `unproject`, which never produces one, but the catch sits
+        here anyway rather than being assumed away: a point this chain
+        cannot place is a point to fall back on, on the same footing as
+        the OSTN15-coverage None right beside it, never a crash.
+        """
+        try:
+            height = self.lidar.sample(latitude, longitude, self.ostn15)
+        except BngError:
+            height = None
+        if height is not None:
+            return height
+        if self.fallback is None:
+            return None
+        # The one place this chain accepts being wrong, and the whole of
+        # what it accepts: COP30 fills water with a flat plane on its own
+        # EGM-family vertical datum rather than voiding it (see
+        # geotiff.py's own docstring on nodata), and the LiDAR DTM is
+        # Ordnance Datum Newlyn; the two do not agree to the millimetre at
+        # the seam between them. This fallback only ever fires where the
+        # LiDAR has nothing to say, over the sea and beyond the mosaic's
+        # own edge, and there COP30's filled water plane is exactly the
+        # value phase 1 already shipped, so nothing a real survey has been
+        # reading for months changes because of it.
+        return self.fallback.sample(latitude, longitude)
