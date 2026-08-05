@@ -5,14 +5,17 @@ import locale
 import os
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
+from mapgen.config import load_config
 from mapgen.geo import BBox, Tile
 from mapgen.package import SurveyRequest, register_default_sources, run_survey
 from mapgen.sources.base import NullProgress
+from mapgen.sources.elevation import MissingApiKeyError, resolve_api_key
 from mapgen.sources.overture import OvertureSource
 
 
@@ -88,6 +91,129 @@ def test_a_real_extent_with_nothing_in_it_is_a_success_with_no_file(tmp_path):
     assert entry["merged_files"] == []
     assert entry["features_merged"] == 0
     assert result.survey["tile_failures"] == []
+
+
+# --- Task 9: the whole Wales LiDAR chain, proven live end to end -------
+#
+# The same 400 x 400 m Barry extent test_lidar_wales.py's own live test
+# already proved has real LiDAR coverage under it (roughly 51.395, -3.27),
+# and independently confirmed (a raw map API probe, outside this suite) to
+# hold 445 `building=*` ways, so "no fused height anywhere in the file"
+# would mean this step broke, not that the extent had nothing to fuse.
+
+_END_TO_END_BBOX = "-3.272,51.393,-3.268,51.397"  # roughly 400 x 400 m, Barry
+
+
+def _opentopography_key_available() -> bool:
+    """Resolved exactly the way ElevationSource itself resolves a key
+    (explicit, then environment, then the saved config), never a second,
+    looser check: a key this function calls "available" and the source
+    then fails to find would be a false positive this test could not
+    afford, since the whole point is to run the real chain rather than
+    assume it.
+
+    Deliberately reads no value out for logging or assertion, only
+    whether resolution succeeds: the key itself is the owner's, kept out
+    of this file exactly as resolve_api_key's own callers keep it out of
+    survey.json and the tile_failed event.
+    """
+    try:
+        resolve_api_key(None, None, load_config().opentopography_api_key or None)
+    except MissingApiKeyError:
+        return False
+    return True
+
+
+@pytest.mark.live
+def test_the_whole_lidar_wales_chain_proves_itself_over_a_real_barry_extent(tmp_path):
+    """Task 9's end-to-end proof: one real `run_survey`, osm + overture +
+    lidar_wales, plus elevation if and only if the owner's own
+    OpenTopography key is actually configured or set in the environment
+    right now. A missing key is not something this test may fabricate or
+    hardcode one to work around (the brief's own ruling): it changes which
+    sources are selected and which `elevation_grid.source` is honest to
+    expect, and both branches are asserted accordingly rather than the
+    test silently skipping either way.
+    """
+    register_default_sources()
+    key_available = _opentopography_key_available()
+    source_ids = (
+        ("osm", "overture", "elevation", "lidar_wales")
+        if key_available
+        else ("osm", "overture", "lidar_wales")
+    )
+    request = SurveyRequest(
+        bbox=BBox.parse(_END_TO_END_BBOX),
+        region="South Wales",
+        site="Barry End To End",
+        output_root=tmp_path,
+        tile_size_m=1000.0,
+        overlap_m=50.0,
+        source_ids=source_ids,
+        run_bridge_step=False,
+    )
+
+    started = time.monotonic()
+    result = run_survey(request)
+    elapsed = time.monotonic() - started
+
+    assert result.complete is True
+    root, stem = result.paths.root, result.paths.stem
+
+    # The .osm holds at least one way this run itself fused, not one that
+    # already carried a height from OSM: fuse_building_heights only ever
+    # writes source:height alongside a height it wrote in the same pass
+    # (see mapgen.heights), so the pair together is what tells "fused"
+    # apart from "already there".
+    osm_path = root / f"{stem}.osm"
+    assert osm_path.exists() and osm_path.stat().st_size > 0
+    fused_tags = None
+    for way in ET.parse(osm_path).getroot().findall("way"):
+        tags = {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        if "height" in tags and "source:height" in tags:
+            fused_tags = tags
+            break
+    assert fused_tags is not None, (
+        "no way in the .osm carries a fused height/source:height pair; "
+        "either the extent's buildings changed or heights.py regressed"
+    )
+    assert "LiDAR" in fused_tags["source:height"]
+
+    dtm_path = root / f"{stem}_lidar_dtm.tif"
+    dsm_path = root / f"{stem}_lidar_dsm.tif"
+    assert dtm_path.exists() and dtm_path.stat().st_size > 0
+    assert dsm_path.exists() and dsm_path.stat().st_size > 0
+
+    contour_5m = root / f"{stem}_contours_5m.geojson"
+    contour_1m = root / f"{stem}_contours_1m.geojson"
+    assert contour_5m.exists() and contour_5m.stat().st_size > 0
+    assert contour_1m.exists() and contour_1m.stat().st_size > 0
+
+    egrid_path = root / f"{stem}.egrid"
+    assert egrid_path.exists() and egrid_path.stat().st_size > 0
+    assert result.survey["elevation_grid"]["written"] is True
+    expected_source = "lidar_wales+opentopography" if key_available else "lidar_wales"
+    assert result.survey["elevation_grid"]["source"] == expected_source
+
+    lidar_entry = next(s for s in result.survey["sources"] if s["id"] == "lidar_wales")
+    assert lidar_entry["licence"] == "Open Government Licence v3.0"
+    assert lidar_entry["attribution"] == (
+        "Contains Welsh Government and Natural Resources Wales information "
+        "licensed under the Open Government Licence v3.0"
+    )
+
+    sizes = {
+        "osm": osm_path.stat().st_size,
+        "lidar_dtm": dtm_path.stat().st_size,
+        "lidar_dsm": dsm_path.stat().st_size,
+        "contours_5m": contour_5m.stat().st_size,
+        "contours_1m": contour_1m.stat().st_size,
+        "egrid": egrid_path.stat().st_size,
+    }
+    print(
+        f"\nTask 9 end-to-end proof: {elapsed:.2f}s wall, "
+        f"key_available={key_available}, sizes={sizes}"
+    )
 
 
 # --- overturemaps 0.20.0 specifically ----------------------------------
