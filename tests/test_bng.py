@@ -215,6 +215,94 @@ def test_load_ostn15_returns_none_without_touching_the_network(tmp_path):
     assert load_ostn15(cache_dir=tmp_path) is None
 
 
+# --------------------------------------------------------------------------
+# _read_cache's own guards, exercised negatively (a deferred gap: until now
+# nothing ever wrote a cache file that fails them on purpose). load_ostn15
+# is the cache-only entry point, so these prove its contract for a corrupt
+# cache directly: it raises BngError with the specific guard sentence,
+# unchanged by ensure_ostn15's self-healing below, which catches this same
+# exception one layer up rather than altering what raises it here.
+# --------------------------------------------------------------------------
+
+
+def test_load_ostn15_raises_the_too_short_sentence_for_a_truncated_header(tmp_path):
+    cache_path = tmp_path / bng._CACHE_FILENAME
+    cache_path.write_bytes(b"short")
+    with pytest.raises(BngError, match="too short to be valid"):
+        load_ostn15(cache_dir=tmp_path)
+
+
+def test_load_ostn15_raises_the_wrong_format_sentence_for_a_bad_magic(tmp_path):
+    grid = bng._parse_data_file(_TINY_EXCERPT.splitlines(keepends=True))
+    cache_path = tmp_path / bng._CACHE_FILENAME
+    bng._write_cache(cache_path, grid)
+    data = bytearray(cache_path.read_bytes())
+    data[0:8] = b"XXXXXXXX"  # not _CACHE_MAGIC
+    cache_path.write_bytes(bytes(data))
+    with pytest.raises(BngError, match="not in the expected format"):
+        load_ostn15(cache_dir=tmp_path)
+
+
+def test_load_ostn15_raises_the_wrong_format_sentence_for_a_truncated_body(tmp_path):
+    grid = bng._parse_data_file(_TINY_EXCERPT.splitlines(keepends=True))
+    cache_path = tmp_path / bng._CACHE_FILENAME
+    bng._write_cache(cache_path, grid)
+    data = cache_path.read_bytes()
+    cache_path.write_bytes(data[: len(data) // 2])  # magic intact, body cut short
+    with pytest.raises(BngError, match="not in the expected format"):
+        load_ostn15(cache_dir=tmp_path)
+
+
+# --------------------------------------------------------------------------
+# ensure_ostn15 self-heals a corrupt cache rather than reporting a
+# download problem that was never the actual failure. A fake session
+# serving a valid pack (the same tiny excerpt test_cache_roundtrip uses,
+# zipped under the real data file name) proves the refetch actually
+# happens, and that the cache it rewrites is not itself corrupt.
+# --------------------------------------------------------------------------
+
+
+def _zip_with_tiny_excerpt() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(bng._DATA_FILE_NAME, _TINY_EXCERPT)
+    return buffer.getvalue()
+
+
+def test_ensure_ostn15_refetches_when_the_cache_has_the_wrong_magic(tmp_path):
+    grid = bng._parse_data_file(_TINY_EXCERPT.splitlines(keepends=True))
+    cache_path = tmp_path / bng._CACHE_FILENAME
+    bng._write_cache(cache_path, grid)
+    data = bytearray(cache_path.read_bytes())
+    data[0:8] = b"XXXXXXXX"
+    cache_path.write_bytes(bytes(data))
+
+    session = _FakeDownloadSession(_zip_with_tiny_excerpt())
+    healed = ensure_ostn15(cache_dir=tmp_path, session=session)
+    assert healed.shift_at(500.0, 500.0) == pytest.approx(grid.shift_at(500.0, 500.0))
+
+    # The rewritten cache is not itself corrupt: a later load succeeds and
+    # agrees, so the heal is not a one-time in-memory patch over a cache
+    # file that would fail the very next call.
+    reloaded = load_ostn15(cache_dir=tmp_path)
+    assert reloaded.shift_at(500.0, 500.0) == pytest.approx(grid.shift_at(500.0, 500.0))
+
+
+def test_ensure_ostn15_refetches_when_the_cache_is_truncated(tmp_path):
+    grid = bng._parse_data_file(_TINY_EXCERPT.splitlines(keepends=True))
+    cache_path = tmp_path / bng._CACHE_FILENAME
+    bng._write_cache(cache_path, grid)
+    data = cache_path.read_bytes()
+    cache_path.write_bytes(data[: len(data) // 2])
+
+    session = _FakeDownloadSession(_zip_with_tiny_excerpt())
+    healed = ensure_ostn15(cache_dir=tmp_path, session=session)
+    assert healed.shift_at(500.0, 500.0) == pytest.approx(grid.shift_at(500.0, 500.0))
+
+    reloaded = load_ostn15(cache_dir=tmp_path)
+    assert reloaded.shift_at(500.0, 500.0) == pytest.approx(grid.shift_at(500.0, 500.0))
+
+
 def test_flag_16_is_treated_as_outside_even_though_it_carries_a_number(tmp_path):
     # OS's own "outside transformation area" flag: the row still carries a
     # real east/north shift (see the module docstring), and this parser

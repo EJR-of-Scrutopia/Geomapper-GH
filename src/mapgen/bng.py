@@ -533,8 +533,22 @@ def ensure_ostn15(
     data file is gone (it lived only in a temp directory) and the 7 MB
     binary cache is what every later call, in this process or the next
     one, reads instead.
+
+    A cache file that exists but fails `_read_cache`'s own magic, node
+    count or length checks (`BngError`, raised through `load_ostn15`) is
+    treated as though no cache were there at all, not let escape: whether
+    that file loads is a fact about that file, not about the network, and
+    letting the load failure propagate here would report every later call
+    as a download problem while leaving the actual, sufficient fix,
+    refetching and overwriting that one file, undone. The alternative is a
+    failure sticky until the owner is told, somewhere, to go and delete
+    `~/.mapgen/ostn15_shifts.bin` by hand; self-healing costs one refetch
+    and needs telling no one anything.
     """
-    cached = load_ostn15(cache_dir)
+    try:
+        cached = load_ostn15(cache_dir)
+    except BngError:
+        cached = None
     if cached is not None:
         return cached
     active_session = session if session is not None else requests.Session()
