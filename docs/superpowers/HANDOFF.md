@@ -9,14 +9,14 @@ detailed ledger is not.
 - Main worktree: `.../VS code/Rhino Plugins/mapgen`, branch `main`
 - Remote: `https://github.com/EJR-of-Scrutopia/Geomapper-GH.git`
 - **The first push happened.** Both remote branches sit at `3748225`.
-  `feat/phase1` is now **162 commits ahead** of the remote (as of this
+  `feat/phase1` is now **164 commits ahead** of the remote (as of this
   task's own last commit, 2026-08-06; count with
   `git rev-list --count origin/feat/phase1..HEAD`) and `main` is 1 ahead.
   The permission layer denies `git push` from the assistant's shells, so
   the owner runs it.
 - Run tests: `.venv\Scripts\python.exe -m pytest -q` and
   `node tests/js/test_app.js`. Add `-m live` for the network tests.
-- Last known green: **1503 Python (12 deselected `live`), 273 Node**, from
+- Last known green: **1506 Python (12 deselected `live`), 273 Node**, from
   this task's own full offline run; only the one live test this task added
   was rerun this pass, not the other 11. Use the venv python, not the
   system one, or every import fails.
