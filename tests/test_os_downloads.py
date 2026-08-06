@@ -544,3 +544,46 @@ def test_sweep_old_versions_survives_a_missing_cache_root(monkeypatch, tmp_path)
     monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
 
     os_downloads.sweep_old_versions("OpenGreenspace", keep_version="2026-04")  # must not raise
+
+
+# --------------------------------------------------------------------------
+# The one live test: the real OS Data Hub, no fakes, no patched opener.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.live
+def test_live_downloads_listing_and_zipreader_over_the_real_openroads_gml():
+    """`product_downloads` against the real OpenGreenspace listing, and
+    `ZipReader` over `HttpByteSource` against the real OpenRoads national
+    GML zip (608,511,751 bytes; downloaded by nothing here except its own
+    central directory, a few hundred KB of range reads, never the member
+    itself).
+
+    `HttpByteSource(entry["url"])` is handed the entry's own url directly,
+    with no redirect pre-resolution: probed by hand ahead of writing this
+    test (see the task report), `HttpByteSource`'s default `requests.
+    Session` already follows the 302 to Azure blob storage on every
+    request it makes, Range header and all, so there is no separate final
+    URL for this module to resolve first. If a future `requests` version,
+    or a differently configured session, ever stopped doing that
+    transparently, this test would start failing at the `members()` call
+    below rather than silently reading the wrong bytes, because `size()`
+    and every subsequent range read would then be answered by
+    `api.os.uk` itself rather than by Azure.
+    """
+    from mapgen.cog import HttpByteSource
+
+    greenspace_entries = os_downloads.product_downloads("OpenGreenspace")
+    ss_entry = os_downloads.entry_for(greenspace_entries, area="SS", fmt="GML")
+    assert ss_entry is not None
+    assert isinstance(ss_entry.get("md5"), str) and ss_entry["md5"]
+    assert isinstance(ss_entry.get("size"), int) and ss_entry["size"] > 0
+    assert isinstance(ss_entry.get("url"), str) and ss_entry["url"].startswith("https://")
+
+    roads_entries = os_downloads.product_downloads("OpenRoads")
+    gml_entry = os_downloads.entry_for(roads_entries, area="GB", fmt="GML")
+    assert gml_entry is not None
+
+    reader = os_downloads.ZipReader(HttpByteSource(gml_entry["url"]))
+    members = reader.members()
+    assert "data/OSOpenRoads_SS.gml" in members
