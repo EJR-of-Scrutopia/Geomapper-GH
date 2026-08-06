@@ -489,3 +489,58 @@ def test_zipreader_raises_range_when_a_members_compressed_span_arrives_short(tmp
     with pytest.raises(os_downloads.OsOpenError) as excinfo:
         truncated_reader.read_member("data/OSOpenRoads_SS.gml")
     assert excinfo.value.kind == "range"
+
+
+# --------------------------------------------------------------------------
+# cache_root / product_cache_dir / sweep_old_versions.
+#
+# Every test here monkeypatches os_downloads.CONFIG_PATH, the name this
+# module imports from mapgen.config, exactly the mechanism
+# test_inspire.py's own
+# test_fetch_authority_zip_default_cache_dir_is_under_the_mapgen_home
+# already establishes for inspire.py's sibling cache: patching the NAME a
+# module imported, not mapgen.config.CONFIG_PATH itself (which os_downloads
+# already read once, at import time, into its own module namespace).
+# --------------------------------------------------------------------------
+
+
+def test_cache_root_is_under_config_paths_own_parent(monkeypatch, tmp_path):
+    fake_config_path = tmp_path / "config.json"
+    monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
+
+    assert os_downloads.cache_root() == tmp_path / "osopen"
+
+
+def test_product_cache_dir_is_named_and_created(monkeypatch, tmp_path):
+    fake_config_path = tmp_path / "config.json"
+    monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
+
+    path = os_downloads.product_cache_dir("OpenGreenspace", "2026-04")
+
+    assert path == tmp_path / "osopen" / "OpenGreenspace_2026-04"
+    assert path.is_dir()
+
+
+def test_sweep_old_versions_removes_only_same_product_siblings(monkeypatch, tmp_path):
+    fake_config_path = tmp_path / "config.json"
+    monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
+
+    old_dir = os_downloads.product_cache_dir("OpenGreenspace", "2026-01")
+    kept_dir = os_downloads.product_cache_dir("OpenGreenspace", "2026-04")
+    other_product_dir = os_downloads.product_cache_dir("OpenRoads", "2026-01")
+    (old_dir / "marker.txt").write_text("stale", encoding="utf-8")
+    (kept_dir / "marker.txt").write_text("current", encoding="utf-8")
+
+    os_downloads.sweep_old_versions("OpenGreenspace", keep_version="2026-04")
+
+    assert not old_dir.exists()
+    assert kept_dir.is_dir()
+    assert (kept_dir / "marker.txt").exists()
+    assert other_product_dir.is_dir()
+
+
+def test_sweep_old_versions_survives_a_missing_cache_root(monkeypatch, tmp_path):
+    fake_config_path = tmp_path / "nested" / "does-not-exist" / "config.json"
+    monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
+
+    os_downloads.sweep_old_versions("OpenGreenspace", keep_version="2026-04")  # must not raise

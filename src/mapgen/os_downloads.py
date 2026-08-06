@@ -73,7 +73,7 @@ from pathlib import Path
 
 from mapgen.cog import ByteSource, CogError
 from mapgen.config import CONFIG_PATH
-from mapgen.fsutil import ensure_dir
+from mapgen.fsutil import best_effort_rmtree, ensure_dir
 from mapgen.sources.base import ProgressSink
 
 # Matching cog.py's own USER_AGENT exactly: one identifying string for
@@ -539,3 +539,75 @@ class ZipReader:
             offset += 46 + name_len + extra_len + comment_len
 
         return members
+
+
+# --------------------------------------------------------------------------
+# Versioned cache directories.
+#
+# One product can have several versions on disk at once, briefly: a
+# survey is already reading last month's shards under the old version's
+# directory while this month's fetch downloads and shards the new one
+# into a directory of its own, and only once THAT has fully landed does
+# anything delete the old one. `product_cache_dir` never collides across
+# versions for exactly this reason, and `sweep_old_versions` is a separate
+# call a caller makes only once it knows the new version is complete (see
+# its own docstring), the same two-step shape bng.py's ensure_ostn15 and
+# inspire.py's fetch_authority_zip both already use for their own caches.
+# --------------------------------------------------------------------------
+
+
+def cache_root() -> Path:
+    """`~/.mapgen/osopen`.
+
+    Resolved from `CONFIG_PATH`, imported into this module's own
+    namespace above, rather than a second, independently chosen home:
+    `CONFIG_PATH.parent` is the one directory `bng.py`'s own `_cache_path`
+    and `inspire.py`'s own `_default_inspire_cache_dir` already treat as
+    this tool's cache root, and every one of this module's own callers
+    gets a subdirectory under it rather than crowding that root directly.
+    A test isolating this cache monkeypatches `os_downloads.CONFIG_PATH`,
+    the same mechanism test_inspire.py's own
+    `test_fetch_authority_zip_default_cache_dir_is_under_the_mapgen_home`
+    already uses for inspire.py's sibling cache: this reads the name at
+    call time, so patching it after import still takes effect.
+    """
+    return CONFIG_PATH.parent / "osopen"
+
+
+def product_cache_dir(product: str, version: str) -> Path:
+    """`cache_root()/f"{product}_{version}"`, created (with any missing
+    parent, including `cache_root()` itself) before it is returned.
+
+    Every caller of this function is about to write files under the path
+    it gets back (a raw downloaded zip, gzipped shards); creating it here
+    means none of them has to remember its own `ensure_dir` call first.
+    """
+    path = cache_root() / f"{product}_{version}"
+    ensure_dir(path)
+    return path
+
+
+def sweep_old_versions(product: str, keep_version: str) -> None:
+    """Deletes every `f"{product}_*"` sibling of `product_cache_dir(product,
+    keep_version)` under `cache_root()`, best-effort.
+
+    Must only be called once a caller has finished building `keep_version`'s
+    own shards successfully: an older version's cache is real, usable data
+    right up until a newer one has fully replaced it, matching the same
+    rule `inspire.py`'s own `_sweep_stale_months` documents for its
+    month-stamped zips (and, one layer up, `fsutil.py`'s own "partial files
+    are worse than absent ones"). This function itself does not check that
+    `keep_version` is actually complete; that is the caller's own
+    responsibility, exactly as it is for `_sweep_stale_months`.
+
+    Survives `cache_root()` not existing at all: nothing to sweep is not a
+    failure, and this is called from `fetch()`-shaped code that may run
+    against a completely fresh cache.
+    """
+    root = cache_root()
+    if not root.exists():
+        return
+    keep_dir = product_cache_dir(product, keep_version)
+    for candidate in root.glob(f"{product}_*"):
+        if candidate != keep_dir:
+            best_effort_rmtree(candidate)
