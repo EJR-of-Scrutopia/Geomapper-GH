@@ -1,4 +1,4 @@
-# mapgen handoff, updated 2026-08-05
+# mapgen handoff, updated 2026-08-06
 
 Read this first when resuming. It is tracked in git deliberately, because the
 detailed ledger is not.
@@ -9,17 +9,17 @@ detailed ledger is not.
 - Main worktree: `.../VS code/Rhino Plugins/mapgen`, branch `main`
 - Remote: `https://github.com/EJR-of-Scrutopia/Geomapper-GH.git`
 - **The first push happened.** Both remote branches sit at `3748225`.
-  `feat/phase1` is now **147 commits ahead** of the remote (as of this fix
-  round's own last commit, 2026-08-05; count with
+  `feat/phase1` is now **162 commits ahead** of the remote (as of this
+  task's own last commit, 2026-08-06; count with
   `git rev-list --count origin/feat/phase1..HEAD`) and `main` is 1 ahead.
   The permission layer denies `git push` from the assistant's shells, so
   the owner runs it.
 - Run tests: `.venv\Scripts\python.exe -m pytest -q` and
   `node tests/js/test_app.js`. Add `-m live` for the network tests.
-- Last known green: **1392 Python (9 deselected `live`), 273 Node**, from
-  this fix round's own full offline run; the 9 live tests were not rerun
-  this pass. Use the venv python, not the system one, or every import
-  fails.
+- Last known green: **1503 Python (12 deselected `live`), 273 Node**, from
+  this task's own full offline run; only the one live test this task added
+  was rerun this pass, not the other 11. Use the venv python, not the
+  system one, or every import fails.
 
 ## The ledger, and why it matters
 
@@ -314,6 +314,27 @@ sentences. This is pending the whole-branch review that has closed every
 prior build item before it shipped; nothing here should be treated as
 final until that review runs.
 
+**Build item 2, INSPIRE property boundaries, is built and proven end to
+end.** `docs/superpowers/plans/2026-08-06-mapgen-phase2-02-inspire-curves.md`'s
+seven tasks are all complete: `inspire` is a registered source that resolves
+a survey extent to whichever of the 318 England and Wales HMLR authorities
+cover it from a committed offline index, downloads and streams their
+INSPIRE Index Polygons through the service's own cookie handshake, and
+deduplicates the parcels into curves rather than parcels: shared edges
+collapse to one line and chains break at junctions, delivered as
+`<stem>_boundaries.geojson` and fused into the `.osm` as `boundary=property`
+ways with negative, collision-safe synthetic ids. Task 7's live
+`run_survey` over a real Llantwit Major extent (osm, lidar_wales, inspire,
+plus elevation when the owner's own key resolves) confirms the whole chain
+on disk at once, alongside item 1's own LiDAR chain still intact: 1,747
+curves, a fused `boundary=property`/`source=hm_land_registry` way whose
+negative ids resolve to real nodes, `survey.json`'s `inspire_boundaries`
+block reporting a real written count, and a `sources` entry carrying both
+required attribution statements with the placeholder year genuinely
+substituted plus the HMLR conditions link. This is pending the
+whole-branch review that has closed every prior build item before it
+shipped; nothing here should be treated as final until that review runs.
+
 **Watch-items for build item 2 onward, carried from Wales LiDAR's own
 review.** The int16 GDAL_METADATA scale/offset refusal deferred at Task 3
 (`cog.py`) needs to land before any 16-bit mosaic path is pointed at: right
@@ -324,7 +345,8 @@ constraints layers both are; and `estimate()` still has no contour-seconds
 term, invisible so far only because Wales LiDAR is the only source that
 generates contours at all.
 
-Next action: plan build item 2, INSPIRE curves, from the phase 2 spec.
+Next action: plan build item 3, an OS Open pack (roads, OpenMap Local,
+UPRN) behind a per-extent tier resolver, from the phase 2 spec.
 
 ## Standing constraints
 

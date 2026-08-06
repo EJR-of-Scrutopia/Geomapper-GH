@@ -163,9 +163,10 @@ the URL, so nothing else on the machine can drive it. On the page:
   neither is ever overwritten once you have typed into it; if one cannot be
   worked out, the estimate panel says which is missing rather than guessing
   from coordinates.
-- Tick which layers you want (OpenStreetMap, Overture Maps, elevation, and
-  Welsh LiDAR where the extent falls inside Wales) and which categories
-  (buildings, roads, broken down into motorway, trunk,
+- Tick which layers you want (OpenStreetMap, Overture Maps, elevation,
+  Welsh LiDAR where the extent falls inside Wales, and HM Land Registry
+  property boundaries where the extent falls in England or Wales) and
+  which categories (buildings, roads, broken down into motorway, trunk,
   primary, secondary, residential, service, footpath, cycleway and track,
   water, vegetation and landuse, rail, boundaries, points of interest).
   Categories are ticked by default, matching the everything-selected
@@ -500,6 +501,9 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_contours_1m.geojson     one file per interval the
   Barry-Waterfront_2026-08-03_contours_0.5m.geojson   extent's own area qualifies
   Barry-Waterfront_2026-08-03_contours_0.25m.geojson  for
+  Barry-Waterfront_2026-08-03_boundaries.geojson      HM Land Registry property
+                                                      boundary curves, only if
+                                                      `inspire` was selected
   Barry-Waterfront_2026-08-03.egrid                   the same DEM, in the format
                                                       Urbano reads terrain from
   Barry-Waterfront_2026-08-03_project_setting.json    point Urbano 2 here,
@@ -568,6 +572,23 @@ Each file:
   `source`, `source_resolution_m` and `interpolated` (`true` below 1 m,
   since a 1 m raster cannot really resolve a quarter-metre rise, so those
   two files are honest about being smoothed rather than measured).
+- **`<stem>_boundaries.geojson`**: HM Land Registry's INSPIRE Index
+  Polygon parcels for whichever local authority (or authorities, at a
+  border) the extent falls into, packaged whenever `inspire` is selected
+  and the extent is inside England or Wales. Not the parcels themselves:
+  shared edges between neighbouring parcels collapse to one line and
+  chains break at junctions, so this is a boundary drawing, a
+  FeatureCollection of LineStrings, never a cadastral database of closed,
+  tagged areas. Every feature's own `note` property repeats HM Land
+  Registry's own caveat verbatim: **"The extent of the land contained in
+  any registered title cannot be established from the INSPIRE Index
+  Polygons."** So does every `boundary=property` way this file is fused
+  into `<stem>.osm` as (see below). The injected ways carry negative,
+  descending ids, the ordinary OSM-editor convention for synthetic data
+  that was never uploaded, and are idempotent: a re-run (including
+  `mapgen bridge`) recognises its own prior fusion by the `source=
+  hm_land_registry` tag and injects nothing twice. `inspire_boundaries`
+  (below) reports what a run actually fused.
 - **`<stem>.egrid`**: a DEM converted into Urbano's own elevation grid,
   which is the only format any Urbano component reads terrain in. When a
   package also holds `<stem>_lidar_dtm.tif` (the `lidar_wales` source's own
@@ -619,7 +640,7 @@ Fields, as actually written:
 | `extent_km` | Width and height of that bbox in kilometres. |
 | `tiling` | `tile_size_m` and `overlap_m` actually used, and the resulting `rows`/`cols`. Always the tiling that was requested: a tile too dense for one request is split inside its own tile (see "Limits worth knowing about") and the plan itself never changes. |
 | `categories` | The resolved category selection: every id in `mapgen categories` if none was specified, otherwise exactly what was asked for. |
-| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `merged_files` (the files this layer actually left in the package root, empty if it left none), `features_merged` (how many features or OSM elements went into them, absent for elevation, whose output is a raster rather than a feature collection), `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), for Overture `types` (the actual Overture types fetched), and for elevation `demtype` (the DEM model the package actually holds, with `licence` and `attribution` beside it being that model's own). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). |
+| `sources` | One entry per requested source: `id`, `licence`, `attribution`, `merged_files` (the files this layer actually left in the package root, empty if it left none), `features_merged` (how many features or OSM elements went into them, absent for elevation, whose output is a raster rather than a feature collection), `endpoints_used` (which real URLs were actually contacted this run; empty if every tile was already on disk from an earlier run, since a skipped tile has no endpoint to record), for Overture `types` (the actual Overture types fetched), and for elevation `demtype` (the DEM model the package actually holds, with `licence` and `attribution` beside it being that model's own). For OpenStreetMap, `routing_note` names which endpoint (map API or Overpass) this run used and why, present only when there is something to say (absent for the default map API run, since that is not a deviation worth flagging). For `inspire`, `conditions_url` (the HM Land Registry conditions page both attribution statements below point at) is always added, and `attribution`'s two `[year]` placeholders are substituted with the real publication year read off this package's own `<stem>_boundaries.geojson` the moment that file has at least one feature to read a year from; a package whose boundaries file is empty (an authority with zero kept parcels in this extent) keeps the placeholder rather than guessing at a year. |
 | `tiles` | One entry per tile, `tile_id` plus an `"ok"`/`"failed"`/`"pending"` status per source. Why a tile is `"failed"` is in `tile_failures` below, not here, so this row keeps the shape every earlier package already has. `"pending"` means the source never got a turn on that tile at all, most often because a Stop request landed first; it is a different, more honest claim than `"failed"`, which means a real attempt came up short. |
 | `tile_failures` | One entry per tile that is still missing when the run ends: `source`, `tile_id`, `kind`, `reason` and `retried`. Empty on an ordinary run. `reason` is a plain sentence written for a person, never a traceback and never a URL. `kind` is the fixed vocabulary the retry decision is made on: `timeout`, `unreachable`, `rate_limited` and `service_error` are retried once, automatically, later in the same run; `not_authorised`, `refused`, `node_cap`, `no_output` and `unknown` are not, because asking again gets the same answer. `retried` says whether that second attempt happened. Every layer produces these, not just OpenStreetMap: elevation and Overture make one whole-extent request each, so a failure of theirs is recorded against every planned tile with the same reason, and the terminal says it once naming the layer rather than once per tile. **A layer that found nothing is not in here.** An extent with no buildings in it produces no file and no failure; the empty `merged_files` in its `sources` entry is what explains that. |
 | `retries` | One entry per tile this run had to ask for a second time, whatever the answer was: `source`, `tile_id`, `pass_number`, `kind`, `reason`, `whole_layer` and `recovered`. Empty on a run that never stumbled. This is what tells a package that completed first time from one that completed only because a retry worked, and it exists because `tile_failures` cannot say: a tile the retry recovered is deliberately dropped from that list, so without this a fragile run and a clean one read identically afterwards. `recovered: true` is the interesting value rather than the alarming one, and the terminal prints one line for it. `recovered: false` deliberately duplicates a `tile_failures` entry, because the same fact is worth having in both the "what is missing" and the "what was fragile" reading. `whole_layer` is the same fact `tile_failures` carries above about elevation and Overture, on the recovery side: those two ask for the whole extent in one request, so one download stumbling and then working produces an entry per planned tile, and `whole_layer: true` is how the file says those entries are one event rather than seventy-two. The entries stay per tile because only the run's final verdict can say which tiles a single request actually delivered, and the terminal names the layer once instead of counting them. |
@@ -631,6 +652,7 @@ Fields, as actually written:
 | `elevation_grid` | `written`, `file`, `nodes`, `covered`, `error`, `source`, `min_height` and `max_height`: whether this package has its DEM in the format Urbano reads terrain from, what it is called, how many grid points it has and how many of those a DEM could give a height for, a plain sentence if the conversion was refused, which raster actually answered it, and the lowest and highest real height on the grid. `written: false` with a null `error` means this package simply has no DEM, which is a different statement from one that could not be converted. `covered` is well under `nodes` on any coastal survey and is not a fault: the grid covers the extent plus 200 m on every side, Urbano's own margin, and a DEM does not reach that far. `source` is `"lidar_wales+opentopography"` when a package's 1 m Welsh LiDAR DTM answered first and the 30 m OpenTopography DEM filled in beyond its edge, `"lidar_wales"` when the LiDAR DTM answered alone (no OpenTopography DEM in the package), `"opentopography"` for the DEM alone, exactly as every package before this existed, and `null` on every branch that wrote nothing at all. `min_height`/`max_height` are the min and max over the grid's own covered nodes, rounded to 2 decimals, so Grasshopper labels can anchor to the terrain's real values instead of the flattened elevations Urbano's GeoJSON import leaves contours with; both are `null` on exactly the branches `covered` is `null`, since a grid with zero covered nodes is refused before it is ever written (`_NoCoverageError`, `egrid.py`), never returned as a `written: true` record with nothing real on it. |
 | `project_setting` | `written`, `file`, `layers` and `error`: whether this package has the one file Urbano 2 is pointed at, what it is called, which layers it names, and a plain sentence if it could not be written. mapgen writes this file itself, so it is a different question from `bridge` above and is answered separately from it: a run whose bridge failed, a `--skip-bridge` run and a run you stopped all still have one. `layers` is what the file actually names, read off what is genuinely in the folder, so it can be shorter than the `sources` list if a layer found nothing. |
 | `lidar_heights` | `written`, `buildings`, `kept_existing`, `no_data` and `error`: whether this package's `<stem>.osm` had DSM-minus-DTM building heights fused into it from the Welsh LiDAR layer. `written` is None on a package that never selected `lidar_wales`, which is different from `written: 0` (fused, and found nothing to add: every building already had a height, or none had enough LiDAR under it). `buildings` is every way tagged `building=*`; `kept_existing` is how many already carried a `height` tag and were left alone; `no_data` is how many could not be given one, for any reason (too little raster coverage, no OSTN15 shift, a malformed footprint): nothing here is invented for a building the rasters have no evidence for. Runs before the bridge, on every run and on `mapgen bridge`, so a package downloaded before this existed gets its buildings fixed in place with no re-download. |
+| `inspire_boundaries` | `written`, `curves`, `kept_existing` and `error`: whether this package's `<stem>.osm` had HM Land Registry property boundary curves fused into it from `<stem>_boundaries.geojson`. `written` is None on a package that never selected `inspire`, which is different from `written: 0`: an authority whose padded extent held zero kept parcels writes a real, empty boundaries file and genuinely fuses nothing, and a re-run of a package already fused writes nothing a second time either, both `written: 0` for different, honest reasons. `curves` is how many LineString curves the boundaries GeoJSON itself holds, read whether or not this run went on to inject any of them. `kept_existing` is how many of that file's own ways were already in `<stem>.osm` from an earlier fusion (the download itself, or an earlier `mapgen bridge`), recognised by their own `source=hm_land_registry` tag, which is what makes a repeat run `written: 0` rather than a duplicate set of ways. Runs immediately after `lidar_heights`, before the bridge, on every run and on `mapgen bridge`. |
 | `started_at`, `finished_at` | UTC timestamps. |
 
 ## Using the output in Grasshopper, with Urbano 2
@@ -699,12 +721,25 @@ including drawing sheets.
 | Overture Maps | Mixed by theme: Open Database License (ODbL) and CDLA-Permissive-2.0 | (c) Overture Maps Foundation |
 | Copernicus DEM, via OpenTopography | Free for any use, with attribution | (c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH |
 | Welsh LiDAR (`lidar_wales`) | Open Government Licence v3.0 | Contains Welsh Government and Natural Resources Wales information licensed under the Open Government Licence v3.0 |
+| HM Land Registry INSPIRE Index Polygons (`inspire`) | Open Government Licence v3.0 | This information is subject to Crown copyright and database rights [year] and is reproduced with the permission of HM Land Registry. The polygons (including the associated geometry, namely x, y co-ordinates) are subject to Crown copyright and database rights [year] Ordnance Survey AC0000851063. |
 | OSTN15 transformation (`bng.py`) | Ordnance Survey, Open Source Initiative BSD Licence | Copyright and database rights Ordnance Survey Limited 2016, Crown copyright and database rights Land & Property Services 2016 and/or Ordnance Survey Ireland, 2016. All rights reserved. |
 
 Every package with a Welsh LiDAR layer or an `.egrid` derived from it carries
 its coordinates through the OSTN15 transformation (`src/mapgen/bng.py`), so
 that row's licence and attribution carry forward too, even though OSTN15
 never appears as a `LayerSource` of its own.
+
+**Both** attribution statements above are required for `inspire`, not one or
+the other: the first covers the underlying INSPIRE data, the second the
+geometry itself, and `survey.json`'s own `sources` entry carries both,
+`[year]` substituted for the real publication year, alongside a
+`conditions_url` pointing at
+[HM Land Registry's own conditions page](https://use-land-property-data.service.gov.uk/datasets/inspire/#conditions),
+which is the current, authoritative text this table summarises. These
+boundaries are indicative, never legal, in HM Land Registry's own words,
+repeated on every curve and on every `boundary=property` way they are fused
+into: "The extent of the land contained in any registered title cannot be
+established from the INSPIRE Index Polygons."
 
 ODbL requires attribution and, if you redistribute the data itself (as
 opposed to a map or drawing derived from it), requires any substantial
@@ -834,11 +869,24 @@ about 2.5 km2, in the Creigiau and Pentyrch corner of north-west Cardiff,
 nowhere near most Welsh sites, so no copy anywhere in this project claims
 25 cm.
 
-Still to come, in build order: INSPIRE Index Polygons as tagged property
-boundary curves next, then an OS Open pack (roads, OpenMap Local, UPRN)
-behind a per-extent tier resolver, DataMapWales constraints and Cadw
-designations together with planning.data.gov.uk for England, Sentinel-2
-context imagery via Earth Search, England LiDAR as its own task (the
-discovery API is open but bulk raster download there has no documented
-route yet), PlanIt planning history, and BGS boreholes. See
+**Build item 2, INSPIRE property boundaries, has shipped.** The `inspire`
+source downloads HM Land Registry's INSPIRE Index Polygons for whichever
+local authority (or authorities, at a border) an extent falls into, from a
+committed, offline index of all 318 England and Wales authorities, and
+deduplicates the parcels into curves: shared edges between neighbouring
+parcels collapse to a single line and chains break at junctions, so the
+result is a boundary drawing, `<stem>_boundaries.geojson`, never a
+cadastral database of closed, tagged parcels. The same curves are fused
+into `<stem>.osm` as `boundary=property` ways, and `survey.json` carries
+both of HM Land Registry's required attribution statements with the
+publication year substituted in, plus the conditions link. See "Data
+sources, licences and attribution" and the `inspire_boundaries` row of the
+`survey.json` schema above for the detail.
+
+Still to come, in build order: an OS Open pack (roads, OpenMap Local, UPRN)
+behind a per-extent tier resolver next, then DataMapWales constraints and
+Cadw designations together with planning.data.gov.uk for England,
+Sentinel-2 context imagery via Earth Search, England LiDAR as its own task
+(the discovery API is open but bulk raster download there has no
+documented route yet), PlanIt planning history, and BGS boreholes. See
 `docs/superpowers/specs/` for the full design record.
