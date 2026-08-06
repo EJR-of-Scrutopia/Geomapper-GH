@@ -23,9 +23,12 @@ from pathlib import Path
 
 from mapgen.boundary_curves import (
     BoundaryCurvesResult,
+    _canonical_direction,
+    _drop_collinear,
     _edge_key,
     _extract_unique_edges,
     _normalise_ring,
+    _ring_key,
     boundary_curves,
     boundary_curves_with_counts,
 )
@@ -71,6 +74,7 @@ def test_two_squares_sharing_an_edge_yield_seven_edges_and_three_curves():
     assert result.rings_deduped == 2  # different shapes, neither is a duplicate
     assert result.edges_in == 8  # 4 + 4, nothing zero-length
     assert result.edges_deduped == 7  # the shared wall counted once, not twice
+    assert result.edges_pruned == 0  # no degree-1 vertex anywhere in this graph
     assert result.curves_out == 3
 
 
@@ -272,6 +276,131 @@ def test_interior_ring_survives_as_its_own_closed_curve():
 
 
 # --------------------------------------------------------------------------
+# Repeated minimum vertex: a ring that touches the same point twice (a
+# pinch point) has more than one rotation that starts at its own smallest
+# vertex, and `_ring_key`/`_canonical_direction` must try every one of
+# them, not just whichever `list.index` finds first, or two physically
+# identical rings recorded starting at different pinch occurrences hash
+# unequal. Code review counterexample.
+# --------------------------------------------------------------------------
+
+
+def test_ring_key_is_canonical_when_the_minimum_vertex_repeats():
+    # ring4 is ring3 phase-shifted to start at the SECOND occurrence of
+    # (0,0) rather than the first: the identical cyclic sequence.
+    ring3 = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0), (2.0, 0.0), (2.0, 1.0)]
+    ring4 = ring3[3:] + ring3[:3]
+    assert ring3 != ring4  # different as plain lists...
+    assert _ring_key(ring3) == _ring_key(ring4)  # ...but the same ring
+
+
+def test_duplicated_pinch_point_ring_dedupes_to_one():
+    ring3 = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0), (2.0, 0.0), (2.0, 1.0)]
+    ring4 = ring3[3:] + ring3[:3]
+
+    result = boundary_curves_with_counts([[ring3], [ring4]])
+
+    assert result.rings_in == 2
+    assert result.rings_deduped == 1  # the two authority files' copies of one ring
+
+
+def test_canonical_direction_is_order_independent_when_minimum_vertex_repeats():
+    # The same closed curve (first == last), recorded starting the seam at
+    # two different occurrences of its own repeated minimum vertex.
+    variant_1 = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 0.0)]
+    variant_2 = variant_1[3:-1] + variant_1[:3] + [variant_1[3]]
+    assert variant_1 != variant_2
+    assert _canonical_direction(variant_1) == _canonical_direction(variant_2)
+
+
+# --------------------------------------------------------------------------
+# The closed-ring seam: a redundant, exactly-collinear vertex must be
+# dropped whether it lands in the middle of the raw chain or happens to be
+# the vertex chaining started its walk from (the seam). Code review
+# counterexample: a rectangle with one extra midpoint on its bottom edge,
+# recorded starting at a real corner in one ordering and at that redundant
+# midpoint in the other.
+#
+# `contours.py`'s own `_drop_collinear` does not check its seam this way,
+# and is deliberately left as-is (see this task's report): its rings come
+# from marching squares, one join pass over segments built in a single,
+# fixed scan order, so the same physical ring is never handed to it twice
+# starting at two different vertices the way stage 1's own duplicate-ring
+# dedup can hand this module two differently-rotated copies of one ring.
+# Order-independence is a correctness property HERE specifically because
+# stage 1 keeps whichever duplicate ring arrived first, and that arbitrary
+# choice must never leak into a different-shaped output curve.
+# --------------------------------------------------------------------------
+
+
+def test_collinear_seam_dropped_regardless_of_which_vertex_the_chain_starts_at():
+    # Real corners: (0,0), (2,0), (2,1), (0,1). (1,0) sits exactly on the
+    # bottom edge between (0,0) and (2,0), a redundant midpoint.
+    starts_at_a_real_corner = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)]
+    starts_at_the_redundant_midpoint = [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+
+    curves_a = boundary_curves([[starts_at_a_real_corner]])
+    curves_b = boundary_curves([[starts_at_the_redundant_midpoint]])
+
+    expected = [[(0.0, 0.0), (0.0, 1.0), (2.0, 1.0), (2.0, 0.0), (0.0, 0.0)]]
+    assert curves_a == expected
+    assert curves_b == expected
+
+
+# --------------------------------------------------------------------------
+# Within-ring spikes: an out-and-back traversal along the same physical
+# edge is digitising noise, not a boundary, and must not survive as a
+# dangling line fused onto whatever real edge happens to be nearby. Code
+# review counterexample plus a two-segment cascade.
+# --------------------------------------------------------------------------
+
+
+def test_within_ring_spike_leaves_no_dangling_line():
+    # Walks (0,0) -> (1,0) -> (0,0) -> (0,1) -> back to (0,0): the whole
+    # ring is two out-and-back spikes sharing a pivot, with no real
+    # enclosed area anywhere, so nothing genuine survives.
+    spike_ring = [(0.0, 0.0), (1.0, 0.0), (0.0, 0.0), (0.0, 1.0)]
+
+    result = boundary_curves_with_counts([[spike_ring]])
+
+    assert result.edges_in == 4
+    assert result.edges_deduped == 2  # (0,0)-(1,0) and (0,0)-(0,1), each walked twice
+    assert result.edges_pruned == 2  # both are spikes: (1,0) and (0,1) are degree-1 dead ends
+    assert result.curves == []
+    assert result.curves_out == 0
+
+
+def test_two_segment_spike_cascades_away_leaving_the_real_square():
+    # A real 4x4 square, with a 2-segment out-and-back spike
+    # ((0,0) -> (1,0) -> (2,0) -> (1,0) -> (0,0)) grafted onto one corner
+    # before the ring continues around the square's own real edges.
+    ring_with_spike = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (2.0, 0.0),
+        (1.0, 0.0),
+        (0.0, 0.0),
+        (4.0, 0.0),
+        (4.0, 4.0),
+        (0.0, 4.0),
+    ]
+
+    result = boundary_curves_with_counts([[ring_with_spike]])
+
+    assert result.edges_in == 8
+    # Unique edges before pruning: (0,0)-(1,0), (1,0)-(2,0), (0,0)-(4,0),
+    # (4,0)-(4,4), (4,4)-(0,4), (0,4)-(0,0) = 6 (the spike's own return
+    # trip collapses onto its outbound trip, same as any shared edge).
+    assert result.edges_deduped == 6
+    # Pruning cascades: (2,0) is degree 1, removing (1,0)-(2,0) exposes
+    # (1,0) as newly degree 1, removing (0,0)-(1,0) in the next pass;
+    # the real square's own 4 edges are untouched (2 pruned, 4 remain).
+    assert result.edges_pruned == 2
+    assert result.curves_out == 1
+    assert result.curves == [[(0.0, 0.0), (0.0, 4.0), (4.0, 4.0), (4.0, 0.0), (0.0, 0.0)]]
+
+
+# --------------------------------------------------------------------------
 # Interface shape: boundary_curves is a thin wrapper over the counts
 # companion, empty input is handled cleanly, and the two never disagree.
 # --------------------------------------------------------------------------
@@ -288,13 +417,14 @@ def test_boundary_curves_returns_exactly_the_counts_companions_curves_field():
 def test_empty_input_returns_no_curves():
     result = boundary_curves_with_counts([])
     assert result.curves == []
-    assert (result.rings_in, result.rings_deduped, result.edges_in, result.edges_deduped, result.curves_out) == (
-        0,
-        0,
-        0,
-        0,
-        0,
-    )
+    assert (
+        result.rings_in,
+        result.rings_deduped,
+        result.edges_in,
+        result.edges_deduped,
+        result.edges_pruned,
+        result.curves_out,
+    ) == (0, 0, 0, 0, 0, 0)
     assert boundary_curves([]) == []
 
 
@@ -393,6 +523,7 @@ def test_grid_of_adjacent_squares_dedupes_edges_and_completes_promptly():
     # size*(size+1) vertical edges: 2 * 50 * 51 = 5100, the plan's own
     # figure for this exact grid.
     assert result.edges_deduped == 2 * size * (size + 1)
+    assert result.edges_pruned == 0  # every vertex in a filled grid keeps degree >= 2
     assert result.curves_out > 0
 
     # Generous on purpose (see the task brief): a guardrail against

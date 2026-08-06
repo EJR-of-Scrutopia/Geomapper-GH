@@ -51,37 +51,63 @@ edges are even extracted, is what stops a repeated ring from doubling its
 own edges into the second collapse's count, and the two stages catch
 genuinely different things: neither can stand in for the other.
 
+## Spike pruning, before chaining
+
+An out-and-back traversal within a single ring (walk out to a point,
+then immediately back the way it came) draws no real boundary at all;
+its two directions are the same undirected edge, so stage 2's own dedup
+already collapses them to one copy, but that one copy's far endpoint is
+then touched by nothing else, a degree-1 dead end no genuine ring vertex
+ever has (see `_prune_spike_edges`'s own docstring for the invariant this
+relies on). These are pruned, cascading along a multi-segment spike, in
+their own pass between edge dedup and chaining, so chaining itself never
+has to reason about them.
+
 ## Chaining: contours.py's own approach, mirrored rather than imported
 
-Stage 3's join-by-endpoint and drop-collinear-vertices are the same
-mechanism `contours.py`'s `_join_segments`/`_drop_collinear` already use,
-including the 0.05 m collinearity tolerance, because a chain of edges
-joined at shared vertices is the same problem whether the edges came from
-marching squares or from parcel rings. `contours.py`'s own version
-additionally rounds every point to a micron before comparing endpoints,
-because ITS points are freshly interpolated floats that need that
-tolerance to agree on what "the same point" means; this module's points
-are already rounded once at entry and never recomputed, so that second
-rounding step would be a no-op here and is left out, not overlooked.
-Mirrored rather than imported (see this task's own report for the case
-that a shared home would now be worth building, not made in this pass):
-the one behavioural difference this module adds on top is stopping every
+Stage 3's join-by-endpoint is the same mechanism `contours.py`'s
+`_join_segments` already uses, because a chain of edges joined at shared
+vertices is the same problem whether the edges came from marching
+squares or from parcel rings; `contours.py`'s own version additionally
+rounds every point to a micron before comparing endpoints, because ITS
+points are freshly interpolated floats that need that tolerance to agree
+on what "the same point" means, while this module's points are already
+rounded once at entry and never recomputed, so that second rounding step
+would be a no-op here and is left out, not overlooked. Mirrored rather
+than imported (see this task's own report for the case that a shared
+home would now be worth building, not made in this pass): the one
+behavioural difference this module's join adds on top is stopping every
 chain at a vertex three or more edges touch, which `contours.py` has
 never needed, because marching-squares segments essentially never meet
 three-deep.
+
+Collinear-vertex dropping (`_drop_collinear`) mirrors `contours.py`'s own
+version too, at the same 0.05 m tolerance, but is NOT identical to it: a
+closed chain's own seam (its shared first/last point) is checked against
+its two real, wrap-around neighbours here, and dropped if collinear,
+which `contours.py`'s own version never does. See `_drop_collinear`'s
+own docstring for the counterexample that makes this a correctness
+requirement here specifically (stage 1's duplicate-ring dedup can hand
+two differently-ROTATED copies of one physical ring to chaining, and
+which rotation happens to survive must never change the drawn shape) and
+for why `contours.py`'s own seam is deliberately left unchanged.
 
 ## Deterministic output
 
 Each finished curve is wound whichever direction makes it compare
 smallest (`_canonical_direction`): an open chain keeps its smaller
-endpoint first, a closed ring is rotated to its own smallest vertex and
-wound the same way `_ring_key` already breaks that tie. The finished list
-is then sorted outright (`list.sort` on lists of point tuples, which
-compares element by element): first by each curve's own first point,
-then, wherever two curves happen to share one, by their next point, and
-so on. Two runs over the same input, regardless of which edge happened to
-start a chain's walk or which parcel arrived first, always produce the
-same list in the same order.
+endpoint first, a closed ring is reduced to its own `_canonical_rotation`
+(the same function `_ring_key` uses, which tries every occurrence of the
+ring's own smallest vertex as a rotation start, in both directions, not
+just the first one found: see that function's own docstring for the
+counterexample a ring touching one point twice produces otherwise). The
+finished list is then sorted outright (`list.sort` on lists of point
+tuples, which compares element by element): first by each curve's own
+first point, then, wherever two curves happen to share one, by their
+next point, and so on. Two runs over the same input, regardless of which
+edge happened to start a chain's walk, which parcel arrived first, or
+which occurrence of a repeated vertex a ring happened to be recorded
+starting at, always produce the same list in the same order.
 """
 
 from __future__ import annotations
@@ -123,6 +149,7 @@ class BoundaryCurvesResult:
     rings_deduped: int
     edges_in: int
     edges_deduped: int
+    edges_pruned: int
     curves_out: int
 
 
@@ -161,8 +188,11 @@ def boundary_curves_with_counts(
     dropped: a zero-length edge was never a line the surviving rings
     intended to draw, so it is excluded from the "in" count the same way
     a degenerate ring is, rather than inflating it before being
-    subtracted back out. `edges_deduped` is the unique-edge count stage 3
-    chains. `curves_out` is `len(curves)`.
+    subtracted back out. `edges_deduped` is the unique-edge count stage 2
+    hands onward, BEFORE spike pruning. `edges_pruned` is how many of
+    those `_prune_spike_edges` then removes (see its own docstring);
+    `edges_deduped - edges_pruned` is what actually reaches chaining.
+    `curves_out` is `len(curves)`.
     """
     rings_in = 0
     normalised_rings: list[Ring] = []
@@ -175,7 +205,8 @@ def boundary_curves_with_counts(
 
     deduped_rings = _dedupe_rings(normalised_rings)
     edges_in, unique_edges = _extract_unique_edges(deduped_rings)
-    curves = _chain_edges(unique_edges)
+    pruned_edges, edges_pruned = _prune_spike_edges(unique_edges)
+    curves = _chain_edges(pruned_edges)
 
     return BoundaryCurvesResult(
         curves=curves,
@@ -183,6 +214,7 @@ def boundary_curves_with_counts(
         rings_deduped=len(deduped_rings),
         edges_in=edges_in,
         edges_deduped=len(unique_edges),
+        edges_pruned=edges_pruned,
         curves_out=len(curves),
     )
 
@@ -220,21 +252,50 @@ def _normalise_ring(ring: list[tuple[float, float]]) -> Ring | None:
     return rounded
 
 
+def _canonical_rotation(sequence: list[Point]) -> list[Point]:
+    """The lexicographically smallest description of the closed loop
+    `sequence` traces: every rotation, tried in both the given direction
+    and reversed, that starts at an occurrence of the loop's own smallest
+    vertex, with the smallest of all of them kept.
+
+    A rotation that does not start at `sequence`'s own smallest element
+    can never be the smallest overall (its first element is already
+    larger), so only rotations starting there are candidates. When that
+    smallest element repeats (a ring that touches the same point twice,
+    a pinch point), EVERY occurrence is a valid candidate start, in both
+    directions: `list.index(min(...))`, tried only once, finds just the
+    FIRST such occurrence, and two physically identical loops recorded
+    starting at DIFFERENT occurrences of the repeated minimum then hash
+    unequal (a real code-review counterexample: a ring visiting (0,0)
+    twice, phase-shifted to start at its other visit, produced a
+    different key here before this function existed). Real parcel and
+    curve sizes are always small (dozens of vertices at most), so the
+    O(n^2) cost of building and comparing every candidate is never a
+    concern in practice.
+    """
+    minimum = min(sequence)
+    length = len(sequence)
+    forward = [
+        sequence[start:] + sequence[:start]
+        for start in range(length)
+        if sequence[start] == minimum
+    ]
+    reversed_sequence = list(reversed(sequence))
+    backward = [
+        reversed_sequence[start:] + reversed_sequence[:start]
+        for start in range(length)
+        if reversed_sequence[start] == minimum
+    ]
+    return min(forward + backward)
+
+
 def _ring_key(ring: Ring) -> tuple[Point, ...]:
     """`ring`'s own shape identity: invariant to which vertex it starts at
-    and which direction it was wound.
-
-    Rotated to start at its own smallest vertex (lexicographic on
-    (easting, northing)), then compared against that same rotation's
-    reversal (wound the other way, but still starting at the same
-    vertex): the lexicographically smaller of the two is the key. Two
+    and which direction it was wound (see `_canonical_rotation`). Two
     rings that are the same shape, however each source file happened to
     start or wind it, always produce this same key.
     """
-    start = ring.index(min(ring))
-    rotated = ring[start:] + ring[:start]
-    reversed_rotated = [rotated[0]] + list(reversed(rotated[1:]))
-    return tuple(min(rotated, reversed_rotated))
+    return tuple(_canonical_rotation(ring))
 
 
 def _dedupe_rings(rings: list[Ring]) -> list[Ring]:
@@ -284,6 +345,53 @@ def _extract_unique_edges(rings: list[Ring]) -> tuple[int, list[tuple[Point, Poi
             edges_in += 1
             unique[_edge_key(a, b)] = None
     return edges_in, list(unique.keys())
+
+
+# --------------------------------------------------------------------------
+# Stage 2.5: spike pruning, before chaining ever sees the result.
+# --------------------------------------------------------------------------
+
+
+def _prune_spike_edges(edges: list[tuple[Point, Point]]) -> tuple[list[tuple[Point, Point]], int]:
+    """Every unique edge with a degree-1 endpoint, removed, cascading
+    until none remain, plus how many were removed.
+
+    Every ring this pipeline accepts is closed, so every vertex it
+    contributes keeps degree >= 2 once stage 2's own presence-dedup has
+    run: an ordinary vertex keeps both of its ring's own edges (or, if
+    one of them turned out to be a duplicate collapsed with another
+    ring's, still at least the one that remains); a junction only ever
+    GAINS a third or more by touching additional edges, never drops
+    below 2. Degree 1 can only arise from an out-and-back traversal
+    within a single ring (the same physical edge walked forward then
+    immediately back, digitising noise rather than a real boundary,
+    a real code-review counterexample: a ring visiting (0,0), (1,0),
+    back to (0,0), then on, drew a dangling line to (1,0) with no
+    physical basis before this function existed): that pattern's two
+    directions are the same undirected edge, already collapsed to one
+    copy by `_extract_unique_edges`, leaving that copy's far endpoint
+    touched by nothing else at all.
+
+    Removing a degree-1 edge can expose a NEW degree-1 endpoint one step
+    further back along a multi-segment spike (each out-and-back segment
+    peels off in its own pass), so this recomputes degree and re-checks
+    from scratch until a pass removes nothing, or nothing is left. A
+    real boundary's own genuine edges are never touched: their endpoints
+    never drop below degree 2, by the invariant above, so they are never
+    candidates for removal in any pass.
+    """
+    remaining = list(edges)
+    pruned = 0
+    while True:
+        degree: dict[Point, int] = defaultdict(int)
+        for a, b in remaining:
+            degree[a] += 1
+            degree[b] += 1
+        survivors = [(a, b) for a, b in remaining if degree[a] >= 2 and degree[b] >= 2]
+        pruned += len(remaining) - len(survivors)
+        if len(survivors) == len(remaining):
+            return survivors, pruned
+        remaining = survivors
 
 
 # --------------------------------------------------------------------------
@@ -372,8 +480,37 @@ def _drop_collinear(points: Curve) -> Curve:
     """The same simplification as contours.py's own `_drop_collinear`, at
     the same 0.05 m tolerance: a vertex within tolerance of the line
     through the last KEPT point and its own next raw neighbour is dropped,
-    which collapses a straight run to its two ends in one pass. The first
-    and last points are always kept, whichever curve, closed or not.
+    which collapses a straight run to its two ends in one pass. An open
+    chain's first and last points are always kept unconditionally, same
+    as contours.py's own version.
+
+    A CLOSED chain's shared first/last point (its seam) is different: it
+    has two real geometric neighbours, the point before it wrapping
+    around from the end and the point after it, exactly like any other
+    vertex, but the pass above never puts it through that same test,
+    because it always treats points[0]/points[-1] as fixed regardless of
+    tolerance. Left unchecked, a ring's own simplified shape would depend
+    on which of its vertices happened to be recorded first (a real
+    code-review counterexample: a rectangle with one redundant midpoint
+    on an edge kept 5 points when that midpoint fell in the middle of the
+    chain and 6 when the chain's own walk happened to start there instead),
+    which breaks this module's own deterministic-output guarantee, since
+    which vertex a chain starts at is an accident of edge-dict iteration
+    order, never a property of the boundary itself. The loop below checks
+    the seam the same way, against its own two wrap-around neighbours,
+    and re-closes on the next survivor if it drops, repeating so a RUN of
+    several redundant vertices straddling the seam all go, not just the
+    first.
+
+    `contours.py`'s own `_drop_collinear` does NOT do this, and is
+    deliberately left as-is (see this task's own report): its rings come
+    from one marching-squares join pass over segments built in a single,
+    fixed scan order, so the same physical ring is never handed to it
+    twice starting at two different vertices; order-independence is a
+    correctness property HERE specifically because stage 1's own
+    duplicate-ring dedup keeps whichever rotation of a duplicated ring
+    happened to arrive first, and that arbitrary choice must never leak
+    into a differently-shaped output curve.
     """
     if len(points) < 3:
         return list(points)
@@ -382,6 +519,18 @@ def _drop_collinear(points: Curve) -> Curve:
         if _perpendicular_distance(points[index], kept[-1], points[index + 1]) > _COLLINEAR_TOLERANCE_M:
             kept.append(points[index])
     kept.append(points[-1])
+
+    # The seam check: only for a closed chain (kept[0] == kept[-1] is
+    # never true for an open one), and never below a triangle (4 points:
+    # 3 distinct vertices plus the closing repeat), the smallest ring
+    # this module's own chaining ever produces.
+    while (
+        len(kept) > 4
+        and kept[0] == kept[-1]
+        and _perpendicular_distance(kept[0], kept[-2], kept[1]) <= _COLLINEAR_TOLERANCE_M
+    ):
+        kept = kept[1:-1] + [kept[1]]
+
     return kept
 
 
@@ -393,17 +542,15 @@ def _canonical_direction(curve: Curve) -> Curve:
 
     An open chain keeps whichever direction puts the smaller endpoint
     first, reversing outright if it does not already. A closed ring is
-    rotated to start at its own smallest vertex and wound whichever way
-    makes the second vertex smaller, exactly `_ring_key`'s own rule,
+    reduced to its own `_canonical_rotation` (exactly `_ring_key`'s own
+    rule, over every occurrence of the ring's smallest vertex, not just
+    the first: a closed curve whose minimum vertex repeats needs the same
+    treatment a duplicate-ring's own hash does, and for the same reason),
     because the two problems, which of a ring's own equivalent
     descriptions is canonical, are the same problem.
     """
     if len(curve) > 2 and curve[0] == curve[-1]:
-        body = curve[:-1]
-        start = body.index(min(body))
-        rotated = body[start:] + body[:start]
-        reversed_rotated = [rotated[0]] + list(reversed(rotated[1:]))
-        chosen = min(rotated, reversed_rotated)
+        chosen = _canonical_rotation(curve[:-1])
         return chosen + [chosen[0]]
     if curve[0] <= curve[-1]:
         return curve
