@@ -178,7 +178,6 @@ def _get_json(url: str, *, what: str) -> object:
     try:
         opener = _build_opener()
         with opener.open(request, timeout=_LISTING_TIMEOUT_SECONDS) as response:
-            status = getattr(response, "status", None)
             body = response.read()
     except urllib.error.HTTPError as exc:
         raise OsOpenError(
