@@ -334,3 +334,158 @@ def test_download_entry_works_with_no_progress_sink(tmp_path, monkeypatch):
     result = os_downloads.download_entry(_entry(len(body)), dest)
 
     assert result == dest
+
+
+# --------------------------------------------------------------------------
+# ZipReader: real zips, built with `zipfile`, read back through
+# FileByteSource (see cog.py). Never a fake ByteSource here: what is under
+# test is the EOCD scan, the central directory walk and the local header
+# read, against real zip bytes.
+# --------------------------------------------------------------------------
+
+
+def _build_sample_zip(path: Path) -> dict[str, bytes]:
+    """A small zip with one stored and one deflated member, both under a
+    `data/` prefix matching the real OpenRoads member naming
+    (`data/OSOpenRoads_<SQ>.gml`).
+    """
+    stored_content = b"<gml>stored content, easy to eyeball on a diff</gml>" * 3
+    # Long and repetitive on purpose, so ZIP_DEFLATED actually shrinks it;
+    # a short or high-entropy body can come back the same size or larger,
+    # which would not exercise the deflate path at all.
+    deflated_content = b"<gml>" + b"repeat this text " * 300 + b"</gml>"
+    contents = {
+        "data/OSOpenRoads_SS.gml": stored_content,
+        "data/OSOpenRoads_ST.gml": deflated_content,
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            zipfile.ZipInfo("data/OSOpenRoads_SS.gml"),
+            stored_content,
+            compress_type=zipfile.ZIP_STORED,
+        )
+        archive.writestr(
+            zipfile.ZipInfo("data/OSOpenRoads_ST.gml"),
+            deflated_content,
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
+    return contents
+
+
+def test_zipreader_lists_members_with_names_and_sizes(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    contents = _build_sample_zip(zip_path)
+
+    reader = os_downloads.ZipReader(FileByteSource(zip_path))
+    members = reader.members()
+
+    assert set(members) == set(contents)
+    for name, data in contents.items():
+        assert members[name].uncompressed_size == len(data)
+        assert members[name].name == name
+    assert members["data/OSOpenRoads_SS.gml"].method == 0
+    assert members["data/OSOpenRoads_ST.gml"].method == 8
+    # The deflated member's own compressed span is genuinely smaller than
+    # its uncompressed size, for the repetitive body _build_sample_zip
+    # writes; a reader that mixed up the two fields would still pass every
+    # other assertion here.
+    deflated = members["data/OSOpenRoads_ST.gml"]
+    assert deflated.compressed_size < deflated.uncompressed_size
+
+
+def test_zipreader_round_trips_the_stored_member(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    contents = _build_sample_zip(zip_path)
+
+    reader = os_downloads.ZipReader(FileByteSource(zip_path))
+    assert reader.read_member("data/OSOpenRoads_SS.gml") == contents["data/OSOpenRoads_SS.gml"]
+
+
+def test_zipreader_round_trips_the_deflated_member(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    contents = _build_sample_zip(zip_path)
+
+    reader = os_downloads.ZipReader(FileByteSource(zip_path))
+    assert reader.read_member("data/OSOpenRoads_ST.gml") == contents["data/OSOpenRoads_ST.gml"]
+
+
+def test_zipreader_read_member_raises_range_for_an_unknown_name(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    _build_sample_zip(zip_path)
+
+    reader = os_downloads.ZipReader(FileByteSource(zip_path))
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        reader.read_member("data/OSOpenRoads_ZZ.gml")
+    assert excinfo.value.kind == "range"
+
+
+def test_zipreader_raises_range_for_a_missing_eocd_signature(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    _build_sample_zip(zip_path)
+    data = bytearray(zip_path.read_bytes())
+    pos = bytes(data).rfind(b"PK\x05\x06")
+    assert pos != -1
+    data[pos:pos + 4] = b"XXXX"
+    zip_path.write_bytes(bytes(data))
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.ZipReader(FileByteSource(zip_path))
+    assert excinfo.value.kind == "range"
+
+
+def test_zipreader_raises_range_for_a_zip64_size_marker(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    _build_sample_zip(zip_path)
+    data = bytearray(zip_path.read_bytes())
+    pos = bytes(data).rfind(b"PK\x05\x06")
+    assert pos != -1
+    # Size of the central directory (a 4 byte field) sits 12 bytes into the
+    # EOCD's own fixed 22 byte record; 0xFFFFFFFF there is the zip64
+    # sentinel this reader refuses rather than misreads.
+    struct.pack_into("<I", data, pos + 12, 0xFFFFFFFF)
+    zip_path.write_bytes(bytes(data))
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.ZipReader(FileByteSource(zip_path))
+    assert excinfo.value.kind == "range"
+
+
+class _TruncatingSource:
+    """Wraps a real `FileByteSource` but shortens exactly one read's own
+    answer, the first one asked for the given `length`: everything else,
+    including every read the central-directory walk itself makes, passes
+    through unmodified. Used to make one member's compressed span arrive
+    short without hand-deriving its file offset, which the length match
+    keeps this test independent of.
+    """
+
+    def __init__(self, inner, target_length: int, truncate_by: int) -> None:
+        self._inner = inner
+        self.name = inner.name
+        self._target_length = target_length
+        self._truncate_by = truncate_by
+        self._matched = False
+
+    def size(self) -> int:
+        return self._inner.size()
+
+    def read(self, start: int, length: int) -> bytes:
+        data = self._inner.read(start, length)
+        if not self._matched and length == self._target_length:
+            self._matched = True
+            return data[: max(0, len(data) - self._truncate_by)]
+        return data
+
+
+def test_zipreader_raises_range_when_a_members_compressed_span_arrives_short(tmp_path):
+    zip_path = tmp_path / "roads.zip"
+    _build_sample_zip(zip_path)
+
+    reader = os_downloads.ZipReader(FileByteSource(zip_path))
+    member = reader.members()["data/OSOpenRoads_SS.gml"]
+
+    truncated_source = _TruncatingSource(FileByteSource(zip_path), member.compressed_size, 1)
+    truncated_reader = os_downloads.ZipReader(truncated_source)
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        truncated_reader.read_member("data/OSOpenRoads_SS.gml")
+    assert excinfo.value.kind == "range"

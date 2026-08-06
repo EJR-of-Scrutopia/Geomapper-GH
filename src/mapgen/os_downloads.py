@@ -87,6 +87,49 @@ _LISTING_TIMEOUT_SECONDS = 30.0
 _DOWNLOAD_TIMEOUT_SECONDS = 120.0
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
+# One member entry out of a zip's central directory, exactly as much of it
+# as ZipReader needs: where the member's own local header is
+# (`header_offset`, the central directory's "relative offset of local
+# header" field, from which read_member finds the compressed span), its
+# compression method (0 stored, 8 deflate; nothing else is read by any
+# product this project reads), and both sizes.
+ZipMember = namedtuple(
+    "ZipMember", "name method compressed_size uncompressed_size header_offset"
+)
+
+# The largest a zip comment can be (a 2 byte length field), which bounds
+# how far before the file's own end the End Of Central Directory record
+# can start. Matches the brief's own stated search window rather than the
+# few bytes more (`_EOCD_FIXED_SIZE`) a maximally-commented real zip would
+# in principle need; every zip this project reads or writes in a test
+# carries no comment at all, so this window is never actually exercised at
+# its edge.
+_EOCD_SEARCH_WINDOW = 65536
+
+_EOCD_SIGNATURE = b"PK\x05\x06"
+_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
+_LOCAL_HEADER_SIGNATURE = b"PK\x03\x04"
+
+# Every struct below is the ZIP format's own fixed-size record, with its
+# 4 byte signature sliced off and checked separately (a plain byte
+# comparison rather than one more struct field), because the three
+# records share no other field in common and unpacking the signature as
+# an integer just to compare it back to a constant would be one extra,
+# needless conversion at every one of these three call sites.
+_EOCD_STRUCT = "<HHHHIIH"  # 18 bytes, after the 4 byte signature.
+_CENTRAL_DIRECTORY_STRUCT = "<HHHHHHIIIHHHHHII"  # 42 bytes, after the signature.
+_LOCAL_HEADER_NAME_EXTRA_LEN_STRUCT = "<HH"  # name_len, extra_len, at offset 26.
+
+_ZIP_METHOD_STORED = 0
+_ZIP_METHOD_DEFLATED = 8
+
+# raw deflate: no zlib/gzip header or trailer, exactly what a zip member's
+# own compressed span holds. -15 is zlib's own spelling of "raw, 15 bit
+# window", the same value cog.py would use if it ever read a deflated tile
+# raw (it does not: TIFF's own deflate tiles carry a zlib header, unlike a
+# zip member's).
+_RAW_DEFLATE_WBITS = -15
+
 
 class OsOpenError(ValueError):
     """Raised for anything this module cannot fetch, verify, or parse.
@@ -289,3 +332,210 @@ def download_entry(entry: dict, dest: Path, progress: ProgressSink | None = None
 
     os.replace(temp_path, dest)
     return dest
+
+
+class ZipReader:
+    """A zip, read one member at a time over a `ByteSource`.
+
+    Never `zipfile`: the one zip this reader exists for (OpenRoads' own
+    national GML zip) is 608,511,751 bytes, and downloading or holding the
+    whole thing just to reach one 100km square's member would defeat the
+    entire point of a ranged reader. Construction reads the End Of Central
+    Directory record and walks the central directory once, which on every
+    product this project reads is a few hundred entries at most; nothing
+    about a member's own compressed bytes is fetched until `read_member`
+    is called for it by name.
+
+    Every failure here is `OsOpenError` kind `"range"`: a missing or
+    malformed EOCD, a zip64 archive (out of scope; see the module
+    docstring), a central directory entry that does not start with its own
+    signature, an unknown member name, an unsupported compression method,
+    or a decompressed length that does not match what the central
+    directory promised. `CogError` raised by the underlying `ByteSource`
+    (`HttpByteSource`'s own Range and Content-Range enforcement; see
+    cog.py) is caught at this class's boundary and re-raised the same way,
+    carrying `status_code` across when `CogError` set one, so a caller
+    never has to catch two exception types to learn about one failure.
+    """
+
+    def __init__(self, source: ByteSource) -> None:
+        self.source = source
+        self._members = self._read_central_directory()
+
+    def members(self) -> dict[str, ZipMember]:
+        """Every member's own name, method and sizes, as read from the
+        central directory at construction time. A fresh dict each call
+        (the same convention `cog.py`'s own read-only accessors use), so a
+        caller mutating what it gets back cannot corrupt this reader's own
+        state.
+        """
+        return dict(self._members)
+
+    def read_member(self, name: str) -> bytes:
+        """`name`'s whole uncompressed content.
+
+        Reads the member's own local header first (30 fixed bytes plus its
+        name and extra field lengths, which is where the compressed data
+        actually starts: not necessarily the same as what the central
+        directory's own extra field length would suggest, since some
+        writers pad the two differently), then the compressed span itself,
+        one range read each. Stored (method 0) data is returned as-is;
+        deflated (method 8) data is inflated with a raw deflate stream
+        (`zlib.decompressobj(-15)`: a zip member's compressed bytes carry
+        no zlib header or trailer, unlike the deflated tiles cog.py
+        reads). Either way the result's length is checked against the
+        central directory's own `uncompressed_size` before it is returned,
+        which is what catches a truncated or otherwise short transfer
+        rather than handing back a partial member silently.
+        """
+        member = self._members.get(name)
+        if member is None:
+            raise OsOpenError(
+                f"{self.source.name} has no member named {name!r}.",
+                kind="range",
+            )
+        try:
+            local_header = self.source.read(member.header_offset, 30)
+            if local_header[:4] != _LOCAL_HEADER_SIGNATURE:
+                raise OsOpenError(
+                    f"{self.source.name}'s local header for {name!r} does "
+                    f"not start with the expected signature, so it is "
+                    f"corrupt.",
+                    kind="range",
+                )
+            name_len, extra_len = struct.unpack_from(
+                _LOCAL_HEADER_NAME_EXTRA_LEN_STRUCT, local_header, 26
+            )
+            data_offset = member.header_offset + 30 + name_len + extra_len
+            payload = self.source.read(data_offset, member.compressed_size)
+        except CogError as exc:
+            raise OsOpenError(
+                f"Reading {name!r} out of {self.source.name} failed: a "
+                f"range request this reader depends on did not answer as "
+                f"expected.",
+                kind="range",
+                status_code=getattr(exc, "status_code", None),
+            ) from None
+
+        if member.method == _ZIP_METHOD_STORED:
+            data = payload
+        elif member.method == _ZIP_METHOD_DEFLATED:
+            decompressor = zlib.decompressobj(_RAW_DEFLATE_WBITS)
+            try:
+                data = decompressor.decompress(payload) + decompressor.flush()
+            except zlib.error:
+                raise OsOpenError(
+                    f"{name!r} in {self.source.name} could not be "
+                    f"inflated: its deflate stream is corrupt.",
+                    kind="range",
+                ) from None
+        else:
+            raise OsOpenError(
+                f"{name!r} in {self.source.name} uses zip compression "
+                f"method {member.method}, which this reader does not "
+                f"support (only stored and deflate are read).",
+                kind="range",
+            )
+
+        if len(data) != member.uncompressed_size:
+            raise OsOpenError(
+                f"{name!r} in {self.source.name} decompressed to "
+                f"{len(data)} bytes, expected {member.uncompressed_size}.",
+                kind="range",
+            )
+        return data
+
+    def _read_central_directory(self) -> dict[str, ZipMember]:
+        try:
+            size = self.source.size()
+            tail_size = min(size, _EOCD_SEARCH_WINDOW)
+            tail = self.source.read(size - tail_size, tail_size)
+        except CogError as exc:
+            raise OsOpenError(
+                f"Reading {self.source.name}'s own end failed: a range "
+                f"request this reader depends on did not answer as "
+                f"expected.",
+                kind="range",
+                status_code=getattr(exc, "status_code", None),
+            ) from None
+
+        eocd_pos = tail.rfind(_EOCD_SIGNATURE)
+        if eocd_pos == -1:
+            raise OsOpenError(
+                f"{self.source.name} has no End Of Central Directory "
+                f"record in its final {_EOCD_SEARCH_WINDOW} bytes, so it "
+                f"is not a zip this reader can read.",
+                kind="range",
+            )
+        (
+            _disk_no, _disk_with_cd, _records_this_disk, total_records,
+            cd_size, cd_offset, _comment_len,
+        ) = struct.unpack_from(_EOCD_STRUCT, tail, eocd_pos + 4)
+
+        if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+            raise OsOpenError(
+                f"{self.source.name} is a zip64 archive (its End Of "
+                f"Central Directory record carries a 0xFFFFFFFF marker); "
+                f"this reader does not support zip64, which none of the "
+                f"products it reads actually need.",
+                kind="range",
+            )
+
+        members: dict[str, ZipMember] = {}
+        offset = cd_offset
+        for index in range(total_records):
+            try:
+                header = self.source.read(offset, 46)
+            except CogError as exc:
+                raise OsOpenError(
+                    f"Reading {self.source.name}'s central directory "
+                    f"failed: a range request this reader depends on did "
+                    f"not answer as expected.",
+                    kind="range",
+                    status_code=getattr(exc, "status_code", None),
+                ) from None
+            if header[:4] != _CENTRAL_DIRECTORY_SIGNATURE:
+                raise OsOpenError(
+                    f"{self.source.name}'s central directory is corrupt: "
+                    f"entry {index} does not start with the expected "
+                    f"signature.",
+                    kind="range",
+                )
+            (
+                _version_made_by, _version_needed, flag, method,
+                _mod_time, _mod_date, _crc32,
+                compressed_size, uncompressed_size,
+                name_len, extra_len, comment_len,
+                _disk_start, _internal_attr, _external_attr,
+                header_offset,
+            ) = struct.unpack_from(_CENTRAL_DIRECTORY_STRUCT, header, 4)
+
+            try:
+                name_bytes = self.source.read(offset + 46, name_len)
+            except CogError as exc:
+                raise OsOpenError(
+                    f"Reading {self.source.name}'s central directory "
+                    f"failed: a range request this reader depends on did "
+                    f"not answer as expected.",
+                    kind="range",
+                    status_code=getattr(exc, "status_code", None),
+                ) from None
+            # UTF-8 when the general purpose bit flag's language encoding
+            # bit (11) is set, cp437 otherwise: the same rule `zipfile`
+            # itself applies, and the one that matters for every real name
+            # this project reads is moot either way (plain ASCII paths
+            # like "data/OSOpenRoads_SS.gml" decode identically under
+            # both).
+            encoding = "utf-8" if flag & 0x0800 else "cp437"
+            name = name_bytes.decode(encoding)
+
+            members[name] = ZipMember(
+                name=name,
+                method=method,
+                compressed_size=compressed_size,
+                uncompressed_size=uncompressed_size,
+                header_offset=header_offset,
+            )
+            offset += 46 + name_len + extra_len + comment_len
+
+        return members
