@@ -1128,16 +1128,19 @@ def _elevation_grid_record(
     covered: int | None = None,
     error: str | None = None,
     source: str | None = None,
+    min_height: float | None = None,
+    max_height: float | None = None,
 ) -> dict[str, object]:
     """survey.json's `elevation_grid` block, in ONE shape whatever happened.
 
-    All six keys, always. README's schema table has always described the
-    block this way (five keys before Task 8, six since), but `covered`
-    used to be added only on the success branch, so a package with no DEM
-    and a package whose DEM could not be read each carried four. Nothing
-    in mapgen noticed, because cli.py reads the block with .get; a reader
-    following the README and indexing the key got a KeyError on exactly
-    the packages where they most wanted to know.
+    All eight keys, always. README's schema table has always described
+    the block this way (five keys before Task 8, six since, eight since
+    the 2026-08-06 post-release fix below), but `covered` used to be added
+    only on the success branch, so a package with no DEM and a package
+    whose DEM could not be read each carried four. Nothing in mapgen
+    noticed, because cli.py reads the block with .get; a reader following
+    the README and indexing the key got a KeyError on exactly the packages
+    where they most wanted to know.
 
     A record whose KEYS depend on the outcome is the kind of shape that is
     only ever found by the reader who trips over it, so the outcome now
@@ -1149,6 +1152,16 @@ def _elevation_grid_record(
     every branch that wrote nothing at all, written or not. It is not
     derivable from `covered` alone, which counts nodes and says nothing
     about which sampler answered them.
+
+    `min_height`/`max_height` (2026-08-06): the min and max over the
+    grid's own covered (non-NaN) nodes, rounded to 2 decimals, so
+    Grasshopper labels can anchor to the terrain's real values instead of
+    the flattened elevations Urbano's GeoJSON import leaves contours with.
+    Both are None on exactly the branches `covered` is None:
+    `write_elevation_grid_from_sampler` already refuses an all-NaN grid
+    (`_NoCoverageError`, egrid.py) before it can ever reach here, so a
+    `written: True` record can never carry a `covered` of zero and never
+    carries a null `min_height`/`max_height` either.
     """
     return {
         "written": written,
@@ -1157,6 +1170,8 @@ def _elevation_grid_record(
         "covered": covered,
         "error": error,
         "source": source,
+        "min_height": min_height,
+        "max_height": max_height,
     }
 
 
@@ -1380,6 +1395,13 @@ def _write_elevation_grid_step(
         sink.emit("elevation_grid_failed", error=error)
         return _elevation_grid_record(error=error)
     covered = grid.real_count
+    # write_elevation_grid_from_sampler already refused an all-NaN grid
+    # (_NoCoverageError) before this line, so height_bounds is never None
+    # here; the `is not None` guard is for anyone reading this file who
+    # has not read that guarantee, not a case this branch actually meets.
+    bounds = grid.height_bounds
+    min_height = round(bounds[0], 2) if bounds is not None else None
+    max_height = round(bounds[1], 2) if bounds is not None else None
     sink.emit(
         "elevation_grid_written",
         file=target.name,
@@ -1392,6 +1414,8 @@ def _write_elevation_grid_step(
         nodes=len(grid.heights),
         covered=covered,
         source=source,
+        min_height=min_height,
+        max_height=max_height,
     )
 
 

@@ -5408,6 +5408,13 @@ def test_a_run_with_a_dem_writes_the_egrid_beside_it(tmp_path):
     # No LiDAR DTM in this package: the phase 1 path, unchanged, and the
     # source says so explicitly rather than leaving it to be inferred.
     assert record["source"] == "opentopography"
+    # min_height/max_height, over real (varying) terrain: not pinned to an
+    # exact figure (that would tie this test to REAL_DEM's own contents,
+    # which the rest of this test already avoids), but ordered correctly,
+    # which a swapped min/max could not fake.
+    assert record["min_height"] is not None
+    assert record["max_height"] is not None
+    assert record["min_height"] < record["max_height"]
 
 
 def test_the_egrid_is_what_the_project_setting_names_and_never_the_raster(tmp_path):
@@ -5447,12 +5454,17 @@ def test_a_dem_that_cannot_be_converted_costs_the_package_nothing(tmp_path):
 
     assert result.complete is True
     record = result.survey["elevation_grid"]
-    # Same six keys as a success and as a package with no DEM at all, so
+    # Same eight keys as a success and as a package with no DEM at all, so
     # a reader following README's schema can index any of them.
-    assert set(record) == {"written", "file", "nodes", "covered", "error", "source"}
+    assert set(record) == {
+        "written", "file", "nodes", "covered", "error", "source",
+        "min_height", "max_height",
+    }
     assert record["written"] is False
     assert record["covered"] is None
     assert record["source"] is None
+    assert record["min_height"] is None
+    assert record["max_height"] is None
     assert "byte order mark" in record["error"]
     assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
     # The rest of the package is untouched, and the project setting says so
@@ -5467,9 +5479,10 @@ def test_a_run_with_no_dem_at_all_says_nothing_went_wrong(tmp_path):
     is a different statement from "the DEM could not be converted" and has to
     read differently in survey.json.
 
-    All six keys, including `covered` and `source`, whatever happened.
-    README describes the block this way, and a record whose KEYS move with
-    the outcome is one only the reader who trips over it ever finds.
+    All eight keys, including `covered`, `source`, `min_height` and
+    `max_height`, whatever happened. README describes the block this way,
+    and a record whose KEYS move with the outcome is one only the reader
+    who trips over it ever finds.
     """
     register(UrbanoReadableStubSource())
     result = run_survey(_request(tmp_path, run_bridge_step=False))
@@ -5477,7 +5490,7 @@ def test_a_run_with_no_dem_at_all_says_nothing_went_wrong(tmp_path):
     record = result.survey["elevation_grid"]
     assert record == {
         "written": False, "file": None, "nodes": None, "covered": None,
-        "error": None, "source": None,
+        "error": None, "source": None, "min_height": None, "max_height": None,
     }
 
 
@@ -5927,6 +5940,12 @@ def test_a_package_with_only_lidar_reports_lidar_alone(tmp_path, monkeypatch):
     assert record["written"] is True
     assert record["source"] == "lidar_wales"
     assert record["covered"] > 0
+    # _covering_lidar_window's own default `value=42.0` covers the whole
+    # padded grid with margin to spare (its own docstring), so every
+    # covered node reads exactly 42.0: a known, synthetic min and max, not
+    # a real terrain figure this test would otherwise have to measure.
+    assert record["min_height"] == 42.0
+    assert record["max_height"] == 42.0
     assert not (result.paths.root / f"{result.paths.stem}.tif").exists()
 
 
@@ -6007,7 +6026,7 @@ def test_lidar_with_unusable_ostn15_and_no_tiff_is_a_recorded_failure_not_a_cras
 @pytest.mark.parametrize(
     "branch_name", ["chain", "tiff_only", "lidar_only", "failure", "removal"]
 )
-def test_the_record_carries_all_six_keys_on_every_branch(tmp_path, monkeypatch, branch_name):
+def test_the_record_carries_all_eight_keys_on_every_branch(tmp_path, monkeypatch, branch_name):
     import mapgen.package as package_module
 
     monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
@@ -6033,7 +6052,10 @@ def test_the_record_carries_all_six_keys_on_every_branch(tmp_path, monkeypatch, 
     result = run_survey(_request(tmp_path, bbox=DEM_BBOX, run_bridge_step=False))
 
     record = result.survey["elevation_grid"]
-    assert set(record) == {"written", "file", "nodes", "covered", "error", "source"}
+    assert set(record) == {
+        "written", "file", "nodes", "covered", "error", "source",
+        "min_height", "max_height",
+    }
 
 
 # --------------------------------------------------------------------------

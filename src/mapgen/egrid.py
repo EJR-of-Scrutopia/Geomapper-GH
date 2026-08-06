@@ -181,6 +181,24 @@ class ElevationGrid:
     def real_count(self) -> int:
         return sum(1 for height in self.heights if height == height)
 
+    @property
+    def height_bounds(self) -> tuple[float, float] | None:
+        """The (min, max) of every real (non-NaN) height on the grid, or
+        None when every node is NaN (which `write_elevation_grid_from_
+        sampler` already refuses before it ever writes anything, via
+        `_NoCoverageError` below; this stays honest about the empty case
+        anyway rather than assuming that guard is the only caller).
+
+        Unrounded, matching `real_count`'s own plain count with no
+        formatting applied at this layer: survey.json's own record is
+        where the 2-decimal rounding for Grasshopper's benefit happens,
+        not here.
+        """
+        finite = [height for height in self.heights if height == height]
+        if not finite:
+            return None
+        return min(finite), max(finite)
+
 
 def _cell_count(
     length: float, smallest: float, largest: float
