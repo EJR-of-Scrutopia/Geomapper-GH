@@ -188,6 +188,17 @@ def _get_json(url: str, *, what: str) -> object:
     2xx body must become an OsOpenError" contract this function's own
     docstring already claimed, just not, before this fix, what its code
     actually did for every input.
+
+    `except OsOpenError: raise` comes before that catch-all, deliberately
+    separate from it even though `OsOpenError` is itself an `Exception`
+    and would otherwise fall into the same branch: a later change adding
+    a call inside this try block that can itself raise `OsOpenError` (none
+    does today) must never have that error silently double-wrapped into a
+    generic kind "listing", status_code None, losing whatever kind and
+    status_code it already carried. A re-review of the catch-all's own
+    introduction found this guard missing; nothing inside this try block
+    currently reaches it, which is exactly why it is a guard and not
+    something a test could catch by exercising today's code paths alone.
     """
     try:
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -200,6 +211,8 @@ def _get_json(url: str, *, what: str) -> object:
             kind="listing",
             status_code=exc.code,
         ) from None
+    except OsOpenError:
+        raise
     except Exception:
         raise OsOpenError(
             f"Could not reach the OS Data Hub {what}.",
@@ -308,6 +321,14 @@ def download_entry(entry: dict, dest: Path, progress: ProgressSink | None = None
     than wrapping: a `KeyboardInterrupt` is the owner stopping the run, not
     a download failure to describe, and it still needs the same `.part`
     cleanup on the way out.
+
+    `except OsOpenError: raise` comes before the catch-all for the same
+    reason `_get_json` has one: nothing inside this try block raises
+    OsOpenError today, but without this guard a future call that did would
+    have it silently double-wrapped into a generic kind "download",
+    status_code None, discarding whatever it already carried. Cleans up
+    the `.part` file first, exactly like every other branch here, since a
+    re-raised OsOpenError is still a failed download.
     """
     name = entry.get("fileName") or "the OS Open file"
     expected_size = entry["size"]
@@ -339,6 +360,9 @@ def download_entry(entry: dict, dest: Path, progress: ProgressSink | None = None
             kind="download",
             status_code=exc.code,
         ) from None
+    except OsOpenError:
+        temp_path.unlink(missing_ok=True)
+        raise
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise OsOpenError(

@@ -449,6 +449,68 @@ def test_download_entry_wraps_any_unexpected_opener_exception(tmp_path, monkeypa
 
 
 # --------------------------------------------------------------------------
+# Re-review finding (Important, latent): the catch-all `except Exception`
+# added for finding 1 is broad enough to catch an OsOpenError too. Nothing
+# inside either try block raises one today, but the guard against it
+# double-wrapping was missing; these tests plant one directly at the
+# opener seam (the only thing either try block calls that a later change
+# could plausibly make raise OsOpenError itself) and assert it survives
+# completely unchanged: same kind, same status_code, same message.
+# --------------------------------------------------------------------------
+
+
+class _PlantedOsOpenErrorOpener:
+    """Raises a specific, recognisable OsOpenError from `.open()`, standing
+    in for some future call inside `_get_json`'s or `download_entry`'s own
+    try block that might one day raise OsOpenError itself. Kind and
+    status_code are deliberately values neither function would ever
+    produce on its own ("planted"/424), so a double-wrap is unmistakable:
+    it would show up as kind "listing"/"download" and status_code None
+    instead.
+    """
+
+    def open(self, request, timeout=None):
+        raise os_downloads.OsOpenError(
+            "a distinctively planted failure", kind="planted", status_code=424
+        )
+
+
+def test_product_downloads_does_not_double_wrap_an_existing_os_open_error(monkeypatch):
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: _PlantedOsOpenErrorOpener())
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.product_downloads("OpenGreenspace")
+
+    assert excinfo.value.kind == "planted"
+    assert excinfo.value.status_code == 424
+    assert str(excinfo.value) == "a distinctively planted failure"
+
+
+def test_product_version_does_not_double_wrap_an_existing_os_open_error(monkeypatch):
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: _PlantedOsOpenErrorOpener())
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.product_version("OpenGreenspace")
+
+    assert excinfo.value.kind == "planted"
+    assert excinfo.value.status_code == 424
+    assert str(excinfo.value) == "a distinctively planted failure"
+
+
+def test_download_entry_does_not_double_wrap_an_existing_os_open_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: _PlantedOsOpenErrorOpener())
+
+    dest = tmp_path / "out" / "x.zip"
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.download_entry(_entry(10), dest)
+
+    assert excinfo.value.kind == "planted"
+    assert excinfo.value.status_code == 424
+    assert str(excinfo.value) == "a distinctively planted failure"
+    assert list(dest.parent.glob("*.part")) == []
+
+
+# --------------------------------------------------------------------------
 # ZipReader: real zips, built with `zipfile`, read back through
 # FileByteSource (see cog.py). Never a fake ByteSource here: what is under
 # test is the EOCD scan, the central directory walk and the local header
