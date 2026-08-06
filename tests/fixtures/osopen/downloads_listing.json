@@ -1,0 +1,29 @@
+[
+  {
+    "md5": "a13f2c9e6b4d0871c5e93a2f7d160c4b",
+    "size": 8741209,
+    "url": "https://api.os.uk/downloads/v1/products/OpenGreenspace/downloads?area=GB&format=GML&subformat=3&redirect",
+    "format": "GML",
+    "subformat": "3",
+    "area": "GB",
+    "fileName": "opgrsp_gml3_gb.zip"
+  },
+  {
+    "md5": "e087721f040e06bdaad6a943c92d0539",
+    "size": 631663,
+    "url": "https://api.os.uk/downloads/v1/products/OpenGreenspace/downloads?area=SS&format=GML&subformat=3&redirect",
+    "format": "GML",
+    "subformat": "3",
+    "area": "SS",
+    "fileName": "opgrsp_gml3_ss.zip"
+  },
+  {
+    "md5": "7d4a915e2b6c8f01934dabc5e1f0a9d2",
+    "size": 2205311,
+    "url": "https://api.os.uk/downloads/v1/products/OpenGreenspace/downloads?area=ST&format=GML&subformat=3&redirect",
+    "format": "GML",
+    "subformat": "3",
+    "area": "ST",
+    "fileName": "opgrsp_gml3_st.zip"
+  }
+]
