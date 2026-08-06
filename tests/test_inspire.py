@@ -29,6 +29,7 @@ from mapgen.sources.inspire import (
     OUTSIDE_ENGLAND_AND_WALES_MESSAGE,
     PARCELS_WORK_NAME,
     BYTES_PER_AUTHORITY,
+    BYTES_PER_SECOND_ESTIMATE,
     SECONDS_FLOOR,
     InspireError,
     InspireSource,
@@ -81,6 +82,35 @@ def test_every_name_is_a_safe_path_segment_and_filename():
     index = load_authority_index()
     bad = [name for name in index if not _NAME_SHAPE.match(name)]
     assert bad == []
+
+
+def test_no_authority_name_is_a_strict_prefix_of_another_followed_by_underscore():
+    """The sweep-safety property `_sweep_stale_months` depends on without
+    ever checking it itself: it deletes every `<name>_*.zip` already in
+    the cache directory other than the one just written (see that
+    function's own docstring), where `name` is one authority's own name.
+    If authority X's name were a strict prefix of authority Y's own name,
+    followed by "_" (a hypothetical "Vale" sitting beside the real
+    "Vale_of_Glamorgan_Council"), sweeping X's own stale months would ALSO
+    match and delete Y's current-month cache file: `_sweep_stale_months`
+    globs `f"{name}_*.zip"`, and "Vale_*.zip" matches
+    "Vale_of_Glamorgan_Council_2026-08.zip" too, just as readily as it
+    matches "Vale_2026-07.zip". None of the real 318 HMLR names collides
+    this way today,
+    but nothing enforces that against a future regeneration of the
+    committed index (`make_authority_index.py`) that happened to add one
+    that does; this test is that enforcement, made self-checking rather
+    than left to be noticed by hand.
+    """
+    names = sorted(load_authority_index())
+    for name in names:
+        prefix = f"{name}_"
+        colliding = [other for other in names if other != name and other.startswith(prefix)]
+        assert colliding == [], (
+            f"{name!r} is a strict prefix of {colliding!r} (each followed by "
+            f"'_'); _sweep_stale_months({name!r}, ...) would also match and "
+            f"delete their own current-month cache files."
+        )
 
 
 def test_every_bbox_is_four_floats_west_south_east_north():
@@ -1104,6 +1134,22 @@ def test_seconds_floor_carries_a_margin_over_every_measured_wall_time():
     largest_measured_seconds = 7.25
     assert SECONDS_FLOOR > largest_measured_seconds
     assert SECONDS_FLOOR >= round(largest_measured_seconds * 1.1, 2)
+
+
+def test_bytes_per_second_estimate_sits_below_the_slowest_measured_rate():
+    # A review finding: unlike BYTES_PER_AUTHORITY and SECONDS_FLOOR just
+    # above, both of which are numerators that must clear a measured
+    # figure from ABOVE, this constant is a DENOMINATOR
+    # (seconds_estimate = bytes_estimate / this rate), so the safe
+    # direction is the opposite: it must sit BELOW the slowest download
+    # rate on record, since a rate above the true slowest one under-reads
+    # the time needed on a day that behaves like that slow one.
+    # 13,689,747 bytes / 7.25 s (Task 2's own pytest-inclusive
+    # measurement) is the slowest rate this project has measured against
+    # this service. The previous figure, 1,900,000, was marginally on the
+    # wrong side of it despite the comment beside it saying otherwise.
+    slowest_measured_bytes_per_second = 13_689_747 / 7.25
+    assert BYTES_PER_SECOND_ESTIMATE < slowest_measured_bytes_per_second
 
 
 # --------------------------------------------------------------------------

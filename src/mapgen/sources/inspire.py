@@ -869,20 +869,24 @@ BYTES_PER_AUTHORITY = 16_000_000
 # decimal that would read as more precise than two samples justify.
 SECONDS_FLOOR = 8.0
 
-# Left UNCHANGED by this refit, deliberately, having considered Task 4's
-# new data and rejected moving it: this term prices a LARGE, multi-authority
-# extent's transfer time (bytes_estimate / this rate), so the safe choice is
-# the SLOWEST of the download rates now on record, not an average of them.
-# 13,689,747 bytes / 7.25 s (Task 2's own pytest-inclusive measurement) is
-# about 1.89 MB/s, still the slowest rate this project has measured against
-# this service even after Task 4's own, much faster, 13,689,747 bytes /
-# 3.229 s (fetch() alone) at about 4.24 MB/s on a different day: keeping the
-# constant at the slow end is what keeps a multi-authority estimate from
-# under-reading on a day that behaves like Task 2's rather than Task 4's.
-# Kept at two significant figures, the same convention every other
-# thin-evidence rate constant in this project's sources/ package uses (see
-# lidar_wales.py's BYTES_PER_SECOND_ESTIMATE).
-BYTES_PER_SECOND_ESTIMATE = 1_900_000.0
+# This term prices a LARGE, multi-authority extent's transfer time
+# (bytes_estimate / this rate), so the safe choice is a rate genuinely
+# BELOW the slowest download rate now on record, not an average of them
+# and not that slowest rate's own rounded value. 13,689,747 bytes / 7.25 s
+# (Task 2's own pytest-inclusive measurement) is about 1,888,000 bytes/s
+# (1.89 MB/s to two significant figures), still the slowest rate this
+# project has measured against this service even after Task 4's own, much
+# faster, 13,689,747 bytes / 3.229 s (fetch() alone) at about 4.24 MB/s on
+# a different day. A review finding: the previous figure here, 1,900,000,
+# was marginally ABOVE that 1,888,000 slowest measurement, the wrong side
+# of it despite this comment's own stated rationale, which UNDER-reads the
+# time needed on a day that behaves like Task 2's rather than Task 4's,
+# the same failure elevation.py's own SECONDS_FLOOR history warns an
+# under-estimate always is. 1,800,000 clears 1,888,000 with a genuine
+# margin below it instead, kept at two significant figures, the same
+# convention every other thin-evidence rate constant in this project's
+# sources/ package uses (see lidar_wales.py's BYTES_PER_SECOND_ESTIMATE).
+BYTES_PER_SECOND_ESTIMATE = 1_800_000.0
 
 
 def _classify_inspire_error(exc: InspireError) -> tuple[str, str, str]:
