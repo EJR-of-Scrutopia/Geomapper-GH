@@ -65,6 +65,7 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.elevation import ElevationSource
+from mapgen.sources.inspire import InspireSource
 from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
@@ -307,9 +308,17 @@ def register_default_sources() -> None:
     owner chooses rather than gets by default), but registering it here is
     what makes it appear in the web UI's layer checklist at all, since that
     checklist is registry-driven rather than hard-coded per source.
+
+    InspireSource (Task 4 of the INSPIRE curves plan) joins the same way,
+    for the same reason: opt-in (an England/Wales-only property-boundary
+    download the owner chooses, not a default), and registering it here is
+    what makes "Property boundaries (INSPIRE)" appear in the layer
+    checklist at all.
     """
     by_id = {source.id: source for source in available_sources()}
-    for source in (OsmSource(), OvertureSource(), ElevationSource(), LidarWalesSource()):
+    for source in (
+        OsmSource(), OvertureSource(), ElevationSource(), LidarWalesSource(), InspireSource(),
+    ):
         existing = by_id.get(source.id)
         if existing is not None and type(existing) is type(source):
             continue

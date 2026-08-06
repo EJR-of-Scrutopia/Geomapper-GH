@@ -564,6 +564,66 @@ def test_check_path_length_checks_lidar_waless_own_contour_file_for_a_long_stem(
     check_path_length(paths, [], source_ids=["lidar_wales"], limit=len(str(contour_path)))
 
 
+# --- Task 4 (INSPIRE curves): inspire needs its own raw-work candidate, or
+# an inspire-only job's raw/inspire/parcels.jsonl is never checked at all
+# ------------------------------------------------------------------------
+
+
+def test_check_path_length_ignores_inspire_when_it_is_not_selected(tmp_path):
+    paths = build_package_paths(tmp_path, "R", "S", date(2026, 8, 1), FINGERPRINT)
+    raw_path = paths.work_dir / "raw" / "inspire" / "parcels.jsonl"
+    limit = len(str(raw_path)) - 1
+
+    with pytest.raises(PathTooLongError):
+        check_path_length(paths, [], source_ids=["inspire"], limit=limit)
+
+    # Not selected: the same limit must not be tripped by a path this job
+    # will never produce.
+    check_path_length(paths, [], source_ids=["osm"], limit=limit)
+
+
+def test_check_path_length_checks_inspires_own_raw_work_file_when_selected_alone(tmp_path):
+    # Isolated with a short, fixed stem, the same way
+    # test_check_path_length_checks_lidar_waless_own_raw_work_file is: an
+    # inspire-only job (no osm, no overture, no elevation, no lidar_wales)
+    # would otherwise add nothing beyond project_setting's own
+    # unconditional candidate, silently missing inspire's own longer raw
+    # path.
+    work_dir = tmp_path / ("x" * 200) / "_work" / FINGERPRINT
+    paths = PackagePaths(
+        root=tmp_path,
+        stem="S",
+        layers_dir=tmp_path / "layers",
+        work_dir=work_dir,
+        survey_json=tmp_path / "survey.json",
+        project_setting=tmp_path / "short.json",
+    )
+    raw_path = work_dir / "raw" / "inspire" / "parcels.jsonl"
+    project_setting_length = len(str(paths.project_setting))
+    raw_length = len(str(raw_path))
+    assert raw_length > project_setting_length, "test setup: inspire's raw path must be the longer one here"
+
+    with pytest.raises(PathTooLongError) as excinfo:
+        check_path_length(paths, [], source_ids=["inspire"], limit=raw_length - 1)
+    assert str(raw_path) in str(excinfo.value)
+
+    check_path_length(paths, [], source_ids=["inspire"], limit=raw_length)
+
+
+def test_check_path_length_inspires_merged_output_never_binds_project_setting_is_longer(tmp_path):
+    # The brief's own arithmetic, pinned: "_boundaries.geojson" (19 chars)
+    # is shorter than project_setting's own fixed "_project_setting.json"
+    # suffix (21 chars) for the same stem, and project_setting is always
+    # an unconditional candidate, so inspire's merged output can never be
+    # the binding candidate at any stem length and needs no candidate of
+    # its own (unlike lidar_wales's 23-character contour suffix, which
+    # sometimes IS longer than project_setting's).
+    long_site = "A" * 40
+    paths = build_package_paths(tmp_path, "R", long_site, date(2026, 8, 1), FINGERPRINT)
+    boundaries_path = paths.root / f"{paths.stem}_boundaries.geojson"
+    assert len(str(boundaries_path)) < len(str(paths.project_setting))
+
+
 # --- what the 240 character limit does and does not cover ------------------
 #
 # check_path_length measures OSM at raw/osm/r00_c00.osm, and Task 26 gave a

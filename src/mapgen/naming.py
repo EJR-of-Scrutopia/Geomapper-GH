@@ -239,6 +239,25 @@ def check_path_length(
     long one favours the contour candidate), so both are checked and the
     existing max-picking loop below settles it, rather than this guard
     guessing which one binds.
+
+    inspire (Task 4 of the INSPIRE curves plan) needs only ONE candidate,
+    unlike lidar_wales, and only because it is gated the same way every
+    other guarded source here is: `selected` filters out every OTHER
+    source's own candidates, including project_setting's unconditional
+    entry only in the sense that it always survives regardless, so a job
+    that selects "inspire" alone (no osm, no overture, no elevation, no
+    lidar_wales) would otherwise add NOTHING beyond project_setting to
+    `candidates` at all, silently skipping inspire's own raw work file
+    ("raw/inspire/parcels.jsonl", 25 characters, longer than "raw/inspire/
+    meta.json"'s 21, so one candidate covers both) even though it is the
+    only source actually selected. inspire's merged output
+    ("<stem>_boundaries.geojson", 19 characters) does NOT need its own
+    candidate the way lidar_wales's contour file does: 19 is shorter than
+    project_setting's own fixed 21-character "_project_setting.json"
+    suffix for the same stem, which is unconditionally checked already,
+    so the merged output can never be the binding candidate for any stem
+    length, unlike lidar_wales's 23-character contour suffix, which
+    sometimes is.
     """
     selected = None if source_ids is None else set(source_ids)
 
@@ -279,6 +298,13 @@ def check_path_length(
         # ever be the binding candidate once this one is checked.
         lidar_contour_path = paths.root / f"{paths.stem}_contours_0.25m.geojson"
         candidates.append((_length(lidar_contour_path), lidar_contour_path))
+
+    if selected is None or "inspire" in selected:
+        # "parcels.jsonl" is longer than "meta.json", so one raw candidate
+        # covers both work files (see the docstring above for why this is
+        # the only inspire candidate needed at all).
+        inspire_raw_path = paths.work_dir / "raw" / "inspire" / "parcels.jsonl"
+        candidates.append((_length(inspire_raw_path), inspire_raw_path))
 
     length, longest_candidate = candidates[0]
     for candidate_length, candidate_path in candidates[1:]:

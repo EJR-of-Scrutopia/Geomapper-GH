@@ -13,10 +13,12 @@ from mapgen.bng import (
     ensure_ostn15,
     from_bng,
     load_ostn15,
+    padded_bng_extent,
     tm_forward,
     tm_inverse,
     to_bng,
 )
+from mapgen.geo import BBox
 from tests.fixtures.ostn15 import make_fixture
 
 
@@ -111,6 +113,62 @@ def test_from_bng_inverts_to_bng(ostn15_fixture_grid):
 def test_outside_grid_refuses(ostn15_fixture_grid):
     with pytest.raises(OutsideOstn15Error):
         ostn15_fixture_grid.shift_at(-50_000.0, -50_000.0)
+
+
+# --------------------------------------------------------------------------
+# padded_bng_extent: promoted from mapgen.sources.lidar_wales (Task 4 of
+# the INSPIRE curves plan) so mapgen.sources.inspire can reuse the exact
+# same arithmetic rather than keeping a second copy. lidar_wales.py's own
+# suite still exercises this indirectly through LidarWalesSource.estimate/
+# fetch; these tests pin the promoted function directly, against TP06
+# (Bridgend), the station the fixture's 3x3 km block was built around.
+# --------------------------------------------------------------------------
+
+_TP06_LAT = 51.4007822014
+_TP06_LON = -3.5512834924
+
+
+def test_padded_bng_extent_pads_every_side_by_the_given_amount(ostn15_fixture_grid):
+    bbox = BBox(
+        west=_TP06_LON - 0.0005,
+        south=_TP06_LAT - 0.0005,
+        east=_TP06_LON + 0.0005,
+        north=_TP06_LAT + 0.0005,
+    )
+    unpadded_sw = to_bng(bbox.south, bbox.west, ostn15_fixture_grid)
+    unpadded_ne = to_bng(bbox.north, bbox.east, ostn15_fixture_grid)
+
+    e_min, n_min, e_max, n_max = padded_bng_extent(bbox, ostn15_fixture_grid, 200.0)
+
+    assert e_min == pytest.approx(min(unpadded_sw[0], unpadded_ne[0]) - 200.0)
+    assert n_min == pytest.approx(min(unpadded_sw[1], unpadded_ne[1]) - 200.0)
+    assert e_max == pytest.approx(max(unpadded_sw[0], unpadded_ne[0]) + 200.0)
+    assert n_max == pytest.approx(max(unpadded_sw[1], unpadded_ne[1]) + 200.0)
+
+
+def test_padded_bng_extent_zero_pad_is_the_bare_corners(ostn15_fixture_grid):
+    bbox = BBox(
+        west=_TP06_LON - 0.0005,
+        south=_TP06_LAT - 0.0005,
+        east=_TP06_LON + 0.0005,
+        north=_TP06_LAT + 0.0005,
+    )
+    e_sw, n_sw = to_bng(bbox.south, bbox.west, ostn15_fixture_grid)
+    e_ne, n_ne = to_bng(bbox.north, bbox.east, ostn15_fixture_grid)
+
+    e_min, n_min, e_max, n_max = padded_bng_extent(bbox, ostn15_fixture_grid, 0.0)
+
+    assert (e_min, n_min, e_max, n_max) == (
+        min(e_sw, e_ne), min(n_sw, n_ne), max(e_sw, e_ne), max(n_sw, n_ne)
+    )
+
+
+def test_padded_bng_extent_raises_for_a_corner_outside_the_grid(ostn15_fixture_grid):
+    # Far outside the fixture's own 3x3 km block, so to_bng's own shift
+    # lookup fails for this corner.
+    bbox = BBox(west=-50.0, south=-10.0, east=-49.9, north=-9.9)
+    with pytest.raises(BngError):
+        padded_bng_extent(bbox, ostn15_fixture_grid, 200.0)
 
 
 # A tiny, hand-written excerpt in the data file's own confirmed column

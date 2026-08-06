@@ -82,6 +82,7 @@ import requests
 
 from mapgen.config import CONFIG_PATH
 from mapgen.fsutil import atomic_write_bytes
+from mapgen.geo import BBox
 
 # GRS80 ellipsoid, which is what OSTN15's input frame (ETRS89) is defined on.
 _A = 6378137.0
@@ -594,3 +595,39 @@ def from_bng(easting: float, northing: float, grid: Ostn15Grid) -> tuple[float, 
         if converged:
             break
     return tm_inverse(e_prime, n_prime)
+
+
+def padded_bng_extent(
+    bbox: BBox, grid: Ostn15Grid, pad_metres: float
+) -> tuple[float, float, float, float]:
+    """`bbox`'s two corners projected to BNG, padded by `pad_metres` on
+    every side, as `(e_min, n_min, e_max, n_max)`.
+
+    Promoted here from `mapgen.sources.lidar_wales._padded_bng_extent`
+    (Task 4 of the INSPIRE curves plan), which needed the identical
+    arithmetic for a second caller (`mapgen.sources.inspire`): the extent
+    `parcels_in` filters against has to be built the same way, corner
+    projection, min/max, and pad, or the two sources would disagree about
+    where "the survey extent" actually is for what is otherwise the same
+    bbox. One home rather than two copies drifting apart.
+
+    `pad_metres` is a parameter, not a name this module imports, on
+    purpose: `egrid.PAD_METRES`, the value both current callers pass, is
+    the elevation grid's own padding constant, and `egrid.py` already
+    imports FROM this module (`BngError`, `Ostn15Grid`); importing
+    `PAD_METRES` back the other way would make the two modules mutually
+    dependent for no reason this function needs. This module (the
+    lowest-level BNG/OSTN15 layer) stays free of that, and every caller
+    is explicit about which pad it means.
+
+    Both corners are projected and min/maxed, not just (south, west)
+    assumed to be the low corner: OSTN15's shift is spatially varying, so
+    a "rotated-ish" projection can in principle leave either corner the
+    more easterly or northerly of the two. Raises `BngError` (via
+    `to_bng`) for a corner OSTN15 does not cover.
+    """
+    e1, n1 = to_bng(bbox.south, bbox.west, grid)
+    e2, n2 = to_bng(bbox.north, bbox.east, grid)
+    e_min, e_max = min(e1, e2) - pad_metres, max(e1, e2) + pad_metres
+    n_min, n_max = min(n1, n2) - pad_metres, max(n1, n2) + pad_metres
+    return e_min, n_min, e_max, n_max

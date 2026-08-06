@@ -76,7 +76,7 @@ from typing import Sequence
 
 import requests
 
-from mapgen.bng import BngError, ensure_ostn15, load_ostn15, to_bng
+from mapgen.bng import BngError, ensure_ostn15, load_ostn15, padded_bng_extent
 from mapgen.cog import (
     CogError,
     CogReader,
@@ -235,23 +235,6 @@ def _classify_cog_error(exc: CogError) -> tuple[str, str]:
     return FAILURE_UNKNOWN, "could not be read"
 
 
-def _padded_bng_extent(bbox: BBox, grid) -> tuple[float, float, float, float]:
-    """The survey bbox's two corners projected to BNG, padded on every side.
-
-    Both corners projected and min/maxed, not just (south, west) assumed to
-    be the low corner: OSTN15's shift is spatially varying, so a
-    "rotated-ish" projection can in principle leave either corner the more
-    easterly or northerly of the two. Raises BngError (via to_bng) for a
-    corner OSTN15 does not cover, which the caller reads as "no Welsh LiDAR
-    here either" (see the module docstring).
-    """
-    e1, n1 = to_bng(bbox.south, bbox.west, grid)
-    e2, n2 = to_bng(bbox.north, bbox.east, grid)
-    e_min, e_max = min(e1, e2) - PAD_METRES, max(e1, e2) + PAD_METRES
-    n_min, n_max = min(n1, n2) - PAD_METRES, max(n1, n2) + PAD_METRES
-    return e_min, n_min, e_max, n_max
-
-
 def _all_nodata(values) -> bool:
     """True if every sample in a window's values is NaN.
 
@@ -377,7 +360,7 @@ class LidarWalesSource:
         padded_area_m2 = None
         if grid is not None:
             try:
-                e_min, n_min, e_max, n_max = _padded_bng_extent(bbox, grid)
+                e_min, n_min, e_max, n_max = padded_bng_extent(bbox, grid, PAD_METRES)
             except BngError:
                 padded_area_m2 = None
             else:
@@ -464,7 +447,7 @@ class LidarWalesSource:
             cancel.raise_if_cancelled()
 
         try:
-            e_min, n_min, e_max, n_max = _padded_bng_extent(bbox, grid)
+            e_min, n_min, e_max, n_max = padded_bng_extent(bbox, grid, PAD_METRES)
         except BngError:
             # A corner OSTN15 cannot place is, for this source's purposes,
             # the same fact as a corner outside the mosaic: see the module

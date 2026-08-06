@@ -86,12 +86,27 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import requests
 
+from mapgen.bng import BngError, ensure_ostn15, from_bng, load_ostn15, padded_bng_extent
+from mapgen.boundary_curves import boundary_curves
 from mapgen.config import CONFIG_PATH
-from mapgen.fsutil import ensure_dir
-from mapgen.geo import BBox
+from mapgen.egrid import PAD_METRES
+from mapgen.fsutil import atomic_write_bytes, atomic_write_text, ensure_dir
+from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken
+from mapgen.sources.base import (
+    FAILURE_NO_OUTPUT,
+    FAILURE_UNKNOWN,
+    FAILURE_UNREACHABLE,
+    Estimate,
+    ProgressSink,
+    TileFailure,
+    classify_status_failure,
+    classify_transport_failure,
+)
 
 AUTHORITY_INDEX_PATH = (
     Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "inspire" / "authority_index.json"
@@ -117,6 +132,19 @@ class InspireError(RuntimeError):
     check here is about the committed fixture being trustworthy, not
     about anything a caller passed in; a bad bbox is BBoxError's job
     (see geo.py), not this module's.
+
+    Also raised by `fetch_authority_zip` (a bad name, a non-200 response,
+    a wrapped `requests.RequestException`) and by `parcels_in` (a zip this
+    module cannot open, a missing GML member, a wrong `srsName`). A
+    non-200 response sets `.status_code` (an int) on the instance before
+    raising, the same structural convention `cog.py`'s `CogError.
+    status_code` already establishes; every other raise site leaves it
+    unset, which `getattr(exc, "status_code", None)` reads as None, "not
+    a status failure". `InspireSource.fetch()` (Task 4) reads this
+    directly, and reads `.__cause__` for the wrapped-RequestException
+    case, rather than parsing either shape back out of this exception's
+    own English sentence: see `classify_status_failure`/
+    `classify_transport_failure` in `sources/base.py`.
     """
 
 
@@ -308,12 +336,22 @@ def fetch_authority_zip(
     try:
         with session.get(url, stream=True, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
             if response.status_code != 200:
-                raise InspireError(
+                # .status_code, set structurally rather than left for a
+                # caller to regex out of the sentence above: Task 4's
+                # InspireSource.fetch() classifies this failure through
+                # classify_status_failure, and CogError.status_code
+                # (cog.py) is the established precedent for exactly this
+                # shape (see lidar_wales.py's own _classify_cog_error).
+                # None (the ordinary case for every other InspireError
+                # this module raises) means "not a status failure".
+                error = InspireError(
                     f"HM Land Registry's INSPIRE download for {name} answered "
                     f"HTTP {response.status_code} instead of 200; this usually "
                     f"means the session did not carry the cookie the service's "
                     f"own redirect sets, and the body received is not the zip."
                 )
+                error.status_code = response.status_code
+                raise error
             with temp_path.open("wb") as handle:
                 for chunk in response.iter_content(1024 * 1024):
                     if chunk:
@@ -599,9 +637,11 @@ def parcels_in(
     British National Grid metres.
 
     `bbox_bng` is `(e_min, n_min, e_max, n_max)`, the same shape and
-    order `lidar_wales._padded_bng_extent` already returns; a caller
-    starting from a WGS84 `BBox` projects it with `bng.to_bng` first,
-    exactly as that module does.
+    order `bng.padded_bng_extent` returns (Task 4 promotes this from
+    `lidar_wales._padded_bng_extent` into `bng.py` so `InspireSource.
+    fetch()`, below, and `lidar_wales.py` share one arithmetic, rather
+    than two copies of it); a caller starting from a WGS84 `BBox`
+    projects it with `bng.to_bng` first, exactly as that module does.
 
     Streams the whole way: see the module docstring's "the parser:
     streaming in, streaming out" section, and `ParcelStream`'s own
@@ -622,3 +662,475 @@ def parcels_in(
     found, rather than being folded into the malformed count.
     """
     return ParcelStream(zip_path, bbox_bng)
+
+
+# --------------------------------------------------------------------------
+# Task 4: InspireSource, the LayerSource wiring and the boundaries GeoJSON.
+#
+# fetch() writes exactly two work files, PARCELS_WORK_NAME and
+# META_WORK_NAME, once ALL selected authorities have downloaded and parsed
+# successfully: nothing is written mid-loop, so a failure partway through a
+# multi-authority extent leaves work_dir exactly as empty as it found it,
+# rather than a parcels.jsonl a later skip-on-resume check might mistake
+# for a completed fetch. This is the same "partial files are worse than
+# absent ones" rule fsutil.py's own module docstring states, applied at
+# the granularity of "the whole per-extent fetch", not just one file's own
+# write.
+#
+# merge() is the one place this module imports mapgen.boundary_curves: it
+# reads PARCELS_WORK_NAME back, one JSON array-of-rings per line, runs the
+# whole dedup-and-chain pipeline over every authority's kept parcels at
+# once (a shared edge between two DIFFERENT authorities' own files, the
+# documented boundary-crossing-parcel case, only collapses if both
+# authorities' parcels are handed to boundary_curves TOGETHER), and
+# unprojects the result through from_bng into the one GeoJSON the brief
+# names.
+# --------------------------------------------------------------------------
+
+# The work_dir file names fetch() writes and merge() reads back BY NAME,
+# never by position (the ElevationSource.merge lesson every other source
+# in this project's sources/ package now follows).
+PARCELS_WORK_NAME = "parcels.jsonl"
+META_WORK_NAME = "meta.json"
+
+# The brief's own sentence, verbatim. Doubles as the refusal for a corner
+# authorities_for approved (a real England/Wales authority's own padded
+# bbox) but that padded_bng_extent's own to_bng call cannot place on the
+# National Grid at all: OSTN15's grid spans the whole of Great Britain, so
+# this is unreachable for any real England/Wales extent in practice, and
+# is handled the same defensive way lidar_wales.py treats the identical
+# shape of BngError (see fetch()'s own docstring).
+OUTSIDE_ENGLAND_AND_WALES_MESSAGE = (
+    "INSPIRE Index Polygons cover England and Wales only, and this extent "
+    "is outside both."
+)
+
+# The two GeoJSON feature properties the brief names verbatim (the third,
+# "year", is per-package rather than a fixed string).
+BOUNDARY_SOURCE_LABEL = "HM Land Registry INSPIRE Index Polygons"
+BOUNDARY_INDICATIVE_NOTE = (
+    "The extent of the land contained in any registered title cannot be "
+    "established from the INSPIRE Index Polygons."
+)
+
+# --------------------------------------------------------------------------
+# Measured constants (Task 2's own live probe, 2026-08-06; see
+# .superpowers/sdd/2026-08-06-mapgen-phase2-02-inspire-curves/task-2-report.md
+# and the plan's own "Measured facts" section). Thin evidence in the same
+# sense every other source's own comment names: one machine, one link, one
+# day, ONE authority (in fact two DIFFERENT authorities for bytes and for
+# time; see below), refit in Task 7.
+# --------------------------------------------------------------------------
+
+# Bridgend_County_Borough_Council.zip measured 13,128,716 bytes (the
+# plan's own live probe, 2026-08-06). 15,000,000 is a round, deliberately
+# generous provisional figure above BOTH single-authority samples this
+# project has actually measured (Bridgend's 13.1 MB here, and Vale of
+# Glamorgan's separate 13.7 MB below): authorities are assumed roughly
+# similar in size until Task 7 has more than one real data point to fit
+# against, and the safe direction for an estimate that runs ahead of a
+# download it cannot yet see is to overstate rather than understate (an
+# under-estimate is a countdown that runs out while the work is still
+# going, which reads as a hang; see elevation.py's own SECONDS_FLOOR
+# history for the same reasoning applied to time instead of bytes).
+BYTES_PER_AUTHORITY = 15_000_000
+
+# Task 2's own live test (`pytest tests/test_inspire.py -m live`) measured
+# 7.25 s of WALL TIME for one authority's whole fetch+parse, end to end:
+# Vale_of_Glamorgan_Council.zip downloaded cold through the real cookie
+# handshake (4.76 s, 13,689,747 bytes) plus parcels_in streamed over the
+# real 65,276-member file down to the Llantwit Major bbox (2.06 s), inside
+# one pytest invocation whose own collection and fixture overhead is
+# folded into that 7.25 s along with the two measured phases (which sum to
+# 6.82 s on their own). Used here exactly as measured, overhead included,
+# because the direction that overhead pushes (the floor a fraction of a
+# second higher than the network alone) is the SAME safe direction
+# BYTES_PER_AUTHORITY's own generosity already argues for, not a distortion
+# fighting it.
+SECONDS_FLOOR = 7.25
+
+# 13,689,747 bytes / 7.25 s (the same single live sample SECONDS_FLOOR is
+# built from) is about 1.89 MB/s; kept at two significant figures, the same
+# convention every other thin-evidence rate constant in this project's
+# sources/ package uses (see lidar_wales.py's BYTES_PER_SECOND_ESTIMATE).
+BYTES_PER_SECOND_ESTIMATE = 1_900_000.0
+
+
+def _classify_inspire_error(exc: InspireError) -> tuple[str, str]:
+    """The (kind, phrase) one authority's own download-or-parse failure
+    implies, read structurally off `exc` rather than out of its own
+    English sentence.
+
+    `.status_code`, when `fetch_authority_zip` set it (a non-200
+    response), goes straight to `classify_status_failure`: the same
+    structural precedent `cog.py`'s `CogError.status_code` establishes,
+    and read the same defensive way `lidar_wales.py`'s own
+    `_classify_cog_error` reads it.
+
+    Otherwise, `exc.__cause__`: every OTHER `InspireError`
+    `fetch_authority_zip` raises wraps a real `requests.RequestException`
+    with `raise ... from exc` (a bad name never reaches this function at
+    all, since `authorities_for`'s own names always pass `_NAME_SHAPE`),
+    so the original exception is still attached and `classify_transport_
+    failure` (which accepts any `BaseException` and falls back to
+    FAILURE_UNKNOWN for anything it does not recognise) is always safe to
+    call on it. `InspireError`s from `parcels_in` (a corrupt zip, a wrong
+    srsName, a missing GML member) have neither a status code nor a
+    chained transport exception, and fall through to the last line: a
+    parse failure is not a transport or status failure, and FAILURE_UNKNOWN
+    is this project's own honest term for "cannot say which recognised
+    cause this is", never retried blind.
+    """
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        return classify_status_failure(status_code)
+    if exc.__cause__ is not None:
+        return classify_transport_failure(exc.__cause__)
+    return FAILURE_UNKNOWN, "could not be read"
+
+
+def _read_parcels_jsonl(path: Path):
+    """Every parcel `PARCELS_WORK_NAME` holds, one line at a time: fetch()'s
+    own write shape, undone. Each line is a JSON array of rings (exterior
+    first, then any interior rings), each ring an array of [easting,
+    northing] pairs; `boundary_curves` only ever indexes a point's two
+    coordinates positionally, so handing it JSON's own nested lists
+    straight through, rather than rebuilding them as tuples first, is
+    correct as well as simpler.
+    """
+    text = path.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if line.strip():
+            yield json.loads(line)
+
+
+class InspireSource:
+    id = "inspire"
+    display_name = "Property boundaries (INSPIRE)"
+    licence = "Open Government Licence v3.0"
+    attribution = (
+        "This information is subject to Crown copyright and database rights "
+        "[year] and is reproduced with the permission of HM Land Registry. "
+        "The polygons (including the associated geometry, namely x, y "
+        "co-ordinates) are subject to Crown copyright and database rights "
+        "[year] Ordnance Survey AC0000851063."
+    )
+    requires_api_key = False
+    # A plain, source-specific attribute (see sources/base.py's own
+    # documentation of this convention: LayerSource attributes beyond the
+    # protocol are read defensively via getattr by whatever needs them).
+    # package.py's `_source_provenance` (checked directly against its own
+    # source, 2026-08-06) reads a FIXED set of such optional attributes
+    # (endpoints_used, merged_features, fetched_types/types, demtype,
+    # routing_note) and none of them is this one, so registering this
+    # source alone does not put the conditions link into survey.json.
+    # Task 5's fusion step is what carries it there, alongside the two
+    # attribution statements above with `[year]` substituted; this task
+    # deliberately does not extend `_source_provenance` speculatively to
+    # read an attribute nothing yet consumes (see this task's own report).
+    conditions_url = "https://use-land-property-data.service.gov.uk/datasets/inspire/#conditions"
+
+    def __init__(
+        self,
+        session: object | None = None,
+        ostn15_cache_dir: Path | None = None,
+        inspire_cache_dir: Path | None = None,
+    ) -> None:
+        self.session = session if session is not None else requests.Session()
+        # None means "the default" for each: bng.py's own ~/.mapgen
+        # (ensure_ostn15/load_ostn15's own cache_dir=None resolution) and
+        # this module's own ~/.mapgen/inspire (fetch_authority_zip's own
+        # cache_dir=None resolution, _default_inspire_cache_dir). A test
+        # or a caller wanting an isolated cache passes a tmp_path for
+        # either, independently.
+        self._ostn15_cache_dir = ostn15_cache_dir
+        self._inspire_cache_dir = inspire_cache_dir
+        # Reset at the top of every fetch(); see sources/base.py's own
+        # documentation of this optional LayerSource extension.
+        self.tile_failures: list[TileFailure] = []
+
+    # -- estimate ------------------------------------------------------------
+
+    def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
+        """Bytes and seconds for every authority `authorities_for(bbox)`
+        names, with no network at all: the authority index is a committed
+        file (`load_authority_index`), not a live lookup.
+
+        Zero authorities is zero bytes and the floor's own seconds ONLY IF
+        that would be honest, and it would not be: zero authorities means
+        `fetch()` refuses before touching anything (see its own docstring),
+        so zero real work is genuinely zero seconds, not SECONDS_FLOOR's
+        "at least one handshake and one zip" floor, which describes work
+        that is never attempted here. `max(..., SECONDS_FLOOR)` is
+        deliberately not applied on this branch for exactly that reason.
+        """
+        authorities = authorities_for(bbox)
+        if not authorities:
+            return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+        bytes_estimate = len(authorities) * BYTES_PER_AUTHORITY
+        seconds_estimate = max(bytes_estimate / BYTES_PER_SECOND_ESTIMATE, SECONDS_FLOOR)
+        return Estimate(bytes_estimate=bytes_estimate, seconds_estimate=seconds_estimate)
+
+    # -- fetch -----------------------------------------------------------------
+
+    def _record_tile_failures(self, tiles: Sequence[Tile], kind: str, reason: str) -> None:
+        """Record why this fetch() could not deliver, once per tile.
+
+        Matches ElevationSource/LidarWalesSource exactly: one whole-extent
+        failure (no authorities, an OSTN15 failure, one authority's own
+        download or parse failure) did not arrive for every tile equally,
+        and `reason` is always composed from the fixed vocabulary plus, at
+        most, an authority NAME (never a URL) and an HTTP status.
+        """
+        self.tile_failures = [
+            TileFailure(source=self.id, tile_id=tile.tile_id, kind=kind, reason=reason)
+            for tile in tiles
+        ]
+
+    def fetch(
+        self,
+        bbox: BBox,
+        tiles: Sequence[Tile],
+        work_dir: Path,
+        progress: ProgressSink,
+        cancel: CancelToken | None = None,
+    ) -> list[Path]:
+        """Every authority `authorities_for(bbox)` names, downloaded through
+        ONE `requests.Session` (this instance's own `self.session`, shared
+        with the OSTN15 grid fetch below: both hosts are fine on one
+        `requests.Session`, which keys cookies per-domain), parsed against
+        the padded BNG extent, and written as PARCELS_WORK_NAME/
+        META_WORK_NAME once every authority has succeeded.
+
+        Refuses immediately, before writing anything and before any
+        network call, when `authorities_for(bbox)` names none:
+        `OUTSIDE_ENGLAND_AND_WALES_MESSAGE`, `FAILURE_NO_OUTPUT`, raised as
+        `InspireError`. The SAME sentence and kind cover a corner
+        `authorities_for` approved but `padded_bng_extent`'s own `to_bng`
+        cannot place (see that constant's own comment): both mean, from
+        this method's point of view, "no INSPIRE data for this extent
+        either way".
+
+        Skips (both work files already non-empty) before any of the above:
+        an ordinary resumed run should not recompute `authorities_for`, let
+        alone re-download, merely to reach a refusal or a repeat of last
+        time's own successful download. A genuinely empty, successful
+        result (every found authority had zero kept parcels in this padded
+        extent) writes a 0-byte `parcels.jsonl` and therefore does NOT
+        satisfy this skip on a later run; this is an accepted, honestly
+        documented rare edge case (an authority whose PADDED bbox brushes
+        the extent but whose actual parcels do not), not a silent gap: the
+        cost is one wasted, harmless re-fetch of the same empty result,
+        never a wrong one.
+
+        One authority's own download or parse failure (`InspireError` from
+        `fetch_authority_zip` or `parcels_in`) ends the whole fetch
+        immediately, classified via `_classify_inspire_error` into
+        `tile_failures` against every handed tile, and re-raised unchanged:
+        this mirrors ElevationSource/LidarWalesSource's own single-shot
+        shape (no continue-past-failure retry loop across authorities, the
+        way OsmSource continues across TILES), since a multi-authority
+        extent's authorities are all needed for one coherent boundaries
+        file, not independent, separately-useful outputs.
+
+        Cancel checkpoints: top of the method (before even the skip
+        check), after `authorities_for` succeeds and before the OSTN15
+        grid fetch, and once per loop iteration before that authority's own
+        download starts (so a stop lands between whole authorities, never
+        mid-download, matching every other source's own convention).
+        """
+        self.tile_failures = []
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+
+        parcels_path = work_dir / PARCELS_WORK_NAME
+        meta_path = work_dir / META_WORK_NAME
+        if (
+            parcels_path.exists() and parcels_path.stat().st_size > 0
+            and meta_path.exists() and meta_path.stat().st_size > 0
+        ):
+            progress.emit("tile_skipped", source=self.id, tile_id="whole-area")
+            return [parcels_path, meta_path]
+
+        authorities = authorities_for(bbox)
+        if not authorities:
+            self._record_tile_failures(tiles, FAILURE_NO_OUTPUT, OUTSIDE_ENGLAND_AND_WALES_MESSAGE)
+            raise InspireError(OUTSIDE_ENGLAND_AND_WALES_MESSAGE)
+
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+
+        try:
+            grid = ensure_ostn15(cache_dir=self._ostn15_cache_dir, session=self.session)
+        except requests.RequestException as exc:
+            # bng.py's own _download_and_parse currently wraps every
+            # requests.RequestException into a BngError before it can
+            # reach here (see the except clause below); kept for the same
+            # reason lidar_wales.py keeps the identical, seemingly
+            # unreachable clause: a future bng.py that let one through
+            # must still be classified correctly rather than falling into
+            # a bare, unclassified raise.
+            kind, phrase = classify_transport_failure(exc)
+            self._record_tile_failures(
+                tiles, kind,
+                f"Failed to download the OSTN15 shift grid needed to place "
+                f"this extent on the National Grid: {phrase}.",
+            )
+            raise
+        except BngError:
+            self._record_tile_failures(
+                tiles, FAILURE_UNREACHABLE,
+                "Failed to download the OSTN15 shift grid needed to place "
+                "this extent on the National Grid.",
+            )
+            raise
+
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+
+        try:
+            bbox_bng = padded_bng_extent(bbox, grid, PAD_METRES)
+        except BngError:
+            self._record_tile_failures(tiles, FAILURE_NO_OUTPUT, OUTSIDE_ENGLAND_AND_WALES_MESSAGE)
+            raise InspireError(OUTSIDE_ENGLAND_AND_WALES_MESSAGE) from None
+
+        all_parcels: list[list[list[tuple[float, float]]]] = []
+        authority_meta: list[dict[str, object]] = []
+        for name in authorities:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            try:
+                zip_path = fetch_authority_zip(name, self.session, cache_dir=self._inspire_cache_dir)
+                stream = parcels_in(zip_path, bbox_bng)
+                kept = list(stream)
+            except InspireError as exc:
+                kind, phrase = _classify_inspire_error(exc)
+                self._record_tile_failures(
+                    tiles, kind,
+                    f"Failed to download the INSPIRE Index Polygons for {name}: {phrase}.",
+                )
+                raise
+            all_parcels.extend(kept)
+            authority_meta.append(
+                {
+                    "name": name,
+                    "parcels_seen": stream.counts.parcels_seen,
+                    "parcels_kept": stream.counts.parcels_kept,
+                    "parcels_skipped_malformed": stream.counts.parcels_skipped_malformed,
+                    "timestamp_year": stream.timestamp_year,
+                }
+            )
+
+        # Nothing above this line writes anything: a failure on authority 3
+        # of 4 leaves work_dir exactly as it found it (see the module
+        # section's own docstring), which is what makes a resumed retry
+        # start clean rather than skip on a half-written file.
+        parcels_text = "".join(
+            json.dumps(rings, separators=(",", ":")) + "\n" for rings in all_parcels
+        )
+        meta = {
+            "authorities": authority_meta,
+            # The newest of the authorities' own collection years, on the
+            # ordinary assumption that every authority in one survey's
+            # padded extent was downloaded in the same monthly HMLR
+            # publication cycle (see the plan's own "first Sunday of the
+            # month" cadence) and therefore agrees; the max, not the
+            # first, is the honest choice on the rare chance a resumed
+            # fetch spans a month boundary between authorities.
+            "year": max(entry["timestamp_year"] for entry in authority_meta),
+        }
+        atomic_write_text(parcels_path, parcels_text)
+        atomic_write_text(meta_path, json.dumps(meta, separators=(",", ":")))
+
+        progress.emit("tile_done", source=self.id, tile_id="whole-area")
+        return [parcels_path, meta_path]
+
+    # -- merge -----------------------------------------------------------------
+
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        """Runs `boundary_curves` over every kept parcel `PARCELS_WORK_NAME`
+        holds and writes `<stem>_boundaries.geojson`: a FeatureCollection of
+        LineStrings, each carrying the brief's exact properties.
+
+        Picks its two work files out of `parts` BY NAME, never by position
+        (the ElevationSource.merge lesson). Unlike LidarWalesSource.merge
+        (two independent rasters, each with its own output), this source's
+        ONE output needs BOTH work files together (the parcel geometry AND
+        the collection year), so "missing work files" here is all-or-
+        nothing: either name absent from `parts` means nothing coherent can
+        be written, the stale package copy of `<stem>_boundaries.geojson`
+        is unlinked (the same I8 stale-output discipline every other
+        source's merge follows), and this returns `[]`.
+
+        The OSTN15 grid needed to unproject curves back to lon/lat is
+        acquired `load_ostn15()` first (cache-only; fetch()'s own
+        `ensure_ostn15` call, on every ordinary run, already cached one for
+        this exact reason `_fuse_heights_step`'s own docstring gives), and
+        only `ensure_ostn15()` (a real network attempt) if that misses:
+        `mapgen bridge` re-running merge on a package moved to a machine
+        that has never run a survey is the one path this actually exercises.
+        If BOTH fail (`BngError`, or the defensive `requests.RequestException`
+        clause lidar_wales.py's own fetch() also keeps), this skips with the
+        same stale-unlink, documented the same way LidarWalesSource.merge
+        skips its own contour generation when no grid is available: a
+        package without boundaries beats a crash over something the
+        package's other outputs do not depend on.
+        """
+        out_dir = Path(out_dir)
+        output_path = out_dir / f"{stem}_boundaries.geojson"
+
+        parcels_part = next((part for part in parts if part.name == PARCELS_WORK_NAME), None)
+        meta_part = next((part for part in parts if part.name == META_WORK_NAME), None)
+        if parcels_part is None or meta_part is None:
+            output_path.unlink(missing_ok=True)
+            return []
+
+        try:
+            meta = json.loads(meta_part.read_text(encoding="utf-8"))
+            year = int(meta["year"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            # meta.json is only ever written by this class's own fetch();
+            # corruption here means a genuinely broken work directory, and
+            # the same "package without X beats a crash" principle applies
+            # rather than raising over a file the owner never touched.
+            output_path.unlink(missing_ok=True)
+            return []
+
+        grid = load_ostn15(cache_dir=self._ostn15_cache_dir)
+        if grid is None:
+            try:
+                grid = ensure_ostn15(cache_dir=self._ostn15_cache_dir, session=self.session)
+            except (requests.RequestException, BngError):
+                output_path.unlink(missing_ok=True)
+                return []
+
+        parcels = _read_parcels_jsonl(parcels_part)
+        curves = boundary_curves(parcels)
+
+        features = []
+        for curve in curves:
+            coordinates = []
+            for easting, northing in curve:
+                latitude, longitude = from_bng(easting, northing, grid)
+                coordinates.append([longitude, latitude])
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "source": BOUNDARY_SOURCE_LABEL,
+                        "note": BOUNDARY_INDICATIVE_NOTE,
+                        "year": year,
+                    },
+                    "geometry": {"type": "LineString", "coordinates": coordinates},
+                }
+            )
+        payload = {"type": "FeatureCollection", "features": features}
+        atomic_write_bytes(
+            output_path, json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        return [output_path]
+
+    def possible_outputs(self, stem: str) -> list[str]:
+        """Every root file merge() could ever write for this stem. Read by
+        package.py's stale-output sweep; see sources/base.py."""
+        return [f"{stem}_boundaries.geojson"]

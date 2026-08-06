@@ -1,4 +1,6 @@
 import datetime
+import io
+import json
 import re
 import zipfile
 from pathlib import Path
@@ -7,11 +9,29 @@ import pytest
 import requests
 
 import mapgen.sources.inspire as inspire_module
-from mapgen.geo import BBox
+from mapgen.bng import _NODE_COUNT, Ostn15Grid, tm_inverse
+from mapgen.boundary_curves import boundary_curves
+from mapgen.geo import BBox, Tile
+from mapgen.jobs import CancelToken, Cancelled
+from mapgen.package import get_source, register_default_sources
+from mapgen.sources.base import (
+    FAILURE_NO_OUTPUT,
+    FAILURE_RATE_LIMITED,
+    FAILURE_SERVICE_ERROR,
+    FAILURE_TIMEOUT,
+    NullProgress,
+)
 from mapgen.sources.inspire import (
     AUTHORITY_INDEX_PATH,
     GML_MEMBER_NAME,
+    INSPIRE_DOWNLOAD_URL_TEMPLATE,
+    META_WORK_NAME,
+    OUTSIDE_ENGLAND_AND_WALES_MESSAGE,
+    PARCELS_WORK_NAME,
+    BYTES_PER_AUTHORITY,
+    SECONDS_FLOOR,
     InspireError,
+    InspireSource,
     ParseCounts,
     authorities_for,
     fetch_authority_zip,
@@ -616,6 +636,33 @@ def test_fetch_authority_zip_only_sweeps_the_same_authoritys_own_files(tmp_path)
     assert other_authority.exists()
 
 
+def test_fetch_authority_zip_non_200_sets_status_code_structurally(tmp_path):
+    # Task 4's InspireSource.fetch() classifies this failure through
+    # classify_status_failure, which needs the raw int, not a regex over
+    # this exception's own English sentence (see InspireError's own
+    # docstring, and cog.py's CogError.status_code precedent).
+    class _RateLimitedSession:
+        def get(self, url, stream=True, timeout=None):
+            return _FakeResponse(429, b"")
+
+    with pytest.raises(InspireError) as excinfo:
+        fetch_authority_zip("Vale_of_Glamorgan_Council", _RateLimitedSession(), cache_dir=tmp_path)
+
+    assert excinfo.value.status_code == 429
+
+
+def test_fetch_authority_zip_transport_failure_leaves_status_code_unset(tmp_path):
+    class _BrokenSession:
+        def get(self, *args, **kwargs):
+            raise requests.exceptions.ConnectionError("simulated")
+
+    with pytest.raises(InspireError) as excinfo:
+        fetch_authority_zip("Vale_of_Glamorgan_Council", _BrokenSession(), cache_dir=tmp_path)
+
+    assert getattr(excinfo.value, "status_code", None) is None
+    assert isinstance(excinfo.value.__cause__, requests.exceptions.ConnectionError)
+
+
 def test_fetch_authority_zip_default_cache_dir_is_under_the_mapgen_home(monkeypatch, tmp_path):
     fake_config_path = tmp_path / ".mapgen" / "config.json"
     monkeypatch.setattr(inspire_module, "CONFIG_PATH", fake_config_path)
@@ -647,3 +694,722 @@ def test_live_fetch_and_parse_vale_of_glamorgan_over_llantwit_major(tmp_path):
     assert stream.counts.parcels_kept == len(parcels)
     assert stream.counts.parcels_seen >= stream.counts.parcels_kept
     assert 2020 <= stream.timestamp_year <= 2030
+
+
+# ==========================================================================
+# Task 4: InspireSource, the LayerSource wiring and the boundaries GeoJSON.
+# ==========================================================================
+#
+# fetch()/merge() unit tests use a ZERO-SHIFT Ostn15Grid throughout (mirrors
+# tests/test_heights.py's own `_zero_shift_grid`), never the real
+# tests/fixtures/ostn15 slice: that slice covers only three named 3x3 km
+# blocks (TP06/TP03/TP40; see make_fixture.py), and this task needs to
+# place synthetic parcels at coordinates of its own choosing, decoupled
+# from any real station's tiny coverage window. A zero-shift grid makes
+# to_bng/from_bng degenerate to the bare tm_forward/tm_inverse pair
+# (exact inverses of each other), which is what lets a test pick a BNG
+# rectangle first and derive the matching WGS84 bbox from it, or the other
+# way round, with no risk of OutsideOstn15Error. `authorities_for` itself
+# is monkeypatched to a fixed list for every fetch()/merge() test below,
+# for the same reason: which real authorities a bbox resolves to is
+# already Task 1's own suite's job, not this one's, and it would otherwise
+# force every synthetic bbox here to also land inside a real committed
+# authority's own footprint.
+
+
+def _zero_shift_grid() -> Ostn15Grid:
+    from array import array
+
+    shifts = array("f", [0.0]) * (_NODE_COUNT * 2)
+    return Ostn15Grid(shifts)
+
+
+def _seed_ostn15_cache(cache_dir: Path, grid: Ostn15Grid) -> None:
+    from mapgen import bng as bng_module
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    bng_module._write_cache(cache_dir / bng_module._CACHE_FILENAME, grid)
+
+
+def _bbox_for_bng_rectangle(
+    e_min: float, n_min: float, e_max: float, n_max: float
+) -> BBox:
+    lat1, lon1 = tm_inverse(e_min, n_min)
+    lat2, lon2 = tm_inverse(e_max, n_max)
+    return BBox(
+        west=min(lon1, lon2), south=min(lat1, lat2),
+        east=max(lon1, lon2), north=max(lat1, lat2),
+    )
+
+
+def _zip_bytes(gml_bytes: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(GML_MEMBER_NAME, gml_bytes)
+    return buffer.getvalue()
+
+
+def _tiles(*tile_ids: str) -> list[Tile]:
+    bbox = BBox(west=-3.3, south=51.4, east=-3.29, north=51.41)
+    return [
+        Tile(tile_id=tid, row=0, col=index, core_bbox=bbox, query_bbox=bbox)
+        for index, tid in enumerate(tile_ids)
+    ]
+
+
+def _write_parcels_jsonl(path: Path, parcels) -> None:
+    text = "".join(json.dumps(rings) + "\n" for rings in parcels)
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_meta_json(path: Path, authorities: list[dict], year: int) -> None:
+    path.write_text(
+        json.dumps({"authorities": authorities, "year": year}), encoding="utf-8"
+    )
+
+
+class _ProgressLog:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def emit(self, event: str, **fields: object) -> None:
+        self.events.append((event, fields))
+
+
+class _AuthorityZipSession:
+    """Serves `fetch_authority_zip`'s own `session.get(url, stream=True,
+    timeout=...)` call, keyed by exact URL, refusing anything else
+    outright: a session that answered any URL would hide a typo in
+    INSPIRE_DOWNLOAD_URL_TEMPLATE, since the wrong URL would still get
+    real bytes back and every test would still pass.
+    """
+
+    def __init__(self, blobs: dict[str, bytes]) -> None:
+        self.blobs = dict(blobs)
+        self.calls: list[str] = []
+
+    def get(self, url, stream=True, timeout=None):
+        self.calls.append(url)
+        if url not in self.blobs:
+            raise AssertionError(f"no fake authority zip registered for {url!r}")
+        return _FakeResponse(200, self.blobs[url])
+
+
+class _CancelAfterFirstAuthoritySession(_AuthorityZipSession):
+    """Cancels `token` as a side effect of serving `trigger_url`, so a
+    test can prove the cancel checkpoint BETWEEN authorities fires
+    without a second authority's zip ever being requested.
+    """
+
+    def __init__(self, blobs: dict[str, bytes], token: CancelToken, trigger_url: str) -> None:
+        super().__init__(blobs)
+        self._token = token
+        self._trigger_url = trigger_url
+
+    def get(self, url, stream=True, timeout=None):
+        response = super().get(url, stream=stream, timeout=timeout)
+        if url == self._trigger_url:
+            self._token.cancel()
+        return response
+
+
+class _FailsOnUrlSession(_AuthorityZipSession):
+    """Answers `target_url` with either a fixed status or a raised
+    transport exception, persistently (fetch_authority_zip has no retry
+    of its own to absorb a single bad answer, unlike cog.py's
+    HttpByteSource, but persistent for the same defensive reason every
+    other fake session in this project's suites is), and behaves like an
+    ordinary `_AuthorityZipSession` for anything else.
+    """
+
+    def __init__(
+        self,
+        blobs: dict[str, bytes],
+        target_url: str,
+        status_code: int | None = None,
+        transport_exc: BaseException | None = None,
+    ) -> None:
+        super().__init__(blobs)
+        self._target_url = target_url
+        self._status_code = status_code
+        self._transport_exc = transport_exc
+
+    def get(self, url, stream=True, timeout=None):
+        self.calls.append(url)
+        if url == self._target_url:
+            if self._transport_exc is not None:
+                raise self._transport_exc
+            return _FakeResponse(self._status_code, b"")
+        if url not in self.blobs:
+            raise AssertionError(f"no fake authority zip registered for {url!r}")
+        return _FakeResponse(200, self.blobs[url])
+
+
+class _RefusesOstn15Session:
+    """A session whose `.get()` always raises a real
+    `requests.RequestException`, so `bng._download_and_parse` wraps it
+    into a `BngError` the way the real library does, rather than an
+    `AssertionError` that would never reach InspireSource's own except
+    clauses at all.
+    """
+
+    def get(self, *args, **kwargs):
+        raise requests.exceptions.ConnectionError("simulated: no OSTN15 network")
+
+
+# A 400 x 400 m square in BNG metres, well inside the valid 701 x 1251 km
+# OSTN15 grid rectangle, used as this section's one fixed "authority 1"
+# parcel location.
+_PARCEL_RING = (
+    "299900 179900 300000 179900 300000 180000 299900 180000 299900 179900"
+)
+_PARCEL_BBOX = _bbox_for_bng_rectangle(299_700.0, 179_700.0, 300_300.0, 180_300.0)
+
+
+def _build_gml(pos_list: str, time_stamp: str = "2026-08-02T03:47:41.090Z") -> bytes:
+    ns = (
+        'xmlns:wfs="http://www.opengis.net/wfs/2.0" '
+        'xmlns:gml="http://www.opengis.net/gml/3.2" '
+        'xmlns:LR="www.landregistry.gov.uk"'
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<wfs:FeatureCollection {ns} "
+        f'numberMatched="1" numberReturned="1" timeStamp="{time_stamp}">'
+        "<wfs:member><LR:PREDEFINED>"
+        '<LR:GEOMETRY><gml:Polygon srsName="urn:ogc:def:crs:EPSG::27700" '
+        'srsDimension="2"><gml:exterior><gml:LinearRing>'
+        f"<gml:posList>{pos_list}</gml:posList>"
+        "</gml:LinearRing></gml:exterior></gml:Polygon></LR:GEOMETRY>"
+        "</LR:PREDEFINED></wfs:member></wfs:FeatureCollection>"
+    ).encode("utf-8")
+
+
+# --------------------------------------------------------------------------
+# Class attributes and registration.
+# --------------------------------------------------------------------------
+
+
+def test_declares_the_briefs_exact_class_attributes():
+    source = InspireSource()
+    assert source.id == "inspire"
+    assert source.display_name == "Property boundaries (INSPIRE)"
+    assert source.licence == "Open Government Licence v3.0"
+    assert source.attribution == (
+        "This information is subject to Crown copyright and database rights "
+        "[year] and is reproduced with the permission of HM Land Registry. "
+        "The polygons (including the associated geometry, namely x, y "
+        "co-ordinates) are subject to Crown copyright and database rights "
+        "[year] Ordnance Survey AC0000851063."
+    )
+    assert source.requires_api_key is False
+    assert source.conditions_url == (
+        "https://use-land-property-data.service.gov.uk/datasets/inspire/#conditions"
+    )
+    assert not hasattr(source, "readiness_problem")
+
+
+def test_register_default_sources_registers_inspire_once_and_honours_the_type_check():
+    register_default_sources()
+    first = get_source("inspire")
+    assert isinstance(first, InspireSource)
+
+    register_default_sources()
+    assert get_source("inspire") is first
+
+
+# --------------------------------------------------------------------------
+# estimate(): no network, ever; zero authorities is honestly zero.
+# --------------------------------------------------------------------------
+
+
+class _RefusesToConnect:
+    def get(self, *args, **kwargs):
+        raise AssertionError("estimate() must not touch the network")
+
+
+def test_estimate_zero_authorities_is_zero_bytes_and_zero_seconds():
+    source = InspireSource(session=_RefusesToConnect())
+    scotland = BBox(west=-3.30, south=55.90, east=-3.10, north=56.00)
+
+    estimate = source.estimate(scotland, [])
+
+    assert estimate.bytes_estimate == 0
+    assert estimate.seconds_estimate == 0.0
+
+
+def test_estimate_one_authority_touches_no_network_and_floors_at_seconds_floor():
+    source = InspireSource(session=_RefusesToConnect())
+    llantwit = BBox(west=-3.495, south=51.395, east=-3.475, north=51.410)
+
+    estimate = source.estimate(llantwit, [])
+
+    assert estimate.bytes_estimate == BYTES_PER_AUTHORITY
+    assert estimate.seconds_estimate >= SECONDS_FLOOR
+
+
+def test_estimate_scales_linearly_with_authority_count():
+    source = InspireSource(session=_RefusesToConnect())
+    llantwit = BBox(west=-3.495, south=51.395, east=-3.475, north=51.410)
+    border = BBox(west=-3.263442, south=51.438073, east=-3.243442, north=51.458073)
+
+    one = source.estimate(llantwit, [])
+    two = source.estimate(border, [])
+
+    assert len(authorities_for(llantwit)) == 1
+    assert len(authorities_for(border)) == 2
+    assert two.bytes_estimate == 2 * one.bytes_estimate
+
+
+# --------------------------------------------------------------------------
+# fetch(): zero authorities, skip-on-resume, cancel checkpoints.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_zero_authorities_refuses_before_any_network(tmp_path):
+    source = InspireSource(session=_RefusesToConnect())
+    scotland = BBox(west=-3.30, south=55.90, east=-3.10, north=56.00)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(InspireError) as excinfo:
+        source.fetch(scotland, _tiles("t1", "t2"), work_dir, NullProgress())
+
+    assert str(excinfo.value) == OUTSIDE_ENGLAND_AND_WALES_MESSAGE
+    assert len(source.tile_failures) == 2
+    for failure in source.tile_failures:
+        assert failure.kind == FAILURE_NO_OUTPUT
+        assert failure.reason == OUTSIDE_ENGLAND_AND_WALES_MESSAGE
+    assert not list(work_dir.iterdir())
+
+
+def test_fetch_skips_when_both_work_files_already_exist(tmp_path):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text('[[[1.0, 2.0]]]\n', encoding="utf-8")
+    (work_dir / META_WORK_NAME).write_text('{"authorities": [], "year": 2026}', encoding="utf-8")
+
+    source = InspireSource(session=_RefusesToConnect())
+    progress = _ProgressLog()
+
+    paths = source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, progress)
+
+    assert sorted(p.name for p in paths) == sorted([PARCELS_WORK_NAME, META_WORK_NAME])
+    assert ("tile_skipped", {"source": "inspire", "tile_id": "whole-area"}) in progress.events
+    assert source.tile_failures == []
+
+
+def test_fetch_does_not_skip_when_one_work_file_is_empty(tmp_path, monkeypatch):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text("real", encoding="utf-8")
+    (work_dir / META_WORK_NAME).write_text("", encoding="utf-8")  # empty: not a valid resume
+
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+    source = InspireSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "no-cache")
+
+    with pytest.raises(AssertionError):
+        # Falls through past the skip check to ensure_ostn15, which
+        # _RefusesToConnect refuses; proves the skip requires BOTH files
+        # non-empty, not just present.
+        source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, NullProgress())
+
+
+def test_fetch_stops_before_any_request_when_already_cancelled(tmp_path):
+    token = CancelToken()
+    token.cancel()
+    source = InspireSource(session=_RefusesToConnect())
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(Cancelled):
+        source.fetch(
+            BBox(west=-3.3, south=51.4, east=-3.29, north=51.41),
+            _tiles("t1"), work_dir, NullProgress(), cancel=token,
+        )
+
+
+# --------------------------------------------------------------------------
+# fetch(): the happy path, one and two authorities, cancel between them.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_happy_path_writes_both_work_files(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+
+    url = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Test_Authority")
+    session = _AuthorityZipSession({url: _zip_bytes(_build_gml(_PARCEL_RING))})
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    progress = _ProgressLog()
+
+    paths = source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, progress)
+
+    assert sorted(p.name for p in paths) == sorted([PARCELS_WORK_NAME, META_WORK_NAME])
+    assert source.tile_failures == []
+    assert ("tile_done", {"source": "inspire", "tile_id": "whole-area"}) in progress.events
+
+    parcels_lines = (work_dir / PARCELS_WORK_NAME).read_text(encoding="utf-8").splitlines()
+    assert len(parcels_lines) == 1
+    rings = json.loads(parcels_lines[0])
+    assert len(rings) == 1  # exterior only, no interior
+
+    meta = json.loads((work_dir / META_WORK_NAME).read_text(encoding="utf-8"))
+    assert meta == {
+        "authorities": [
+            {
+                "name": "Test_Authority",
+                "parcels_seen": 1,
+                "parcels_kept": 1,
+                "parcels_skipped_malformed": 0,
+                "timestamp_year": 2026,
+            }
+        ],
+        "year": 2026,
+    }
+
+
+def test_fetch_two_authorities_accumulates_both_into_one_parcels_file(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(
+        inspire_module, "authorities_for", lambda bbox: ["Authority_A", "Authority_B"]
+    )
+
+    url_a = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_A")
+    url_b = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_B")
+    session = _AuthorityZipSession(
+        {
+            url_a: _zip_bytes(_build_gml(_PARCEL_RING)),
+            url_b: _zip_bytes(_build_gml(_PARCEL_RING)),
+        }
+    )
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    paths = source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    parcels_lines = (work_dir / PARCELS_WORK_NAME).read_text(encoding="utf-8").splitlines()
+    assert len(parcels_lines) == 2
+
+    meta = json.loads((work_dir / META_WORK_NAME).read_text(encoding="utf-8"))
+    assert [entry["name"] for entry in meta["authorities"]] == ["Authority_A", "Authority_B"]
+    assert meta["year"] == 2026
+
+
+def test_fetch_cancel_between_authorities_leaves_no_failure_records(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(
+        inspire_module, "authorities_for", lambda bbox: ["Authority_A", "Authority_B"]
+    )
+
+    url_a = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_A")
+    url_b = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_B")
+    token = CancelToken()
+    session = _CancelAfterFirstAuthoritySession(
+        {url_a: _zip_bytes(_build_gml(_PARCEL_RING)), url_b: _zip_bytes(_build_gml(_PARCEL_RING))},
+        token,
+        url_a,
+    )
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(Cancelled):
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress(), cancel=token)
+
+    assert source.tile_failures == []
+    assert url_b not in session.calls
+    assert not list(work_dir.iterdir())
+
+
+# --------------------------------------------------------------------------
+# fetch(): per-authority failure classification, and the OSTN15 grid path.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_classifies_a_rate_limited_authority_and_never_leaks_a_url(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+
+    url = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Test_Authority")
+    session = _FailsOnUrlSession({}, url, status_code=429)
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(InspireError) as excinfo:
+        source.fetch(_PARCEL_BBOX, _tiles("t1", "t2"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 2
+    for failure in source.tile_failures:
+        assert failure.kind == FAILURE_RATE_LIMITED
+        assert "429" in failure.reason
+        assert url not in failure.reason
+    assert url not in str(excinfo.value)
+
+
+def test_fetch_classifies_a_500_as_service_error_and_it_is_retryable(tmp_path, monkeypatch):
+    from mapgen.sources.base import RETRYABLE_FAILURE_KINDS
+
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+
+    url = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Test_Authority")
+    session = _FailsOnUrlSession({}, url, status_code=500)
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(InspireError):
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    failure = source.tile_failures[0]
+    assert failure.kind == FAILURE_SERVICE_ERROR
+    assert failure.kind in RETRYABLE_FAILURE_KINDS
+    assert "500" in failure.reason
+    assert url not in failure.reason
+
+
+def test_fetch_classifies_a_timeout_and_never_leaks_a_url(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+
+    url = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Test_Authority")
+    session = _FailsOnUrlSession(
+        {}, url, transport_exc=requests.exceptions.Timeout("simulated stall")
+    )
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(InspireError) as excinfo:
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    assert source.tile_failures[0].kind == FAILURE_TIMEOUT
+    assert "did not answer in time" in source.tile_failures[0].reason
+    assert url not in source.tile_failures[0].reason
+    assert url not in str(excinfo.value)
+    # No partial work file survives a failed authority.
+    assert not (work_dir / PARCELS_WORK_NAME).exists()
+
+
+def test_fetch_classifies_an_ostn15_download_failure_and_reraises(tmp_path, monkeypatch):
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+    source = InspireSource(session=_RefusesOstn15Session(), ostn15_cache_dir=tmp_path / "no-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(Exception):
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    assert source.tile_failures[0].reason  # a plain sentence, not empty
+    assert "ordnancesurvey" not in source.tile_failures[0].reason.lower()
+
+
+# --------------------------------------------------------------------------
+# merge(): the boundaries GeoJSON, dedup, missing inputs, OSTN15 skip.
+# --------------------------------------------------------------------------
+
+
+def test_merge_produces_the_boundaries_geojson_with_exact_properties_and_dedup(tmp_path):
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+
+    # Two squares sharing one edge, the same hand-built case
+    # test_boundary_curves.py's own suite uses, in BNG metres.
+    square_a = [
+        [(300_000.0, 180_000.0), (300_010.0, 180_000.0), (300_010.0, 180_010.0), (300_000.0, 180_010.0)]
+    ]
+    square_b = [
+        [(300_010.0, 180_000.0), (300_020.0, 180_000.0), (300_020.0, 180_010.0), (300_010.0, 180_010.0)]
+    ]
+    expected_curves = boundary_curves([square_a, square_b])
+    assert len(expected_curves) > 0
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    _write_parcels_jsonl(work_dir / PARCELS_WORK_NAME, [square_a, square_b])
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Test_Authority", "parcels_seen": 2, "parcels_kept": 2, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
+
+    source = InspireSource(ostn15_cache_dir=cache_dir)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "Barry-Waterfront_2026-08-06"
+
+    written = source.merge([work_dir / PARCELS_WORK_NAME, work_dir / META_WORK_NAME], out_dir, stem)
+
+    assert [p.name for p in written] == [f"{stem}_boundaries.geojson"]
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert payload["type"] == "FeatureCollection"
+    assert len(payload["features"]) == len(expected_curves)
+    for feature, curve in zip(payload["features"], expected_curves):
+        assert feature["type"] == "Feature"
+        assert feature["properties"] == {
+            "source": "HM Land Registry INSPIRE Index Polygons",
+            "note": (
+                "The extent of the land contained in any registered title "
+                "cannot be established from the INSPIRE Index Polygons."
+            ),
+            "year": 2026,
+        }
+        assert feature["geometry"]["type"] == "LineString"
+        assert len(feature["geometry"]["coordinates"]) == len(curve)
+        for lon, lat in feature["geometry"]["coordinates"]:
+            assert -180.0 <= lon <= 180.0
+            assert -90.0 <= lat <= 90.0
+
+
+def test_merge_over_the_real_fixture_produces_curves_matching_boundary_curves(tmp_path):
+    # "fixture GML via Task 2's own machinery for parse-dependent tests":
+    # the real committed 10-parcel fixture, run through the real parcels_in,
+    # proving merge() wires real parsed geometry through to real curves,
+    # not just the hand-built squares above.
+    from mapgen.boundary_curves import boundary_curves_with_counts
+
+    zip_path = _fixture_zip(tmp_path)
+    parcels = list(parcels_in(zip_path, FIXTURE_BBOX_ALL))
+    result = boundary_curves_with_counts(parcels)
+    expected_curves = result.curves
+    assert len(expected_curves) > 0
+    # Task 2/3's own reports: this fixture's members 1-3 share a 3-edge
+    # run of boundary, which collapses at the edge level (curve COUNT is
+    # not guaranteed to drop, since chaining can split the outer boundary
+    # into more pieces at a junction; see Task 3's own two-squares case).
+    assert result.edges_deduped < result.edges_in, (
+        "dedup should collapse at least one shared edge across this fixture's "
+        "known shared-boundary pair (see Task 2/3's own reports)"
+    )
+
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    _write_parcels_jsonl(work_dir / PARCELS_WORK_NAME, parcels)
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Vale_of_Glamorgan_Council", "parcels_seen": 10, "parcels_kept": 10, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
+
+    source = InspireSource(ostn15_cache_dir=cache_dir)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    written = source.merge([work_dir / PARCELS_WORK_NAME, work_dir / META_WORK_NAME], out_dir, "Fixture_2026-08-06")
+
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert len(payload["features"]) == len(expected_curves)
+
+
+def test_merge_missing_both_work_files_returns_nothing_and_unlinks_stale(tmp_path):
+    source = InspireSource()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "Barry-Waterfront_2026-08-06"
+    stale = out_dir / f"{stem}_boundaries.geojson"
+    stale.write_bytes(b"stale")
+
+    written = source.merge([], out_dir, stem)
+
+    assert written == []
+    assert not stale.exists()
+
+
+def test_merge_missing_meta_json_returns_nothing_and_unlinks_stale(tmp_path):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    _write_parcels_jsonl(work_dir / PARCELS_WORK_NAME, [])
+    parcels_only = [work_dir / PARCELS_WORK_NAME]
+
+    source = InspireSource()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "Barry-Waterfront_2026-08-06"
+    stale = out_dir / f"{stem}_boundaries.geojson"
+    stale.write_bytes(b"stale")
+
+    written = source.merge(parcels_only, out_dir, stem)
+
+    assert written == []
+    assert not stale.exists()
+
+
+def test_merge_skips_with_stale_unlink_when_ostn15_grid_is_unavailable(tmp_path):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    _write_parcels_jsonl(
+        work_dir / PARCELS_WORK_NAME,
+        [[[(300_000.0, 180_000.0), (300_010.0, 180_000.0), (300_010.0, 180_010.0), (300_000.0, 180_010.0)]]],
+    )
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[{"name": "Test_Authority", "parcels_seen": 1, "parcels_kept": 1, "parcels_skipped_malformed": 0, "timestamp_year": 2026}],
+        year=2026,
+    )
+
+    source = InspireSource(session=_RefusesOstn15Session(), ostn15_cache_dir=tmp_path / "no-such-cache")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "Barry-Waterfront_2026-08-06"
+    stale = out_dir / f"{stem}_boundaries.geojson"
+    stale.write_bytes(b"stale")
+
+    written = source.merge([work_dir / PARCELS_WORK_NAME, work_dir / META_WORK_NAME], out_dir, stem)
+
+    assert written == []
+    assert not stale.exists()
+
+
+def test_possible_outputs_is_the_closed_list_of_one_name():
+    source = InspireSource()
+    stem = "Barry-Waterfront_2026-08-06"
+    assert source.possible_outputs(stem) == [f"{stem}_boundaries.geojson"]
+
+
+# --------------------------------------------------------------------------
+# The one live test: a real fetch + merge over Llantwit Major.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.live
+def test_live_fetch_and_merge_over_llantwit_major(tmp_path):
+    bbox = BBox(west=-3.495, south=51.395, east=-3.475, north=51.410)
+    source = InspireSource(inspire_cache_dir=tmp_path / "inspire-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    tiles = [Tile(tile_id="whole-area", row=0, col=0, core_bbox=bbox, query_bbox=bbox)]
+
+    paths = source.fetch(bbox, tiles, work_dir, NullProgress())
+    assert source.tile_failures == []
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "Llantwit_live-test"
+    written = source.merge(paths, out_dir, stem)
+
+    assert [p.name for p in written] == source.possible_outputs(stem)
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert len(payload["features"]) > 0
+    for feature in payload["features"]:
+        assert 2020 <= feature["properties"]["year"] <= 2030
+        assert feature["properties"]["source"] == "HM Land Registry INSPIRE Index Polygons"
