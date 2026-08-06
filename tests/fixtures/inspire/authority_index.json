@@ -1,0 +1,1910 @@
+{
+  "Adur_District_Council": [
+    -0.3875734,
+    50.8067144,
+    -0.1994567,
+    50.8837897
+  ],
+  "Amber_Valley_Borough_Council": [
+    -1.6251946,
+    52.91409,
+    -1.2904127,
+    53.1433723
+  ],
+  "Arun_District_Council": [
+    -0.7794766,
+    50.7429183,
+    -0.348359,
+    50.9161604
+  ],
+  "Ashfield_District_Council": [
+    -1.3603723,
+    52.9986968,
+    -1.1479859,
+    53.1807649
+  ],
+  "Ashford_Borough_Council": [
+    0.5694729,
+    50.9745373,
+    1.0524675,
+    51.2876592
+  ],
+  "Babergh_District_Council": [
+    0.6022851,
+    51.9343195,
+    1.3088095,
+    52.1918875
+  ],
+  "Barnsley_Metropolitan_Borough_Council": [
+    -1.8380369,
+    53.4280615,
+    -1.2591929,
+    53.6228622
+  ],
+  "Basildon_Borough_Council": [
+    0.3563908,
+    51.5199796,
+    0.5866715,
+    51.6608651
+  ],
+  "Basingstoke_and_Deane_Borough_Council": [
+    -1.475917,
+    51.123,
+    -0.957214,
+    51.3952001
+  ],
+  "Bassetlaw_District_Council": [
+    -1.2289433,
+    53.1873716,
+    -0.7270523,
+    53.5136153
+  ],
+  "Bath_and_North_East_Somerset_Council": [
+    -2.7238233,
+    51.2629551,
+    -2.263291,
+    51.4486884
+  ],
+  "Bedford_Borough_Council": [
+    -0.6876009,
+    52.0419477,
+    -0.2209382,
+    52.3343593
+  ],
+  "Birmingham_City_Council": [
+    -2.0485568,
+    52.3717538,
+    -1.7135783,
+    52.6178243
+  ],
+  "Blaby_District_Council": [
+    -1.3548049,
+    52.4825477,
+    -1.0423682,
+    52.6742344
+  ],
+  "Blackburn_with_Darwen_Borough_Council": [
+    -2.5804524,
+    53.6071855,
+    -2.3471416,
+    53.7911682
+  ],
+  "Blackpool_Borough_Council": [
+    -3.0766163,
+    53.7638723,
+    -2.9676643,
+    53.8852403
+  ],
+  "Blaenau_Gwent_County_Borough_Council": [
+    -3.3255016,
+    51.6705151,
+    -3.0896587,
+    51.8362581
+  ],
+  "Bolsover_District_Council": [
+    -1.3945745,
+    53.0709889,
+    -1.1508231,
+    53.3223261
+  ],
+  "Bolton_Metropolitan_Borough_Council": [
+    -2.6445587,
+    53.513436,
+    -2.3217614,
+    53.6553825
+  ],
+  "Borough_Council_of_Kings_Lynn_and_West_Norfolk": [
+    0.1275052,
+    52.4194642,
+    0.8423757,
+    53.007462
+  ],
+  "Boston_Borough_Council": [
+    -0.2641667,
+    52.8493917,
+    0.2172452,
+    53.1018971
+  ],
+  "Bournemouth_Christchurch_and_Poole_Council": [
+    -2.0550214,
+    50.6732458,
+    -1.6670674,
+    50.8187174
+  ],
+  "Bracknell_Forest_Council": [
+    -0.8522867,
+    51.3213862,
+    -0.6153339,
+    51.4783092
+  ],
+  "Braintree_District_Council": [
+    0.3495443,
+    51.7375469,
+    0.8042825,
+    52.1024945
+  ],
+  "Breckland_District_Council": [
+    0.5045199,
+    52.3577204,
+    1.1356076,
+    52.8268004
+  ],
+  "Brentwood_Borough_Council": [
+    0.156965,
+    51.5529845,
+    0.4294018,
+    51.7289774
+  ],
+  "Bridgend_County_Borough_Council": [
+    -3.7816157,
+    51.4591788,
+    -3.4462985,
+    51.6570444
+  ],
+  "Brighton_and_Hove_City_Council": [
+    -0.2615849,
+    50.7897244,
+    0.0014076,
+    50.9025271
+  ],
+  "Bristol_City_Council": [
+    -2.7711333,
+    51.3873413,
+    -2.4955468,
+    51.554235
+  ],
+  "Broadland_District_Council": [
+    0.961026,
+    52.5424626,
+    1.7100135,
+    52.844465
+  ],
+  "Bromsgrove_District_Council": [
+    -2.1825701,
+    52.2689584,
+    -1.8306087,
+    52.4542073
+  ],
+  "Broxbourne_Borough_Council": [
+    -0.1302198,
+    51.6715044,
+    0.0298051,
+    51.7912061
+  ],
+  "Broxtowe_Borough_Council": [
+    -1.3537418,
+    52.8829286,
+    -1.1648088,
+    53.0635042
+  ],
+  "Buckinghamshire_Council": [
+    -1.1617653,
+    51.4743729,
+    -0.4445007,
+    52.0920095
+  ],
+  "Burnley_Borough_Council": [
+    -2.3577523,
+    53.7136402,
+    -2.0968572,
+    53.8343677
+  ],
+  "Bury_Metropolitan_Borough_Council": [
+    -2.3989665,
+    53.5027793,
+    -2.2188529,
+    53.6764089
+  ],
+  "Caerphilly_County_Borough_Council": [
+    -3.3491975,
+    51.5344832,
+    -3.0478328,
+    51.8103077
+  ],
+  "Calderdale_Metropolitan_Borough_Council": [
+    -2.1888977,
+    53.6060276,
+    -1.7111221,
+    53.8344931
+  ],
+  "Cambridge_City_Council": [
+    0.0513158,
+    52.1475153,
+    0.2014292,
+    52.2478052
+  ],
+  "Cannock_Chase_District_Council": [
+    -2.0695655,
+    52.6306799,
+    -1.8959344,
+    52.7831783
+  ],
+  "Canterbury_City_Council": [
+    0.9255269,
+    51.1645304,
+    1.267713,
+    51.3959974
+  ],
+  "Cardiff_Council": [
+    -3.3590425,
+    51.363687,
+    -3.0511131,
+    51.5703826
+  ],
+  "Carmarthenshire_County_Council": [
+    -4.7516457,
+    51.6340804,
+    -3.6189123,
+    52.1545814
+  ],
+  "Castle_Point_Borough_Council": [
+    0.5024081,
+    51.4974218,
+    0.6551355,
+    51.5982435
+  ],
+  "Central_Bedfordshire_Council": [
+    -0.7196734,
+    51.7909856,
+    -0.1264428,
+    52.205083
+  ],
+  "Ceredigion_County_Council": [
+    -4.7348851,
+    52.010528,
+    -3.6320231,
+    52.5751421
+  ],
+  "Charnwood_Borough_Council": [
+    -1.3515099,
+    52.6440876,
+    -0.9290003,
+    52.8354476
+  ],
+  "Chelmsford_City_Council": [
+    0.3095624,
+    51.6056776,
+    0.6738771,
+    51.8681032
+  ],
+  "Cheltenham_Borough_Council": [
+    -2.157731,
+    51.8492802,
+    -1.9956468,
+    51.9479186
+  ],
+  "Cherwell_District_Council": [
+    -1.5396752,
+    51.7701961,
+    -1.0255847,
+    52.1783878
+  ],
+  "Cheshire_East_Council": [
+    -2.7734897,
+    52.9369885,
+    -1.9597145,
+    53.3972045
+  ],
+  "Cheshire_West_and_Chester_Council": [
+    -3.1393314,
+    52.9709322,
+    -2.3293165,
+    53.3542134
+  ],
+  "Chesterfield_Borough_Council": [
+    -1.4993993,
+    53.2028455,
+    -1.2857198,
+    53.3084938
+  ],
+  "Chichester_District_Council": [
+    -0.9755314,
+    50.7092492,
+    -0.4569138,
+    51.1085014
+  ],
+  "Chorley_Borough_Council": [
+    -2.840547,
+    53.5834139,
+    -2.4957627,
+    53.7606202
+  ],
+  "City_of_Bradford_Metropolitan_District_Council": [
+    -2.0766807,
+    53.7150489,
+    -1.6235249,
+    53.9721886
+  ],
+  "City_of_Lincoln_Council": [
+    -0.6385958,
+    53.1766337,
+    -0.4781886,
+    53.2645389
+  ],
+  "City_of_London_Corporation": [
+    -0.1286478,
+    51.4987121,
+    -0.0577723,
+    51.532569
+  ],
+  "City_of_Westminster": [
+    -0.2321783,
+    51.4753778,
+    -0.0955913,
+    51.5493675
+  ],
+  "City_of_Wolverhampton_Council": [
+    -2.2219061,
+    52.5348301,
+    -2.0331565,
+    52.646939
+  ],
+  "City_of_York_Council": [
+    -1.2408216,
+    53.8644122,
+    -0.9000029,
+    54.0670257
+  ],
+  "Colchester_Borough_Council": [
+    0.6773518,
+    51.7582641,
+    1.0428318,
+    51.9923629
+  ],
+  "Conwy_County_Borough_Council": [
+    -4.0574344,
+    52.9369872,
+    -3.4381499,
+    53.3573407
+  ],
+  "Cornwall_Council": [
+    -5.826333,
+    49.9337885,
+    -4.1346764,
+    50.9458024
+  ],
+  "Cotswold_District_Council": [
+    -2.3415701,
+    51.5682721,
+    -1.5991502,
+    52.1213332
+  ],
+  "Council_of_the_Isles_of_Scilly": [
+    -6.4416424,
+    49.8550238,
+    -6.2236467,
+    49.9917249
+  ],
+  "Coventry_City_Council": [
+    -1.6297315,
+    52.354358,
+    -1.4087944,
+    52.4740499
+  ],
+  "Crawley_Borough_Council": [
+    -0.2720307,
+    51.0748743,
+    -0.1183251,
+    51.1774574
+  ],
+  "Cumberland_Council": [
+    -3.6825384,
+    54.1745437,
+    -2.4568622,
+    55.1989571
+  ],
+  "Dacorum_Borough_Council": [
+    -0.7647803,
+    51.6691859,
+    -0.3898326,
+    51.8681438
+  ],
+  "Darlington_Borough_Council": [
+    -1.7260465,
+    54.4419137,
+    -1.3914506,
+    54.62853
+  ],
+  "Dartford_Borough_Council": [
+    0.1337058,
+    51.3773992,
+    0.3633299,
+    51.4898721
+  ],
+  "Denbighshire_County_Council": [
+    -3.626768,
+    52.8513523,
+    -3.0726811,
+    53.3652391
+  ],
+  "Derby_City_Council": [
+    -1.5722738,
+    52.8517749,
+    -1.3675835,
+    52.9774403
+  ],
+  "Derbyshire_Dales_District_Council": [
+    -1.934122,
+    52.8589236,
+    -1.4773589,
+    53.4013663
+  ],
+  "Doncaster_Metropolitan_Borough_Council": [
+    -1.3665369,
+    53.3947745,
+    -0.8496241,
+    53.6726403
+  ],
+  "Dorset_Council": [
+    -2.9812219,
+    50.5005044,
+    -1.7752977,
+    51.0902294
+  ],
+  "Dover_District_Council": [
+    1.1236765,
+    51.0827012,
+    1.4309906,
+    51.3434237
+  ],
+  "Dudley_Metropolitan_Borough_Council": [
+    -2.2069353,
+    52.4169634,
+    -1.9967425,
+    52.5672749
+  ],
+  "Durham_County_Council": [
+    -2.3732307,
+    54.4401598,
+    -1.2218139,
+    54.9274268
+  ],
+  "East_Cambridgeshire_District_Council": [
+    0.0095771,
+    52.1453189,
+    0.5452683,
+    52.5275472
+  ],
+  "East_Devon_District_Council": [
+    -3.6051602,
+    50.5948669,
+    -2.8677231,
+    50.9190922
+  ],
+  "East_Hampshire_District_Council": [
+    -1.1511935,
+    50.8561896,
+    -0.7274506,
+    51.2239663
+  ],
+  "East_Hertfordshire_District_Council": [
+    -0.2013159,
+    51.7206882,
+    0.216273,
+    52.0086113
+  ],
+  "East_Lindsey_District_Council": [
+    -0.343858,
+    52.9857121,
+    0.3909817,
+    53.5439111
+  ],
+  "East_Riding_of_Yorkshire_Council": [
+    -1.1203553,
+    53.5616344,
+    0.1929646,
+    54.1928476
+  ],
+  "East_Staffordshire_Borough_Council": [
+    -2.0586095,
+    52.7205293,
+    -1.5684451,
+    53.0551746
+  ],
+  "East_Suffolk_Council": [
+    1.1324993,
+    51.9109823,
+    1.7839953,
+    52.5732747
+  ],
+  "Eastbourne_Borough_Council": [
+    0.1944081,
+    50.7235562,
+    0.3541584,
+    50.8235446
+  ],
+  "Eastleigh_Borough_Council": [
+    -1.4158534,
+    50.8394658,
+    -1.2434997,
+    51.0133787
+  ],
+  "Elmbridge_Borough_Council": [
+    -0.4973336,
+    51.2845531,
+    -0.2917682,
+    51.4226291
+  ],
+  "Epping_Forest_District_Council": [
+    -0.03846,
+    51.5906453,
+    0.3666269,
+    51.8343261
+  ],
+  "Epsom_and_Ewell_Borough_Council": [
+    -0.3221224,
+    51.2825545,
+    -0.2014731,
+    51.3900639
+  ],
+  "Erewash_Borough_Council": [
+    -1.4960785,
+    52.8628666,
+    -1.2213669,
+    53.0134852
+  ],
+  "Exeter_City_Council": [
+    -3.5854265,
+    50.6645054,
+    -3.4370285,
+    50.7711865
+  ],
+  "Fareham_Borough_Council": [
+    -1.3235297,
+    50.7995637,
+    -1.0969247,
+    50.9077683
+  ],
+  "Fenland_District_Council": [
+    -0.2192196,
+    52.3732375,
+    0.2629075,
+    52.7549202
+  ],
+  "Flintshire_County_Council": [
+    -3.416967,
+    53.0602565,
+    -2.9029932,
+    53.3691836
+  ],
+  "Folkestone_and_Hythe_District_Council": [
+    0.7586092,
+    50.8948972,
+    1.2425713,
+    51.2206761
+  ],
+  "Forest_of_Dean_District_Council": [
+    -2.7061653,
+    51.6001783,
+    -2.2509858,
+    52.0335144
+  ],
+  "Fylde_Borough_Council": [
+    -3.0744988,
+    53.7213527,
+    -2.7642576,
+    53.8743526
+  ],
+  "Gateshead_Metropolitan_Borough_Council": [
+    -1.8685043,
+    54.8685295,
+    -1.4941031,
+    54.993503
+  ],
+  "Gedling_Borough_Council": [
+    -1.2482248,
+    52.9385814,
+    -0.989452,
+    53.1134202
+  ],
+  "Gloucester_City_Council": [
+    -2.3162507,
+    51.7985052,
+    -2.1625277,
+    51.8942688
+  ],
+  "Gosport_Borough_Council": [
+    -1.2290019,
+    50.7640826,
+    -1.0967431,
+    50.8485657
+  ],
+  "Gravesham_Borough_Council": [
+    0.2898814,
+    51.3130437,
+    0.5075824,
+    51.4740102
+  ],
+  "Great_Yarmouth_Borough_Council": [
+    1.516823,
+    52.513639,
+    1.7744814,
+    52.755409
+  ],
+  "Guildford_Borough_Council": [
+    -0.7639481,
+    51.1635913,
+    -0.3704802,
+    51.3435898
+  ],
+  "Gwynedd_Council": [
+    -4.8488243,
+    52.5169153,
+    -3.4078003,
+    53.2653493
+  ],
+  "Halton_Borough_Council": [
+    -2.8486514,
+    53.2948781,
+    -2.5799337,
+    53.4123646
+  ],
+  "Harborough_District_Council": [
+    -1.3222913,
+    52.3790443,
+    -0.6938579,
+    52.6974068
+  ],
+  "Harlow_District_Council": [
+    0.0377257,
+    51.7242325,
+    0.1832053,
+    51.8077991
+  ],
+  "Hart_District_Council": [
+    -1.0189664,
+    51.1750175,
+    -0.7473087,
+    51.3758698
+  ],
+  "Hartlepool_Borough_Council": [
+    -1.3996555,
+    54.6125509,
+    -1.140468,
+    54.7367751
+  ],
+  "Hastings_Borough_Council": [
+    0.4864788,
+    50.829827,
+    0.6740908,
+    50.9045287
+  ],
+  "Havant_Borough_Council": [
+    -1.0709138,
+    50.7674181,
+    -0.9111948,
+    50.9188991
+  ],
+  "Herefordshire_Council": [
+    -3.1633759,
+    51.8133047,
+    -2.3213678,
+    52.407082
+  ],
+  "Hertsmere_Borough_Council": [
+    -0.4026935,
+    51.6116153,
+    -0.1469043,
+    51.7488104
+  ],
+  "High_Peak_Borough_Council": [
+    -2.0493258,
+    53.185339,
+    -1.6375583,
+    53.5495127
+  ],
+  "Hinckley_and_Bosworth_Borough_Council": [
+    -1.5874453,
+    52.4913101,
+    -1.1839677,
+    52.7256464
+  ],
+  "Horsham_District_Council": [
+    -0.5853996,
+    50.8516512,
+    -0.1855738,
+    51.1565193
+  ],
+  "Hull_City_Council": [
+    -0.438704,
+    53.7081468,
+    -0.2238552,
+    53.8236657
+  ],
+  "Huntingdonshire_District_Council": [
+    -0.521436,
+    52.1455924,
+    0.0760254,
+    52.5935095
+  ],
+  "Hyndburn_Borough_Council": [
+    -2.4813984,
+    53.6955594,
+    -2.2981814,
+    53.8258469
+  ],
+  "Ipswich_Borough_Council": [
+    1.0899665,
+    52.0113643,
+    1.2427424,
+    52.1043217
+  ],
+  "Isle_of_Anglesey_County_Council": [
+    -4.7233181,
+    53.1095284,
+    -3.9962829,
+    53.4521612
+  ],
+  "Isle_of_Wight_Council": [
+    -1.6061185,
+    50.5642134,
+    -1.0538431,
+    50.7776379
+  ],
+  "Kirklees_Council": [
+    -2.024661,
+    53.5101065,
+    -1.5550662,
+    53.7741933
+  ],
+  "Knowsley_Metropolitan_Borough_Council": [
+    -2.9383132,
+    53.3370299,
+    -2.7274848,
+    53.5138786
+  ],
+  "Lancaster_City_Council": [
+    -2.9443371,
+    53.9086682,
+    -2.4399847,
+    54.2485545
+  ],
+  "Leeds_City_Council": [
+    -1.8165231,
+    53.6887182,
+    -1.2720526,
+    53.9565127
+  ],
+  "Leicester_City_Council": [
+    -1.2317339,
+    52.5708835,
+    -1.0302582,
+    52.7009018
+  ],
+  "Lewes_District_Council": [
+    -0.1548675,
+    50.7465766,
+    0.1793084,
+    51.013385
+  ],
+  "Lichfield_District_Council": [
+    -1.9781234,
+    52.5752812,
+    -1.5705062,
+    52.8167978
+  ],
+  "Liverpool_City_Council": [
+    -3.0246701,
+    53.3165206,
+    -2.8026827,
+    53.4847104
+  ],
+  "London_Borough_of_Barking_and_Dagenham": [
+    0.0509965,
+    51.5024636,
+    0.2068793,
+    51.6098051
+  ],
+  "London_Borough_of_Barnet": [
+    -0.3229234,
+    51.5449438,
+    -0.1131133,
+    51.6807069
+  ],
+  "London_Borough_of_Bexley": [
+    0.0592366,
+    51.3982316,
+    0.2335978,
+    51.5231565
+  ],
+  "London_Borough_of_Brent": [
+    -0.3510053,
+    51.5180328,
+    -0.1745185,
+    51.6103222
+  ],
+  "London_Borough_of_Bromley": [
+    -0.1007099,
+    51.2785889,
+    0.1791072,
+    51.4551718
+  ],
+  "London_Borough_of_Camden": [
+    -0.2295424,
+    51.5033253,
+    -0.0886272,
+    51.5826491
+  ],
+  "London_Borough_of_Croydon": [
+    -0.1775511,
+    51.2757282,
+    0.0215908,
+    51.4329443
+  ],
+  "London_Borough_of_Ealing": [
+    -0.4356828,
+    51.4796762,
+    -0.2287186,
+    51.5696228
+  ],
+  "London_Borough_of_Enfield": [
+    -0.2025577,
+    51.5961582,
+    0.006865,
+    51.7021058
+  ],
+  "London_Borough_of_Hackney": [
+    -0.1207783,
+    51.5097432,
+    -0.0006145,
+    51.5874685
+  ],
+  "London_Borough_of_Hammersmith_and_Fulham": [
+    -0.2709649,
+    51.4556344,
+    -0.1627727,
+    51.541914
+  ],
+  "London_Borough_of_Haringey": [
+    -0.185973,
+    51.5546517,
+    -0.0267586,
+    51.620744
+  ],
+  "London_Borough_of_Harrow": [
+    -0.4205557,
+    51.5425738,
+    -0.2511504,
+    51.6507254
+  ],
+  "London_Borough_of_Havering": [
+    0.1174234,
+    51.4759838,
+    0.3530506,
+    51.642308
+  ],
+  "London_Borough_of_Hillingdon": [
+    -0.5252054,
+    51.4434208,
+    -0.3577435,
+    51.6408619
+  ],
+  "London_Borough_of_Hounslow": [
+    -0.4768181,
+    51.4096582,
+    -0.2295038,
+    51.5143157
+  ],
+  "London_Borough_of_Islington": [
+    -0.1589535,
+    51.5091192,
+    -0.060661,
+    51.5848509
+  ],
+  "London_Borough_of_Lambeth": [
+    -0.1678306,
+    51.4011134,
+    -0.0601984,
+    51.518102
+  ],
+  "London_Borough_of_Lewisham": [
+    -0.0901014,
+    51.4036834,
+    0.0564638,
+    51.5027002
+  ],
+  "London_Borough_of_Merton": [
+    -0.2704884,
+    51.3697458,
+    -0.1079847,
+    51.4514137
+  ],
+  "London_Borough_of_Newham": [
+    -0.0373377,
+    51.4883768,
+    0.1135422,
+    51.5742146
+  ],
+  "London_Borough_of_Redbridge": [
+    -0.0090381,
+    51.5332331,
+    0.1650937,
+    51.638211
+  ],
+  "London_Borough_of_Richmond_upon_Thames": [
+    -0.408407,
+    51.3809822,
+    -0.2078373,
+    51.5002158
+  ],
+  "London_Borough_of_Southwark": [
+    -0.1289891,
+    51.4109107,
+    -0.0172396,
+    51.5177647
+  ],
+  "London_Borough_of_Sutton": [
+    -0.261709,
+    51.3118878,
+    -0.1005395,
+    51.4034623
+  ],
+  "London_Borough_of_Tower_Hamlets": [
+    -0.0951855,
+    51.4766103,
+    0.0251913,
+    51.5544194
+  ],
+  "London_Borough_of_Waltham_Forest": [
+    -0.0779005,
+    51.5404007,
+    0.0407067,
+    51.6563512
+  ],
+  "London_Borough_of_Wandsworth": [
+    -0.2748729,
+    51.4085238,
+    -0.1118702,
+    51.4960421
+  ],
+  "Luton_Borough_Council": [
+    -0.5219695,
+    51.8445198,
+    -0.3335261,
+    51.9376029
+  ],
+  "Maidstone_Borough_Council": [
+    0.3588427,
+    51.1193358,
+    0.8161087,
+    51.3515215
+  ],
+  "Maldon_District_Council": [
+    0.5686951,
+    51.6102475,
+    0.9723065,
+    51.8404152
+  ],
+  "Malvern_Hills_District_Council": [
+    -2.6788045,
+    51.9560094,
+    -2.1336446,
+    52.3781691
+  ],
+  "Manchester_City_Council": [
+    -2.3359989,
+    53.3310906,
+    -2.1313085,
+    53.5537662
+  ],
+  "Mansfield_District_Council": [
+    -1.2758967,
+    53.1052427,
+    -1.0796291,
+    53.2456945
+  ],
+  "Medway_Council": [
+    0.3821745,
+    51.3150423,
+    0.7401774,
+    51.4991015
+  ],
+  "Melton_Borough_Council": [
+    -1.0643788,
+    52.6352789,
+    -0.6424823,
+    52.9889842
+  ],
+  "Merthyr_Tydfil_County_Borough_Council": [
+    -3.4700034,
+    51.6341041,
+    -3.2583798,
+    51.8456361
+  ],
+  "Mid_Devon_District_Council": [
+    -3.9466959,
+    50.6913262,
+    -3.1237855,
+    51.0466577
+  ],
+  "Mid_Suffolk_District_Council": [
+    0.7716866,
+    52.0474746,
+    1.4272082,
+    52.4274593
+  ],
+  "Mid_Sussex_District_Council": [
+    -0.2692391,
+    50.8544659,
+    0.0601335,
+    51.1542505
+  ],
+  "Middlesbrough_Borough_Council": [
+    -1.3015204,
+    54.4920681,
+    -1.1202482,
+    54.5999227
+  ],
+  "Milton_Keynes_Council": [
+    -0.9055178,
+    51.9592499,
+    -0.5745227,
+    52.2074033
+  ],
+  "Mole_Valley_District_Council": [
+    -0.4562927,
+    51.0926738,
+    -0.1556997,
+    51.3458475
+  ],
+  "Monmouthshire_County_Council": [
+    -3.176163,
+    51.5132683,
+    -2.6310958,
+    51.9951531
+  ],
+  "Neath_Port_Talbot_County_Borough_Council": [
+    -3.9526104,
+    51.5147357,
+    -3.5432425,
+    51.8236871
+  ],
+  "New_Forest_District_Council": [
+    -1.9717507,
+    50.695809,
+    -1.289824,
+    51.0185635
+  ],
+  "Newark_and_Sherwood_District_Council": [
+    -1.1957917,
+    52.946545,
+    -0.6505508,
+    53.2717377
+  ],
+  "Newcastle-under-Lyme_Borough_Council": [
+    -2.4879983,
+    52.8649197,
+    -2.1652589,
+    53.1248574
+  ],
+  "Newcastle_City_Council": [
+    -1.791516,
+    54.9508099,
+    -1.5140659,
+    55.0886728
+  ],
+  "Newport_City_Council": [
+    -3.1400943,
+    51.491573,
+    -2.7865397,
+    51.658686
+  ],
+  "North_Devon_District_Council": [
+    -4.2808554,
+    50.8589372,
+    -3.5741097,
+    51.2580555
+  ],
+  "North_East_Derbyshire_District_Council": [
+    -1.6161466,
+    53.0936277,
+    -1.2664733,
+    53.3517532
+  ],
+  "North_East_Lincolnshire_Council": [
+    -0.3143346,
+    53.4224067,
+    0.0380351,
+    53.6502712
+  ],
+  "North_Hertfordshire_District_Council": [
+    -0.4246029,
+    51.8194919,
+    0.0924786,
+    52.0929807
+  ],
+  "North_Kesteven_District_Council": [
+    -0.7873779,
+    52.8745703,
+    -0.1640556,
+    53.2685311
+  ],
+  "North_Lincolnshire_Council": [
+    -0.9665436,
+    53.4389754,
+    -0.1824815,
+    53.7307949
+  ],
+  "North_Norfolk_District_Council": [
+    0.6877142,
+    52.6670326,
+    1.7100055,
+    52.9954552
+  ],
+  "North_Northamptonshire_Council": [
+    -0.9273685,
+    52.1781804,
+    -0.3202813,
+    52.6568266
+  ],
+  "North_Somerset_Council": [
+    -3.133367,
+    51.2797712,
+    -2.5714923,
+    51.5124384
+  ],
+  "North_Tyneside_Council": [
+    -1.6560922,
+    54.9733635,
+    -1.3861972,
+    55.084549
+  ],
+  "North_Warwickshire_Borough_Council": [
+    -1.803962,
+    52.4257351,
+    -1.4435543,
+    52.6967638
+  ],
+  "North_West_Leicestershire_District_Council": [
+    -1.6128348,
+    52.6538889,
+    -1.2298685,
+    52.8874025
+  ],
+  "Northumberland_County_Council": [
+    -2.7164966,
+    54.7716695,
+    -1.4342301,
+    55.8188711
+  ],
+  "Norwich_City_Council": [
+    1.1856371,
+    52.58239,
+    1.4402682,
+    52.6962353
+  ],
+  "Nottingham_City_Council": [
+    -1.2633948,
+    52.8793591,
+    -1.0697422,
+    53.0279705
+  ],
+  "Nuneaton_and_Bedworth_Borough_Council": [
+    -1.5717539,
+    52.4406182,
+    -1.3873648,
+    52.5613641
+  ],
+  "Oadby_and_Wigston_Borough_Council": [
+    -1.1598603,
+    52.5468473,
+    -1.0261392,
+    52.6276025
+  ],
+  "Oldham_Metropolitan_Borough_Council": [
+    -2.2015553,
+    53.4820834,
+    -1.8943165,
+    53.6331185
+  ],
+  "Oxford_City_Council": [
+    -1.3197225,
+    51.7016864,
+    -1.1601513,
+    51.8053766
+  ],
+  "Pembrokeshire_County_Council": [
+    -5.7140235,
+    51.5661215,
+    -4.450858,
+    52.1321773
+  ],
+  "Pendle_Borough_Council": [
+    -2.3497514,
+    53.7963134,
+    -2.0298003,
+    53.9613281
+  ],
+  "Peterborough_City_Council": [
+    -0.5150907,
+    52.4929471,
+    0.0055735,
+    52.6904701
+  ],
+  "Plymouth_City_Council": [
+    -4.2214284,
+    50.3229566,
+    -4.0033315,
+    50.4547606
+  ],
+  "Portsmouth_City_Council": [
+    -1.1875888,
+    50.7404859,
+    -1.006021,
+    50.8688584
+  ],
+  "Powys_County_Council": [
+    -3.9579464,
+    51.7411429,
+    -2.9242316,
+    52.9124572
+  ],
+  "Preston_City_Council": [
+    -2.8426928,
+    53.7385532,
+    -2.5795983,
+    53.9054503
+  ],
+  "Reading_Borough_Council": [
+    -1.0684217,
+    51.4003733,
+    -0.9130253,
+    51.5028674
+  ],
+  "Redcar_and_Cleveland_Borough_Council": [
+    -1.2189447,
+    54.477521,
+    -0.7698366,
+    54.6569884
+  ],
+  "Redditch_Borough_Council": [
+    -2.0336482,
+    52.2262127,
+    -1.8604717,
+    52.3332118
+  ],
+  "Reigate_and_Banstead_Borough_Council": [
+    -0.2914804,
+    51.1501336,
+    -0.1061507,
+    51.3536783
+  ],
+  "Rhondda_Cynon_Taf_County_Borough_Council": [
+    -3.6108529,
+    51.4876511,
+    -3.2203228,
+    51.8415994
+  ],
+  "Ribble_Valley_Borough_Council": [
+    -2.6675744,
+    53.7467768,
+    -2.1683575,
+    54.0585132
+  ],
+  "Rochdale_Metropolitan_Borough_Council": [
+    -2.2983908,
+    53.5198882,
+    -2.0116132,
+    53.6947894
+  ],
+  "Rochford_District_Council": [
+    0.5317489,
+    51.5276561,
+    0.9736684,
+    51.6506181
+  ],
+  "Rossendale_Borough_Council": [
+    -2.4266582,
+    53.6051005,
+    -2.12971,
+    53.7642043
+  ],
+  "Rother_District_Council": [
+    0.2986336,
+    50.7999203,
+    0.8907721,
+    51.0940763
+  ],
+  "Rotherham_Metropolitan_Borough_Council": [
+    -1.4740271,
+    53.291715,
+    -1.0977322,
+    53.5247387
+  ],
+  "Royal_Borough_of_Greenwich": [
+    -0.0432174,
+    51.4136467,
+    0.1402168,
+    51.5229701
+  ],
+  "Royal_Borough_of_Kensington_and_Chelsea": [
+    -0.245171,
+    51.4678544,
+    -0.1337831,
+    51.5393064
+  ],
+  "Royal_Borough_of_Kingston_upon_Thames": [
+    -0.345705,
+    51.3160461,
+    -0.2223786,
+    51.4473382
+  ],
+  "Royal_Borough_of_Windsor_and_Maidenhead": [
+    -0.8718517,
+    51.3725918,
+    -0.5038149,
+    51.5881506
+  ],
+  "Rugby_Borough_Council": [
+    -1.481081,
+    52.2433111,
+    -1.1541854,
+    52.5436908
+  ],
+  "Runnymede_Borough_Council": [
+    -0.6356146,
+    51.3291474,
+    -0.441154,
+    51.460545
+  ],
+  "Rushcliffe_Borough_Council": [
+    -1.2913494,
+    52.7772798,
+    -0.7989102,
+    53.0476757
+  ],
+  "Rushmoor_Borough_Council": [
+    -0.8230262,
+    51.2213006,
+    -0.7132124,
+    51.3294668
+  ],
+  "Rutland_County_Council_District_Council": [
+    -0.8416368,
+    52.5123913,
+    -0.4115369,
+    52.7710882
+  ],
+  "Salford_City_Council": [
+    -2.5057711,
+    53.4067519,
+    -2.2295836,
+    53.5517839
+  ],
+  "Sandwell_Metropolitan_Borough_Council": [
+    -2.1120922,
+    52.4517314,
+    -1.903355,
+    52.5780414
+  ],
+  "Sefton_Metropolitan_Borough_Council": [
+    -3.1238515,
+    53.4284867,
+    -2.8644357,
+    53.708067
+  ],
+  "Sevenoaks_District_Council": [
+    0.0157309,
+    51.1198538,
+    0.3630541,
+    51.4298013
+  ],
+  "Sheffield_City_Council": [
+    -1.8173125,
+    53.2945325,
+    -1.3067901,
+    53.5123119
+  ],
+  "Shropshire_Council": [
+    -3.2660067,
+    52.2924468,
+    -2.2162959,
+    53.0077736
+  ],
+  "Slough_Borough_Council": [
+    -0.6762207,
+    51.4587089,
+    -0.4741892,
+    51.5482157
+  ],
+  "Solihull_Metropolitan_Borough_Council": [
+    -1.8868101,
+    52.3382686,
+    -1.577479,
+    52.523645
+  ],
+  "Somerset_Council": [
+    -3.8586053,
+    50.8014885,
+    -2.2278002,
+    51.3420017
+  ],
+  "South_Cambridgeshire_District_Council": [
+    -0.2547267,
+    51.9902303,
+    0.4459164,
+    52.3666071
+  ],
+  "South_Derbyshire_District_Council": [
+    -1.765487,
+    52.686235,
+    -1.3029603,
+    52.9574215
+  ],
+  "South_Gloucestershire_Council": [
+    -2.6902179,
+    51.4059327,
+    -2.2370716,
+    51.68719
+  ],
+  "South_Hams_District_Council": [
+    -4.2089325,
+    50.1852749,
+    -3.4870759,
+    50.5568863
+  ],
+  "South_Holland_District_Council": [
+    -0.325189,
+    52.6354461,
+    0.2947721,
+    52.9385977
+  ],
+  "South_Kesteven_District_Council": [
+    -0.8292474,
+    52.6273474,
+    -0.1816758,
+    53.0699364
+  ],
+  "South_Norfolk_Council": [
+    0.9180583,
+    52.3330595,
+    1.7113365,
+    52.6936316
+  ],
+  "South_Oxfordshire_District_Council": [
+    -1.3068274,
+    51.449722,
+    -0.8478929,
+    51.8235458
+  ],
+  "South_Ribble_Borough_Council": [
+    -2.8715689,
+    53.6614236,
+    -2.5290902,
+    53.7922476
+  ],
+  "South_Staffordshire_Council": [
+    -2.3416552,
+    52.4139434,
+    -1.9689122,
+    52.7954541
+  ],
+  "South_Tyneside_Council": [
+    -1.5502444,
+    54.9187659,
+    -1.3367594,
+    55.0209085
+  ],
+  "Southampton_City_Council": [
+    -1.4921084,
+    50.8708031,
+    -1.3069321,
+    50.9654496
+  ],
+  "Southend-on-Sea_Borough_Council": [
+    0.6075904,
+    51.5114548,
+    0.837371,
+    51.5860963
+  ],
+  "Spelthorne_Borough_Council": [
+    -0.5575222,
+    51.3683789,
+    -0.3667827,
+    51.4807663
+  ],
+  "St_Albans_City_and_District_Council": [
+    -0.4584822,
+    51.6767596,
+    -0.2229467,
+    51.8599433
+  ],
+  "St_Helens_Council": [
+    -2.8410212,
+    53.3755646,
+    -2.5607644,
+    53.5415771
+  ],
+  "Stafford_Borough_Council": [
+    -2.4326927,
+    52.7055939,
+    -1.9182225,
+    52.9897303
+  ],
+  "Staffordshire_Moorlands_District_Council": [
+    -2.2268076,
+    52.9074616,
+    -1.7598261,
+    53.2350415
+  ],
+  "Stevenage_Borough_Council": [
+    -0.2502876,
+    51.8602601,
+    -0.1297382,
+    51.9421359
+  ],
+  "Stockport_Metropolitan_Borough_Council": [
+    -2.262231,
+    53.3180692,
+    -1.9772588,
+    53.4640253
+  ],
+  "Stockton-on-Tees_Borough_Council": [
+    -1.4700307,
+    54.4540442,
+    -1.1427027,
+    54.6549151
+  ],
+  "Stoke-on-Trent_City_Council": [
+    -2.2538017,
+    52.937075,
+    -2.0642531,
+    53.1018561
+  ],
+  "Stratford-on-Avon_District_Council": [
+    -1.9768219,
+    51.9445858,
+    -1.2150923,
+    52.37716
+  ],
+  "Stroud_District_Council": [
+    -2.551346,
+    51.5800639,
+    -2.053901,
+    51.8595329
+  ],
+  "Sunderland_City_Council": [
+    -1.5858351,
+    54.7894274,
+    -1.3308943,
+    54.9540508
+  ],
+  "Surrey_Heath_Borough_Council": [
+    -0.791229,
+    51.2683226,
+    -0.5327706,
+    51.4031896
+  ],
+  "Swale_Borough_Council": [
+    0.5810374,
+    51.2106584,
+    1.0399117,
+    51.4599098
+  ],
+  "Swansea_Council": [
+    -4.3585062,
+    51.5243511,
+    -3.8219866,
+    51.7856514
+  ],
+  "Swindon_Borough_Council": [
+    -1.8798131,
+    51.4730185,
+    -1.5868456,
+    51.7019627
+  ],
+  "Tameside_Metropolitan_Borough_Council": [
+    -2.1849356,
+    53.4168923,
+    -1.9482731,
+    53.5403833
+  ],
+  "Tamworth_Borough_Council": [
+    -1.7509244,
+    52.5795135,
+    -1.6180674,
+    52.6667097
+  ],
+  "Tandridge_District_Council": [
+    -0.1730787,
+    51.1258942,
+    0.0775327,
+    51.3496472
+  ],
+  "Teignbridge_District_Council": [
+    -3.9036227,
+    50.4486301,
+    -3.4038408,
+    50.7762292
+  ],
+  "Telford_and_Wrekin_Council": [
+    -2.6833737,
+    52.6045269,
+    -2.2964783,
+    52.8377296
+  ],
+  "Tendring_District_Council": [
+    0.9071125,
+    51.754128,
+    1.3124376,
+    51.9714519
+  ],
+  "Test_Valley_Borough_Council": [
+    -1.7102318,
+    50.9184199,
+    -1.2923482,
+    51.3489318
+  ],
+  "Tewkesbury_Borough_Council": [
+    -2.3688954,
+    51.8098686,
+    -1.7868721,
+    52.0595282
+  ],
+  "Thanet_District_Council": [
+    1.192781,
+    51.2961335,
+    1.4653346,
+    51.4087596
+  ],
+  "The_North_Yorkshire_Council": [
+    -2.5861011,
+    53.6015781,
+    -0.1782074,
+    54.5739252
+  ],
+  "Three_Rivers_District_Council": [
+    -0.5549667,
+    51.5886925,
+    -0.3439306,
+    51.7512933
+  ],
+  "Thurrock_Council": [
+    0.1943916,
+    51.4384009,
+    0.5586072,
+    51.5796534
+  ],
+  "Tonbridge_and_Malling_Borough_Council": [
+    0.1834422,
+    51.1607706,
+    0.5434054,
+    51.3819989
+  ],
+  "Torbay_Council": [
+    -3.645358,
+    50.3633402,
+    -3.463689,
+    50.5279175
+  ],
+  "Torfaen_County_Borough_Council": [
+    -3.1586662,
+    51.5968135,
+    -2.9439178,
+    51.8065011
+  ],
+  "Torridge_District_Council": [
+    -4.6965651,
+    50.6308173,
+    -3.8618779,
+    51.226717
+  ],
+  "Trafford_Borough_Council": [
+    -2.4944529,
+    53.3478968,
+    -2.2373333,
+    53.4895311
+  ],
+  "Tunbridge_Wells_Borough_Council": [
+    0.1302057,
+    50.9928695,
+    0.6674095,
+    51.214769
+  ],
+  "Uttlesford_District_Council": [
+    0.0429098,
+    51.7547436,
+    0.5471822,
+    52.1054017
+  ],
+  "Vale_of_Glamorgan_Council": [
+    -3.6580651,
+    51.3683044,
+    -3.1478407,
+    51.5278409
+  ],
+  "Vale_of_White_Horse_District_Council": [
+    -1.7157643,
+    51.5072807,
+    -1.1842162,
+    51.8007825
+  ],
+  "Wakefield_Metropolitan_District_Council": [
+    -1.6407404,
+    53.5657204,
+    -1.1828396,
+    53.7521927
+  ],
+  "Walsall_Metropolitan_Borough_Council": [
+    -2.0927522,
+    52.5382829,
+    -1.8574935,
+    52.6717461
+  ],
+  "Warrington_Borough_Council": [
+    -2.7144413,
+    53.3127912,
+    -2.4096794,
+    53.4901836
+  ],
+  "Warwick_District_Council": [
+    -1.7955554,
+    52.2038604,
+    -1.3904255,
+    52.3987499
+  ],
+  "Watford_Borough_Council": [
+    -0.4552221,
+    51.6280193,
+    -0.3534492,
+    51.7114119
+  ],
+  "Waverley_Borough_Council": [
+    -0.8666682,
+    51.0590317,
+    -0.3949959,
+    51.2544823
+  ],
+  "Wealden_District_Council": [
+    -0.0651627,
+    50.7244496,
+    0.4785346,
+    51.1592794
+  ],
+  "Welwyn_Hatfield_Borough_Council": [
+    -0.2962473,
+    51.6756489,
+    -0.0727311,
+    51.8708048
+  ],
+  "West_Berkshire_Council": [
+    -1.6041548,
+    51.3166496,
+    -0.9631491,
+    51.5738898
+  ],
+  "West_Devon_Borough_Council": [
+    -4.3605161,
+    50.4225219,
+    -3.7087508,
+    50.888975
+  ],
+  "West_Lancashire_Borough_Council": [
+    -3.0665429,
+    53.4720799,
+    -2.6723582,
+    53.7440818
+  ],
+  "West_Lindsey_District_Council": [
+    -0.84212,
+    53.167646,
+    -0.108939,
+    53.6315633
+  ],
+  "West_Northamptonshire_Council": [
+    -1.3498847,
+    51.9639765,
+    -0.6820579,
+    52.4891733
+  ],
+  "West_Oxfordshire_District_Council": [
+    -1.7346393,
+    51.6732642,
+    -1.269684,
+    52.0064686
+  ],
+  "West_Suffolk_Council": [
+    0.3142565,
+    52.034543,
+    0.9878979,
+    52.4782213
+  ],
+  "Westmorland_and_Furness_Council": [
+    -3.3144524,
+    54.0344835,
+    -2.1419262,
+    54.8660299
+  ],
+  "Wigan_Metropolitan_Borough_Council": [
+    -2.7470331,
+    53.436199,
+    -2.3987626,
+    53.6183189
+  ],
+  "Wiltshire_Council": [
+    -2.3846916,
+    50.9349273,
+    -1.4672356,
+    51.7116719
+  ],
+  "Winchester_City_Council": [
+    -1.4729218,
+    50.8459413,
+    -1.0135012,
+    51.2068453
+  ],
+  "Wirral_Borough_Council": [
+    -3.245703,
+    53.2793046,
+    -2.9132416,
+    53.4528117
+  ],
+  "Woking_Borough_Council": [
+    -0.665556,
+    51.2554659,
+    -0.4461215,
+    51.3606629
+  ],
+  "Wokingham_Borough_Council": [
+    -1.0271493,
+    51.3424509,
+    -0.7693962,
+    51.57227
+  ],
+  "Worcester_City_Council": [
+    -2.2781364,
+    52.1525694,
+    -2.1419093,
+    52.2404927
+  ],
+  "Worthing_Borough_Council": [
+    -0.4618517,
+    50.7927336,
+    -0.3167742,
+    50.8731137
+  ],
+  "Wrexham_County_Borough_Council": [
+    -3.397962,
+    52.8563729,
+    -2.7077774,
+    53.1450593
+  ],
+  "Wychavon_District_Council": [
+    -2.2910696,
+    51.9901948,
+    -1.7414108,
+    52.3701935
+  ],
+  "Wyre_Borough_Council": [
+    -3.068217,
+    53.8092599,
+    -2.5969444,
+    53.9897869
+  ],
+  "Wyre_Forest_District_Council": [
+    -2.4525223,
+    52.3056198,
+    -2.1043796,
+    52.4645893
+  ]
+}
