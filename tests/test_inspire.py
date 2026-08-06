@@ -866,7 +866,11 @@ _PARCEL_RING = (
 _PARCEL_BBOX = _bbox_for_bng_rectangle(299_700.0, 179_700.0, 300_300.0, 180_300.0)
 
 
-def _build_gml(pos_list: str, time_stamp: str = "2026-08-02T03:47:41.090Z") -> bytes:
+def _build_gml(
+    pos_list: str,
+    time_stamp: str = "2026-08-02T03:47:41.090Z",
+    srs_name: str = "urn:ogc:def:crs:EPSG::27700",
+) -> bytes:
     ns = (
         'xmlns:wfs="http://www.opengis.net/wfs/2.0" '
         'xmlns:gml="http://www.opengis.net/gml/3.2" '
@@ -877,7 +881,7 @@ def _build_gml(pos_list: str, time_stamp: str = "2026-08-02T03:47:41.090Z") -> b
         f"<wfs:FeatureCollection {ns} "
         f'numberMatched="1" numberReturned="1" timeStamp="{time_stamp}">'
         "<wfs:member><LR:PREDEFINED>"
-        '<LR:GEOMETRY><gml:Polygon srsName="urn:ogc:def:crs:EPSG::27700" '
+        f'<LR:GEOMETRY><gml:Polygon srsName="{srs_name}" '
         'srsDimension="2"><gml:exterior><gml:LinearRing>'
         f"<gml:posList>{pos_list}</gml:posList>"
         "</gml:LinearRing></gml:exterior></gml:Polygon></LR:GEOMETRY>"
@@ -984,10 +988,18 @@ def test_fetch_zero_authorities_refuses_before_any_network(tmp_path):
 
 
 def test_fetch_skips_when_both_work_files_already_exist(tmp_path):
+    # parcels.jsonl's own line count (1) is consistent with meta's own
+    # claimed parcels_kept total (1): the ordinary, non-empty resume case.
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     (work_dir / PARCELS_WORK_NAME).write_text('[[[1.0, 2.0]]]\n', encoding="utf-8")
-    (work_dir / META_WORK_NAME).write_text('{"authorities": [], "year": 2026}', encoding="utf-8")
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Test_Authority", "parcels_seen": 1, "parcels_kept": 1, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
 
     source = InspireSource(session=_RefusesToConnect())
     progress = _ProgressLog()
@@ -999,19 +1011,125 @@ def test_fetch_skips_when_both_work_files_already_exist(tmp_path):
     assert source.tile_failures == []
 
 
+def test_fetch_skips_a_completed_zero_parcel_fetch(tmp_path):
+    # The review finding this fix closes: every authority found had zero
+    # kept parcels, a legitimate, complete result that writes a 0-byte
+    # parcels.jsonl by construction. meta's own claimed total (0) agrees
+    # with that, so this must skip, with a session that raises on any use
+    # proving no network is touched at all.
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text("", encoding="utf-8")
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Test_Authority", "parcels_seen": 5, "parcels_kept": 0, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
+
+    source = InspireSource(session=_RefusesToConnect())
+    progress = _ProgressLog()
+
+    paths = source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, progress)
+
+    assert sorted(p.name for p in paths) == sorted([PARCELS_WORK_NAME, META_WORK_NAME])
+    assert ("tile_skipped", {"source": "inspire", "tile_id": "whole-area"}) in progress.events
+    assert source.tile_failures == []
+
+
+def test_fetch_does_not_skip_when_parcels_jsonl_is_empty_but_meta_claims_kept_parcels(tmp_path, monkeypatch):
+    # The truncation case the old non-empty check was actually guarding,
+    # still guarded: a 0-byte parcels.jsonl inconsistent with meta's own
+    # claimed kept=3 must not skip.
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text("", encoding="utf-8")
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Test_Authority", "parcels_seen": 5, "parcels_kept": 3, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
+
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+    source = InspireSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "no-cache")
+
+    with pytest.raises(AssertionError):
+        # Falls through past the (refused) skip to ensure_ostn15, which
+        # _RefusesToConnect refuses.
+        source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, NullProgress())
+
+
+def test_fetch_does_not_skip_when_parcels_jsonl_has_content_but_meta_claims_zero_kept(tmp_path, monkeypatch):
+    # The same inconsistency, the other way round: a non-empty
+    # parcels.jsonl beside a meta claiming kept=0 must not skip either.
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text('[[[1.0, 2.0]]]\n', encoding="utf-8")
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Test_Authority", "parcels_seen": 5, "parcels_kept": 0, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
+
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+    source = InspireSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "no-cache")
+
+    with pytest.raises(AssertionError):
+        source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, NullProgress())
+
+
+def test_fetch_does_not_skip_when_meta_json_is_corrupt(tmp_path, monkeypatch):
+    # Non-empty parcels.jsonl deliberately: the OLD "both files non-empty"
+    # check would have skipped here (meta.json is non-empty bytes, just
+    # not valid JSON), which is exactly the review finding. meta.json
+    # cannot be trusted to say what parcels.jsonl actually holds, so this
+    # must not skip regardless of parcels.jsonl's own size.
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text('[[[1.0, 2.0]]]\n', encoding="utf-8")
+    (work_dir / META_WORK_NAME).write_text("not json", encoding="utf-8")
+
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+    source = InspireSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "no-cache")
+
+    with pytest.raises(AssertionError):
+        source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, NullProgress())
+
+
+def test_fetch_does_not_skip_when_meta_json_is_missing_the_expected_keys(tmp_path, monkeypatch):
+    # Same discriminating shape as the corrupt-JSON test above: valid
+    # JSON, non-empty, but missing the "authorities"/"year" keys this
+    # class's own fetch() always writes and merge() always reads.
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / PARCELS_WORK_NAME).write_text('[[[1.0, 2.0]]]\n', encoding="utf-8")
+    (work_dir / META_WORK_NAME).write_text('{"foo": "bar"}', encoding="utf-8")
+
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+    source = InspireSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "no-cache")
+
+    with pytest.raises(AssertionError):
+        source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, NullProgress())
+
+
 def test_fetch_does_not_skip_when_one_work_file_is_empty(tmp_path, monkeypatch):
     work_dir = tmp_path / "work"
     work_dir.mkdir()
     (work_dir / PARCELS_WORK_NAME).write_text("real", encoding="utf-8")
-    (work_dir / META_WORK_NAME).write_text("", encoding="utf-8")  # empty: not a valid resume
+    (work_dir / META_WORK_NAME).write_text("", encoding="utf-8")  # empty: not valid JSON at all
 
     monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
     source = InspireSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "no-cache")
 
     with pytest.raises(AssertionError):
         # Falls through past the skip check to ensure_ostn15, which
-        # _RefusesToConnect refuses; proves the skip requires BOTH files
-        # non-empty, not just present.
+        # _RefusesToConnect refuses; proves an unparseable meta.json never
+        # skips, regardless of what parcels.jsonl itself holds.
         source.fetch(BBox(west=-3.3, south=51.4, east=-3.29, north=51.41), _tiles("t1"), work_dir, NullProgress())
 
 
@@ -1216,6 +1334,32 @@ def test_fetch_classifies_an_ostn15_download_failure_and_reraises(tmp_path, monk
     assert len(source.tile_failures) == 1
     assert source.tile_failures[0].reason  # a plain sentence, not empty
     assert "ordnancesurvey" not in source.tile_failures[0].reason.lower()
+
+
+def test_fetch_classifies_a_parse_failure_as_could_not_read_not_failed_to_download(tmp_path, monkeypatch):
+    # A review Minor: the zip downloaded fine (a real 200, real bytes);
+    # what failed is parcels_in's own read of it (a wrong srsName). The
+    # sentence's own opening verb must say so, not claim a download that
+    # actually succeeded failed.
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+
+    url = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Test_Authority")
+    bad_srs_gml = _build_gml(_PARCEL_RING, srs_name="urn:ogc:def:crs:EPSG::4326")
+    session = _AuthorityZipSession({url: _zip_bytes(bad_srs_gml)})
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(InspireError):
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert len(source.tile_failures) == 1
+    failure = source.tile_failures[0]
+    assert failure.reason.startswith("Could not read the INSPIRE Index Polygons for Test_Authority")
+    assert "Failed to download" not in failure.reason
+    assert url not in failure.reason
 
 
 # --------------------------------------------------------------------------

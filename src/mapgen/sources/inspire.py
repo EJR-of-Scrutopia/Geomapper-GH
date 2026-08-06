@@ -756,10 +756,10 @@ SECONDS_FLOOR = 7.25
 BYTES_PER_SECOND_ESTIMATE = 1_900_000.0
 
 
-def _classify_inspire_error(exc: InspireError) -> tuple[str, str]:
-    """The (kind, phrase) one authority's own download-or-parse failure
-    implies, read structurally off `exc` rather than out of its own
-    English sentence.
+def _classify_inspire_error(exc: InspireError) -> tuple[str, str, str]:
+    """The (kind, verb, phrase) one authority's own download-or-parse
+    failure implies, read structurally off `exc` rather than out of its
+    own English sentence.
 
     `.status_code`, when `fetch_authority_zip` set it (a non-200
     response), goes straight to `classify_status_failure`: the same
@@ -780,13 +780,27 @@ def _classify_inspire_error(exc: InspireError) -> tuple[str, str]:
     parse failure is not a transport or status failure, and FAILURE_UNKNOWN
     is this project's own honest term for "cannot say which recognised
     cause this is", never retried blind.
+
+    `verb` is the sentence's own opening word, distinguishing the two
+    shapes of failure for the owner's benefit, not just for `kind`'s: a
+    status or transport failure is a real download that did not complete
+    ("Failed to download"), while a parse failure is a download that DID
+    complete, of a file this module could not then make sense of ("Could
+    not read"). Composed here, in the one place that already knows which
+    branch fired, rather than as a second check in `fetch()`'s own except
+    clause risking disagreeing with this function's own branch (a review
+    finding: an earlier version always said "Failed to download", even
+    for a wrong-srsName or corrupt-zip failure that had, in fact,
+    downloaded successfully).
     """
     status_code = getattr(exc, "status_code", None)
     if status_code is not None:
-        return classify_status_failure(status_code)
+        kind, phrase = classify_status_failure(status_code)
+        return kind, "Failed to download", phrase
     if exc.__cause__ is not None:
-        return classify_transport_failure(exc.__cause__)
-    return FAILURE_UNKNOWN, "could not be read"
+        kind, phrase = classify_transport_failure(exc.__cause__)
+        return kind, "Failed to download", phrase
+    return FAILURE_UNKNOWN, "Could not read", "could not be parsed"
 
 
 def _read_parcels_jsonl(path: Path):
@@ -802,6 +816,33 @@ def _read_parcels_jsonl(path: Path):
     for line in text.splitlines():
         if line.strip():
             yield json.loads(line)
+
+
+def _total_kept_from_meta(meta_path: Path) -> int | None:
+    """The sum of every authority's own `parcels_kept` recorded in
+    `meta_path`, or `None` if `meta_path` cannot be trusted as a completed
+    fetch's own meta at all: missing, unparseable, not a JSON object, or
+    missing or malformed `authorities`/`parcels_kept`/`year` keys (the
+    same shape `fetch()` itself always writes and `merge()` itself always
+    reads back).
+
+    `None` means "cannot tell, so do not skip", never "assume zero": a
+    corrupt or truncated `meta.json` must not let a real, non-empty
+    `parcels.jsonl` skip re-validation on the strength of a file this
+    function could not actually read, which is exactly the review finding
+    this function exists to close (see `fetch()`'s own docstring, "the
+    fix").
+    """
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        authorities = meta["authorities"]
+        if not isinstance(authorities, list):
+            raise TypeError("authorities is not a list")
+        total_kept = sum(int(entry["parcels_kept"]) for entry in authorities)
+        int(meta["year"])  # merge()'s own requirement; checked here too.
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    return total_kept
 
 
 class InspireSource:
@@ -911,17 +952,47 @@ class InspireSource:
         this method's point of view, "no INSPIRE data for this extent
         either way".
 
-        Skips (both work files already non-empty) before any of the above:
-        an ordinary resumed run should not recompute `authorities_for`, let
-        alone re-download, merely to reach a refusal or a repeat of last
-        time's own successful download. A genuinely empty, successful
-        result (every found authority had zero kept parcels in this padded
-        extent) writes a 0-byte `parcels.jsonl` and therefore does NOT
-        satisfy this skip on a later run; this is an accepted, honestly
-        documented rare edge case (an authority whose PADDED bbox brushes
-        the extent but whose actual parcels do not), not a silent gap: the
-        cost is one wasted, harmless re-fetch of the same empty result,
-        never a wrong one.
+        Skips before any of the above when `meta.json` witnesses a
+        completed fetch AND `parcels.jsonl`'s own byte count agrees with
+        it: an ordinary resumed run should not recompute
+        `authorities_for`, let alone re-download, merely to reach a
+        refusal or a repeat of last time's own successful download.
+
+        THE FIX (a review finding): an earlier version skipped only when
+        BOTH files were non-empty, on the reasoning that a completed
+        fetch always writes real bytes to both. That reasoning was wrong
+        for the ordinary case of a genuinely empty, successful result:
+        every authority `authorities_for` names having zero kept parcels
+        in this padded extent (a coastal extent whose padded authority
+        bbox brushes sea, say) is a legitimate, complete fetch that
+        writes a 0-byte `parcels.jsonl` by construction (`"".join(...)`
+        over an empty list), and the old check re-downloaded the full
+        authority zip and re-parsed it, forever, on every subsequent run
+        over that same extent, for no reason: nothing about it was ever
+        going to change.
+
+        `meta.json` is the one true completion marker, not `parcels.
+        jsonl`'s own byte count, because it is `atomic_write_text`'d
+        LAST, after `parcels.jsonl` (see the code below): its mere
+        existence already witnesses that every authority succeeded and
+        every write below it completed. What its own byte count cannot
+        do alone is tell a genuinely empty result apart from a truncated
+        one (a process killed between the two atomic writes, leaving a
+        real, non-empty `parcels.jsonl` from THIS attempt but the
+        write that would have replaced it with more, or an OLD, stale
+        `meta.json` from a previous attempt at a different bbox sitting
+        beside a fresh, empty `parcels.jsonl`). `_total_kept_from_meta`
+        reads `meta.json`'s own claimed total kept count, and the skip
+        fires only when `parcels.jsonl` being empty agrees exactly with
+        that claim being zero (`(parcels_path.stat().st_size == 0) ==
+        (total_kept == 0)`): a 0-byte `parcels.jsonl` beside a meta
+        claiming `kept > 0` does NOT skip (the truncation case the old
+        non-empty check was actually guarding, still guarded), and,
+        symmetrically, a non-empty `parcels.jsonl` beside a meta claiming
+        `kept == 0` does not skip either (the same inconsistency, the
+        other way round). A `meta.json` that will not parse, or is
+        missing the keys this check or `merge()` itself needs, makes
+        `_total_kept_from_meta` return `None`, which never skips.
 
         One authority's own download or parse failure (`InspireError` from
         `fetch_authority_zip` or `parcels_in`) ends the whole fetch
@@ -945,12 +1016,13 @@ class InspireSource:
 
         parcels_path = work_dir / PARCELS_WORK_NAME
         meta_path = work_dir / META_WORK_NAME
-        if (
-            parcels_path.exists() and parcels_path.stat().st_size > 0
-            and meta_path.exists() and meta_path.stat().st_size > 0
-        ):
-            progress.emit("tile_skipped", source=self.id, tile_id="whole-area")
-            return [parcels_path, meta_path]
+        if parcels_path.exists() and meta_path.exists():
+            total_kept = _total_kept_from_meta(meta_path)
+            if total_kept is not None and (
+                (parcels_path.stat().st_size == 0) == (total_kept == 0)
+            ):
+                progress.emit("tile_skipped", source=self.id, tile_id="whole-area")
+                return [parcels_path, meta_path]
 
         authorities = authorities_for(bbox)
         if not authorities:
@@ -1004,10 +1076,10 @@ class InspireSource:
                 stream = parcels_in(zip_path, bbox_bng)
                 kept = list(stream)
             except InspireError as exc:
-                kind, phrase = _classify_inspire_error(exc)
+                kind, verb, phrase = _classify_inspire_error(exc)
                 self._record_tile_failures(
                     tiles, kind,
-                    f"Failed to download the INSPIRE Index Polygons for {name}: {phrase}.",
+                    f"{verb} the INSPIRE Index Polygons for {name}: {phrase}.",
                 )
                 raise
             all_parcels.extend(kept)
