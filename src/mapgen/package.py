@@ -1738,6 +1738,32 @@ def _boundary_coordinates(feature: object, index: int) -> list[tuple[float, floa
     return points
 
 
+def _minimum_existing_id(root: ET.Element) -> int:
+    """The smallest id any `<node>`, `<way>` or `<relation>` in `root`
+    already carries, or 0 if none carries a parseable one.
+
+    Collision safety, not merely readability, is why this step's own
+    negative counter is not simply hard-coded to start at -1 (see
+    `_fuse_boundaries_step`'s own docstring, "collision safety" section,
+    for the full reasoning). This function is the fix: it looks at every
+    element the file actually holds, of any type and either sign, rather
+    than assuming nothing already sits at or below -1.
+    """
+    minimum = 0
+    for element in root:
+        if element.tag not in ("node", "way", "relation"):
+            continue
+        raw_id = element.get("id")
+        if raw_id is None:
+            continue
+        try:
+            value = int(raw_id)
+        except ValueError:
+            continue
+        minimum = min(minimum, value)
+    return minimum
+
+
 def _existing_boundary_way_count(root: ET.Element) -> int:
     """Every `<way>` in `root` already tagged `source=hm_land_registry`:
     the idempotence signal the plan asks for. A prior fusion's own ways
@@ -1801,6 +1827,24 @@ def _fuse_boundaries_step(root: Path, stem: str, sink: ProgressSink) -> dict[str
     descending ids are therefore safe, and no positive-id fallback is
     implemented.
 
+    **Collision safety, not merely readability.** Reading right is not
+    the same question as landing somewhere unused. The idempotence guard
+    below only recognises a PRIOR RUN OF THIS FUNCTION, because only the
+    ways it writes carry the `source=hm_land_registry` tag; a negative id
+    introduced by any OTHER route (a hand-edited `.osm`, a foreign tool
+    using the same negative-descending convention, a future sibling
+    feature doing the same) is invisible to that guard. Starting a fresh
+    counter at a bare -1 regardless of what is already in the file would
+    collide with such an id silently: two elements sharing one id is
+    legal-looking XML that `OsmSharp.Streams.Collections.OsmIdIndex`
+    (see above) then indexes ambiguously, since it is built to answer
+    "does this id exist" and "resolve this id to an element", not
+    "which of the two elements that both claim it did the caller mean".
+    `_minimum_existing_id` closes this: the counter starts one below the
+    file's own actual minimum id, across every element type and both
+    signs, so an injected id always sits strictly below everything
+    already present, no matter who put it there or why.
+
     Idempotent by tag detection, exactly like `_fuse_heights_step`'s own
     `height` tag: any existing way already tagged
     `source=hm_land_registry` means a previous run (the download itself,
@@ -1853,7 +1897,12 @@ def _fuse_boundaries_step(root: Path, stem: str, sink: ProgressSink) -> dict[str
 
         written = 0
         if kept_existing == 0:
-            next_id = -1
+            # Strictly below every id already in the file, positive or
+            # negative, not merely below -1 (see _minimum_existing_id's
+            # own docstring and this function's "collision safety"
+            # paragraph above): a bare -1 would silently collide with a
+            # foreign negative id this run has no way to know about.
+            next_id = _minimum_existing_id(osm_root) - 1
             new_nodes: list[ET.Element] = []
             new_ways: list[ET.Element] = []
             for index, feature in enumerate(features):

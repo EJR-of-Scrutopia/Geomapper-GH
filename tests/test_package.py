@@ -6019,6 +6019,82 @@ def test_boundaries_fusion_injects_ways_with_the_right_tags_and_resolves_negativ
     assert any(lat.startswith("51.38") for lat in seen_lat)
 
 
+def _write_osm_with_foreign_negative_ids(out_dir: Path, stem: str) -> Path:
+    """A real single-building `.osm` (the same fixture the tests above
+    use) plus a foreign negative node (id -5, the coordinator review's
+    own example value) and a foreign negative way (id -1, carrying no
+    `hm_land_registry` tag, so the idempotence guard cannot see it):
+    ids this step never wrote, sitting at exactly the small magnitudes a
+    counter that started at a bare -1 regardless of the file's own
+    contents would walk into within its first few assignments.
+    """
+    osm_path = _write_single_building_osm(
+        out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+    )
+    text = osm_path.read_text(encoding="utf-8")
+    foreign = (
+        '  <node id="-5" lat="51.3800000" lon="-3.2900000" />\n'
+        '  <way id="-1"><nd ref="-5" /><tag k="natural" v="coastline" /></way>\n'
+    )
+    osm_path.write_text(text.replace("</osm>", foreign + "</osm>"), encoding="utf-8")
+    return osm_path
+
+
+class ForeignNegativeIdsBoundariesStubSource(StubSource):
+    """Writes `_write_osm_with_foreign_negative_ids`'s own `.osm` plus the
+    ordinary boundaries GeoJSON: the exact package shape this step must
+    inject into without colliding with ids it never wrote.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_osm_with_foreign_negative_ids(out_dir, stem)
+        geojson_path = _write_boundaries_geojson(out_dir, stem)
+        return [osm_path, geojson_path]
+
+
+def test_injected_ids_never_collide_with_a_foreign_negative_id_already_in_the_file(
+    tmp_path,
+):
+    """Coordinator review, Important finding: the counter must start
+    below the file's OWN actual minimum id, not a bare -1, or it
+    silently collides with a negative id this step never wrote (a
+    hand-edited `.osm`, a foreign tool using the same negative-descending
+    convention, a future sibling feature doing the same). The fixture's
+    foreign way (id -1) and foreign node (id -5) sit exactly where a bare
+    -1 counter would land on its first two assignments (way, then its
+    first node), so a regression here reproduces as a real, checkable id
+    collision rather than a hypothetical one.
+    """
+    register(ForeignNegativeIdsBoundariesStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["inspire_boundaries"] == {
+        "written": 2, "curves": 2, "kept_existing": 0, "error": None,
+    }
+
+    osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    osm_root = ET.fromstring(osm_text)
+
+    all_ids = [
+        element.get("id")
+        for element in osm_root
+        if element.tag in ("node", "way", "relation")
+    ]
+    assert len(all_ids) == len(set(all_ids)), "no id may be reused across any element"
+
+    boundary_ways = _boundary_ways(osm_root)
+    assert len(boundary_ways) == 2
+    injected_ids = set()
+    for way in boundary_ways:
+        injected_ids.add(int(way.get("id")))
+        for nd in way.findall("nd"):
+            injected_ids.add(int(nd.get("ref")))
+    assert injected_ids, "the test fixture must actually inject something"
+    # Strictly below the fixture's own known minimum (-5), not merely
+    # below -1: this is what a bare -1 counter would have failed.
+    assert max(injected_ids) < -5
+
+
 def test_boundaries_fusion_is_skipped_when_no_inspire_layer_is_packaged(tmp_path):
     register(StubSource())
     log = EventLog()
