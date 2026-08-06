@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -35,7 +36,7 @@ from mapgen.fsutil import (
 )
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
 from mapgen.geotiff import GeoTiffError, read_dem
-from mapgen.heights import HeightsError, fuse_building_heights
+from mapgen.heights import HeightsError, _declaration_line, _rewrite_osm, fuse_building_heights
 from mapgen.jobs import FAILED, OK, PENDING, CancelToken, Cancelled, JobState
 from mapgen.merge import assert_inputs_present
 from mapgen.naming import (
@@ -65,7 +66,7 @@ from mapgen.sources.base import (
     register,
 )
 from mapgen.sources.elevation import ElevationSource
-from mapgen.sources.inspire import InspireSource
+from mapgen.sources.inspire import BOUNDARY_INDICATIVE_NOTE, InspireSource
 from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
@@ -919,6 +920,17 @@ def run_survey(
         # source in the same run never got its turn.
         lidar_heights = _fuse_heights_step(root=paths.root, stem=paths.stem, sink=sink)
 
+        # Task 5 of the INSPIRE curves plan. Immediately after the heights
+        # fusion above and, like it, unconditionally BEFORE the bridge
+        # step below: gated only on the two files _fuse_boundaries_step
+        # itself needs already being in the package, not on `stopped` or
+        # `unrecoverable`, for the identical reason heights fusion is not
+        # gated on them either (see that step's own comment, two lines
+        # up).
+        inspire_boundaries = _fuse_boundaries_step(
+            root=paths.root, stem=paths.stem, sink=sink
+        )
+
         # Urbano is one product of a survey among several (the OSM/Overture/
         # elevation data on disk are the others). A missing or failing
         # Urbano install must not destroy those: the failure is recorded
@@ -1023,6 +1035,7 @@ def run_survey(
         project_setting,
         elevation_grid,
         lidar_heights,
+        inspire_boundaries,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -1574,6 +1587,407 @@ def _fuse_heights_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, o
     )
 
 
+# --------------------------------------------------------------------------
+# Task 5 of the INSPIRE curves plan: fusing HM Land Registry property
+# boundary curves into <stem>.osm, following _fuse_heights_step's own
+# pattern exactly (see that function's own docstring, and this task's own
+# report for the negative-id verification).
+# --------------------------------------------------------------------------
+
+# The exact tag keys and values the plan specifies, verbatim, named rather
+# than repeated as literals at each call site: the same convention
+# heights.py's own HEIGHT_TAG_KEY/SOURCE_HEIGHT_TAG_KEY establish for its
+# tags.
+BOUNDARY_TAG_KEY = "boundary"
+BOUNDARY_TAG_VALUE = "property"
+BOUNDARY_SOURCE_TAG_KEY = "source"
+BOUNDARY_SOURCE_TAG_VALUE = "hm_land_registry"
+BOUNDARY_NOTE_TAG_KEY = "note"
+
+
+class BoundariesFusionError(RuntimeError):
+    """Raised when `<stem>_boundaries.geojson` is not the shape
+    `InspireSource.merge` itself writes: not a FeatureCollection, a
+    feature with no LineString geometry, or a LineString with fewer than
+    two coordinate pairs.
+
+    A RuntimeError, matching `HeightsError`, `ElevationGridError` and
+    every other refusal a post-step in this module records rather than
+    propagates (see `_fuse_boundaries_step`'s own docstring). `<stem>.osm`
+    reading and rewriting failures raise `heights.HeightsError` instead,
+    since `_declaration_line`/`_rewrite_osm` (imported from there rather
+    than duplicated) already raise that type; this class exists only for
+    the shape this step's OWN new input, the boundaries GeoJSON, can get
+    wrong.
+    """
+
+
+def _boundaries_record(
+    written: int | None = None,
+    curves: int | None = None,
+    kept_existing: int | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    """survey.json's `inspire_boundaries` block, in ONE shape whatever
+    happened, following `_heights_record`'s own ruling exactly: four keys,
+    always, so a reader can index any of them on a package this step
+    never ran on (no `.osm`, no boundaries GeoJSON, no error) the same way
+    it does on one it fused.
+
+    `curves` is how many LineString features `<stem>_boundaries.geojson`
+    itself holds, read whether or not this run went on to inject any of
+    them (see `_fuse_boundaries_step`'s own idempotence branch): it is a
+    fact about the package's own data, not a count of this run's actions,
+    which `written` already is.
+    """
+    return {
+        "written": written,
+        "curves": curves,
+        "kept_existing": kept_existing,
+        "error": error,
+    }
+
+
+def _load_boundary_features(geojson_path: Path) -> list:
+    """Every feature `<stem>_boundaries.geojson` holds, in file order.
+
+    Only the top level shape is checked here (a JSON object naming
+    `"FeatureCollection"` and holding a `features` list): this file is
+    mapgen's own output (`InspireSource.merge`), never hand edited, the
+    same standing `heights.py` gives `<stem>.osm` itself, so a wrong shape
+    here is this project's own bug and is raised rather than silently
+    read as zero features. Each feature's own geometry is checked later
+    (`_boundary_coordinates`), only for the features this step actually
+    goes on to inject: a run whose `kept_existing` branch fires never
+    looks at a single coordinate, and has no reason to validate ones it
+    will not use.
+    """
+    try:
+        text = geojson_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BoundariesFusionError(
+            f"{geojson_path.name} could not be read: {exc}"
+        ) from None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise BoundariesFusionError(
+            f"{geojson_path.name} is not valid JSON: {exc}"
+        ) from None
+    if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
+        raise BoundariesFusionError(
+            f"{geojson_path.name} is not a GeoJSON FeatureCollection."
+        )
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise BoundariesFusionError(f"{geojson_path.name} has no features list.")
+    return features
+
+
+def _boundary_note(feature: object) -> str:
+    """A feature's own `note` property, or, absent one, the constant
+    `InspireSource.merge` itself always writes there today
+    (`BOUNDARY_INDICATIVE_NOTE`, imported rather than restated): one
+    source of truth for HMLR's own indicative sentence, per the plan.
+    """
+    properties = feature.get("properties") if isinstance(feature, dict) else None
+    if isinstance(properties, dict):
+        note = properties.get("note")
+        if isinstance(note, str) and note:
+            return note
+    return BOUNDARY_INDICATIVE_NOTE
+
+
+def _boundary_coordinates(feature: object, index: int) -> list[tuple[float, float]]:
+    """One LineString feature's own vertices, as `(longitude, latitude)`
+    pairs in file order: the injected `<node>` shape wants `lat`/`lon`
+    directly, and `InspireSource.merge` already writes GeoJSON's own
+    `[longitude, latitude]` order, so this is a read, not a projection.
+
+    Raises `BoundariesFusionError`, naming the feature's own index rather
+    than any coordinate value, for anything about this one feature this
+    function cannot trust: not a LineString, fewer than two coordinate
+    pairs (not a line), or a pair that is not exactly two numbers.
+    """
+    geometry = feature.get("geometry") if isinstance(feature, dict) else None
+    if not isinstance(geometry, dict) or geometry.get("type") != "LineString":
+        raise BoundariesFusionError(
+            f"Feature {index} in the boundaries GeoJSON is not a LineString."
+        )
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list) or len(coordinates) < 2:
+        raise BoundariesFusionError(
+            f"Feature {index} in the boundaries GeoJSON has fewer than two "
+            f"coordinates."
+        )
+    points: list[tuple[float, float]] = []
+    for pair in coordinates:
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2):
+            raise BoundariesFusionError(
+                f"Feature {index} in the boundaries GeoJSON has a malformed "
+                f"coordinate pair."
+            )
+        try:
+            longitude, latitude = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError) as exc:
+            raise BoundariesFusionError(
+                f"Feature {index} in the boundaries GeoJSON has a "
+                f"non-numeric coordinate."
+            ) from exc
+        points.append((longitude, latitude))
+    return points
+
+
+def _existing_boundary_way_count(root: ET.Element) -> int:
+    """Every `<way>` in `root` already tagged `source=hm_land_registry`:
+    the idempotence signal the plan asks for. A prior fusion's own ways
+    are identifiable by that one tag alone, whether the download itself
+    wrote them or an earlier `mapgen bridge` did.
+    """
+    count = 0
+    for element in root:
+        if element.tag != "way":
+            continue
+        for tag in element.findall("tag"):
+            if (
+                tag.get("k") == BOUNDARY_SOURCE_TAG_KEY
+                and tag.get("v") == BOUNDARY_SOURCE_TAG_VALUE
+            ):
+                count += 1
+                break
+    return count
+
+
+def _fuse_boundaries_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, object]:
+    """Inject `<stem>_boundaries.geojson`'s own curves into `<stem>.osm`
+    as tagged ways, reported as a record, in the same
+    one-shape-whatever-happened style as `_fuse_heights_step`.
+
+    Runs only when both files it needs are already in the package:
+    `<stem>.osm` (OsmSource.merge, or an earlier bridge's own output) and
+    `<stem>_boundaries.geojson` (InspireSource.merge). Any other
+    combination, including the ordinary case of a survey that never
+    selected the `inspire` source at all, records the all-None shape and
+    emits `boundaries_fusion_skipped` rather than being treated as a
+    failure, matching `_fuse_heights_step`'s own reasoning for the
+    identical gate.
+
+    Each LineString feature becomes fresh `<node>` elements for its own
+    vertices (never shared with another feature's nodes, even where two
+    curves happen to touch at the same point: the brief's own mechanics
+    say a LineString becomes node elements for ITS vertices, and
+    de-duplicating shared endpoints across features is a refinement
+    nothing here asks for) plus one `<way>` tagged `boundary=property`,
+    `source=hm_land_registry` and `note=` (see `_boundary_note`). Ids are
+    negative, descending from -1, through one counter shared by nodes and
+    ways.
+
+    **Negative ids, verified rather than assumed.** `docs/urbano/README.md`
+    names Urbano's OSM reader (`OsmExtension.ImportOsmGeometries`) but says
+    nothing about id sign; its own report,
+    `.superpowers/sdd/2026-08-01-mapgen-phase1/task-34-report.md`, is what
+    identifies that reader as `OsmSharp.Streams.XmlOsmStreamSource`, an
+    unmodified, unobfuscated copy of the real OsmSharp library merged into
+    `Urbano.SiteAnalysis.gha`. Decompiling that exact type (ilspycmd, this
+    task's own report) settles the rest directly: `OsmGeo.Id` is `long?`;
+    `Node.ReadXml`, `Way.ReadXml` and the `nd ref` list all read it through
+    `XmlExtensions.GetAttributeInt64`, which is
+    `long.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture,
+    out result)`, and `NumberStyles.Any` allows a leading sign; and
+    `OsmSharp.Streams.Collections.OsmIdIndex.Add(long number)` branches
+    explicitly on `number >= 0` with a SEPARATE path for negative numbers,
+    which only makes sense if negative ids are a deliberately supported
+    case, not an accident of the field being a signed integer. Negative,
+    descending ids are therefore safe, and no positive-id fallback is
+    implemented.
+
+    Idempotent by tag detection, exactly like `_fuse_heights_step`'s own
+    `height` tag: any existing way already tagged
+    `source=hm_land_registry` means a previous run (the download itself,
+    or an earlier `mapgen bridge`) already injected these curves, so
+    EVERY such way is counted as `kept_existing`, nothing is injected, and
+    the file is never even opened for writing, which is what makes a
+    second run byte-identical to the first rather than merely equivalent
+    to it.
+
+    Reuses `heights._declaration_line` and `heights._rewrite_osm` rather
+    than a second copy of them: both are small, module-private helpers,
+    but the atomic-write shape they implement
+    (`fsutil.atomic_write_bytes`, one line per top level element, in file
+    order) is delicate enough that an independently maintained second copy
+    risks drifting from the first. One consequence of that reuse, carried
+    over unchanged rather than fixed by this task: `ET.tostring` on a
+    parsed element includes that element's own trailing whitespace
+    (`.tail`, the newline-plus-indent between two sibling elements in the
+    ORIGINAL file), so every EXISTING top level element gains a
+    whitespace-only blank line after it once `_rewrite_osm` runs at all,
+    while the NEW node/way elements this step appends carry no `.tail` of
+    their own and stay on one clean line each. The result is cosmetically
+    uneven and functionally identical: OSM XML's own whitespace between
+    elements is insignificant, and `OsmSharp.Streams.XmlOsmStreamSource`
+    parses it as such. `_fuse_heights_step`'s own runs already produce
+    this same quirk in production; matching it here rather than diverging
+    is the point.
+
+    A failure anywhere on this path (an unreadable or malformed `.osm`, a
+    malformed boundaries GeoJSON, a disk write failure) is caught here and
+    recorded rather than raised: a package with no injected boundaries is
+    exactly the package the owner already had, and losing the survey's
+    real data over this step would be the same mistake Task 20 already
+    fixed once for the bridge.
+    """
+    osm_path = Path(root) / f"{stem}.osm"
+    geojson_path = Path(root) / f"{stem}_boundaries.geojson"
+    if not (osm_path.is_file() and geojson_path.is_file()):
+        sink.emit("boundaries_fusion_skipped")
+        return _boundaries_record()
+
+    sink.emit("boundaries_fusion_started")
+    try:
+        text = osm_path.read_text(encoding="utf-8")
+        declaration = _declaration_line(text)
+        osm_root = ET.fromstring(text)
+        features = _load_boundary_features(geojson_path)
+        curves = len(features)
+        kept_existing = _existing_boundary_way_count(osm_root)
+
+        written = 0
+        if kept_existing == 0:
+            next_id = -1
+            new_nodes: list[ET.Element] = []
+            new_ways: list[ET.Element] = []
+            for index, feature in enumerate(features):
+                points = _boundary_coordinates(feature, index)
+                note = _boundary_note(feature)
+
+                way_id = next_id
+                next_id -= 1
+                way = ET.Element("way")
+                way.set("id", str(way_id))
+                for longitude, latitude in points:
+                    node_id = next_id
+                    next_id -= 1
+                    node = ET.Element("node")
+                    node.set("id", str(node_id))
+                    node.set("lat", f"{latitude:.7f}")
+                    node.set("lon", f"{longitude:.7f}")
+                    new_nodes.append(node)
+                    nd = ET.SubElement(way, "nd")
+                    nd.set("ref", str(node_id))
+                for key, value in (
+                    (BOUNDARY_TAG_KEY, BOUNDARY_TAG_VALUE),
+                    (BOUNDARY_SOURCE_TAG_KEY, BOUNDARY_SOURCE_TAG_VALUE),
+                    (BOUNDARY_NOTE_TAG_KEY, note),
+                ):
+                    tag = ET.SubElement(way, "tag")
+                    tag.set("k", key)
+                    tag.set("v", value)
+                new_ways.append(way)
+                written += 1
+
+            if written > 0:
+                for node in new_nodes:
+                    osm_root.append(node)
+                for way in new_ways:
+                    osm_root.append(way)
+                _rewrite_osm(osm_path, declaration, osm_root)
+    except (HeightsError, BoundariesFusionError, ET.ParseError, OSError) as exc:
+        error = str(exc)
+        sink.emit("boundaries_fusion_failed", error=error)
+        return _boundaries_record(error=error)
+
+    sink.emit(
+        "boundaries_fusion_written",
+        written=written,
+        curves=curves,
+        kept_existing=kept_existing,
+    )
+    return _boundaries_record(written=written, curves=curves, kept_existing=kept_existing)
+
+
+def _inspire_boundaries_year(root: Path, stem: str) -> int | None:
+    """The publication year recorded in `<stem>_boundaries.geojson`'s own
+    feature properties, or None if the file is absent, unreadable, or (an
+    authority set with zero kept parcels in this padded extent) carries a
+    real, empty FeatureCollection with no feature anywhere to read a year
+    from.
+
+    Read from the package's own merged output, not from work_dir's
+    meta.json: the latter is swept once a complete run's `_work/` is
+    removed (see `run_survey`'s own cleanup, near its end) and never
+    exists at all for `mapgen bridge` against a package downloaded
+    elsewhere, so it is not a fact this function could rely on being
+    there. The GeoJSON is a package ROOT file and is what both of this
+    function's callers (`_build_survey_json`, `bridge_package`) already
+    have on disk.
+    """
+    path = Path(root) / f"{stem}_boundaries.geojson"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    features = payload.get("features") if isinstance(payload, dict) else None
+    if not isinstance(features, list):
+        return None
+    for feature in features:
+        if isinstance(feature, dict):
+            properties = feature.get("properties")
+            if isinstance(properties, dict):
+                year = properties.get("year")
+                if isinstance(year, int):
+                    return year
+    return None
+
+
+def _enrich_inspire_provenance(
+    sources_entries: list, root: Path, stem: str, conditions_url: str | None
+) -> None:
+    """Substitutes `[year]` in the "inspire" entry of survey.json's own
+    `sources` list and adds its `conditions_url`, in place, if that entry
+    is there at all.
+
+    Deliberately its own function rather than an extension of
+    `_source_provenance` (see `InspireSource.conditions_url`'s own
+    docstring in `mapgen/sources/inspire.py`, which names this exact
+    seam): every OTHER optional attribute `_source_provenance` reads
+    (`endpoints_used`, `demtype`, `routing_note`, ...) is read off the
+    source object alone and applies however many sources choose to expose
+    it. A `[year]` substitution needs THIS package's own merged
+    boundaries GeoJSON, not merely an attribute on the source object, so
+    folding it into that generic function would mean `_source_provenance`
+    reading a file off disk on every source's behalf, for a fact only one
+    source has. `conditions_url` genuinely could have gone through the
+    generic path (it is a plain attribute, read defensively); it lives
+    here instead so the two facts the plan asks be delivered together
+    (the substituted attribution and the conditions link) are written by
+    one piece of code rather than two that could drift apart.
+
+    Called from both `_build_survey_json` (a fresh run) and
+    `bridge_package` (re-run over an existing survey.json), which is why
+    it takes plain data (a list of dicts, a root and stem, an
+    already-resolved `conditions_url`) rather than a `sources` list of
+    LayerSource objects: `bridge_package` never has the latter, only the
+    JSON payload a previous run already wrote.
+    """
+    entry = next(
+        (
+            item
+            for item in sources_entries
+            if isinstance(item, dict) and item.get("id") == "inspire"
+        ),
+        None,
+    )
+    if entry is None:
+        return
+    attribution = entry.get("attribution")
+    if isinstance(attribution, str) and "[year]" in attribution:
+        year = _inspire_boundaries_year(root, stem)
+        if year is not None:
+            entry["attribution"] = attribution.replace("[year]", str(year))
+    if conditions_url is not None:
+        entry["conditions_url"] = conditions_url
+
+
 def _write_project_setting_step(
     bbox: BBox, root: Path, stem: str, sink: ProgressSink
 ) -> dict[str, object]:
@@ -1907,6 +2321,28 @@ def bridge_package(
     # `written: 0`, `kept_existing` at least as large as the download's own
     # `written` count, never re-adding a tag that is already there.
     payload["lidar_heights"] = _fuse_heights_step(root=root, stem=stem, sink=sink)
+
+    # Task 5 of the INSPIRE curves plan. Same ordering as run_survey's own
+    # call site: immediately after heights fusion, unconditionally before
+    # the bridge attempt below. The provenance enrichment runs regardless
+    # of whether this package's own survey.json has ever seen it before
+    # (a package downloaded before this task shipped carries an
+    # unsubstituted "[year]" and no conditions_url in its "inspire" entry
+    # until the first `mapgen bridge` run after upgrading fixes it, the
+    # same way this run is what first fuses its boundaries into the
+    # `.osm`).
+    payload["inspire_boundaries"] = _fuse_boundaries_step(root=root, stem=stem, sink=sink)
+    try:
+        inspire_source = get_source("inspire")
+    except UnknownSourceError:
+        inspire_source = None
+    existing_sources = payload.get("sources")
+    _enrich_inspire_provenance(
+        existing_sources if isinstance(existing_sources, list) else [],
+        root,
+        stem,
+        getattr(inspire_source, "conditions_url", None),
+    )
 
     ok, error = _run_bridge_step(
         bbox=bbox,
@@ -3049,6 +3485,7 @@ def _build_survey_json(
     project_setting=None,
     elevation_grid=None,
     lidar_heights=None,
+    inspire_boundaries=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
@@ -3063,11 +3500,34 @@ def _build_survey_json(
         "written": None, "buildings": None, "kept_existing": None,
         "no_data": None, "error": None,
     }
+    inspire_boundaries = inspire_boundaries or {
+        "written": None, "curves": None, "kept_existing": None, "error": None,
+    }
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
     }
     retries = retries or []
+    # Task 5 of the INSPIRE curves plan. Built here, before the return
+    # dict below, rather than inline as a list comprehension the way it
+    # was before this task, so _enrich_inspire_provenance can mutate the
+    # "inspire" entry in place afterward: the [year] substitution and the
+    # conditions link both need this package's own root and stem, which
+    # _source_provenance itself is deliberately not extended to know
+    # about (see that function's own enrichment helper for why).
+    sources_provenance = [
+        _source_provenance(source, outputs_by_source.get(source.id, ()))
+        for source in sources
+    ]
+    inspire_source = next(
+        (source for source in sources if getattr(source, "id", None) == "inspire"), None
+    )
+    _enrich_inspire_provenance(
+        sources_provenance,
+        paths.root,
+        paths.stem,
+        getattr(inspire_source, "conditions_url", None),
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": __version__,
@@ -3090,10 +3550,7 @@ def _build_survey_json(
             "rows": max((t.row for t in tiles), default=0) + 1,
             "cols": max((t.col for t in tiles), default=0) + 1,
         },
-        "sources": [
-            _source_provenance(source, outputs_by_source.get(source.id, ()))
-            for source in sources
-        ],
+        "sources": sources_provenance,
         # The resolved selection (never the possibly-None raw field:
         # every other audit-trail value here is a concrete, resolved
         # fact, not "whatever was asked for or a default"), so a package
@@ -3228,6 +3685,13 @@ def _build_survey_json(
         # sentence when the step ran and could not finish; every OTHER
         # layer's own data is untouched either way, per Task 20's ruling.
         "lidar_heights": lidar_heights,
+        # Task 5 of the INSPIRE curves plan. Same None-vs-0 discipline as
+        # `lidar_heights` immediately above: `written` is None, not 0,
+        # on a package this step never ran on at all (no `.osm`, or no
+        # boundaries GeoJSON), so a reader can tell "nothing to fuse"
+        # apart from "fused, and found zero curves to inject"
+        # (`written: 0`).
+        "inspire_boundaries": inspire_boundaries,
         "started_at": started_at,
         "finished_at": _now(),
     }

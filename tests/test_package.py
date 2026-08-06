@@ -2,6 +2,7 @@ import json
 import math
 import threading
 import time
+import xml.etree.ElementTree as ET
 from array import array
 from datetime import date
 from pathlib import Path
@@ -29,6 +30,7 @@ from mapgen.package import (
     run_survey,
 )
 from mapgen.sources.elevation import ElevationSource
+from mapgen.sources.inspire import InspireSource
 from mapgen.sources.base import (
     DuplicateSourceError,
     Estimate,
@@ -3519,9 +3521,11 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # `project_setting` (task 35), which mapgen now writes whether or not the
     # bridge is working; `elevation_grid` (task 39), the DEM converted
     # into the format Urbano reads terrain from, which every package
-    # downloaded before that task is missing; and `lidar_heights` (task 7),
+    # downloaded before that task is missing; `lidar_heights` (task 7),
     # which re-runs the same fusion the download itself may already have
-    # done. Everything else is still read and never written.
+    # done; and `inspire_boundaries` (task 5 of the INSPIRE curves plan),
+    # the same re-run shape for property boundary curves. Everything else
+    # is still read and never written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
     before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
@@ -3531,7 +3535,10 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     after = json.loads((root / "survey.json").read_text(encoding="utf-8"))
     assert after["complete"] is False
     assert after["stopped"] is True
-    for changed in ("bridge", "project_setting", "elevation_grid", "lidar_heights"):
+    for changed in (
+        "bridge", "project_setting", "elevation_grid", "lidar_heights",
+        "inspire_boundaries",
+    ):
         before.pop(changed, None)
         after.pop(changed, None)
     assert after == before
@@ -3548,16 +3555,19 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
     # The project setting is written after the bridge attempt and regardless
     # of it, which is exactly what run_survey does, so the two commands go
     # on emitting the same vocabulary in the same order (task 35). The
-    # heights fusion runs first of all (task 7): this package has no
-    # packaged LiDAR rasters, so it is skipped rather than attempted.
+    # heights fusion runs first of all (task 7), then boundaries fusion
+    # (task 5 of the INSPIRE curves plan): this package has no packaged
+    # LiDAR rasters and no boundaries GeoJSON, so both are skipped rather
+    # than attempted.
     assert [e["event"] for e in log.events] == [
         "heights_fusion_skipped",
+        "boundaries_fusion_skipped",
         "bridge_started",
         "bridge_failed",
         "project_setting_started",
         "project_setting_written",
     ]
-    assert "exit code 1" in log.events[2]["error"]
+    assert "exit code 1" in log.events[3]["error"]
 
 
 def test_a_stop_that_landed_at_the_very_end_can_have_its_urbano_files_afterwards(tmp_path):
@@ -5817,6 +5827,360 @@ def test_bridge_package_re_runs_fusion_idempotently(tmp_path, monkeypatch):
     # The file itself agrees: still exactly one height tag, not two.
     osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
     assert osm_text.count('k="height" v="6.0"') == 1
+
+
+# --------------------------------------------------------------------------
+# Task 5 of the INSPIRE curves plan: fusing HM Land Registry property
+# boundary curves into <stem>.osm, following the heights fusion tests
+# above shape for shape. mapgen.package.load_ostn15 is not monkeypatched
+# here (unlike the heights tests above): this step never touches OSTN15
+# at all, it only reads lon/lat straight out of the boundaries GeoJSON.
+# --------------------------------------------------------------------------
+
+_BOUNDARY_NOTE = (
+    "The extent of the land contained in any registered title cannot be "
+    "established from the INSPIRE Index Polygons."
+)
+
+_BOUNDARY_FEATURES = [
+    {
+        "type": "Feature",
+        "properties": {
+            "source": "HM Land Registry INSPIRE Index Polygons",
+            "note": _BOUNDARY_NOTE,
+            "year": 2026,
+        },
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[-3.29, 51.38], [-3.285, 51.385], [-3.28, 51.39]],
+        },
+    },
+    {
+        "type": "Feature",
+        "properties": {
+            "source": "HM Land Registry INSPIRE Index Polygons",
+            "note": _BOUNDARY_NOTE,
+            "year": 2026,
+        },
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[-3.281, 51.381], [-3.282, 51.382]],
+        },
+    },
+]
+
+
+def _write_boundaries_geojson(out_dir: Path, stem: str, features=None) -> Path:
+    path = out_dir / f"{stem}_boundaries.geojson"
+    payload = {
+        "type": "FeatureCollection",
+        "features": _BOUNDARY_FEATURES if features is None else features,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+class BoundariesStubSource(StubSource):
+    """Writes a real `.osm` (one flat-roofed building, the same fixture
+    `LidarHeightsStubSource` uses) and a real `<stem>_boundaries.geojson`
+    beside it: the exact two files `_fuse_boundaries_step` looks for, so a
+    run through `run_survey` and `bridge_package` exercises the real
+    injection rather than a stand-in for it.
+    """
+
+    def __init__(self, source_id="stub", features=None, **kwargs):
+        super().__init__(source_id=source_id, **kwargs)
+        self._features = features
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        geojson_path = _write_boundaries_geojson(out_dir, stem, self._features)
+        return [osm_path, geojson_path]
+
+
+class BoundariesOnlyStubSource(StubSource):
+    """Writes only the boundaries GeoJSON, no `.osm`: the symmetric half
+    of `_fuse_heights_step`'s own "only the rasters are missing" case.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        return [_write_boundaries_geojson(out_dir, stem)]
+
+
+class BoundariesAndHeightsStubSource(StubSource):
+    """Writes everything BOTH fusion steps look for: `LidarHeightsStubSource`'s
+    own building-plus-rasters, plus a real `<stem>_boundaries.geojson`
+    beside them, so the ordering between the two real steps (and the
+    bridge after them) can be checked against real events rather than a
+    skip.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dsm_path = out_dir / f"{stem}_lidar_dsm.tif"
+        write_bng_geotiff(dtm_path, _constant_window(100.0))
+        write_bng_geotiff(dsm_path, _constant_window(106.0))
+        geojson_path = _write_boundaries_geojson(out_dir, stem)
+        return [osm_path, dtm_path, dsm_path, geojson_path]
+
+
+class MalformedBoundariesStubSource(StubSource):
+    """Writes a real `.osm` but a `<stem>_boundaries.geojson` that is not
+    a GeoJSON FeatureCollection at all: a package this step must refuse
+    rather than guess at, exactly as `_fuse_heights_step` refuses an
+    `.osm` it cannot parse.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        geojson_path = out_dir / f"{stem}_boundaries.geojson"
+        geojson_path.write_text("not json at all {{{", encoding="utf-8")
+        return [osm_path, geojson_path]
+
+
+class InspireProvenanceStubSource(StubSource):
+    """A stub whose `id`, `attribution` and `conditions_url` match the
+    real `InspireSource` (mapgen.sources.inspire), so a package-level test
+    can check `_build_survey_json`'s own `[year]` substitution and
+    `conditions_url` addition without a real, network-backed
+    `InspireSource`.
+    """
+
+    def __init__(self, features=None, **kwargs):
+        super().__init__(source_id="inspire", **kwargs)
+        self.attribution = InspireSource.attribution
+        self.conditions_url = InspireSource.conditions_url
+        self._features = features
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        geojson_path = _write_boundaries_geojson(out_dir, stem, self._features)
+        return [osm_path, geojson_path]
+
+
+def _boundary_ways(osm_root: ET.Element) -> list[ET.Element]:
+    return [
+        element
+        for element in osm_root
+        if element.tag == "way"
+        and any(
+            tag.get("k") == "source" and tag.get("v") == "hm_land_registry"
+            for tag in element.findall("tag")
+        )
+    ]
+
+
+def test_boundaries_fusion_injects_ways_with_the_right_tags_and_resolves_negative_ids(
+    tmp_path,
+):
+    register(BoundariesStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["inspire_boundaries"] == {
+        "written": 2, "curves": 2, "kept_existing": 0, "error": None,
+    }
+
+    osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    osm_root = ET.fromstring(osm_text)  # parseable XML, or this raises
+
+    all_ids = [element.get("id") for element in osm_root if element.tag in ("node", "way")]
+    assert len(all_ids) == len(set(all_ids)), "every injected id must be unique"
+
+    nodes_by_id = {element.get("id"): element for element in osm_root if element.tag == "node"}
+    boundary_ways = _boundary_ways(osm_root)
+    assert len(boundary_ways) == 2
+
+    seen_lat = set()
+    for way in boundary_ways:
+        assert int(way.get("id")) < 0
+        tags = {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        assert tags == {
+            "boundary": "property",
+            "source": "hm_land_registry",
+            "note": _BOUNDARY_NOTE,
+        }
+        refs = [nd.get("ref") for nd in way.findall("nd")]
+        assert len(refs) >= 2
+        for ref in refs:
+            assert int(ref) < 0
+            node = nodes_by_id[ref]  # KeyError here means a ref did not resolve
+            seen_lat.add(node.get("lat"))
+    # The GeoJSON's own first feature's first vertex, round-tripped: proves
+    # this is the real feature data, not placeholder coordinates.
+    assert any(lat.startswith("51.38") for lat in seen_lat)
+
+
+def test_boundaries_fusion_is_skipped_when_no_inspire_layer_is_packaged(tmp_path):
+    register(StubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.survey["inspire_boundaries"] == {
+        "written": None, "curves": None, "kept_existing": None, "error": None,
+    }
+    names = [e["event"] for e in log.snapshot()]
+    assert "boundaries_fusion_skipped" in names
+
+
+def test_boundaries_fusion_is_skipped_when_only_the_osm_is_present(tmp_path):
+    register(UrbanoReadableStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+    assert result.survey["inspire_boundaries"]["written"] is None
+
+
+def test_boundaries_fusion_is_skipped_when_only_the_geojson_is_present(tmp_path):
+    register(BoundariesOnlyStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["inspire_boundaries"]["written"] is None
+
+
+def test_a_boundaries_fusion_failure_is_recorded_and_the_survey_still_finishes(tmp_path):
+    """The same ruling task 20 made for the bridge and task 7 made for
+    heights fusion: a package with no injected boundaries because this
+    step could not run costs the package nothing else.
+    """
+    register(MalformedBoundariesStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.complete is True
+    record = result.survey["inspire_boundaries"]
+    assert record["written"] is None
+    assert record["curves"] is None
+    assert record["kept_existing"] is None
+    assert record["error"] is not None
+    names = [e["event"] for e in log.snapshot()]
+    assert names.index("boundaries_fusion_started") < names.index("boundaries_fusion_failed")
+    # The rest of the package is untouched by this step's own failure.
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+
+
+def test_boundaries_fusion_runs_after_heights_fusion_and_before_the_bridge_in_run_survey(
+    tmp_path, monkeypatch
+):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(BoundariesAndHeightsStubSource())
+    log = EventLog()
+
+    run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        progress=log,
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+
+    names = [e["event"] for e in log.snapshot()]
+    assert (
+        names.index("heights_fusion_written")
+        < names.index("boundaries_fusion_started")
+        < names.index("boundaries_fusion_written")
+        < names.index("bridge_started")
+    )
+
+
+def test_boundaries_fusion_runs_after_heights_fusion_and_before_the_bridge_in_bridge_package(
+    tmp_path, monkeypatch
+):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(BoundariesAndHeightsStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    bridge_package(result.paths.root, progress=log, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    names = [e["event"] for e in log.snapshot()]
+    assert (
+        names.index("heights_fusion_written")
+        < names.index("boundaries_fusion_started")
+        < names.index("boundaries_fusion_written")
+        < names.index("bridge_started")
+    )
+
+
+def test_bridge_package_re_runs_boundaries_fusion_idempotently_and_byte_identically(
+    tmp_path,
+):
+    """The reason this matters: every package the owner already has was
+    downloaded before this task existed, so every one of them can now
+    have its boundaries fused in place by a plain re-bridge. A package
+    the DOWNLOAD already fused must not be re-fused into duplicate ways
+    either, which is the idempotence half of this same test, checked at
+    the byte level rather than merely by the record's own numbers.
+    """
+    register(BoundariesStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    downloaded = result.survey["inspire_boundaries"]
+    assert downloaded == {"written": 2, "curves": 2, "kept_existing": 0, "error": None}
+
+    osm_path = result.paths.root / f"{result.paths.stem}.osm"
+    first_bytes = osm_path.read_bytes()
+
+    payload = bridge_package(result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    rebridged = payload["inspire_boundaries"]
+    assert rebridged == {"written": 0, "curves": 2, "kept_existing": 2, "error": None}
+
+    second_bytes = osm_path.read_bytes()
+    assert second_bytes == first_bytes, "a second run must leave the file byte-identical"
+
+
+def test_the_inspire_provenance_entry_carries_the_substituted_attribution_and_conditions_link(
+    tmp_path,
+):
+    register(InspireProvenanceStubSource())
+    result = run_survey(_request(tmp_path, source_ids=("inspire",), run_bridge_step=False))
+
+    entries = [s for s in result.survey["sources"] if s["id"] == "inspire"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert "[year]" not in entry["attribution"]
+    assert entry["attribution"] == InspireSource.attribution.replace("[year]", "2026")
+    assert entry["conditions_url"] == InspireSource.conditions_url
+
+
+def test_the_inspire_provenance_entry_keeps_the_placeholder_with_no_curves_to_read_a_year_from(
+    tmp_path,
+):
+    """Nothing fabricated: with zero features in the boundaries GeoJSON,
+    there is no year anywhere in the package to substitute honestly, so
+    the placeholder stays. conditions_url is a fact about the LICENCE,
+    not about any one run's data, and is added regardless.
+    """
+    register(InspireProvenanceStubSource(features=[]))
+    result = run_survey(_request(tmp_path, source_ids=("inspire",), run_bridge_step=False))
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "inspire")
+    assert "[year]" in entry["attribution"]
+    assert entry["conditions_url"] == InspireSource.conditions_url
+
+
+def test_bridge_package_also_enriches_the_inspire_provenance_entry(tmp_path):
+    register(InspireProvenanceStubSource())
+    result = run_survey(_request(tmp_path, source_ids=("inspire",), run_bridge_step=False))
+
+    payload = bridge_package(result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    entry = next(s for s in payload["sources"] if s["id"] == "inspire")
+    assert "[year]" not in entry["attribution"]
+    assert entry["conditions_url"] == InspireSource.conditions_url
 
 
 # --------------------------------------------------------------------------
