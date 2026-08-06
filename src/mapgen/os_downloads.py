@@ -170,12 +170,27 @@ def _get_json(url: str, *, what: str) -> object:
     `what` is a short phrase for the error message only ("downloads
     listing for 'OpenGreenspace'"), never the URL itself: see the module
     docstring's "no-URL rule". Raises OsOpenError kind "listing" for
-    anything that stopped this from becoming a 2xx response with a body
-    (an HTTPError, a URLError, a timeout, all subclasses of URLError), and
-    kind "parse" for a body that came back but was not valid JSON.
+    anything that stopped this from becoming a 2xx response with a body,
+    and kind "parse" for a body that came back but was not valid JSON.
+
+    The `except Exception` below is deliberately a catch-all, not a list
+    of the exception types this module happened to think of first. A
+    review found that a `product` string (or, for `download_entry`'s own
+    sibling try block, an entry's own `url` field) containing a space or a
+    control character raises `http.client.InvalidURL` deep inside
+    `putrequest`, and non-ASCII input raises `UnicodeEncodeError` when the
+    request line is encoded, both while building the request, both
+    `HTTPException`/`ValueError`-family exceptions rather than
+    `URLError` subclasses, so the previous two-branch `except HTTPError` /
+    `except URLError` let either escape unwrapped, `InvalidURL`'s own
+    message carrying the literal URL. `Request(url, ...)` is inside this
+    try for the same reason: it is the same "anything short of a decoded
+    2xx body must become an OsOpenError" contract this function's own
+    docstring already claimed, just not, before this fix, what its code
+    actually did for every input.
     """
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         opener = _build_opener()
         with opener.open(request, timeout=_LISTING_TIMEOUT_SECONDS) as response:
             body = response.read()
@@ -185,7 +200,7 @@ def _get_json(url: str, *, what: str) -> object:
             kind="listing",
             status_code=exc.code,
         ) from None
-    except urllib.error.URLError:
+    except Exception:
         raise OsOpenError(
             f"Could not reach the OS Data Hub {what}.",
             kind="listing",
@@ -281,15 +296,27 @@ def download_entry(entry: dict, dest: Path, progress: ProgressSink | None = None
     Never puts `entry["url"]` in the message: see the module docstring's
     "no-URL rule". `entry["fileName"]` (never a URL) names the file in
     every message instead.
+
+    The `except Exception` below (before the final `except BaseException`)
+    is a deliberate catch-all, matching `_get_json`'s own fix for the same
+    review finding: a malformed `entry["url"]` (a space, a control
+    character, non-ASCII) raises `http.client.InvalidURL` or
+    `UnicodeEncodeError` while the request is being built or sent, neither
+    a `URLError` subclass, and the previous two named excepts let either
+    escape unwrapped, `InvalidURL`'s own message carrying the literal URL.
+    `except BaseException` still comes last and still re-raises rather
+    than wrapping: a `KeyboardInterrupt` is the owner stopping the run, not
+    a download failure to describe, and it still needs the same `.part`
+    cleanup on the way out.
     """
     name = entry.get("fileName") or "the OS Open file"
     expected_size = entry["size"]
     ensure_dir(dest.parent)
     temp_path = dest.with_name(f"{dest.name}.part")
 
-    request = urllib.request.Request(entry["url"], headers={"User-Agent": USER_AGENT})
     written = 0
     try:
+        request = urllib.request.Request(entry["url"], headers={"User-Agent": USER_AGENT})
         opener = _build_opener()
         with opener.open(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
             with temp_path.open("wb") as handle:
@@ -312,7 +339,7 @@ def download_entry(entry: dict, dest: Path, progress: ProgressSink | None = None
             kind="download",
             status_code=exc.code,
         ) from None
-    except urllib.error.URLError:
+    except Exception:
         temp_path.unlink(missing_ok=True)
         raise OsOpenError(
             f"Could not download {name}.",
@@ -382,10 +409,17 @@ class ZipReader:
         deflated (method 8) data is inflated with a raw deflate stream
         (`zlib.decompressobj(-15)`: a zip member's compressed bytes carry
         no zlib header or trailer, unlike the deflated tiles cog.py
-        reads). Either way the result's length is checked against the
-        central directory's own `uncompressed_size` before it is returned,
-        which is what catches a truncated or otherwise short transfer
-        rather than handing back a partial member silently.
+        reads), bounded at the decompressor to at most `uncompressed_size`
+        bytes of output (see the inline comment where this is done, and
+        cog.py's own module docstring, "The caps"): a member whose central
+        directory understates its own decompressed size never gets more
+        than that many bytes actually produced, and any real content left
+        over past the cap (`decompressor.unconsumed_tail`) is reported as
+        an overrun rather than silently discarded. Either way the result's
+        length is checked against the central directory's own
+        `uncompressed_size` before it is returned, which is what catches a
+        truncated or otherwise short transfer rather than handing back a
+        partial member silently.
         """
         member = self._members.get(name)
         if member is None:
@@ -421,13 +455,43 @@ class ZipReader:
         elif member.method == _ZIP_METHOD_DEFLATED:
             decompressor = zlib.decompressobj(_RAW_DEFLATE_WBITS)
             try:
-                data = decompressor.decompress(payload) + decompressor.flush()
+                # Bounded at the decompressor, exactly the defense cog.py's
+                # own module docstring documents by name ("The caps":
+                # "Deflate output is bounded at the decompressor rather
+                # than after it, so a zip bomb in a tile is refused rather
+                # than decompressed and then measured", cog.py's own
+                # `_decode`: `decompressobj().decompress(payload,
+                # expected)`). A review found the previous unbounded
+                # `decompressor.decompress(payload)` here let a member
+                # whose central directory understated its own
+                # uncompressed_size force this reader to materialise the
+                # FULL real output (measured at 601.7 MB peak for a
+                # crafted ~300 KB compressed span) before the length check
+                # a few lines below ever got a chance to catch the
+                # mismatch. Capping the call at `uncompressed_size` means
+                # a member lying about its own size never gets more than
+                # that many bytes actually produced.
+                data = decompressor.decompress(payload, member.uncompressed_size)
             except zlib.error:
                 raise OsOpenError(
                     f"{name!r} in {self.source.name} could not be "
                     f"inflated: its deflate stream is corrupt.",
                     kind="range",
                 ) from None
+            if decompressor.unconsumed_tail:
+                # decompress() stopped at the cap above with real,
+                # not-yet-decoded compressed input still left over: this
+                # member's true decompressed size is larger than its own
+                # uncompressed_size field claims. Exactly the zip-bomb
+                # shape the cap above exists to catch before the excess is
+                # ever produced, so it is reported without decompressing
+                # any further to find out by how much.
+                raise OsOpenError(
+                    f"{name!r} in {self.source.name} decompresses to more "
+                    f"than the {member.uncompressed_size} bytes its own "
+                    f"central directory entry declares.",
+                    kind="range",
+                )
         else:
             raise OsOpenError(
                 f"{name!r} in {self.source.name} uses zip compression "
@@ -587,8 +651,9 @@ def product_cache_dir(product: str, version: str) -> Path:
 
 
 def sweep_old_versions(product: str, keep_version: str) -> None:
-    """Deletes every `f"{product}_*"` sibling of `product_cache_dir(product,
-    keep_version)` under `cache_root()`, best-effort.
+    """Deletes every other version of `product`'s own cache directory under
+    `cache_root()`, best-effort, leaving `product_cache_dir(product,
+    keep_version)` and every OTHER product's cache untouched.
 
     Must only be called once a caller has finished building `keep_version`'s
     own shards successfully: an older version's cache is real, usable data
@@ -602,11 +667,29 @@ def sweep_old_versions(product: str, keep_version: str) -> None:
     Survives `cache_root()` not existing at all: nothing to sweep is not a
     failure, and this is called from `fetch()`-shaped code that may run
     against a completely fresh cache.
+
+    A candidate matches `product` only when its directory name's own
+    segment before the LAST underscore equals `product` exactly
+    (`name.rsplit("_", 1)[0] == product`), not merely when the name starts
+    with `f"{product}_"`. A review found the previous `root.glob(f"
+    {product}_*")` cross-deletes a genuinely different product whenever
+    that other product's own id happens to literally begin with `"<this
+    product>_"` (verified: sweeping `"Open"` deleted `"Open_Extra"`'s
+    directory, because `"Open_Extra_2026-01"` matches the glob
+    `"Open_*"` just as validly as `"Open_2026-01"` does). Splitting on the
+    directory name's own LAST underscore instead treats everything before
+    it as the product id, which is correct for every real OS Open version
+    string this project reads (`"2026-04"`, hyphenated, never carrying an
+    underscore of its own; see the plan's verified facts), and is what
+    keeps `"Open_Extra_2026-01"`'s own product segment
+    (`"Open_Extra"`) from ever comparing equal to `"Open"`.
     """
     root = cache_root()
     if not root.exists():
         return
     keep_dir = product_cache_dir(product, keep_version)
-    for candidate in root.glob(f"{product}_*"):
-        if candidate != keep_dir:
+    for candidate in root.iterdir():
+        if not candidate.is_dir() or candidate == keep_dir:
+            continue
+        if candidate.name.rsplit("_", 1)[0] == product:
             best_effort_rmtree(candidate)

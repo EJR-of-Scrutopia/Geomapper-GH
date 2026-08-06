@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import tracemalloc
 import urllib.error
 import zipfile
 import zlib
@@ -337,6 +338,117 @@ def test_download_entry_works_with_no_progress_sink(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Review finding 1 (Critical): a malformed product id or entry url must
+# never let a non-OsOpenError exception escape, and must never carry a URL
+# once wrapped. Two of these hit the real, unpatched urllib machinery
+# directly (a space or a non-ASCII character in what becomes a request
+# line raises http.client.InvalidURL or UnicodeEncodeError before any
+# socket is ever touched, confirmed by hand: both fail in under 20ms with
+# no patched opener at all), so those run against the real _build_opener,
+# not the fake, on purpose: this is the exact path the review's own
+# reproduction used. A third test proves the wrapping is a genuine
+# catch-all rather than a list of exception types that happens to include
+# these two, by scripting a fake opener that raises something this module
+# has never seen before.
+# --------------------------------------------------------------------------
+
+
+def test_product_downloads_wraps_a_space_in_the_product_id_with_no_url_leaking():
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.product_downloads("Open Greenspace")
+
+    assert excinfo.value.kind == "listing"
+    assert excinfo.value.status_code is None
+    assert "/downloads/v1/products/" not in str(excinfo.value)
+    assert "api.os.uk" not in str(excinfo.value)
+
+
+def test_product_downloads_wraps_a_non_ascii_product_id():
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.product_downloads("ürban")
+
+    assert excinfo.value.kind == "listing"
+    assert excinfo.value.status_code is None
+
+
+def test_product_version_wraps_a_space_in_the_product_id_with_no_url_leaking():
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.product_version("Open Greenspace")
+
+    assert excinfo.value.kind == "listing"
+    assert excinfo.value.status_code is None
+    assert "api.os.uk" not in str(excinfo.value)
+
+
+def test_product_downloads_wraps_any_unexpected_opener_exception(monkeypatch):
+    failing_url_fragment = "https://api.os.uk/downloads/v1/products/OpenGreenspace/downloads"
+
+    class _Unforeseen(Exception):
+        pass
+
+    class _BoomOpener:
+        def open(self, request, timeout=None):
+            raise _Unforeseen(f"kaboom while fetching {failing_url_fragment}")
+
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: _BoomOpener())
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.product_downloads("OpenGreenspace")
+
+    assert excinfo.value.kind == "listing"
+    assert excinfo.value.status_code is None
+    assert failing_url_fragment not in str(excinfo.value)
+
+
+def test_download_entry_wraps_a_space_in_the_entry_url_with_no_url_leaking(tmp_path):
+    entry = _entry(10, url="https://api.os.uk/downloads/v1/x y")
+    dest = tmp_path / "out" / "x.zip"
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.download_entry(entry, dest)
+
+    assert excinfo.value.kind == "download"
+    assert excinfo.value.status_code is None
+    assert "x y" not in str(excinfo.value)
+    assert "api.os.uk" not in str(excinfo.value)
+    assert list(dest.parent.glob("*.part")) == []
+    assert not dest.exists()
+
+
+def test_download_entry_wraps_a_non_ascii_entry_url(tmp_path):
+    entry = _entry(10, url="https://api.os.uk/downloads/v1/ürban")
+    dest = tmp_path / "out" / "x.zip"
+
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.download_entry(entry, dest)
+
+    assert excinfo.value.kind == "download"
+    assert list(dest.parent.glob("*.part")) == []
+
+
+def test_download_entry_wraps_any_unexpected_opener_exception(tmp_path, monkeypatch):
+    failing_url_fragment = "https://api.os.uk/downloads/v1/x"
+
+    class _Unforeseen(Exception):
+        pass
+
+    class _BoomOpener:
+        def open(self, request, timeout=None):
+            raise _Unforeseen(f"kaboom while fetching {failing_url_fragment}")
+
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: _BoomOpener())
+
+    dest = tmp_path / "out" / "x.zip"
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.download_entry(_entry(10, url=failing_url_fragment), dest)
+
+    assert excinfo.value.kind == "download"
+    assert excinfo.value.status_code is None
+    assert failing_url_fragment not in str(excinfo.value)
+    assert list(dest.parent.glob("*.part")) == []
+
+
+# --------------------------------------------------------------------------
 # ZipReader: real zips, built with `zipfile`, read back through
 # FileByteSource (see cog.py). Never a fake ByteSource here: what is under
 # test is the EOCD scan, the central directory walk and the local header
@@ -491,6 +603,90 @@ def test_zipreader_raises_range_when_a_members_compressed_span_arrives_short(tmp
     assert excinfo.value.kind == "range"
 
 
+def _build_lying_zip(
+    path: Path, name: str, compressed_payload: bytes, declared_uncompressed_size: int
+) -> None:
+    """A one-member zip, built by hand rather than through `zipfile`, whose
+    central directory (and local header) both declare
+    `declared_uncompressed_size` for a member whose real, decompressed
+    size may be far larger: `compressed_payload` is handed through
+    untouched, a genuine raw-deflate stream (method 8) the caller built
+    however it likes.
+
+    Exists only to prove `ZipReader.read_member` bounds its own
+    decompression rather than trusting the archive's own (here,
+    deliberately dishonest) declared size; see
+    `test_zipreader_bounds_deflate_decompression_and_flags_the_overrun`.
+    Every field this reader itself ignores (crc32, mod time/date, disk
+    numbers, attributes) is written as 0, since nothing in ZipReader reads
+    them.
+    """
+    name_bytes = name.encode("ascii")
+    local_header = b"PK\x03\x04" + struct.pack(
+        "<HHHHHIIIHH",
+        20, 0, 8, 0, 0, 0,
+        len(compressed_payload), declared_uncompressed_size,
+        len(name_bytes), 0,
+    )
+    local_record = local_header + name_bytes + compressed_payload
+
+    central_entry = (
+        b"PK\x01\x02"
+        + struct.pack(
+            "<HHHHHHIIIHHHHHII",
+            20, 20, 0, 8, 0, 0, 0,
+            len(compressed_payload), declared_uncompressed_size,
+            len(name_bytes), 0, 0, 0, 0, 0, 0,
+        )
+        + name_bytes
+    )
+    eocd = b"PK\x05\x06" + struct.pack(
+        "<HHHHIIH", 0, 0, 1, 1, len(central_entry), len(local_record), 0
+    )
+    path.write_bytes(local_record + central_entry + eocd)
+
+
+def test_zipreader_bounds_deflate_decompression_and_flags_the_overrun(tmp_path):
+    """Review finding 2: a member whose central directory LIES about its
+    own uncompressed size (declaring 100 bytes for a member that really
+    inflates to 64 MiB of zeros) must not make `read_member` materialise
+    the full 64 MiB before its own length check catches the mismatch,
+    mirroring cog.py's own zip-bomb defense (`decompressobj().decompress
+    (payload, expected)`, bounded at the decompressor rather than after
+    it; see that module's "The caps" section).
+
+    Measured with `tracemalloc`, the same tool the review itself used:
+    against the unbounded implementation this review found, this single
+    call peaks at very roughly true_size worth of Python-level
+    allocation (the review's own probe measured 601.7 MB peak for a
+    comparable 300 MB bomb); against the bounded fix, the peak stays
+    near the tiny DECLARED size instead. `true_size // 4` is a generous
+    ceiling well under true_size, so this fails loudly if a future change
+    quietly drops the bound rather than merely nudging a number.
+    """
+    name = "data/bomb.gml"
+    true_size = 64 * 1024 * 1024  # 64 MiB of zeros: highly compressible.
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    bomb_payload = compressor.compress(b"\x00" * true_size) + compressor.flush()
+    # A real bomb: compresses to well under 1% of what it inflates to.
+    assert len(bomb_payload) < true_size // 100
+
+    zip_path = tmp_path / "bomb.zip"
+    _build_lying_zip(zip_path, name, bomb_payload, declared_uncompressed_size=100)
+
+    reader = os_downloads.ZipReader(FileByteSource(zip_path))
+    tracemalloc.start()
+    try:
+        with pytest.raises(os_downloads.OsOpenError) as excinfo:
+            reader.read_member(name)
+    finally:
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    assert excinfo.value.kind == "range"
+    assert peak < true_size // 4
+
+
 # --------------------------------------------------------------------------
 # cache_root / product_cache_dir / sweep_old_versions.
 #
@@ -544,6 +740,33 @@ def test_sweep_old_versions_survives_a_missing_cache_root(monkeypatch, tmp_path)
     monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
 
     os_downloads.sweep_old_versions("OpenGreenspace", keep_version="2026-04")  # must not raise
+
+
+def test_sweep_old_versions_does_not_cross_delete_a_product_whose_id_is_a_delimiter_prefix(
+    monkeypatch, tmp_path
+):
+    """Review finding 3: the cache directory name is `f"{product}_{version}"`,
+    and a naive `f"{product}_*"` glob also matches a DIFFERENT product
+    whose own id literally begins with `"<this product>_"`. "Open" and
+    "Open_Extra" are exactly that pair: sweeping "Open" must delete only
+    its own stale version, never "Open_Extra"'s cache, which is a
+    distinct product that merely happens to share the delimiter as a
+    literal prefix.
+    """
+    fake_config_path = tmp_path / "config.json"
+    monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_config_path)
+
+    kept_dir = os_downloads.product_cache_dir("Open", "2026-04")
+    old_dir = os_downloads.product_cache_dir("Open", "2026-01")
+    foreign_dir = os_downloads.product_cache_dir("Open_Extra", "2026-01")
+    (foreign_dir / "marker.txt").write_text("unrelated product", encoding="utf-8")
+
+    os_downloads.sweep_old_versions("Open", keep_version="2026-04")
+
+    assert kept_dir.is_dir()
+    assert not old_dir.exists()
+    assert foreign_dir.is_dir()
+    assert (foreign_dir / "marker.txt").exists()
 
 
 # --------------------------------------------------------------------------
