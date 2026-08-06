@@ -386,6 +386,19 @@ def _configured_sources(request: SurveyRequest) -> list:
     model) each have such a per-request selection; every other source id
     is used exactly as registered, with no id-specific branch needed for
     it to keep working unchanged.
+
+    inspire (the INSPIRE curves review's own fix) joins the dispatch for
+    a different reason than the three above: it has no per-request
+    selection to pass through at all, so its own `configure()` takes no
+    argument beyond self. What it needs a fresh copy FOR is
+    `endpoints_used`'s new lifetime (see InspireSource.fetch()'s own
+    docstring): that list now accumulates across every fetch() call one
+    instance ever serves, which package.py's retry pass depends on
+    within a single survey, but would otherwise go on accumulating
+    across every survey ever run through the one InspireSource
+    register_default_sources() builds for the whole process. Calling
+    `configure()` with no arguments at all is what a source needs when
+    "give me a clean, request-scoped copy" is the whole ask.
     """
     configured = []
     for source_id in request.source_ids:
@@ -398,6 +411,8 @@ def _configured_sources(request: SurveyRequest) -> list:
                 source = configure(request.effective_categories)
             elif source_id == "elevation":
                 source = configure(request.elevation_demtype)
+            elif source_id == "inspire":
+                source = configure()
         configured.append(source)
     return configured
 

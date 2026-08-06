@@ -845,6 +845,33 @@ class _FailsOnUrlSession(_AuthorityZipSession):
         return _FakeResponse(200, self.blobs[url])
 
 
+class _FailsOnceThenSucceedsSession(_AuthorityZipSession):
+    """Answers `flaky_url` with a fixed failing status on its FIRST call,
+    then behaves like an ordinary `_AuthorityZipSession` (a real 200,
+    `flaky_url`'s own blob) on every call after that: package.py's retry
+    pass calling `fetch()` again on the same InspireSource instance is
+    exactly this shape, a service that failed once and answered normally
+    the second time (see test_endpoints_used_survives_the_retry_pass_on_
+    one_instance, the coordinator review's own probe reproduced).
+    """
+
+    def __init__(
+        self, blobs: dict[str, bytes], flaky_url: str, status_code: int
+    ) -> None:
+        super().__init__(blobs)
+        self._flaky_url = flaky_url
+        self._status_code = status_code
+        self._flaky_calls = 0
+
+    def get(self, url, stream=True, timeout=None):
+        if url == self._flaky_url:
+            self._flaky_calls += 1
+            if self._flaky_calls == 1:
+                self.calls.append(url)
+                return _FakeResponse(self._status_code, b"")
+        return super().get(url, stream=stream, timeout=timeout)
+
+
 class _RefusesOstn15Session:
     """A session whose `.get()` always raises a real
     `requests.RequestException`, so `bng._download_and_parse` wraps it
@@ -920,6 +947,57 @@ def test_register_default_sources_registers_inspire_once_and_honours_the_type_ch
 
     register_default_sources()
     assert get_source("inspire") is first
+
+
+# --------------------------------------------------------------------------
+# configure(): the request-scoping seam Item 1 wires into package.py's
+# _configured_sources, so the one registered instance is never itself the
+# thing fetch() is called on and endpoints_used can never accumulate across
+# separate surveys.
+# --------------------------------------------------------------------------
+
+
+def test_configure_returns_a_fresh_instance_sharing_transport_and_cache_config(tmp_path):
+    session = object()
+    ostn15_dir = tmp_path / "ostn15"
+    inspire_dir = tmp_path / "inspire"
+    registered = InspireSource(
+        session=session, ostn15_cache_dir=ostn15_dir, inspire_cache_dir=inspire_dir
+    )
+
+    configured = registered.configure()
+
+    assert configured is not registered
+    assert configured.session is session
+    assert configured._ostn15_cache_dir == ostn15_dir
+    assert configured._inspire_cache_dir == inspire_dir
+
+
+def test_configure_never_mutates_the_registered_instance_and_starts_endpoints_used_empty():
+    # The whole point of this seam (Item 1, part 2): a registered instance
+    # that has already served one survey (a real URL in its own
+    # endpoints_used) must hand back a CLEAN copy, never the same list,
+    # and must never have itself changed by being asked.
+    registered = InspireSource()
+    registered.endpoints_used.append("https://example.invalid/already-served.zip")
+
+    configured = registered.configure()
+
+    assert configured.endpoints_used == []
+    assert registered.endpoints_used == ["https://example.invalid/already-served.zip"]
+
+
+def test_configure_keeps_the_subclass_it_was_called_on():
+    # The same N1 finding ElevationSource.configure's own test guards
+    # against: a subclass built to fail in a specific, reproducible way
+    # for a test must stay that subclass through configure(), not
+    # silently become a plain InspireSource that would make a real
+    # request.
+    class Subclassed(InspireSource):
+        pass
+
+    configured = Subclassed().configure()
+    assert type(configured) is Subclassed
 
 
 # --------------------------------------------------------------------------
@@ -1323,6 +1401,50 @@ def test_fetch_records_no_endpoints_when_every_authority_is_a_cache_hit(tmp_path
     source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
 
     assert source.endpoints_used == []
+
+
+def test_endpoints_used_survives_the_retry_pass_on_one_instance(tmp_path, monkeypatch):
+    """Coordinator review finding, proven by an executed probe: package.py's
+    retry pass re-invokes fetch() on the SAME InspireSource instance (see
+    package._retry_failed_tiles, which walks `fetched`, the very objects
+    the first pass used, not fresh ones). Pass 1 downloads Authority_A
+    (now cached) and records its URL, then Authority_B answers 500 and
+    fetch() raises. Pass 2 (B recovers) must end with BOTH urls present
+    once each: A is a cache hit on pass 2 and records nothing new, so the
+    old top-of-fetch() reset would have wiped pass 1's own record of A the
+    moment pass 2 started, leaving endpoints_used == [url_b] even though
+    both were genuinely contacted this run.
+    """
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(
+        inspire_module, "authorities_for", lambda bbox: ["Authority_A", "Authority_B"]
+    )
+
+    url_a = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_A")
+    url_b = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_B")
+    session = _FailsOnceThenSucceedsSession(
+        {
+            url_a: _zip_bytes(_build_gml(_PARCEL_RING)),
+            url_b: _zip_bytes(_build_gml(_PARCEL_RING)),
+        },
+        flaky_url=url_b,
+        status_code=500,
+    )
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    # Pass 1: A downloads and is recorded; B answers 500 and fetch() raises.
+    with pytest.raises(InspireError):
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+    assert source.endpoints_used == [url_a]
+    assert not (work_dir / PARCELS_WORK_NAME).exists()  # nothing written on a failed pass
+
+    # Pass 2 (package.py's retry, same instance): A is now a cache hit
+    # (recording nothing new), B recovers and downloads for real.
+    source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+    assert source.endpoints_used == [url_a, url_b]
 
 
 def test_fetch_cancel_between_authorities_leaves_no_failure_records(tmp_path, monkeypatch):

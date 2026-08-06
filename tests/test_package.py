@@ -30,7 +30,7 @@ from mapgen.package import (
     run_survey,
 )
 from mapgen.sources.elevation import ElevationSource
-from mapgen.sources.inspire import InspireSource
+from mapgen.sources.inspire import INSPIRE_DOWNLOAD_URL_TEMPLATE, InspireSource
 from mapgen.sources.base import (
     DuplicateSourceError,
     Estimate,
@@ -6280,6 +6280,89 @@ def test_bridge_package_also_enriches_the_inspire_provenance_entry(tmp_path):
     entry = next(s for s in payload["sources"] if s["id"] == "inspire")
     assert "[year]" not in entry["attribution"]
     assert entry["conditions_url"] == InspireSource.conditions_url
+
+
+def test_run_survey_gives_each_survey_its_own_inspire_endpoints_used(tmp_path, monkeypatch):
+    """Item 1, part 2 of the coordinator review's INSPIRE curves fix
+    (the real InspireSource, not the provenance stub the tests above use,
+    proving the seam package.py actually exercises).
+
+    register_default_sources() builds and registers exactly ONE
+    InspireSource for the life of the whole process. Item 1's own fix
+    (removing the top-of-fetch() reset so endpoints_used survives
+    package.py's retry pass calling fetch() again on that same instance;
+    see test_inspire.py's own
+    test_endpoints_used_survives_the_retry_pass_on_one_instance) means
+    that list now accumulates across EVERY fetch() call one instance ever
+    serves. Without a per-request boundary, two entirely separate surveys
+    sharing the one registered instance would leak survey 1's own URL
+    into survey 2's. InspireSource.configure(), wired into
+    package._configured_sources the same way Overture's/OSM's/
+    Elevation's own configure() already is, is that boundary.
+
+    Registers only ONE InspireSource, deliberately, and reuses it for
+    BOTH run_survey calls below: this is exactly the shape that would
+    leak without configure() in place, since register() runs once and
+    _configured_sources is the only thing standing between this one
+    instance and either request.
+    """
+    from tests.test_inspire import _AuthorityZipSession, _build_gml, _zip_bytes, _PARCEL_RING
+
+    import mapgen.sources.inspire as inspire_module
+
+    grid = _zero_shift_grid()
+    # ensure_ostn15 is inspire.py's own direct import from bng.py, not
+    # something package.py's load_ostn15/ensure_ostn15 monkeypatches
+    # would reach; faked here the same way test_inspire.py's own fetch()
+    # tests avoid the real OSTN15 network path, but by monkeypatching the
+    # function itself rather than seeding a real cache file, since this
+    # test's only interest is endpoints_used, not the projected geometry.
+    monkeypatch.setattr(
+        inspire_module, "ensure_ostn15", lambda cache_dir=None, session=None: grid
+    )
+
+    url_a = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_A")
+    url_b = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_B")
+    session = _AuthorityZipSession(
+        {
+            url_a: _zip_bytes(_build_gml(_PARCEL_RING)),
+            url_b: _zip_bytes(_build_gml(_PARCEL_RING)),
+        }
+    )
+    register(
+        InspireSource(
+            session=session,
+            ostn15_cache_dir=tmp_path / "ostn15-cache",
+            inspire_cache_dir=tmp_path / "inspire-cache",
+        )
+    )
+
+    # force=True: the synthetic _PARCEL_RING fixture has no reason to fall
+    # inside the real Barry Waterfront BBOX once projected to BNG, so this
+    # run's own parcels.jsonl is legitimately empty (zero kept parcels).
+    # That is InspireSource.fetch()'s own honest, complete result (see its
+    # docstring's "THE FIX"), but assert_inputs_present's own, separate,
+    # whole-package gate still refuses to merge an empty input unless
+    # asked to; this test's only interest is endpoints_used, not the
+    # merged geometry, so force is the right tool here rather than
+    # reshaping the fixture to land inside a real bbox it has no bearing
+    # on otherwise.
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Authority_A"])
+    result1 = run_survey(
+        _request(tmp_path / "job1", source_ids=("inspire",), run_bridge_step=False, force=True)
+    )
+    entry1 = next(s for s in result1.survey["sources"] if s["id"] == "inspire")
+    assert entry1["endpoints_used"] == [url_a]
+
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Authority_B"])
+    result2 = run_survey(
+        _request(tmp_path / "job2", source_ids=("inspire",), run_bridge_step=False, force=True)
+    )
+    entry2 = next(s for s in result2.survey["sources"] if s["id"] == "inspire")
+    # The proof: survey 2 shows ONLY its own authority's url, never
+    # survey 1's, even though both requests ran through the SAME
+    # registered instance's own session and cache configuration.
+    assert entry2["endpoints_used"] == [url_b]
 
 
 # --------------------------------------------------------------------------

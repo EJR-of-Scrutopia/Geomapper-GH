@@ -958,9 +958,63 @@ class InspireSource:
         # succeeded (see fetch()'s own docstring, "endpoints_used" section,
         # for how this source tells "about to hit the network" apart from
         # "about to read a cache file" without changing fetch_authority_zip's
-        # own return shape). Reset at the top of every fetch(), same as
-        # tile_failures immediately above.
+        # own return shape).
+        #
+        # NOT reset at the top of fetch(), unlike tile_failures immediately
+        # above (a review finding): tile_failures is documented PER-CALL
+        # state, describing only the most recent fetch() so package.py's
+        # retry pass sees just what THAT attempt could not deliver.
+        # endpoints_used is PER-RUN state instead, initialised here in
+        # __init__ and never touched again inside fetch() itself, because
+        # package.py's retry pass calls fetch() again on this SAME
+        # instance: a pass 1 that downloads Authority_A, records its URL,
+        # then fails on Authority_B must not have A's own URL wiped by a
+        # reset at the top of pass 2, in which A is now a cache hit that
+        # records nothing new. What gives each SEPARATE survey a clean
+        # start instead is InspireSource.configure() (below), the seam
+        # package.py's _configured_sources uses to hand every request a
+        # fresh instance rather than ever reusing the one
+        # register_default_sources() built once for the life of the
+        # process.
         self.endpoints_used: list[str] = []
+
+    def configure(self) -> "InspireSource":
+        """Returns a fresh InspireSource sharing this instance's transport
+        and cache configuration, never mutating self.
+
+        Unlike OvertureSource.configure(types), OsmSource.configure
+        (categories) or ElevationSource.configure(demtype), InspireSource
+        has no request-scoped SELECTION to pass through: every request
+        that chooses "inspire" wants the same authorities for the same
+        bbox, the same parser, the same output. What it needs a fresh
+        copy for instead is `endpoints_used`'s own new lifetime (see
+        fetch()'s docstring, "endpoints_used"): that list now survives
+        package.py's retry pass calling fetch() again on one instance,
+        which is a genuine WITHIN-one-survey requirement, but
+        `register_default_sources()` builds and registers exactly one
+        InspireSource for the life of the whole server process. Without
+        this seam, that single registered instance would go on
+        accumulating URLs across every survey ever run through it, not
+        merely across one survey's own retries, the moment the reset this
+        task removed from fetch() stopped clearing it between requests.
+
+        package.py's `_configured_sources` calls this with no arguments at
+        all (the one case among the four sources with a `configure`
+        extension where "configure" means only "give me a clean copy",
+        not "give me a copy scoped to X"): VERIFY the call shape there
+        before assuming a future parameter belongs on this signature.
+
+        `type(self)(...)`, not `InspireSource(...)`, for the same reason
+        ElevationSource.configure gives at length: a subclass built to
+        fail in a specific, reproducible way for a test must stay that
+        subclass through configure(), not silently become a plain
+        InspireSource that would make a real request.
+        """
+        return type(self)(
+            session=self.session,
+            ostn15_cache_dir=self._ostn15_cache_dir,
+            inspire_cache_dir=self._inspire_cache_dir,
+        )
 
     # -- estimate ------------------------------------------------------------
 
@@ -1112,9 +1166,28 @@ class InspireSource:
         pre-check is a plain filesystem read of the same deterministic
         path, not a second, competing source of truth for what that
         function did.
+
+        Survives package.py's retry pass on this same instance (a second
+        review finding, proven by an executed probe): pass 1 downloading
+        Authority_A, recording its URL, then raising on Authority_B's own
+        500 must not have that URL erased when pass 2 calls fetch() again
+        and finds A already cached. `endpoints_used` is therefore never
+        reset inside this method (see __init__'s own comment on the
+        attribute); it accumulates across every fetch() call this ONE
+        instance ever serves. That is safe only because this instance
+        itself is request-scoped: package.py's `_configured_sources` asks
+        this class's own `configure()` for a fresh copy once per request,
+        so the registered singleton `register_default_sources()` builds
+        once for the whole process is never the thing fetch() is actually
+        called on, and one survey's URLs can never accumulate into the
+        next survey's.
         """
         self.tile_failures = []
-        self.endpoints_used = []
+        # endpoints_used is deliberately NOT reset here; see __init__'s own
+        # comment beside it for why a per-call reset would wipe an earlier
+        # pass's URL the moment package.py's retry pass re-invokes fetch()
+        # on this same instance, and why configure() is what gives each
+        # SEPARATE survey a clean list instead.
         if cancel is not None:
             cancel.raise_if_cancelled()
 
