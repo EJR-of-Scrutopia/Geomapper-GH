@@ -261,6 +261,38 @@ def _sweep_stale_months(cache_dir: Path, name: str, keep: Path) -> None:
             candidate.unlink(missing_ok=True)
 
 
+def _resolve_inspire_cache_dir(cache_dir: Path | None) -> Path:
+    """`cache_dir` if given, otherwise `_default_inspire_cache_dir()`: the
+    one-line ternary `fetch_authority_zip` itself resolves, factored out so
+    `InspireSource.fetch()` (see its own `endpoints_used` bookkeeping) can
+    resolve the SAME directory without a second, independently maintained
+    copy of this ternary that could drift from the first.
+    """
+    return cache_dir if cache_dir is not None else _default_inspire_cache_dir()
+
+
+def _authority_cache_path(name: str, resolved_cache_dir: Path) -> Path:
+    """The month-stamped cache path `fetch_authority_zip` itself resolves
+    `name` to, given an ALREADY-RESOLVED cache directory (see
+    `_resolve_inspire_cache_dir`): pure path arithmetic, no filesystem
+    access, no network.
+
+    Factored out for one reason: `InspireSource.fetch()` needs to know,
+    honestly, whether calling `fetch_authority_zip` is about to hit the
+    network or a cache file already on disk, so it can record the
+    authority's own download URL in `endpoints_used` only when a real
+    request is about to happen (see that method's own docstring). Rather
+    than have `fetch_authority_zip` change its own return shape to report
+    that fact, which every one of this module's own tests and every other
+    caller would then have to unpack, the source computes this SAME path
+    with `.exists()` immediately before calling `fetch_authority_zip`. One
+    function computing the path either way is what keeps the two call
+    sites from ever quietly disagreeing about what "this month's cache
+    file" means.
+    """
+    return resolved_cache_dir / f"{name}_{_current_month_stamp()}.zip"
+
+
 def fetch_authority_zip(
     name: str, session: object, cache_dir: Path | None = None
 ) -> Path:
@@ -321,8 +353,8 @@ def fetch_authority_zip(
             f"filename from it."
         )
 
-    resolved_cache_dir = cache_dir if cache_dir is not None else _default_inspire_cache_dir()
-    cache_path = resolved_cache_dir / f"{name}_{_current_month_stamp()}.zip"
+    resolved_cache_dir = _resolve_inspire_cache_dir(cache_dir)
+    cache_path = _authority_cache_path(name, resolved_cache_dir)
     if cache_path.exists():
         return cache_path
 
@@ -917,6 +949,18 @@ class InspireSource:
         # Reset at the top of every fetch(); see sources/base.py's own
         # documentation of this optional LayerSource extension.
         self.tile_failures: list[TileFailure] = []
+        # Every authority zip's own download URL, but ONLY for an authority
+        # this fetch() call actually downloaded: a month-stamped cache hit
+        # (see fetch_authority_zip) appends nothing, matching OsmSource's
+        # own endpoints_used docstring ("a tile skipped because it was
+        # already downloaded... contributes nothing to this list") and its
+        # own convention of recording only once the request is known to have
+        # succeeded (see fetch()'s own docstring, "endpoints_used" section,
+        # for how this source tells "about to hit the network" apart from
+        # "about to read a cache file" without changing fetch_authority_zip's
+        # own return shape). Reset at the top of every fetch(), same as
+        # tile_failures immediately above.
+        self.endpoints_used: list[str] = []
 
     # -- estimate ------------------------------------------------------------
 
@@ -955,6 +999,17 @@ class InspireSource:
             TileFailure(source=self.id, tile_id=tile.tile_id, kind=kind, reason=reason)
             for tile in tiles
         ]
+
+    def _record_endpoint(self, endpoint: str) -> None:
+        """Append `endpoint` to `endpoints_used` unless it is already
+        there. Deduplicated, first-seen order, the same shape
+        `OsmSource._record_endpoint` already establishes; a distinct
+        method rather than an inline `if` at the one call site so a
+        future second call site (a retried authority, say) cannot
+        quietly duplicate the check.
+        """
+        if endpoint not in self.endpoints_used:
+            self.endpoints_used.append(endpoint)
 
     def fetch(
         self,
@@ -1037,8 +1092,29 @@ class InspireSource:
         grid fetch, and once per loop iteration before that authority's own
         download starts (so a stop lands between whole authorities, never
         mid-download, matching every other source's own convention).
+
+        **endpoints_used** (a review finding: this was previously never
+        populated at all, which made survey.json's own documented promise,
+        "which real URLs were actually contacted this run", false for this
+        source on every run, including one that genuinely downloaded a
+        zip). Per authority, BEFORE calling `fetch_authority_zip`, this
+        method checks whether that authority's own month-stamped cache
+        file already exists (`_authority_cache_path`, the exact path
+        `fetch_authority_zip` itself would resolve to): if it does not, a
+        real network request is about to happen, and the authority's own
+        download URL is appended to `endpoints_used` once `fetch_
+        authority_zip` and `parcels_in` have both returned without raising.
+        Recording only on that success, never merely on "a request was
+        attempted", matches `OsmSource._record_endpoint`'s own convention
+        (called only after a 200 response, never inside its retry loop).
+        A cache hit records nothing, the same as a skipped OSM tile.
+        `fetch_authority_zip`'s own return shape is untouched by this: the
+        pre-check is a plain filesystem read of the same deterministic
+        path, not a second, competing source of truth for what that
+        function did.
         """
         self.tile_failures = []
+        self.endpoints_used = []
         if cancel is not None:
             cancel.raise_if_cancelled()
 
@@ -1094,11 +1170,20 @@ class InspireSource:
             self._record_tile_failures(tiles, FAILURE_NO_OUTPUT, OUTSIDE_ENGLAND_AND_WALES_MESSAGE)
             raise InspireError(OUTSIDE_ENGLAND_AND_WALES_MESSAGE) from None
 
+        resolved_inspire_cache_dir = _resolve_inspire_cache_dir(self._inspire_cache_dir)
         all_parcels: list[list[list[tuple[float, float]]]] = []
         authority_meta: list[dict[str, object]] = []
         for name in authorities:
             if cancel is not None:
                 cancel.raise_if_cancelled()
+            # Computed BEFORE the call, from the same deterministic path
+            # fetch_authority_zip itself resolves to (see this method's own
+            # docstring, "endpoints_used"): True means this call is about
+            # to hit the network, False means it is about to read this
+            # month's cache file. Not re-checked after the call, since the
+            # call itself is the only thing that could change it, and this
+            # process is the only writer of its own cache directory.
+            will_download = not _authority_cache_path(name, resolved_inspire_cache_dir).exists()
             try:
                 zip_path = fetch_authority_zip(name, self.session, cache_dir=self._inspire_cache_dir)
                 stream = parcels_in(zip_path, bbox_bng)
@@ -1110,6 +1195,8 @@ class InspireSource:
                     f"{verb} the INSPIRE Index Polygons for {name}: {phrase}.",
                 )
                 raise
+            if will_download:
+                self._record_endpoint(INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name=name))
             all_parcels.extend(kept)
             authority_meta.append(
                 {

@@ -6248,6 +6248,29 @@ def test_the_inspire_provenance_entry_keeps_the_placeholder_with_no_curves_to_re
     assert entry["conditions_url"] == InspireSource.conditions_url
 
 
+def test_the_inspire_provenance_entry_carries_endpoints_used_through_the_generic_getattr(
+    tmp_path,
+):
+    """Coordinator review finding: `InspireSource` now populates
+    `endpoints_used` honestly (see its own `fetch()` docstring in
+    `mapgen/sources/inspire.py`), and `_source_provenance` already reads
+    it off ANY source generically (`getattr(source, "endpoints_used",
+    [])`, unchanged by that fix). This proves the seam specifically for
+    the "inspire" entry, the one README's own `sources` schema row now
+    promises it for.
+    """
+    stub = InspireProvenanceStubSource()
+    stub.endpoints_used = [
+        "https://use-land-property-data.service.gov.uk/datasets/inspire/download/"
+        "Vale_of_Glamorgan_Council.zip"
+    ]
+    register(stub)
+    result = run_survey(_request(tmp_path, source_ids=("inspire",), run_bridge_step=False))
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "inspire")
+    assert entry["endpoints_used"] == stub.endpoints_used
+
+
 def test_bridge_package_also_enriches_the_inspire_provenance_entry(tmp_path):
     register(InspireProvenanceStubSource())
     result = run_survey(_request(tmp_path, source_ids=("inspire",), run_bridge_step=False))

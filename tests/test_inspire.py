@@ -1264,6 +1264,67 @@ def test_fetch_two_authorities_accumulates_both_into_one_parcels_file(tmp_path, 
     assert meta["year"] == 2026
 
 
+def test_fetch_records_each_downloaded_authoritys_url_in_order(tmp_path, monkeypatch):
+    """Coordinator review finding: InspireSource never populated
+    endpoints_used at all, so survey.json's own documented promise
+    ("which real URLs were actually contacted this run") was false for
+    this source on every run. Two real downloads must report both URLs,
+    in the order the authorities were actually fetched.
+    """
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(
+        inspire_module, "authorities_for", lambda bbox: ["Authority_A", "Authority_B"]
+    )
+
+    url_a = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_A")
+    url_b = INSPIRE_DOWNLOAD_URL_TEMPLATE.format(name="Authority_B")
+    session = _AuthorityZipSession(
+        {
+            url_a: _zip_bytes(_build_gml(_PARCEL_RING)),
+            url_b: _zip_bytes(_build_gml(_PARCEL_RING)),
+        }
+    )
+    source = InspireSource(session=session, ostn15_cache_dir=cache_dir, inspire_cache_dir=tmp_path / "zip-cache")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert source.endpoints_used == [url_a, url_b]
+
+
+def test_fetch_records_no_endpoints_when_every_authority_is_a_cache_hit(tmp_path, monkeypatch):
+    """The other half of the same finding: a month-stamped cache hit must
+    record nothing, the same as a skipped OSM tile records nothing for
+    OsmSource. Both authorities' own zips are pre-seeded at the exact
+    cache path fetch_authority_zip itself resolves to, and the session
+    would raise on any call at all, so a non-empty endpoints_used here
+    could only mean the pre-check is wrong, never a real download.
+    """
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(
+        inspire_module, "authorities_for", lambda bbox: ["Authority_A", "Authority_B"]
+    )
+
+    zip_cache_dir = tmp_path / "zip-cache"
+    zip_cache_dir.mkdir()
+    stamp = datetime.datetime.now().strftime("%Y-%m")
+    for name in ("Authority_A", "Authority_B"):
+        (zip_cache_dir / f"{name}_{stamp}.zip").write_bytes(_zip_bytes(_build_gml(_PARCEL_RING)))
+
+    source = InspireSource(
+        session=_RaisesOnAnyCall(), ostn15_cache_dir=cache_dir, inspire_cache_dir=zip_cache_dir
+    )
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    assert source.endpoints_used == []
+
+
 def test_fetch_cancel_between_authorities_leaves_no_failure_records(tmp_path, monkeypatch):
     cache_dir = tmp_path / "ostn15-cache"
     _seed_ostn15_cache(cache_dir, _zero_shift_grid())
