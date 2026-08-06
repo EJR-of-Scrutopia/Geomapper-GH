@@ -141,6 +141,23 @@ EMPTY_EXTENT_MESSAGE = (
 # allowed to be wrong in).
 BYTES_PER_WINDOW_PIXEL = 3.4
 
+# 1.2 bytes/pixel for ANY overview level (level 1 and coarser), separate
+# from BYTES_PER_WINDOW_PIXEL above because that 3.4 was measured at level
+# 0 only (the Barry window never left full resolution) and estimate() used
+# to charge every padded extent at it regardless of which level
+# read_window would actually deliver. Overview pixels are averaged, not
+# merely resampled, and compress far better than full resolution does,
+# which is the post-release bug this constant fixes: the owner's first
+# real Wales LiDAR download large enough to fall to an overview
+# (Llantwit-Major, 9.47 x 4.77 km) was estimated at 114.1 MB and came to
+# 29.0 MB, about 4x over. Two measurements, both thin, both dated: this
+# extent's own level 1, measured 2026-08-06, 29.0 MB of DTM+DSM over
+# 25.36 M combined pixels, 1.14 bytes/pixel; and Task 3's 20 x 20 km probe
+# (task-3-report.md), level 3, 0.87 bytes/pixel. 1.2 sits just above the
+# higher of the two: two extents, one day, no more an average than
+# BYTES_PER_WINDOW_PIXEL above was when it carried the same caveat.
+BYTES_PER_OVERVIEW_PIXEL = 1.2
+
 # What is being paid for is the padded extent's own two mosaic opens plus
 # two window reads, not a transfer: even the largest byte figure this
 # module has ever measured is a few megabytes, nothing on this link (see
@@ -246,6 +263,38 @@ def _all_nodata(values) -> bool:
     return not any(value == value for value in values)
 
 
+def _pixels_per_raster(
+    padded_area_m2: float, max_pixels: int = MAX_WINDOW_PIXELS
+) -> tuple[float, bool]:
+    """The pixel count one of read_window's two rasters would actually
+    come back at for a padded_area_m2 extent, and whether that count came
+    from an overview level rather than full resolution.
+
+    Mirrors read_window's own finest-first level walk (cog.py) in pure
+    arithmetic, with no mosaic open and no network touched: pixels at 1 m
+    equal area in square metres (the real mosaics are 1 m pixels at level
+    0), and each level's pixel count is a QUARTER of the level before it,
+    the area-shaped version of read_window halving pixel size per axis.
+    cog.py's own measured per-axis ratios (1.9999895 to 2.0000000 per
+    level, never exactly 2) mean quartering the area is an approximation
+    of the real per-axis anisotropy read_window itself has to carry, not a
+    duplication of it; close enough for an estimate, which is the only
+    thing this function is for. Stops at the first level whose count fits
+    max_pixels, exactly the condition read_window checks, so a caller
+    reusing MAX_WINDOW_PIXELS here cannot silently drift from the cap
+    read_window itself enforces.
+
+    Always terminates: each step divides by 4, so the count is eventually
+    at or under any positive max_pixels, however large padded_area_m2 is.
+    """
+    pixels = padded_area_m2
+    is_overview = False
+    while pixels > max_pixels:
+        pixels /= 4.0
+        is_overview = True
+    return pixels, is_overview
+
+
 class LidarWalesSource:
     id = "lidar_wales"
     display_name = "LiDAR terrain (Wales, 1 m)"
@@ -299,15 +348,22 @@ class LidarWalesSource:
         and the true BNG area agree to a few percent, which is inside the
         "thin evidence" band the byte and second constants already carry.
 
-        `pixels = min(padded_area_m2, MAX_WINDOW_PIXELS)` per raster is the
-        shape the brief sanctions explicitly: it does not model
-        read_window's own overview fallback (Task 6 has no reason to
-        duplicate CogReader's level-selection arithmetic just to estimate),
-        so a padded extent large enough to fall to an overview level is
-        systematically OVERESTIMATED here, in the safe direction, never
-        understated. BYTES_PER_WINDOW_PIXEL and BYTES_PER_SECOND_ESTIMATE
-        are both documented above with the measurement and the thinness of
-        the evidence behind them; Task 9 refits `SECONDS_FLOOR` from the
+        `_pixels_per_raster` mirrors read_window's own finest-first level
+        walk (cog.py) in pure arithmetic: pixels at 1 m equal the padded
+        area, quartered per level until the count fits MAX_WINDOW_PIXELS,
+        the same stopping condition read_window itself checks. This
+        replaces an earlier shape, `min(padded_area_m2, MAX_WINDOW_PIXELS)`,
+        that never modelled the overview fallback at all and priced every
+        large extent at BYTES_PER_WINDOW_PIXEL (measured at full
+        resolution) regardless of which level read_window would actually
+        deliver: a post-release bug, found on the owner's own first Wales
+        LiDAR extent large enough to fall to an overview, where it
+        overstated the real download by about 4x (see
+        BYTES_PER_OVERVIEW_PIXEL's own comment for the measurement this fix
+        is built on, and how thin it still is). BYTES_PER_WINDOW_PIXEL,
+        BYTES_PER_OVERVIEW_PIXEL and BYTES_PER_SECOND_ESTIMATE are all
+        documented above with their own measurement and the thinness of
+        the evidence behind it; Task 9 refits `SECONDS_FLOOR` from the
         live test.
 
         Honest about its own scope and nothing past it: this prices
@@ -330,8 +386,9 @@ class LidarWalesSource:
             width_m, height_m = extent_metres(bbox)
             padded_area_m2 = (width_m + 2.0 * PAD_METRES) * (height_m + 2.0 * PAD_METRES)
 
-        pixels_per_raster = min(padded_area_m2, float(MAX_WINDOW_PIXELS))
-        bytes_estimate = int(pixels_per_raster * 2.0 * BYTES_PER_WINDOW_PIXEL)
+        pixels_per_raster, is_overview = _pixels_per_raster(padded_area_m2)
+        bytes_per_pixel = BYTES_PER_OVERVIEW_PIXEL if is_overview else BYTES_PER_WINDOW_PIXEL
+        bytes_estimate = int(pixels_per_raster * 2.0 * bytes_per_pixel)
         seconds_estimate = max(bytes_estimate / BYTES_PER_SECOND_ESTIMATE, SECONDS_FLOOR)
         return Estimate(bytes_estimate=bytes_estimate, seconds_estimate=seconds_estimate)
 

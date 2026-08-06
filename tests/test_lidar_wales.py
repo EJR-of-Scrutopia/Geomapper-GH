@@ -30,7 +30,7 @@ from mapgen import bng
 from mapgen.bng import to_bng
 from mapgen.cog import BngWindow, CogReader, FileByteSource
 from mapgen.egrid import PAD_METRES
-from mapgen.geo import BBox, Tile
+from mapgen.geo import BBox, EARTH_RADIUS_M, Tile
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken, Cancelled
 from mapgen.package import get_source, register_default_sources
@@ -336,6 +336,64 @@ def test_estimate_with_and_without_a_cached_grid_agree_closely(tmp_path, ostn15_
     projected = with_cache.estimate(NEAR_TP06_BBOX, [])
 
     assert projected.bytes_estimate == pytest.approx(fallback.bytes_estimate, rel=0.05)
+
+
+def test_estimate_at_a_large_extent_prices_the_level_it_actually_falls_to(tmp_path):
+    """The 2026-08-06 post-release bug, reproduced at the size that found
+    it: the owner's real Llantwit-Major download (9.47 x 4.77 km) pads out
+    on egrid.PAD_METRES to about 9.87 x 5.14 km, which read_window actually
+    answers at overview level 1 (12.68 M pixels per raster, measured live
+    against the real mosaics; see the post-release fix report). The old
+    `min(padded_area_m2, MAX_WINDOW_PIXELS)` shape priced this at
+    MAX_WINDOW_PIXELS * 2 * BYTES_PER_WINDOW_PIXEL regardless (114.1 MB),
+    about 4x the 29.0 MB the two rasters actually came to on disk.
+
+    The bracket is honest, not exact: this bbox is built from a plain
+    equirectangular metres-per-degree construction (no OSTN15 grid cached,
+    so estimate() takes its own fallback path), which will not agree with
+    the real BNG-projected area to the byte, and the fix's own evidence
+    (BYTES_PER_OVERVIEW_PIXEL's comment) does not support a tighter pin
+    than this either.
+    """
+    ref_lat = _TP06_LAT
+    # Unpadded; +2*PAD_METRES (200 m a side, egrid.PAD_METRES) makes this a
+    # 9.87 x 5.14 km padded extent, the size the post-release fix report
+    # measures against.
+    width_m, height_m = 9_470.0, 4_740.0
+    delta_lon = math.degrees(width_m / (EARTH_RADIUS_M * math.cos(math.radians(ref_lat))))
+    delta_lat = math.degrees(height_m / EARTH_RADIUS_M)
+    bbox = BBox(
+        west=_TP06_LON - delta_lon / 2.0,
+        south=ref_lat - delta_lat / 2.0,
+        east=_TP06_LON + delta_lon / 2.0,
+        north=ref_lat + delta_lat / 2.0,
+    )
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+
+    estimate = source.estimate(bbox, [])
+
+    centre = 12.68e6 * 2 * 1.2
+    assert 0.8 * centre <= estimate.bytes_estimate <= 2.0 * centre
+
+
+def test_estimate_at_a_small_extent_still_prices_full_resolution(tmp_path):
+    """The regression guard the fix must not break: an extent whose padded
+    area never leaves level 0 (an ordinary site survey, not a whole
+    county) prices exactly as it always did,
+    `padded_area_m2 * 2 * BYTES_PER_WINDOW_PIXEL`, never
+    BYTES_PER_OVERVIEW_PIXEL, because there is no overview fallback to
+    model in the first place.
+    """
+    from mapgen.geo import extent_metres
+    from mapgen.sources.lidar_wales import BYTES_PER_WINDOW_PIXEL
+
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    estimate = source.estimate(NEAR_TP06_BBOX, [])
+
+    width_m, height_m = extent_metres(NEAR_TP06_BBOX)
+    padded_area_m2 = (width_m + 2.0 * PAD_METRES) * (height_m + 2.0 * PAD_METRES)
+    expected = int(padded_area_m2 * 2.0 * BYTES_PER_WINDOW_PIXEL)
+    assert estimate.bytes_estimate == expected
 
 
 # --------------------------------------------------------------------------
