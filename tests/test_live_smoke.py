@@ -3,6 +3,7 @@
 import json
 import locale
 import os
+import re
 import subprocess
 import sys
 import time
@@ -13,9 +14,23 @@ import pytest
 
 from mapgen.config import load_config
 from mapgen.geo import BBox, Tile
-from mapgen.package import SurveyRequest, register_default_sources, run_survey
+from mapgen.package import (
+    BOUNDARY_NOTE_TAG_KEY,
+    BOUNDARY_SOURCE_TAG_KEY,
+    BOUNDARY_SOURCE_TAG_VALUE,
+    BOUNDARY_TAG_KEY,
+    BOUNDARY_TAG_VALUE,
+    SurveyRequest,
+    register_default_sources,
+    run_survey,
+)
 from mapgen.sources.base import NullProgress
 from mapgen.sources.elevation import MissingApiKeyError, resolve_api_key
+from mapgen.sources.inspire import (
+    BOUNDARY_INDICATIVE_NOTE,
+    BOUNDARY_SOURCE_LABEL,
+    InspireSource,
+)
 from mapgen.sources.overture import OvertureSource
 
 
@@ -213,6 +228,171 @@ def test_the_whole_lidar_wales_chain_proves_itself_over_a_real_barry_extent(tmp_
     print(
         f"\nTask 9 end-to-end proof: {elapsed:.2f}s wall, "
         f"key_available={key_available}, sizes={sizes}"
+    )
+
+
+# --- Phase 2, item 2 (INSPIRE curves): the boundaries chain, proven live
+# end to end, coexisting with item 1's own LiDAR chain ------------------
+#
+# Llantwit Major, not Barry: the brief for this task originally proposed
+# a 400 m extent around 51.395, -3.27, which is the Barry extent the test
+# directly above already uses. This one deliberately reuses different,
+# already-proven ground instead: Llantwit Major, roughly 51.408, -3.49,
+# is the owner's own real Wales LiDAR download (lidar_wales.py's own
+# BYTES_PER_OVERVIEW_PIXEL comment: a real 9.47 x 4.77 km pull over this
+# exact town, measured 2026-08-06) and the same authority
+# (Vale_of_Glamorgan_Council) Tasks 1 to 4 of this plan built and tested
+# the INSPIRE chain against. One extent that both chains have already
+# been separately proven over is a stronger proof of coexistence than a
+# third, untested corner would be.
+
+_BOUNDARIES_BBOX = "-3.492,51.406,-3.488,51.410"  # roughly 400 x 445 m, Llantwit Major
+
+# Probed live before this test was written (not part of the test itself):
+# the real OSM map API answers this extent with 1,395 nodes, 143 ways, 81
+# of them tagged building=*; authorities_for it returns exactly
+# ["Vale_of_Glamorgan_Council"], matching Task 1's own fixture assertion
+# for Llantwit Major; and its padded BNG extent sits comfortably inside
+# lidar_wales.py's own MOSAIC_BOUNDS. Real ground for all three sources,
+# not assumed.
+
+
+@pytest.mark.live
+def test_the_whole_inspire_boundaries_chain_proves_itself_over_llantwit_major(tmp_path):
+    """Phase 2 item 2's end-to-end proof: one real `run_survey`, osm +
+    lidar_wales + inspire, plus elevation if and only if the owner's own
+    OpenTopography key resolves right now (the same honest, no-fabrication
+    rule test_the_whole_lidar_wales_chain_proves_itself_over_a_real_barry_extent
+    above already follows, read here rather than duplicated by inventing a
+    second convention).
+
+    Proves two things at once: that the INSPIRE curves this task's plan
+    added are real, injected, and provenanced end to end, AND that item 1's
+    own LiDAR chain (fused heights, both rasters, the egrid) still works
+    unchanged alongside it, over ground both chains have independently been
+    tested against before (see the module-level comment above).
+    """
+    register_default_sources()
+    key_available = _opentopography_key_available()
+    source_ids = (
+        ("osm", "elevation", "lidar_wales", "inspire")
+        if key_available
+        else ("osm", "lidar_wales", "inspire")
+    )
+    request = SurveyRequest(
+        bbox=BBox.parse(_BOUNDARIES_BBOX),
+        region="South Wales",
+        site="Llantwit Major Boundaries End To End",
+        output_root=tmp_path,
+        tile_size_m=1000.0,
+        overlap_m=50.0,
+        source_ids=source_ids,
+        run_bridge_step=False,
+    )
+
+    started = time.monotonic()
+    result = run_survey(request)
+    elapsed = time.monotonic() - started
+
+    assert result.complete is True
+    root, stem = result.paths.root, result.paths.stem
+    osm_path = root / f"{stem}.osm"
+    assert osm_path.exists() and osm_path.stat().st_size > 0
+    osm_root = ET.parse(osm_path).getroot()
+
+    # -- the boundaries GeoJSON: non-zero curve count, exact property keys
+    boundaries_path = root / f"{stem}_boundaries.geojson"
+    assert boundaries_path.exists() and boundaries_path.stat().st_size > 0
+    boundaries_payload = json.loads(boundaries_path.read_text(encoding="utf-8"))
+    assert boundaries_payload["type"] == "FeatureCollection"
+    features = boundaries_payload["features"]
+    curve_count = len(features)
+    assert curve_count > 0, "no curves over ground Vale of Glamorgan's own zip covers"
+    year = None
+    for feature in features:
+        assert feature["type"] == "Feature"
+        assert feature["geometry"]["type"] == "LineString"
+        assert len(feature["geometry"]["coordinates"]) >= 2
+        properties = feature["properties"]
+        assert set(properties.keys()) == {"source", "note", "year"}
+        assert properties["source"] == BOUNDARY_SOURCE_LABEL
+        assert properties["note"] == BOUNDARY_INDICATIVE_NOTE
+        assert isinstance(properties["year"], int)
+        year = properties["year"]
+    assert year is not None and re.fullmatch(r"\d{4}", str(year))
+
+    # -- the .osm: at least one injected way, negative ids, real nodes
+    node_ids = {int(node.get("id")) for node in osm_root.findall("node")}
+    boundary_ways = []
+    for way in osm_root.findall("way"):
+        tags = {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        if (
+            tags.get(BOUNDARY_TAG_KEY) == BOUNDARY_TAG_VALUE
+            and tags.get(BOUNDARY_SOURCE_TAG_KEY) == BOUNDARY_SOURCE_TAG_VALUE
+        ):
+            boundary_ways.append((way, tags))
+    assert boundary_ways, "no way in the .osm carries boundary=property/source=hm_land_registry"
+    for way, tags in boundary_ways:
+        assert int(way.get("id")) < 0
+        assert tags.get(BOUNDARY_NOTE_TAG_KEY) == BOUNDARY_INDICATIVE_NOTE
+        refs = [int(nd.get("ref")) for nd in way.findall("nd")]
+        assert refs, "an injected boundary way has no nd refs at all"
+        for ref in refs:
+            assert ref < 0
+            assert ref in node_ids, f"nd ref {ref} does not resolve to a real <node>"
+
+    # -- survey.json's inspire_boundaries block
+    inspire_boundaries = result.survey["inspire_boundaries"]
+    assert inspire_boundaries["error"] is None
+    assert inspire_boundaries["written"] is not None and inspire_boundaries["written"] > 0
+    assert inspire_boundaries["written"] == curve_count
+    assert inspire_boundaries["curves"] == curve_count
+    assert inspire_boundaries["kept_existing"] == 0
+
+    # -- the provenance block: both statements, a real year, the conditions link
+    inspire_entry = next(s for s in result.survey["sources"] if s["id"] == "inspire")
+    expected_attribution = InspireSource.attribution.replace("[year]", str(year))
+    assert "[year]" not in inspire_entry["attribution"]
+    assert inspire_entry["attribution"] == expected_attribution
+    assert inspire_entry["conditions_url"] == InspireSource.conditions_url
+
+    # -- item 1's own shapes, unchanged, coexisting with the above
+    fused_tags = None
+    for way in osm_root.findall("way"):
+        tags = {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        if "height" in tags and "source:height" in tags:
+            fused_tags = tags
+            break
+    assert fused_tags is not None, (
+        "no way in the .osm carries a fused height/source:height pair; "
+        "either the extent's buildings changed or heights.py regressed"
+    )
+    assert "LiDAR" in fused_tags["source:height"]
+
+    dtm_path = root / f"{stem}_lidar_dtm.tif"
+    dsm_path = root / f"{stem}_lidar_dsm.tif"
+    assert dtm_path.exists() and dtm_path.stat().st_size > 0
+    assert dsm_path.exists() and dsm_path.stat().st_size > 0
+
+    egrid_path = root / f"{stem}.egrid"
+    assert egrid_path.exists() and egrid_path.stat().st_size > 0
+    assert result.survey["elevation_grid"]["written"] is True
+    expected_source = "lidar_wales+opentopography" if key_available else "lidar_wales"
+    assert result.survey["elevation_grid"]["source"] == expected_source
+
+    sizes = {
+        "osm": osm_path.stat().st_size,
+        "boundaries_geojson": boundaries_path.stat().st_size,
+        "lidar_dtm": dtm_path.stat().st_size,
+        "lidar_dsm": dsm_path.stat().st_size,
+        "egrid": egrid_path.stat().st_size,
+    }
+    inspire_endpoints = inspire_entry.get("endpoints_used")
+    print(
+        f"\nPhase 2 item 2 end-to-end proof: {elapsed:.2f}s wall, "
+        f"key_available={key_available}, curve_count={curve_count}, "
+        f"inspire_boundaries={inspire_boundaries}, "
+        f"inspire_endpoints_used={inspire_endpoints}, sizes={sizes}"
     )
 
 
