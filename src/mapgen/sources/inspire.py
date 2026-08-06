@@ -133,10 +133,14 @@ class InspireError(RuntimeError):
     about anything a caller passed in; a bad bbox is BBoxError's job
     (see geo.py), not this module's.
 
-    Also raised by `fetch_authority_zip` (a bad name, a non-200 response,
-    a wrapped `requests.RequestException`) and by `parcels_in` (a zip this
-    module cannot open, a missing GML member, a wrong `srsName`). A
-    non-200 response sets `.status_code` (an int) on the instance before
+    Also raised by `fetch_authority_zip` (a bad name, a non-200 response, a
+    wrapped `requests.RequestException`) and by `parcels_in` (a zip this
+    module cannot open at all, a zip that is corrupt or whose GML member is
+    malformed whether discovered immediately or only partway through the
+    read, a missing GML member, or a wrong `srsName`; see
+    `_raise_corrupt_cache_file` for the corrupt-zip cases specifically,
+    which also deletes the cache file before raising). A non-200 response
+    sets `.status_code` (an int) on the instance before
     raising, the same structural convention `cog.py`'s `CogError.
     status_code` already establishes; every other raise site leaves it
     unset, which `getattr(exc, "status_code", None)` reads as None, "not
@@ -566,6 +570,41 @@ def _open_gml_member(archive: zipfile.ZipFile):
         ) from exc
 
 
+def _raise_corrupt_cache_file(zip_path: Path) -> None:
+    """Deletes `zip_path` and raises `InspireError` naming it: the shared
+    ending for every way `_walk` can learn that a zip it is reading is not
+    a valid one, whether that shows up immediately (`zipfile.ZipFile`
+    itself refuses the header) or only partway through the read (a CRC
+    failure on a member's compressed bytes, or `ET.iterparse` refusing
+    the GML inside once decompressed).
+
+    `zip_path` is always `fetch_authority_zip`'s own month-stamped cache
+    path (see its own docstring), whether THIS call just downloaded it or
+    found it already there: a corrupt zip is a fact about that one file
+    on disk, not about the network or about the source data HMLR actually
+    publishes, and left in place it would go on answering every retry
+    this month identically, since `fetch_authority_zip`'s own cache-hit
+    check has no way to tell a corrupt file from a good one apart from
+    reading it (the very thing that just failed). Deleting it here, before
+    raising, is the same self-heal `bng.py`'s own `ensure_ostn15` already
+    applies to a shift-grid cache that fails its own read checks, for the
+    same reason that docstring gives: the alternative is a failure sticky
+    for the rest of the month, until the owner is told, somewhere, to go
+    and delete a file by hand.
+
+    Raises with neither `.status_code` nor a chained cause (`from None`),
+    deliberately: `_classify_inspire_error` reads both to tell a status or
+    transport failure from a parse failure, and this is always the
+    latter, the same as `_extract_rings`' own wrong-srsName raise a few
+    lines above in this same file.
+    """
+    zip_path.unlink(missing_ok=True)
+    raise InspireError(
+        f"{zip_path} could not be read as a valid INSPIRE zip; the cached "
+        f"copy has been deleted so the next attempt downloads it again."
+    ) from None
+
+
 class ParcelStream:
     """The iterator `parcels_in` returns.
 
@@ -621,42 +660,72 @@ class ParcelStream:
     def _walk(self, zip_path: Path, bbox_bng: tuple[float, float, float, float]):
         try:
             archive = zipfile.ZipFile(zip_path)
-        except (OSError, zipfile.BadZipFile) as exc:
+        except OSError as exc:
+            # A file this module could not even open (missing, permission
+            # denied): a fact about ACCESS, not about the cached bytes
+            # themselves, so this is left exactly as it was, with no
+            # self-heal unlink (there may be nothing there to unlink at
+            # all, or unlinking on a permission error would just raise a
+            # second, more confusing one).
             raise InspireError(f"Could not open {zip_path} as a zip file.") from exc
+        except zipfile.BadZipFile:
+            # A file that opened as bytes but is not a zip at all (a bad
+            # header): the same "corrupt cache" case the iteration-body
+            # catch below exists for, just caught earlier. See
+            # _raise_corrupt_cache_file's own docstring.
+            _raise_corrupt_cache_file(zip_path)
 
-        with archive:
-            with _open_gml_member(archive) as member_stream:
-                context = ET.iterparse(member_stream, events=("start", "end"))
-                _, root = next(context)
-                self.timestamp_year = _parse_timestamp_year(root.get("timeStamp"))
+        # A review finding (Item 2): the try/except above used to be the
+        # ONLY thing in this method that ever wrapped a raw exception into
+        # InspireError. Everything from here down ran unguarded, so a
+        # cached zip that opens fine as a CONTAINER but fails partway
+        # through being READ (a CRC failure on the GML member's own
+        # compressed bytes, `zipfile.BadZipFile`, raised lazily as
+        # `member_stream` is pulled through by `iterparse`) or a GML
+        # member whose XML is malformed (`ET.ParseError`, a truncated
+        # download being the ordinary way this happens) escaped straight
+        # out of this generator, past `parcels_in`'s own caller and past
+        # `InspireSource.fetch()`'s `except InspireError`, ending the
+        # whole survey with an unclassified exception and leaving
+        # tile_failures empty. Both are exactly the same kind of fact as
+        # the BadZipFile above, just discovered later, so both get the
+        # same treatment.
+        try:
+            with archive:
+                with _open_gml_member(archive) as member_stream:
+                    context = ET.iterparse(member_stream, events=("start", "end"))
+                    _, root = next(context)
+                    self.timestamp_year = _parse_timestamp_year(root.get("timeStamp"))
 
-                for event, elem in context:
-                    if event != "end" or elem.tag != _MEMBER_TAG:
-                        continue
+                    for event, elem in context:
+                        if event != "end" or elem.tag != _MEMBER_TAG:
+                            continue
 
-                    # Measured BEFORE this member is cleared: see
-                    # ParcelStream's own docstring for why this plateaus
-                    # at roughly one iterparse read chunk's worth of
-                    # members rather than settling at 1, and why that
-                    # plateau, not a literal 1, is what stays flat as
-                    # the file grows.
-                    self.peak_live_members = max(self.peak_live_members, len(root))
+                        # Measured BEFORE this member is cleared: see
+                        # ParcelStream's own docstring for why this plateaus
+                        # at roughly one iterparse read chunk's worth of
+                        # members rather than settling at 1, and why that
+                        # plateau, not a literal 1, is what stays flat as
+                        # the file grows.
+                        self.peak_live_members = max(self.peak_live_members, len(root))
 
-                    self.counts.parcels_seen += 1
-                    try:
-                        rings = _extract_rings(elem)
-                    except _MalformedParcel:
-                        self.counts.parcels_skipped_malformed += 1
-                        rings = None
-                    finally:
-                        elem.clear()
-                        root.clear()
+                        self.counts.parcels_seen += 1
+                        try:
+                            rings = _extract_rings(elem)
+                        except _MalformedParcel:
+                            self.counts.parcels_skipped_malformed += 1
+                            rings = None
+                        finally:
+                            elem.clear()
+                            root.clear()
 
-                    if rings is not None and _bboxes_intersect(
-                        _ring_bbox(rings[0]), bbox_bng
-                    ):
-                        self.counts.parcels_kept += 1
-                        yield rings
+                        if rings is not None and _bboxes_intersect(
+                            _ring_bbox(rings[0]), bbox_bng
+                        ):
+                            self.counts.parcels_kept += 1
+                            yield rings
+        except (zipfile.BadZipFile, ET.ParseError):
+            _raise_corrupt_cache_file(zip_path)
 
 
 def parcels_in(

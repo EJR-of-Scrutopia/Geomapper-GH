@@ -474,6 +474,24 @@ def test_parcels_in_raises_when_the_path_is_not_a_zip_file_at_all(tmp_path):
         list(parcels_in(not_a_zip, WORLD_BBOX))
 
 
+def test_parcels_in_wraps_a_parse_error_from_malformed_gml_inside_a_valid_zip(tmp_path):
+    """Coordinator review finding (Item 2): the ZipFile constructor was
+    the only thing `_walk` ever wrapped. A zip that opens perfectly well
+    as a CONTAINER but whose GML member is malformed (this test's own
+    shape: the root `wfs:FeatureCollection` element is never closed,
+    exactly what a download truncated mid-transfer would leave behind)
+    used to raise a raw `xml.etree.ElementTree.ParseError` straight out of
+    this generator, past every `except InspireError` up the call chain.
+    """
+    full_gml = _one_member_gml()
+    truncated_gml = full_gml[: full_gml.rindex(b"</wfs:FeatureCollection>")]
+    zip_path = tmp_path / "truncated.zip"
+    _write_synthetic_zip(zip_path, truncated_gml)
+
+    with pytest.raises(InspireError):
+        list(parcels_in(zip_path, WORLD_BBOX))
+
+
 # --------------------------------------------------------------------------
 # fetch_authority_zip: fakes shaped like requests' own Session/Response.
 # --------------------------------------------------------------------------
@@ -1588,6 +1606,55 @@ def test_fetch_classifies_a_parse_failure_as_could_not_read_not_failed_to_downlo
     assert failure.reason.startswith("Could not read the INSPIRE Index Polygons for Test_Authority")
     assert "Failed to download" not in failure.reason
     assert url not in failure.reason
+
+
+def test_fetch_classifies_a_corrupt_cached_zip_and_deletes_it_so_the_next_attempt_redownloads(
+    tmp_path, monkeypatch
+):
+    """Coordinator review finding (Item 2, bundled with the parse-error
+    wrap above): before this fix, a corrupt cached zip escaped fetch()'s
+    own `except InspireError` entirely (a raw `ET.ParseError`), ending the
+    whole survey with an unclassified message and leaving tile_failures
+    empty; and even once classified, the month-stamped cache file (see
+    `fetch_authority_zip`'s own docstring) would go on being handed back
+    as a "hit" for the rest of the month, failing every retry identically
+    until the owner found it and deleted it by hand.
+
+    Planted directly as a cache HIT (`_RaisesOnAnyCall` proves the session
+    is never touched), reproducing exactly the shape a corrupted earlier
+    download would leave sitting in the cache for a later run to trip
+    over.
+    """
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+    monkeypatch.setattr(inspire_module, "authorities_for", lambda bbox: ["Test_Authority"])
+
+    zip_cache_dir = tmp_path / "zip-cache"
+    zip_cache_dir.mkdir()
+    stamp = datetime.datetime.now().strftime("%Y-%m")
+    cache_path = zip_cache_dir / f"Test_Authority_{stamp}.zip"
+    full_gml = _build_gml(_PARCEL_RING)
+    truncated_gml = full_gml[: full_gml.rindex(b"</wfs:FeatureCollection>")]
+    _write_synthetic_zip(cache_path, truncated_gml)
+
+    source = InspireSource(
+        session=_RaisesOnAnyCall(), ostn15_cache_dir=cache_dir, inspire_cache_dir=zip_cache_dir
+    )
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    with pytest.raises(InspireError):
+        source.fetch(_PARCEL_BBOX, _tiles("t1"), work_dir, NullProgress())
+
+    # Classified, not a raw ParseError escaping unrecognised.
+    assert len(source.tile_failures) == 1
+    failure = source.tile_failures[0]
+    assert failure.reason.startswith("Could not read the INSPIRE Index Polygons for Test_Authority")
+    assert "Failed to download" not in failure.reason
+
+    # Self-healed: the corrupt cache file is gone, so next month's (or a
+    # retry's) fetch_authority_zip call sees no cache and downloads fresh.
+    assert not cache_path.exists()
 
 
 # --------------------------------------------------------------------------
