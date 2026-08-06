@@ -966,6 +966,51 @@ def test_estimate_scales_linearly_with_authority_count():
 
 
 # --------------------------------------------------------------------------
+# Task 7: the constants refit from every measurement now on record (the
+# plan's own live probe, plus Tasks 2 and 4's own live tests; see both
+# reports and inspire.py's own "Measured constants" comment for the full
+# arithmetic). Both tests below assert a real MARGIN over the largest
+# figure actually measured, not mere equality with it: a constant pinned
+# exactly to one sample carries no protection against a bigger authority
+# or a slower day than the one it was measured on, which is what "an
+# estimate that under-reads is worse than one that over-reads" means in
+# practice. Both are genuine RED against the pre-refit values (15,000,000
+# and 7.25): 15,000,000 clears Bridgend's 13,128,716 alone by 14.2%, but
+# only 9.6% over Vale of Glamorgan's own 13,689,747, under the 10% floor
+# these tests hold every future authority sample to; 7.25 IS Task 2's own
+# measurement, with no margin over itself at all.
+# --------------------------------------------------------------------------
+
+
+def test_bytes_per_authority_carries_a_margin_over_both_measured_authorities():
+    # Bridgend_County_Borough_Council.zip: 13,128,716 bytes (the plan's own
+    # live probe, 2026-08-06). Vale_of_Glamorgan_Council.zip: 13,689,747
+    # bytes, measured twice on different days (Task 2's and Task 4's own
+    # live tests) and unchanged between them, the larger and the more
+    # trustworthy of the two samples since it is independently confirmed
+    # stable rather than a single read.
+    largest_measured_bytes = 13_689_747
+    assert BYTES_PER_AUTHORITY > largest_measured_bytes
+    assert BYTES_PER_AUTHORITY >= round(largest_measured_bytes * 1.1)
+
+
+def test_seconds_floor_carries_a_margin_over_every_measured_wall_time():
+    # Task 2's live test measured 7.25 s (one pytest invocation's whole
+    # wall time, collection overhead included) for one authority's cold
+    # download plus parse. Task 4's own standalone script measured only
+    # 3.734 s for fetch()+merge() together, over the SAME zip, on a
+    # different day: a swing of nearly 2x for what is meant to be the same
+    # piece of work, which is real network variance to this one service
+    # rather than noise a bigger sample would average away. The floor must
+    # clear the LARGER of the two real measurements with margin, since a
+    # slower day than either one already seen is the case this constant
+    # exists to protect against.
+    largest_measured_seconds = 7.25
+    assert SECONDS_FLOOR > largest_measured_seconds
+    assert SECONDS_FLOOR >= round(largest_measured_seconds * 1.1, 2)
+
+
+# --------------------------------------------------------------------------
 # fetch(): zero authorities, skip-on-resume, cancel checkpoints.
 # --------------------------------------------------------------------------
 

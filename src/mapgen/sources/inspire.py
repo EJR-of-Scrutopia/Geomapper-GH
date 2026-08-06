@@ -714,45 +714,73 @@ BOUNDARY_INDICATIVE_NOTE = (
 )
 
 # --------------------------------------------------------------------------
-# Measured constants (Task 2's own live probe, 2026-08-06; see
-# .superpowers/sdd/2026-08-06-mapgen-phase2-02-inspire-curves/task-2-report.md
-# and the plan's own "Measured facts" section). Thin evidence in the same
-# sense every other source's own comment names: one machine, one link, one
-# day, ONE authority (in fact two DIFFERENT authorities for bytes and for
-# time; see below), refit in Task 7.
+# Measured constants, refit in Task 7 (2026-08-06) from every live sample on
+# record: the plan's own probe of Bridgend, plus Task 2's and Task 4's own
+# live tests of Vale of Glamorgan (see both tasks' reports in
+# .superpowers/sdd/2026-08-06-mapgen-phase2-02-inspire-curves/). Still thin
+# in the sense every other source's own comment names: two authorities of
+# 318, both mid-sized Welsh unitary/county boroughs, nothing sampled from a
+# large metropolitan authority (Cardiff, Birmingham, Leeds) that could plainly
+# hold more parcels and more bytes than either. Both constants below carry a
+# real MARGIN over the largest figure actually measured, not mere equality
+# with it, which is the change this refit makes: the PREVIOUS figures were
+# each pinned close to, or exactly at, a single sample, with no protection
+# against a bigger authority or a slower day than the one that sample came
+# from (see tests/test_inspire.py's own two covering tests for the exact
+# arithmetic, RED against the pre-refit values and GREEN against these).
 # --------------------------------------------------------------------------
 
-# Bridgend_County_Borough_Council.zip measured 13,128,716 bytes (the
-# plan's own live probe, 2026-08-06). 15,000,000 is a round, deliberately
-# generous provisional figure above BOTH single-authority samples this
-# project has actually measured (Bridgend's 13.1 MB here, and Vale of
-# Glamorgan's separate 13.7 MB below): authorities are assumed roughly
-# similar in size until Task 7 has more than one real data point to fit
-# against, and the safe direction for an estimate that runs ahead of a
-# download it cannot yet see is to overstate rather than understate (an
-# under-estimate is a countdown that runs out while the work is still
-# going, which reads as a hang; see elevation.py's own SECONDS_FLOOR
-# history for the same reasoning applied to time instead of bytes).
-BYTES_PER_AUTHORITY = 15_000_000
+# Two real authorities now measured: Bridgend_County_Borough_Council.zip
+# 13,128,716 bytes (the plan's own live probe, 2026-08-06), and
+# Vale_of_Glamorgan_Council.zip 13,689,747 bytes, measured twice on
+# different days (Task 2's and Task 4's own live tests) and unchanged
+# between them, so it is the more trustworthy of the two samples as well as
+# the larger. The two are close (about 4% apart), which is some evidence
+# that authorities of this kind cluster in this range, but with 316 of 318
+# still unsampled and the tail entirely unknown, 16,000,000 keeps the same
+# "round, deliberately generous" shape the previous figure had while
+# clearing the new, larger confirmed sample by roughly 17% rather than the
+# roughly 10% the old 15,000,000 gave it (14.2% over Bridgend alone, but
+# only 9.6% once Vale of Glamorgan's own, independently confirmed, larger
+# figure is the one that has to be cleared). An under-estimate is a
+# countdown that runs out while the work is still going, which reads as a
+# hang; see elevation.py's own SECONDS_FLOOR history for the same reasoning
+# applied to time instead of bytes.
+BYTES_PER_AUTHORITY = 16_000_000
 
-# Task 2's own live test (`pytest tests/test_inspire.py -m live`) measured
+# Task 2's live test (`pytest tests/test_inspire.py -m live`) measured
 # 7.25 s of WALL TIME for one authority's whole fetch+parse, end to end:
 # Vale_of_Glamorgan_Council.zip downloaded cold through the real cookie
 # handshake (4.76 s, 13,689,747 bytes) plus parcels_in streamed over the
 # real 65,276-member file down to the Llantwit Major bbox (2.06 s), inside
-# one pytest invocation whose own collection and fixture overhead is
-# folded into that 7.25 s along with the two measured phases (which sum to
-# 6.82 s on their own). Used here exactly as measured, overhead included,
-# because the direction that overhead pushes (the floor a fraction of a
-# second higher than the network alone) is the SAME safe direction
-# BYTES_PER_AUTHORITY's own generosity already argues for, not a distortion
-# fighting it.
-SECONDS_FLOOR = 7.25
+# one pytest invocation whose own collection and fixture overhead is folded
+# into that 7.25 s along with the two measured phases (which sum to 6.82 s
+# on their own). Task 4's own standalone script (no pytest overhead)
+# measured fetch()+merge() together over the SAME zip, on a different day,
+# at only 3.734 s: a swing of nearly 2x for what is meant to be the same
+# piece of work, real variance in this one service's own response time
+# rather than something a bigger sample would average away. The PREVIOUS
+# figure was Task 2's own 7.25 s used verbatim, with no margin above itself
+# at all; this refit keeps 7.25 s as the worse of the two real
+# measurements and adds a deliberate margin on top of it, rather than
+# trusting that no future run lands on a day slower than either one seen so
+# far. 8.0 clears 7.25 by just over 10%, a clean number rather than a
+# decimal that would read as more precise than two samples justify.
+SECONDS_FLOOR = 8.0
 
-# 13,689,747 bytes / 7.25 s (the same single live sample SECONDS_FLOOR is
-# built from) is about 1.89 MB/s; kept at two significant figures, the same
-# convention every other thin-evidence rate constant in this project's
-# sources/ package uses (see lidar_wales.py's BYTES_PER_SECOND_ESTIMATE).
+# Left UNCHANGED by this refit, deliberately, having considered Task 4's
+# new data and rejected moving it: this term prices a LARGE, multi-authority
+# extent's transfer time (bytes_estimate / this rate), so the safe choice is
+# the SLOWEST of the download rates now on record, not an average of them.
+# 13,689,747 bytes / 7.25 s (Task 2's own pytest-inclusive measurement) is
+# about 1.89 MB/s, still the slowest rate this project has measured against
+# this service even after Task 4's own, much faster, 13,689,747 bytes /
+# 3.229 s (fetch() alone) at about 4.24 MB/s on a different day: keeping the
+# constant at the slow end is what keeps a multi-authority estimate from
+# under-reading on a day that behaves like Task 2's rather than Task 4's.
+# Kept at two significant figures, the same convention every other
+# thin-evidence rate constant in this project's sources/ package uses (see
+# lidar_wales.py's BYTES_PER_SECOND_ESTIMATE).
 BYTES_PER_SECOND_ESTIMATE = 1_900_000.0
 
 
