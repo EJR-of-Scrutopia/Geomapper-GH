@@ -95,6 +95,74 @@ field is inert on every other route, while a real path is exactly what
 component that does read it. So it stays. If Import Buildings says "not a
 parquet file", set its data source to OSM.
 
+## Import Geojson File: the Z ordinate is discarded, not merely unread
+
+Task 6 asked whether a GeoJSON position written as `[lon, lat, z]` (a
+mapgen contour vertex, for instance) survives **Import Geojson File**
+with its height intact. Decompiled `Urbano.Grasshopper.
+ImportGeojsonComponent.SolveInstance` and its two downstream helpers to
+settle it rather than guess, because this README's other GeoJSON mention
+(the `OvertureFilePath` note above) never reached this component's own
+body. It does not survive, and the reason is architectural, not a
+parsing bug:
+
+**The file parses through the real, unmodified NetTopologySuite, which
+does read Z.** `Urbano.Core.Helpers.GeoJson`'s constructor is `new
+NetTopologySuite.IO.GeoJsonReader().Read<FeatureCollection>(jsonString)`,
+the genuine NTS reader, which populates a `Coordinate`'s `Z` field
+from a three-element position array. Nothing drops the third ordinate
+here.
+
+**But `SolveInstance` never reads it.** For every vertex it calls
+`Urbano.Grasshopper.UrbanoGhHelpers.LatLonToRhinoPoint(coordinate2.Y,
+coordinate2.X, item, item2, elevationGrid)`, passing only `Y` (latitude)
+and `X` (longitude) off each parsed `Coordinate`, never `.Z`. The method has
+no parameter for it to go in:
+
+    public static Point3d LatLonToRhinoPoint(double lat, double lon,
+        string utm, Transform toOrigin, ElevationGrid elevationGrid)
+    {
+        var (e, n) = GeoProjector.LatLongToUTM(lat, lon, utm);
+        var result = new Point3d(e, n, 0.0);
+        result.Transform(toOrigin);
+        if (elevationGrid != null)
+        {
+            double z = ElevationExtensions.SampleGridBilinear(elevationGrid, e, n);
+            if (double.IsFinite(z)) result.Z = z;
+        }
+        return result;
+    }
+
+Height starts at a literal `0.0` and is only ever overwritten by
+sampling an `ElevationGrid`, which this same component builds from a
+freshly downloaded USGS 3DEP tiff
+(`TiffExtensions.DownloadTiffFile.DownloadUsgs3DepTiffForBounds`) behind
+its own "sample elevation" toggle. That DEM source is United States
+only (see "Naming a layer commits Urbano to fetching it" above), so for
+a UK mapgen package the toggle path never fires, and every imported
+vertex lands at Z = 0 regardless of what the source file's third
+ordinate said.
+
+**Conclusion: a contour vertex written as `[lon, lat, elevation]` would
+import identically to today's `[lon, lat]`, flattened to Z = 0.** This is
+the mechanism behind the owner's own observation that contours arrive in
+Urbano flattened. `src/mapgen/contours.py`'s vertex serialisation is
+unchanged by task 6; the `elevation` property remains the only place a
+contour's height reaches Urbano at all, and reaching Grasshopper with a
+real Z would need a change on Urbano's side
+(`LatLonToRhinoPoint` gaining a Z parameter, or the component reading
+`coordinate2.Z` itself), not mapgen's.
+
+Evidence chain, decompiled with `ilspycmd -t <type> "...\Urbano2\2.2.1.2\
+Urbano.SiteAnalysis.gha"` on 2026-08-06 (same assembly and tool as task
+5's negative-id check above): `ImportGeojsonComponent.SolveInstance`
+calls `new GeoJson(File.ReadAllText(path)).FeatureCollection` (confirms
+NTS parses Z into `Coordinate.Z`) and then, per vertex,
+`UrbanoGhHelpers.LatLonToRhinoPoint(coordinate2.Y, coordinate2.X, item,
+item2, elevationGrid)` (confirms `.Z` is never passed);
+`LatLonToRhinoPoint` itself hardcodes `Z = 0.0` unless the US-only
+`ElevationGrid` path overwrites it.
+
 ## The elevation grid, which is how terrain reaches Grasshopper
 
 `<stem>.egrid` (task 39, `src/mapgen/egrid.py`) is the DEM in the only format
