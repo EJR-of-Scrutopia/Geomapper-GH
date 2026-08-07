@@ -920,11 +920,14 @@ the same OS Data Hub client in a short task if wanted.
 
 Still to come, in build order: categorised property boundaries, roof forms
 read off the DSM, canopy positions, and a Grasshopper GeoTIFF reader script,
-all owner-approved additions to the phase 2 spec; an OS benchmark comparing
-mapgen's own output against OS's paid developer tooling in dev mode, to
-calibrate the tier resolver's own tier tables against a second opinion; then
-DataMapWales constraints and Cadw designations together with
+items the owner named directly in the 2026-08-07 working session that
+produced this build's own plan, with their own spec addendum still to be
+written; an OS benchmark, a dev-mode comparison against OS's paid developer
+tooling to calibrate the tier resolver's own tier tables against a second
+opinion, whose design is likewise still to be written; then, per the phase 2
+design record, DataMapWales constraints and Cadw designations together with
 planning.data.gov.uk for England, Sentinel-2 context imagery via Earth
 Search, England LiDAR as its own task (the discovery API is open but bulk
 raster download there has no documented route yet), PlanIt planning history,
-and BGS boreholes. See `docs/superpowers/specs/` for the full design record.
+and BGS boreholes. See `docs/superpowers/specs/` for the design record
+covering that last group.

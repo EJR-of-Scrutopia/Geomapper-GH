@@ -386,9 +386,15 @@ THIRD would-be consumer beside INSPIRE and the DataMapWales constraints
 layers: `os_downloads.py`'s own OS Data Hub listing and download calls have
 no Retry-After handling of their own either, and a keyless, high-traffic
 public API is exactly the shape that starts answering 429 under load.
-`estimate()` still has no contour-seconds term, invisible so far only
-because Wales LiDAR is the only source that generates contours at all. New
-this task: `inspire.py`'s own cache self-heal (`_raise_corrupt_cache_file`,
+`estimate()`'s own per-source seconds still carry no term for merge-time CPU
+cost that scales with extent, a gap parked twice already under two names:
+Wales LiDAR's own contour-generation seconds (item 1's final review) and
+INSPIRE's own boundary-curve chaining seconds (item 2's review, named there
+as that gap's sibling). Task 9's `os_open` `SECONDS_FLOOR` refit prices a
+different thing (warm-path listing and shard-read overhead) and closes
+neither: both are sources whose `merge()` cost genuinely grows with feature
+count, which a fixed floor cannot stand in for. New this task: `inspire.py`'s
+own cache self-heal (`_raise_corrupt_cache_file`,
 also see `ParcelStream._walk`'s own `OSError` branch) only unlinks a cache
 file that failed a CONTENT check (a bad zip header, a CRC failure, malformed
 GML); an ACCESS failure (permission denied, a file gone in a race) is left
@@ -402,13 +408,17 @@ Task 4's cold run: the first real owner run that ticks addresses is what
 will measure them, the same way Task 4's own cold Cowbridge run measured
 `os_open`'s.
 
-Next action, in the order the owner has approved: (a) the spec addendum
-items, categorised property boundaries, roof forms read off the DSM, canopy
-positions, and a Grasshopper GeoTIFF reader script; (b) an OS benchmark, a
+Next action, in the order the owner approved in the 2026-08-07 working
+session that produced this plan (their own spec documents do not exist yet
+and are themselves the next docs to write, not something already sitting in
+`docs/superpowers/specs/`): (a) a spec addendum for categorised property
+boundaries, roof forms read off the DSM, canopy positions, and a Grasshopper
+GeoTIFF reader script; (b) a benchmark design for an OS comparison, a
 dev-mode comparison against OS's own paid developer tooling, to calibrate
 the tier resolver's own tier tables against a second opinion; then (c) phase
 2 item 4, DataMapWales constraints and Cadw designations together with
-planning.data.gov.uk for England.
+planning.data.gov.uk for England, which the existing
+`docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md` already covers.
 
 ## Standing constraints
 
