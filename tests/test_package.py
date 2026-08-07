@@ -1571,7 +1571,7 @@ def test_register_default_sources_registers_the_five_default_sources():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_wales", "os_open", "osm", "overture",
+        "elevation", "inspire", "lidar_wales", "os_open", "os_uprn", "osm", "overture",
     ]
 
 
@@ -1583,7 +1583,7 @@ def test_register_default_sources_called_twice_is_a_no_op():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_wales", "os_open", "osm", "overture",
+        "elevation", "inspire", "lidar_wales", "os_open", "os_uprn", "osm", "overture",
     ]
 
 
