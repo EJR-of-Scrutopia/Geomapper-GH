@@ -195,7 +195,7 @@ class BuildingsFusionRecord:
 # --------------------------------------------------------------------------
 
 
-def _point_in_ring(x: float, y: float, ring: Sequence[tuple[float, float]]) -> bool:
+def point_in_ring(x: float, y: float, ring: Sequence[tuple[float, float]]) -> bool:
     """The ordinary even-odd (ray casting, PNPOLY) test, identical
     convention to `heights._point_in_polygon` and to `contours.py`'s own
     crossing rule (that module's docstring: "a corner's state is always
@@ -208,6 +208,12 @@ def _point_in_ring(x: float, y: float, ring: Sequence[tuple[float, float]]) -> b
     `prev` at index -1, so a ring this module has already stripped its
     own closing duplicate from (`_drop_closing_duplicate`) and a raw
     GeoJSON ring that never had one both test identically.
+
+    Public (promoted from `_point_in_ring`) because `classify.py`'s
+    sampled-majority parcel classifier needs the identical ray cast for
+    its own overlay lookups; `_point_in_ring` is kept below as an alias
+    so every existing call site and test in this module and
+    `test_buildings.py` still resolves unchanged.
     """
     inside = False
     prev_x, prev_y = ring[-1]
@@ -218,6 +224,12 @@ def _point_in_ring(x: float, y: float, ring: Sequence[tuple[float, float]]) -> b
                 inside = not inside
         prev_x, prev_y = cx, cy
     return inside
+
+
+# Old, module-private name kept as a plain alias: every call site in this
+# module (and `test_buildings.py`) that already spells `_point_in_ring`
+# keeps working unchanged.
+_point_in_ring = point_in_ring
 
 
 def _drop_closing_duplicate(
@@ -264,7 +276,7 @@ def _horizontal_spans(
     ]
 
 
-def _representative_point(ring: Sequence[tuple[float, float]]) -> tuple[float, float]:
+def representative_point(ring: Sequence[tuple[float, float]]) -> tuple[float, float]:
     """A point GUARANTEED interior to `ring`, replacing a plain vertex-
     average centroid, which is NOT guaranteed interior to a concave ring
     (code review task-6-review.md, Critical C1: a U-shaped footprint's
@@ -290,6 +302,13 @@ def _representative_point(ring: Sequence[tuple[float, float]]) -> tuple[float, f
     to the bounding box's own centre, rather than raising over a shape
     that should never have passed the caller's own minimum-points check
     in the first place.
+
+    Public (promoted from `_representative_point`) because `classify.py`'s
+    sampled-majority parcel classifier reuses it both for the "too small
+    for a grid" sampling fallback and as the always-interior point that
+    guarantees that fallback never samples zero points; `_representative_point`
+    is kept below as an alias so every existing call site and test in
+    this module and `test_buildings.py` still resolves unchanged.
     """
     points = _drop_closing_duplicate(ring)
     ys = sorted(set(y for _, y in points))
@@ -317,6 +336,12 @@ def _representative_point(ring: Sequence[tuple[float, float]]) -> tuple[float, f
         return ((min(xs) + max(xs)) / 2.0, test_y)
     widest = max(spans, key=lambda span: span[1] - span[0])
     return ((widest[0] + widest[1]) / 2.0, test_y)
+
+
+# Old, module-private name kept as a plain alias: every call site in this
+# module (and `test_buildings.py`) that already spells `_representative_point`
+# keeps working unchanged.
+_representative_point = representative_point
 
 
 def _ring_bbox(ring: Sequence[tuple[float, float]]) -> tuple[float, float, float, float]:
