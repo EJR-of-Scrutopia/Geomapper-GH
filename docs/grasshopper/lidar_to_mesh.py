@@ -164,6 +164,17 @@ def _load_mapgen(mapgen_src):
     src = str(Path(mapgen_src))
     if src not in sys.path:
         sys.path.insert(0, src)
+    if "requests" not in sys.modules:
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            # bng.py imports requests at module level for its OSTN15
+            # download path. This script never downloads: the grid must
+            # already be cached (any mapgen survey run caches it), so a
+            # placeholder satisfies the import without installing
+            # anything into Rhino's own Python.
+            import types
+            sys.modules["requests"] = types.ModuleType("requests")
     from mapgen import bng, utm
     return bng, utm
 
@@ -351,7 +362,22 @@ def _run_component():
     return built, info, "{:.3f}, {:.3f}".format(*origin)
 
 
-if __name__ == "__main__":
+def _in_rhino():
+    """Rhino 8's script component runs this module AS __main__, so the
+    classic __name__ check cannot tell Grasshopper from a terminal; the
+    Rhino module can, and only Rhino has it."""
+    try:
+        import Rhino  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+if _in_rhino():
+    # Grasshopper: the component's inputs arrive as globals; missing path
+    # yields a hint on the info output instead of an error.
+    mesh, info, origin = _run_component()
+elif __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
@@ -376,8 +402,3 @@ if __name__ == "__main__":
     print(grid_info)
     print(f"mesh would carry {faces:,} quad faces; "
           f"min corner {grid_origin[0]:.2f}, {grid_origin[1]:.2f}")
-else:
-    # Inside Grasshopper the component body runs the module top to bottom:
-    # only act when the component's own inputs exist as globals.
-    if "path" in globals():
-        mesh, info, origin = _run_component()
