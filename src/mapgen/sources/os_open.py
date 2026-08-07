@@ -135,7 +135,15 @@ PRODUCTS = ("OpenMapLocal", "OpenRoads", "OpenGreenspace")
 # actually been measured; thin evidence in the same sense every other
 # per-square/per-authority constant in this project's sources/ package
 # carries the same caveat for (see InspireSource.BYTES_PER_AUTHORITY).
-OML_BYTES_PER_SQUARE = 120_000_000
+#
+# Review finding (Minor 3, 2026-08-07): the first cut of this constant,
+# 120,000,000, sat about 1.25% BELOW the one real ST figure in the comment
+# above it, the opposite of "carries margin over the single figure actually
+# measured", the convention this whole block states and every sibling
+# constant here and in inspire.py/lidar_wales.py follows. 130,000,000 sits
+# a genuine ~7% above the measured 121.5 MB instead of a rounding error
+# below it.
+OML_BYTES_PER_SQUARE = 130_000_000
 
 # The ST member's own uncompressed size (428.6 MB, os_downloads.py's own
 # module docstring) at the HP square's own measured deflate ratio (0.082,
@@ -147,11 +155,39 @@ ROADS_BYTES_PER_SQUARE = 40_000_000
 # names the same two figures for the per-square Greenspace zips).
 GREENSPACE_BYTES_PER_SQUARE = 3_000_000
 
-# The slowest real transfer rate this project has measured against a UK
-# government download endpoint (InspireSource.BYTES_PER_SECOND_ESTIMATE's
-# own history, 2026-08-06), reused here rather than a fresh, unmeasured
-# guess for a sibling government service on the same kind of home link.
-BYTES_PER_SECOND_ESTIMATE = 1_800_000.0
+# Review finding (Important 1, 2026-08-07): the first cut of this constant
+# reused InspireSource.BYTES_PER_SECOND_ESTIMATE verbatim (1,800,000.0), a
+# figure measured against a DIFFERENT service (HM Land Registry, not the OS
+# Data Hub) and never checked against this task's own live numbers, which
+# contradict it. This task's own live probe (task-4-report.md, the
+# Cowbridge run) measured, from clean download_progress totals:
+#
+#   OpenMapLocal:    166,818,477 bytes / 112.557121 s  ~ 1,482,000 bytes/s
+#   OpenGreenspace:    2,830,794 bytes /   3.114896 s  ~   908,793 bytes/s
+#   aggregate (all three products): 213,681,893 bytes / 153.90 s ~ 1,388,000 bytes/s
+#
+# (OpenRoads' own ~1,150,000 bytes/s figure is excluded: the live test's own
+# comment flags it as possibly including a one-time, unrelated OSTN15 pack
+# download on a cold cache, so it is not a clean OS Data Hub measurement.)
+#
+# This term prices a LARGE transfer's time (bytes_estimate / this rate), so
+# the safe choice is a rate genuinely AT OR BELOW the slowest CLEAN rate now
+# on record, not an average of the three and not that slowest rate's own
+# rounded value (the same rule inspire.py's own BYTES_PER_SECOND_ESTIMATE
+# history states and the reused 1,800,000.0 figure violated against these
+# numbers: it sat 50% ABOVE the slowest measured rate, the wrong side of
+# it). OpenGreenspace's own 908,793 bytes/s is the slowest, plausibly BECAUSE
+# it is the smallest transfer (fixed per-request overhead, TLS handshake and
+# all, dominates a 2.8 MB download far more than a 167 MB one), not because
+# the link itself is slower for that product specifically; that does not
+# change which figure this constant must clear, since a survey's own
+# smallest OS Open transfer is exactly the case this rate has to price
+# honestly. 850,000.0 sits a genuine ~6.5% below 908,793, two significant
+# figures, the same margin-not-equality shape every other thin-evidence rate
+# constant in this project's sources/ package uses. One machine, one link,
+# one day, three products: Task 9's own full-pipeline run re-verifies this
+# rather than trusting a second, still-thin sample.
+BYTES_PER_SECOND_ESTIMATE = 850_000.0
 
 # Placeholder until Task 9 refits this from a live run's own measured wall
 # time (this task's own Step 9 live test measures real numbers and prints

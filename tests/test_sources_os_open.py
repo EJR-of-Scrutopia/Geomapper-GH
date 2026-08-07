@@ -41,6 +41,7 @@ from mapgen.os_downloads import OsOpenError
 from mapgen.os_shards import shards_complete, write_shards
 from mapgen.sources.base import FAILURE_SERVICE_ERROR, NullProgress
 from mapgen.sources.os_open import (
+    BYTES_PER_SECOND_ESTIMATE,
     GREENSPACE_BYTES_PER_SQUARE,
     OML_BYTES_PER_SQUARE,
     OSTN15_BYTES,
@@ -103,13 +104,70 @@ class _PoisonedOpener:
         raise AssertionError("estimate() must never touch the network")
 
 
-@pytest.fixture(autouse=True)
-def _isolate_osopen_cache(tmp_path, monkeypatch):
-    """Every test gets its own ~/.mapgen/osopen: os_downloads.cache_root()
-    reads mapgen.config.CONFIG_PATH.parent at call time (see os_downloads.py's
-    own docstring), so patching CONFIG_PATH here is the same isolation
-    mechanism test_os_downloads.py's own cache tests already use.
+def _is_live_marked(request) -> bool:
+    """True if the test `request` belongs to carries pytest's own `live`
+    marker (`@pytest.mark.live`), read the same way pytest's own marker
+    machinery does (`request.node.get_closest_marker`), not by name-sniffing
+    the test function.
+
+    Extracted out of `_isolate_osopen_cache` so the fixture's own live/
+    not-live decision is a plain function a test can call directly against
+    a minimal fake `request`, rather than something only provable by
+    running two real pytest sessions against each other.
     """
+    return request.node.get_closest_marker("live") is not None
+
+
+def test_is_live_marked_true_for_a_node_carrying_the_live_marker():
+    class _FakeMarker:
+        pass
+
+    class _FakeNode:
+        def get_closest_marker(self, name):
+            return _FakeMarker() if name == "live" else None
+
+    class _FakeRequest:
+        node = _FakeNode()
+
+    assert _is_live_marked(_FakeRequest()) is True
+
+
+def test_is_live_marked_false_for_a_node_with_no_markers():
+    class _FakeNode:
+        def get_closest_marker(self, name):
+            return None
+
+    class _FakeRequest:
+        node = _FakeNode()
+
+    assert _is_live_marked(_FakeRequest()) is False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_osopen_cache(request, tmp_path, monkeypatch):
+    """Every NON-LIVE test gets its own ~/.mapgen/osopen: os_downloads.
+    cache_root() reads mapgen.config.CONFIG_PATH.parent at call time (see
+    os_downloads.py's own docstring), so patching CONFIG_PATH here is the
+    same isolation mechanism test_os_downloads.py's own cache tests already
+    use.
+
+    Review finding (Important 2, 2026-08-07): this fixture used to patch
+    CONFIG_PATH for EVERY test in this module, live test included, which
+    made `test_live_fetch_and_merge_over_cowbridge`'s own module docstring
+    ("cached under ~/.mapgen/osopen from then on... a poor trade for that
+    proof") false as shipped: that test takes only `tmp_path`, has no way to
+    undo an autouse fixture's patch, and its real OS Open downloads were
+    silently redirected into a throwaway per-test tmp_path every run,
+    confirmed empirically (`~/.mapgen/osopen` did not exist on the review
+    machine despite a completed live run being reported). The live test's
+    own OSTN15 grid cache was never affected by this bug (it lives under the
+    separate `bng.CONFIG_PATH`, genuinely unpatched by this fixture), only
+    its OS Open shard cache. Skipping the patch for a `live`-marked test, via
+    `_is_live_marked`, is the fix: the live test now genuinely reads and
+    writes the real default `cache_root()`.
+    """
+    if _is_live_marked(request):
+        return
     fake_home = tmp_path / "mapgen_home"
     fake_home.mkdir()
     monkeypatch.setattr(os_downloads, "CONFIG_PATH", fake_home / "config.json")
@@ -196,6 +254,37 @@ def test_estimate_is_zero_bytes_for_an_extent_with_no_gb_squares(tmp_path, ostn1
     result = source.estimate(paris_bbox, _tiles("r00_c00"))
 
     assert result.bytes_estimate == 0
+
+
+def test_bytes_per_second_estimate_sits_at_or_below_the_slowest_measured_product_rate():
+    """Task 4 review, Important 1. `BYTES_PER_SECOND_ESTIMATE` was reused
+    verbatim from `InspireSource` (1,800,000.0, a different service) rather
+    than derived from anything OS Data Hub specific, and this task's own
+    live probe (task-4-report.md) measured OpenGreenspace at
+    2,830,794 bytes / 3.1148959 s, about 908,793 bytes/s: slower than the
+    reused figure by about 50%, which under-reports real wall time exactly
+    the way this project's own comments warn against (see
+    `sources/inspire.py`'s `BYTES_PER_SECOND_ESTIMATE`, "an under-estimate
+    is a countdown that runs out while the work is still going").
+
+    This pins the same "rate floor sits AT OR BELOW the slowest measured
+    rate" convention inspire.py's own history documents, against the real
+    number this task measured, rather than trusting a borrowed one.
+    """
+    slowest_measured_rate = 2_830_794 / 3.1148959000056493
+    assert BYTES_PER_SECOND_ESTIMATE <= slowest_measured_rate
+
+
+def test_oml_bytes_per_square_sits_above_the_measured_st_square(tmp_path):
+    """Task 4 review, Minor 3. The constant's own comment cites "ST zip
+    121.5 MB, measured 2026-08-07" as its evidence; the constant must sit
+    ABOVE that figure (margin over the single measured value, not below
+    it), matching the stated convention one paragraph above it in
+    os_open.py and every sibling constant in this file and in
+    inspire.py/lidar_wales.py.
+    """
+    measured_st_bytes = 121_500_000
+    assert OML_BYTES_PER_SQUARE > measured_st_bytes
 
 
 # --------------------------------------------------------------------------
@@ -777,6 +866,18 @@ def test_possible_outputs_names_the_six_files(tmp_path, merge_source):
 # tests leave OSTN15's cache at its real default: a survey tool's own real
 # cache is what this is actually proving, and repeating a ~200 MB download
 # on every run of this one test would be a poor trade for that proof).
+#
+# This claim was FALSE as first shipped (review finding, Important 2): the
+# autouse `_isolate_osopen_cache` fixture above used to patch
+# `os_downloads.CONFIG_PATH` for every test in this module including this
+# one, with no way for a test that takes only `tmp_path` to undo an autouse
+# fixture's own patch, so every "live" run was silently redirected into a
+# throwaway tmp_path and never touched or populated the real cache this
+# comment describes. Confirmed empirically on the review machine
+# (`~/.mapgen/osopen` did not exist despite a completed live run being
+# reported) and fixed by making that fixture skip any `live`-marked test
+# (`_is_live_marked`); this test genuinely reads and writes the real
+# default `cache_root()` now.
 #
 # Cowbridge, Vale of Glamorgan: the brief points at "the verified-facts
 # section" for this bbox, but that section (see this task's own plan doc)
