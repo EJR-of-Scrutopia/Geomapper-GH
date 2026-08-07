@@ -630,3 +630,93 @@ def test_wrong_root_error_names_the_product_never_a_url():
     assert "OpenMapLocal" in message
     assert "http://" not in message
     assert "https://" not in message
+
+
+# --------------------------------------------------------------------------
+# Review findings, round 2: Minor 3 upgraded on global-constraint grounds
+# ("if a tile has no data then it has no data": nothing fabricated). A
+# whitespace-only or empty posList/pos currently falls through every
+# check added in round 1 (nothing on that path raises: `"".split()` and
+# `"   ".split()` both give an empty token list, which the ring/
+# LineString code turns into a fabricated `{"coordinates": []}` or
+# `{"coordinates": [[]]}` rather than an error) and belongs with the six
+# round-1 cases under the same whole-stream-failure contract.
+# --------------------------------------------------------------------------
+
+_BUILDING_WITH_WHITESPACE_ONLY_POSLIST = (
+    '<os:featureMember><oml:Building gml:id="idBAD00008-0000-0000-0000-000000000000">'
+    "<oml:geometry><gml:Surface "
+    'gml:id="idBAD00008-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing>"
+    "<gml:posList>   </gml:posList>"
+    "</gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></gml:Surface>"
+    "</oml:geometry><oml:featureCode>15014</oml:featureCode>"
+    "</oml:Building></os:featureMember>"
+)
+
+_ROADLINK_WITH_WHITESPACE_ONLY_POSLIST = (
+    '<os:featureMember><road:RoadLink gml:id="idBAD00009-0000-0000-0000-000000000000">'
+    "<net:centrelineGeometry><gml:LineString "
+    'gml:id="idBAD00009-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:posList>   </gml:posList>"
+    "</gml:LineString></net:centrelineGeometry>"
+    "</road:RoadLink></os:featureMember>"
+)
+
+_GREENSPACE_WRAPPER_HEAD = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<os:FeatureCollection xmlns:os="http://namespaces.os.uk/product/1.0" '
+    'xmlns:ogsp="http://namespaces.ordnancesurvey.co.uk/Open/Greenspace/1.0" '
+    'xmlns:gml="http://www.opengis.net/gml/3.2">'
+)
+_GREENSPACE_WRAPPER_TAIL = "</os:FeatureCollection>"
+
+_ACCESS_POINT_WITH_EMPTY_POS = (
+    '<os:featureMember><ogsp:AccessPoint gml:id="idBAD00010-0000-0000-0000-000000000000">'
+    '<ogsp:accessType codeSpace="x">Pedestrian</ogsp:accessType>'
+    "<ogsp:refToGreenspaceSite>idSITE0000-0000-0000-0000-000000000000</ogsp:refToGreenspaceSite>"
+    "<ogsp:geometry><gml:Point "
+    'gml:id="idBAD00010-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:pos>   </gml:pos>"
+    "</gml:Point></ogsp:geometry>"
+    "</ogsp:AccessPoint></os:featureMember>"
+)
+
+
+def _greenspace_features_from_body(body: str):
+    data = (_GREENSPACE_WRAPPER_HEAD + body + _GREENSPACE_WRAPPER_TAIL).encode("utf-8")
+    return list(os_gml.iter_greenspace_features(io.BytesIO(data)))
+
+
+def test_whitespace_only_poslist_on_a_building_surface_raises_os_open_error_kind_parse():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_BUILDING_WITH_WHITESPACE_ONLY_POSLIST)
+    assert exc_info.value.kind == "parse"
+    message = str(exc_info.value)
+    assert "Building" in message
+    assert "idBAD00008-0000-0000-0000-000000000000" in message
+
+
+def test_empty_poslist_on_a_roadlink_centreline_raises_os_open_error_kind_parse():
+    with pytest.raises(OsOpenError) as exc_info:
+        _road_features_from_body(_ROADLINK_WITH_WHITESPACE_ONLY_POSLIST)
+    assert exc_info.value.kind == "parse"
+    message = str(exc_info.value)
+    assert "RoadLink" in message
+    assert "idBAD00009-0000-0000-0000-000000000000" in message
+
+
+def test_empty_pos_on_a_greenspace_access_point_raises_os_open_error_kind_parse():
+    with pytest.raises(OsOpenError) as exc_info:
+        _greenspace_features_from_body(_ACCESS_POINT_WITH_EMPTY_POS)
+    assert exc_info.value.kind == "parse"
+    message = str(exc_info.value)
+    assert "AccessPoint" in message
+    assert "idBAD00010-0000-0000-0000-000000000000" in message
+
+
+def test_whitespace_poslist_never_fabricates_an_empty_ring_or_coordinate_list():
+    # The exact shape the coordinator's finding named: {"type": "Polygon",
+    # "coordinates": [[]]} silently returned instead of raising.
+    with pytest.raises(OsOpenError):
+        _oml_features_from_body(_BUILDING_WITH_WHITESPACE_ONLY_POSLIST)

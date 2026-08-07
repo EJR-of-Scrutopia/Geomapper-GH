@@ -121,14 +121,24 @@ above) and never the raw stdlib exception.
 
 A GML stream can be perfectly well-formed XML while the GML CONTENT
 inside one feature is not usable: an odd number of posList tokens, an
-empty or self-closing `posList`/`pos`, a non-numeric coordinate token, or
-a RoadLink `length` that will not parse as a float. A review (task-2-
-review.md, Critical finding 1) found the first version of this module let
-every one of these escape as a raw `IndexError`/`AttributeError`/
-`ValueError` instead of `OsOpenError`, narrowing this task's own "never a
-raw exception" contract down to "never a raw `ET.ParseError`" only, and
-regressing the exact "wrap every escaping exception" rule commit 1e99afb
-had just established for `os_downloads.py` on this same task.
+absent (self-closing) or present-but-blank (whitespace-only) `posList`/
+`pos`, a non-numeric coordinate token, or a RoadLink `length` that will
+not parse as a float. A review (task-2-review.md, Critical finding 1)
+found the first version of this module let every one of the first three
+shapes escape as a raw `IndexError`/`AttributeError`/`ValueError` instead
+of `OsOpenError`, narrowing this task's own "never a raw exception"
+contract down to "never a raw `ET.ParseError`" only, and regressing the
+exact "wrap every escaping exception" rule commit 1e99afb had just
+established for `os_downloads.py` on this same task. A second pass (task-
+2-review.md's own Minor finding 3, upgraded by the coordinator on global
+"nothing fabricated" grounds) found the fix above still let a present-
+but-blank `posList` through as a FABRICATED empty ring or empty
+LineString (`{"coordinates": [[]]}` / `{"coordinates": []}`), because
+`"".split()` and `"   ".split()` both return an empty token list rather
+than raising on their own the way `None.split()` (a fully absent
+`posList`) already does; `_parse_pos_list` now raises explicitly for that
+case too, before it ever reaches the return statement that used to
+fabricate the empty ring or line silently.
 
 The fix wraps only the per-feature `OsFeature(...)` construction (`_geometry`
 plus the property extractor) in `except OsOpenError: raise` followed by a
@@ -261,6 +271,19 @@ def _child_text(elem: ET.Element, tag: str) -> str | None:
 
 def _parse_pos_list(text: str) -> list[list[float]]:
     values = [float(token) for token in text.split()]
+    if not values:
+        # A present-but-blank posList ("" or whitespace only) splits to an
+        # empty token list, which the two lines below would otherwise turn
+        # into a silently fabricated empty ring or empty LineString
+        # (`{"coordinates": [[]]}` / `{"coordinates": []}`) rather than an
+        # error: str.split() never raises on its own, unlike the missing-
+        # element (`None.split()`, AttributeError) and odd-count
+        # (IndexError) shapes this function already refused. Raised here,
+        # explicitly, so it is caught by the same broad `except Exception`
+        # in `_walk_features` that wraps every other malformed-content
+        # shape into `OsOpenError` kind "parse", rather than reaching the
+        # return below at all.
+        raise ValueError("posList carries no coordinate values")
     return [[values[i], values[i + 1]] for i in range(0, len(values), 2)]
 
 
