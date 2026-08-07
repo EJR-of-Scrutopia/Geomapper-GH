@@ -567,6 +567,23 @@ class ElevationSource:
         """
         return 2 if category == "terrain" else None
 
+    # -- detail (mapgen.resolver) ---------------------------------------------
+
+    def detail(self, bbox: BBox) -> str:
+        """The spec's own resolution copy, verbatim, for the default
+        COP30 model this class attribute set is built around.
+
+        Fixed regardless of bbox: resolve() only ever calls this on a
+        source whose covers(bbox) was not "none" for the same bbox
+        (mapgen.resolver's own candidate filter, see sources/base.py's
+        own docstring on this optional extension), and this source
+        covers every bbox at the one ground sample distance its
+        configured model reads at, so there is no bbox-dependent answer
+        to give and no covers() gate needed here either. Never touches
+        the network, trivially: nothing here reads anything at all.
+        """
+        return "30 m (Copernicus GLO-30)"
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """One whole-area request, so nothing here counts tiles.
 

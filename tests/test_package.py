@@ -95,18 +95,20 @@ class StubSource:
 
 
 class ResolvableStubSource(StubSource):
-    """Like StubSource, but defines covers()/tier(), the tier resolver's
-    own optional LayerSource extensions (mapgen.resolver), so a run
-    selecting it actually resolves one category through it.
+    """Like StubSource, but defines covers()/tier()/detail(), the tier
+    resolver's own optional LayerSource extensions (mapgen.resolver), so
+    a run selecting it actually resolves one category through it, and
+    that category's own entry carries a "detail" key too (Task 2 of the
+    detail-preview plan).
 
-    Every plain StubSource in this file defines neither, on purpose:
-    resolve() must skip a source missing either one silently (see
-    sources/base.py's own documented convention), which is why the
-    ordinary run_survey tests below pin survey.json's own "resolution"
-    key as an empty list. This class exists to pin the non-empty side of
-    that same contract, so the shape is checked against real data at
-    least once rather than only against the trivial "nothing resolves"
-    case every other stub here happens to produce.
+    Every plain StubSource in this file defines none of the three, on
+    purpose: resolve() must skip a source missing covers()/tier() either
+    one silently (see sources/base.py's own documented convention), which
+    is why the ordinary run_survey tests below pin survey.json's own
+    "resolution" key as an empty list. This class exists to pin the
+    non-empty side of that same contract, so the shape is checked against
+    real data at least once rather than only against the trivial "nothing
+    resolves" case every other stub here happens to produce.
     """
 
     def covers(self, bbox):
@@ -114,6 +116,13 @@ class ResolvableStubSource(StubSource):
 
     def tier(self, category):
         return 1 if category == "buildings" else None
+
+    def detail(self, bbox):
+        """A fixed, made-up figure: this stub exists to pin resolve()'s
+        own "detail" key passthrough into survey.json (Task 2 of the
+        detail-preview plan), not to represent anything real.
+        """
+        return "stub detail: 1 unit"
 
 
 class CallRecordingStubSource:
@@ -479,6 +488,7 @@ def test_estimate_resolution_reflects_a_source_that_actually_resolves(tmp_path):
                     "tier": 1,
                     "coverage": "full",
                     "role": "base",
+                    "detail": "stub detail: 1 unit",
                 }
             ],
         }
@@ -755,6 +765,7 @@ def test_run_writes_survey_json_with_a_non_trivial_resolution(tmp_path):
                     "tier": 1,
                     "coverage": "full",
                     "role": "base",
+                    "detail": "stub detail: 1 unit",
                 }
             ],
         }

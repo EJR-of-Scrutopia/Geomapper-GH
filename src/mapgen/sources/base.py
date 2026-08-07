@@ -403,6 +403,23 @@ class LayerSource(Protocol):
     elevation.py: every one of them answers any extent worldwide) returns
     a fixed "full" unconditionally.
 
+    detail(bbox) -> str | None is the same optional-extension convention
+    a third time, beside covers() and tier(): a human-readable resolution
+    or quality figure for THIS bbox, read by mapgen.resolver's own
+    resolve() and added to a category entry as "detail" only when the
+    method exists and answers something other than None; a source that
+    omits it simply contributes no such key, the same as one with no
+    covers()/tier() contributing no entry at all. lidar_wales.py's own
+    detail() genuinely depends on bbox (it names the pixel size a real
+    download would come back at over this extent, see its own
+    docstring); elevation.py's and the other five sources' own detail()
+    each return one fixed string regardless of bbox, since what they
+    have to say about their own resolution is a property of the dataset,
+    not of where in it a given survey happens to land. Never touches the
+    network, under the same rule as covers() above, for the same reason:
+    a settings panel may call /api/estimate long before any survey has
+    fetched anything.
+
     fetch()'s own `cancel` parameter (Task 22) is different in kind from
     everything above: those are all optional EXTENSIONS, read defensively
     with getattr because a source that has no opinion on them can simply

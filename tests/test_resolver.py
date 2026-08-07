@@ -370,6 +370,62 @@ def test_resolve_returns_empty_list_for_no_sources():
     assert resolve(CARDIFF_BBOX, []) == []
 
 
+def test_resolve_cardiff_terrain_carries_lidar_and_elevation_detail(tmp_path):
+    # Task 2 of the detail-preview plan: an entry's own detail(), when the
+    # source defines one, flows straight through resolve() into the
+    # entry dict. lidar_wales.detail() (Task 1, committed) is bbox-shaped,
+    # so only its own leading words are pinned here, not the whole
+    # sentence; elevation.detail() is the fixed spec-copy string this
+    # task adds, and is pinned exactly.
+    result = resolve(CARDIFF_BBOX, _all_sources(tmp_path))
+    by_category = _by_category(result)
+    terrain = {s["id"]: s for s in by_category["terrain"]}
+    assert terrain["lidar_wales"]["detail"].startswith(("1 m", "2 m"))
+    assert terrain["elevation"]["detail"] == "30 m (Copernicus GLO-30)"
+
+
+def test_resolve_entry_omits_detail_key_when_source_has_no_detail_method():
+    class _StubNoDetail:
+        id = "stub-no-detail"
+        display_name = "Stub No Detail"
+
+        def covers(self, bbox):
+            return "full"
+
+        def tier(self, category):
+            return 1 if category == "terrain" else None
+
+    result = resolve(CARDIFF_BBOX, [_StubNoDetail()])
+    entry = result[0]["sources"][0]
+    assert "detail" not in entry
+
+
+def test_resolve_entry_omits_detail_key_when_detail_returns_none():
+    # The resolver's own defensive rule: "detail" is added only when
+    # getattr(source, "detail", None) is callable AND returns non-None,
+    # never a present key holding None. No real source in this project
+    # reaches this branch through resolve() itself (a source whose
+    # covers(bbox) is not "none" is exactly the source whose detail(bbox)
+    # this project's own sources answer with a real string, never None),
+    # so this is exercised with a stub built for exactly that shape.
+    class _StubDetailNone:
+        id = "stub-detail-none"
+        display_name = "Stub Detail None"
+
+        def covers(self, bbox):
+            return "full"
+
+        def tier(self, category):
+            return 1 if category == "terrain" else None
+
+        def detail(self, bbox):
+            return None
+
+    result = resolve(CARDIFF_BBOX, [_StubDetailNone()])
+    entry = result[0]["sources"][0]
+    assert "detail" not in entry
+
+
 def test_resolve_ties_break_on_source_id():
     class _StubA:
         id = "zzz-stub"

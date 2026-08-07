@@ -439,6 +439,24 @@ class OvertureSource:
         """
         return self._TIERS.get(category)
 
+    # -- detail (mapgen.resolver) ---------------------------------------------
+
+    def detail(self, bbox: BBox) -> str:
+        """The spec's own resolution copy, verbatim.
+
+        Fixed regardless of bbox: resolve() only ever calls this on a
+        source whose covers(bbox) was not "none" for the same bbox (see
+        sources/base.py's own docstring on this optional extension), and
+        this figure is a property of how Overture's own conflated
+        sources trace geometry, not of which extent a given survey
+        happens to draw, so there is no bbox-dependent answer to give
+        and no covers() gate needed here either (this source's own
+        covers() is a fixed "full" regardless, in any case). Never
+        touches the network, trivially: nothing here reads anything at
+        all.
+        """
+        return "traced footprints and centrelines, typically 1 to 5 m positional accuracy"
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """Bytes per type, seconds per BATCH of concurrent types.
 

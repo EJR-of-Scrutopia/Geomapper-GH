@@ -370,6 +370,33 @@ def test_estimate_endpoint_carries_a_resolution_list(server, tmp_path):
     assert payload["resolution"] == []
 
 
+def test_estimate_endpoint_resolution_carries_detail_for_a_source_that_defines_it(server, tmp_path):
+    # Task 2 of the detail-preview plan: a resolution entry's own
+    # "detail" key (mapgen.resolver) reaches the HTTP /api/estimate
+    # response exactly as it reaches the plain estimate_survey() payload
+    # (test_package.py's own test_estimate_resolution_reflects_a_source_
+    # that_actually_resolves). ElevationSource is real, needs no network
+    # for covers()/tier()/detail(), always covers "full", and its detail()
+    # is the fixed spec-copy string, independent of bbox. Already
+    # registered under "elevation" by the `server` fixture's own
+    # build_server() -> register_default_sources() call, so no explicit
+    # register() here: a second one would raise DuplicateSourceError.
+    status, payload = _post(
+        server,
+        "/api/estimate",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["elevation"],
+        },
+    )
+    assert status == 200
+    terrain = next(c for c in payload["resolution"] if c["category"] == "terrain")
+    assert terrain["sources"][0]["detail"] == "30 m (Copernicus GLO-30)"
+
+
 def test_estimate_returns_400_for_a_bad_bbox(server, tmp_path):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _post(

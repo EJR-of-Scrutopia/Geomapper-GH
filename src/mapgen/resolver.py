@@ -66,12 +66,30 @@ is tier 1 for roads in some future retiering, because what makes a layer
 least one covering, serving source, in `CATEGORIES` order, each shaped
 `{"category": str, "sources": list[dict]}`; a category with no covering
 source is omitted entirely, never included empty. Each inner dict is
-`{"id", "display_name", "tier", "coverage", "role"}`, sorted by tier
-ascending, ties broken by source id for determinism (two sources tied at
-the same tier have no other honest ordering to fall back on, and a
-resolution list that reordered itself between two runs over the identical
-bbox and selection would be a worse record than one that picks a
-deterministic, if arbitrary, tiebreak).
+`{"id", "display_name", "tier", "coverage", "role"}`, plus an optional
+`"detail"` (a human-readable resolution/quality figure, see the next
+section), sorted by tier ascending, ties broken by source id for
+determinism (two sources tied at the same tier have no other honest
+ordering to fall back on, and a resolution list that reordered itself
+between two runs over the identical bbox and selection would be a worse
+record than one that picks a deterministic, if arbitrary, tiebreak).
+
+## The third optional LayerSource extension: `detail(bbox) -> str | None`
+
+Beside `covers()`/`tier()` above, a source may define `detail(bbox) ->
+str | None`, read the same defensive, getattr way: called only if
+present, and its answer added to the entry as `"detail"` only when it is
+not `None`. A source with nothing to say about its own resolution simply
+omits the method, the same as a source with no `readiness_problem`; its
+entries carry no `"detail"` key at all, rather than one holding `None`,
+which is what keeps every entry this module produced before this
+extension existed exactly the shape it already was. Most sources answer a
+fixed string regardless of `bbox` (their own detail is a property of the
+dataset, not of where in it a given survey happens to land);
+`lidar_wales.py`'s own `detail()` is the one exception, naming the actual
+pixel size a real download would come back at for THIS extent, which
+does depend on `bbox`. Never touches the network, by the same rule as
+`covers()`.
 
 Nesting by category, rather than returning one flat list of entries each
 carrying its own `"category"` key, is what makes "entry order within a
@@ -190,16 +208,34 @@ def resolve(bbox: BBox, sources: Sequence[object]) -> list[dict]:
 
         candidates.sort(key=lambda entry: (entry[0], entry[1]))
         best_tier = candidates[0][0]
-        entries = [
-            {
+        entries = []
+        for tier, source_id, source, coverage in candidates:
+            entry = {
                 "id": source_id,
                 "display_name": source.display_name,
                 "tier": tier,
                 "coverage": coverage,
                 "role": _role_for(category, source_id, tier, best_tier),
             }
-            for tier, source_id, source, coverage in candidates
-        ]
+            # detail() is a THIRD optional LayerSource extension, beside
+            # covers()/tier() (see the module docstring's own section on
+            # the first two): a human-readable resolution figure, added
+            # to the entry ONLY when the source defines one and it
+            # answers with an actual string, never a present key holding
+            # None. Keeping the key absent rather than null is what keeps
+            # every entry from every source that predates this task, and
+            # every test stub in this project's own suite, exactly the
+            # shape it already was: Task 8's renderer and every existing
+            # equality assertion against a plain five-key entry keep
+            # working unchanged. Placed after "role" so a reader scanning
+            # one entry meets the tier-derived facts first and the
+            # free-text figure last.
+            detail_fn = getattr(source, "detail", None)
+            if callable(detail_fn):
+                detail = detail_fn(bbox)
+                if detail is not None:
+                    entry["detail"] = detail
+            entries.append(entry)
         result.append({"category": category, "sources": entries})
 
     return result

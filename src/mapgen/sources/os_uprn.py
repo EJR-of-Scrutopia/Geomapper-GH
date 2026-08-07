@@ -485,6 +485,22 @@ class OsUprnSource:
         """
         return 1 if category == "addresses" else None
 
+    # -- detail (mapgen.resolver) ----------------------------------------------
+
+    def detail(self, bbox: BBox) -> str:
+        """The spec's own resolution copy, verbatim.
+
+        Fixed regardless of bbox: resolve() only ever calls this on a
+        source whose covers(bbox) was not "none" for the same bbox (see
+        sources/base.py's own docstring on this optional extension), and
+        UPRN's own one-point-per-address shape is a property of the
+        dataset, not of which extent a given survey happens to draw, so
+        there is no bbox-dependent answer to give and no covers() gate
+        needed here either. Never touches the network, trivially:
+        nothing here reads anything at all.
+        """
+        return "one point per addressable location"
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """Bytes and seconds for the one-time national UPRN download,
         with no network at all.
