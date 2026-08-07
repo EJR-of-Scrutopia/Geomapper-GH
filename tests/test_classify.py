@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import time
 
+from mapgen.buildings import point_in_ring
 from mapgen.classify import (
     GIANT_RING_CELLS,
     SAMPLE_CAP,
     OverlaySets,
+    _build_overlay_index,
+    _clip_ring_to_bbox,
     _flat_candidates,
     _OverlayIndex,
     classify_parcel,
@@ -366,6 +369,15 @@ def test_giant_ring_bbox_skips_per_cell_bucketing_and_classifies_correctly() -> 
     keeps `_by_cell` itself small regardless of how large a single
     overlay ring's bbox is, and a real classification against it must
     still complete, correctly, in bounded time.
+
+    Round 2 (below) adds a clip that shrinks a real overlay ring BEFORE
+    it ever reaches `_OverlayIndex`, so on the real classification path
+    (`classify_parcels`) the overflow list this test exercises should
+    now stay empty; this test builds `_OverlayIndex` directly, bypassing
+    that clip on purpose, to keep proving `GIANT_RING_CELLS`'s own
+    overflow path still protects a ring the clip never got the chance to
+    shrink (a direct `_OverlayIndex` construction, or a future case the
+    clip cannot reduce enough).
     """
     giant_water = _rect(-5.0, 45.0, 5.0, 55.0)
     overlays = OverlaySets(
@@ -385,6 +397,112 @@ def test_giant_ring_bbox_skips_per_cell_bucketing_and_classifies_correctly() -> 
     # A small, ordinary parcel sitting inside the giant ring's own area
     # still classifies correctly: the overflow list is tested exactly
     # like the bucketed candidates, never skipped.
+    results = classify_parcels([_PARCEL], overlays)
+    assert results == [("water", results[0][1])]
+
+
+# --------------------------------------------------------------------------
+# Round 2 of the giant-ring fix (task-3-review.md): clipping every overlay
+# candidate to the parcels' own padded extent before it ever reaches
+# `_OverlayIndex`, so a real, un-clipped continent-scale ring shrinks to a
+# small sliver rather than depending on the overflow list above at all.
+# --------------------------------------------------------------------------
+
+# A concave "comb" subject: two horizontal teeth (y in [-1, -0.2] and
+# y in [0.2, 1]) extending from a base far to the west (x <= -500) out
+# past x = 1000 to the east, with a real gap (y in [-0.2, 0.2]) between
+# them. `_CLIP_WINDOW` below sits entirely within the teeth's own x-range
+# but straddles the gap in y, so clipping this ring to that window keeps
+# two separate visible pieces (one per tooth) joined only by material
+# outside the window (the base, far to the west): exactly the shape that
+# forces Sutherland-Hodgman's own degenerate seam along the window's own
+# boundary between the two pieces.
+_COMB_RING: list[tuple[float, float]] = [
+    (-1000.0, -1.0),
+    (1000.0, -1.0),
+    (1000.0, -0.2),
+    (-500.0, -0.2),
+    (-500.0, 0.2),
+    (1000.0, 0.2),
+    (1000.0, 1.0),
+    (-1000.0, 1.0),
+]
+
+_CLIP_WINDOW = (-1.0, -1.0, 1.0, 1.0)
+
+# (ring, window, points to check): a handful of hand-built cases, the
+# last one the concave comb above.
+_CLIP_PRESERVES_CLASSIFICATION_CASES = [
+    (
+        # A huge rectangle fully containing the window: clips down to
+        # exactly the window's own four corners.
+        _rect(-1000.0, -1000.0, 1000.0, 1000.0),
+        _CLIP_WINDOW,
+        [(0.0, 0.0), (0.9, 0.9), (-0.9, -0.9), (0.5, -0.5)],
+    ),
+    (
+        # A huge rectangle only partially overlapping the window (its
+        # own right edge at x=0.5 cuts through it).
+        _rect(-1000.0, -1000.0, 0.5, 1000.0),
+        _CLIP_WINDOW,
+        [(-0.9, 0.0), (0.0, 0.0), (0.9, 0.0), (0.5, 0.9)],
+    ),
+    (
+        # The concave comb: points in tooth1, in tooth2, in the gap
+        # between them, and near two corners.
+        _COMB_RING,
+        _CLIP_WINDOW,
+        [(0.0, -0.6), (0.0, 0.6), (0.0, 0.0), (0.9, -0.9), (-0.9, 0.9)],
+    ),
+]
+
+
+def test_clipping_an_overlay_ring_preserves_classification_for_points_inside_the_window() -> None:
+    """The clip's own correctness argument (`_clip_overlay_candidates`'s
+    own docstring), checked directly rather than assumed: for a handful
+    of hand-built (ring, window, points) cases, including the concave
+    comb above (which forces a Sutherland-Hodgman seam), every point
+    inside the window classifies IDENTICALLY against the ORIGINAL ring
+    and the CLIPPED one, and every vertex of the clipped ring lies
+    within the window.
+    """
+    for ring, window, points in _CLIP_PRESERVES_CLASSIFICATION_CASES:
+        clipped = _clip_ring_to_bbox(ring, window)
+        assert clipped is not None
+        min_x, min_y, max_x, max_y = window
+        for x, y in clipped:
+            assert min_x - 1e-9 <= x <= max_x + 1e-9
+            assert min_y - 1e-9 <= y <= max_y + 1e-9
+        for point in points:
+            original_hit = point_in_ring(point[0], point[1], ring)
+            clipped_hit = point_in_ring(point[0], point[1], clipped)
+            assert original_hit == clipped_hit, (
+                f"classification diverged at {point}: "
+                f"original={original_hit}, clipped={clipped_hit}"
+            )
+
+
+def test_classify_parcels_clips_overlay_rings_so_the_overflow_list_stays_empty() -> None:
+    """Round 2's own point: the SAME synthetic 10 deg x 10 deg ring that
+    populates `_OverlayIndex._overflow` when built directly (the test
+    above) clips down to a small sliver around the actual parcel once
+    `_build_overlay_index` (what `classify_parcels` itself calls) runs
+    the clip first, so the overflow list stays EMPTY: `GIANT_RING_CELLS`
+    is a second line of defence a real overlay ring should never actually
+    need to reach any more, checked here via the index's own `_overflow`
+    length rather than assumed from the clip alone.
+    """
+    giant_water = _rect(-5.0, 45.0, 5.0, 55.0)
+    overlays = OverlaySets(
+        buildings=[], landuse=[], water=[giant_water], greenspace=[], woodland=[],
+    )
+
+    index = _build_overlay_index([_PARCEL], overlays)
+
+    assert len(index._overflow) == 0, (
+        "clipping should shrink the giant ring before it ever reaches "
+        "the index, so the overflow path should not engage at all"
+    )
     results = classify_parcels([_PARCEL], overlays)
     assert results == [("water", results[0][1])]
 

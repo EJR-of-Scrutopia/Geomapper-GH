@@ -685,15 +685,262 @@ class _OverlayIndex:
         return candidates
 
 
+# --------------------------------------------------------------------------
+# Round 2 of the giant-ring fix (task-3-review.md): clipping every overlay
+# candidate to the parcels' own padded extent BEFORE it ever reaches
+# `_OverlayIndex`, so a real, un-clipped continent-scale ring (Overture's
+# own "sea" feature, the review's own reproduction) shrinks to the small
+# sliver of it that could ever matter to THIS run, rather than depending
+# on `GIANT_RING_CELLS`'s own overflow list (still kept, as a second line
+# of defence: see that constant's own docstring) to survive it cheaply.
+# Measured on the real, un-defanged Cowbridge package: round 1's fix
+# completed in 283.27s; this round's own clip, over the identical
+# package, completes in single-digit seconds (see this module's own test
+# suite and task-3-report.md's own fix-round addendum for the exact
+# number), because the four real giant rings each shrink from tens of
+# thousands of vertices to a short coastline fragment, or to nothing at
+# all, before a single sample is ever tested against them.
+# --------------------------------------------------------------------------
+
+# The maximum sampling spacing this module's own grid ever uses
+# (`_SPACING_MAX_M`) plus a small, fixed safety margin: the padding
+# `_parcels_clip_window` adds around the parcels' own bbox, in metres,
+# before converting to degrees. See that function's own docstring for
+# why padding is a SAFETY margin, not a correctness requirement.
+_CLIP_PADDING_EPSILON_M = 1.0
+
+
+def _parcels_clip_window(rings: Sequence[Ring]) -> tuple[float, float, float, float] | None:
+    """The axis-aligned bbox `classify_parcels` clips every overlay
+    candidate ring to before indexing them: the union of every ring in
+    `rings`, padded by `_SPACING_MAX_M + _CLIP_PADDING_EPSILON_M` metres
+    (21 m) on every side, converted to degrees with the same cos-latitude
+    factor `_sample_points`'s own grid spacing already uses, evaluated
+    ONCE at the collective bbox's own mid-latitude (never per-parcel: a
+    single shared window is what lets one clipped candidate list serve
+    every parcel `classify_parcels` classifies in one call).
+
+    `None` for an empty `rings`: `classify_parcels` is never actually
+    called this way in practice (there would be nothing to classify),
+    but this gives that case a total, honest answer rather than crashing
+    on `min()`/`max()` of an empty sequence, the same defensive standard
+    `_sample_points`'s own empty-ring branch already holds.
+
+    Padding is a SAFETY margin, not what makes the clip correct: for any
+    point p strictly inside the (unpadded) union bbox, "p in ring" and "p
+    in ring INTERSECT bbox" already agree (see `_clip_overlay_candidates`'s
+    own docstring for the full argument, which needs no padding at all).
+    What padding buys is keeping every real sample point comfortably
+    inside the window's own INTERIOR, never within a hair's breadth of
+    its boundary, which is where a Sutherland-Hodgman seam artifact (see
+    `_clip_overlay_candidates`'s own "Honest caveat") could in principle
+    live. `_SPACING_MAX_M` is the largest distance `_sample_points` ever
+    puts between a parcel's own edge and its nearest interior grid
+    sample, so padding by at least that much guarantees no real sample
+    point is ever born within the margin; the extra fixed metre is
+    headroom against the cos-latitude conversion's own rounding, nothing
+    more.
+    """
+    all_points = [point for ring in rings for point in ring]
+    if not all_points:
+        return None
+    xs = [point[0] for point in all_points]
+    ys = [point[1] for point in all_points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    lat0 = (min_y + max_y) / 2.0
+    pad_m = _SPACING_MAX_M + _CLIP_PADDING_EPSILON_M
+    pad_lon = pad_m / _metres_per_degree_lon(lat0)
+    pad_lat = pad_m / _METRES_PER_DEGREE_LAT
+    return (min_x - pad_lon, min_y - pad_lat, max_x + pad_lon, max_y + pad_lat)
+
+
+def _sutherland_hodgman_pass(
+    polygon: list[tuple[float, float]],
+    inside: Callable[[tuple[float, float]], bool],
+    intersect: Callable[[tuple[float, float], tuple[float, float]], tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """One Sutherland-Hodgman clip pass: `polygon`'s own vertices, kept
+    only on the `inside` side of ONE half-plane, with a new vertex
+    spliced in at every edge that crosses it (`intersect`). Walking
+    `polygon`'s own edges (including the wraparound from its last vertex
+    back to its first, `prev` starting at `polygon[-1]`) and classifying
+    each edge by its two endpoints' own `inside` status is the whole
+    algorithm for one half-plane; `_clip_ring_to_bbox` runs this four
+    times, once per side of an axis-aligned rectangle, which is what
+    makes the full clip exact against ANY simple polygon, convex or
+    concave (each pass alone is exact against a single half-plane
+    regardless of the subject's own shape; only the CLIP window's own
+    convexity matters for Sutherland-Hodgman, and a rectangle is always
+    convex).
+    """
+    if not polygon:
+        return []
+    output: list[tuple[float, float]] = []
+    prev = polygon[-1]
+    prev_inside = inside(prev)
+    for point in polygon:
+        point_inside = inside(point)
+        if point_inside:
+            if not prev_inside:
+                output.append(intersect(prev, point))
+            output.append(point)
+        elif prev_inside:
+            output.append(intersect(prev, point))
+        prev, prev_inside = point, point_inside
+    return output
+
+
+def _clip_ring_to_bbox(ring: Ring, bbox: tuple[float, float, float, float]) -> Ring | None:
+    """`ring` clipped to `bbox` (`min_x, min_y, max_x, max_y`) by four
+    Sutherland-Hodgman passes (`_sutherland_hodgman_pass`), one per
+    rectangle side, in `left, right, bottom, top` order (the order does
+    not affect the result, only which intermediate polygon each pass
+    sees).
+
+    Returns None for a ring that clips away to fewer than 3 points (lies
+    entirely outside `bbox`, or is reduced to a degenerate sliver at its
+    boundary): the caller drops such a ring entirely, the identical
+    "not a real polygon any more" standard `_normalise_ring`
+    (`boundary_curves.py`) and `_exterior_ring` (`buildings.py`) already
+    hold a ring to elsewhere in this project.
+    """
+    min_x, min_y, max_x, max_y = bbox
+    polygon: list[tuple[float, float]] = list(ring)
+
+    polygon = _sutherland_hodgman_pass(
+        polygon,
+        inside=lambda p: p[0] >= min_x,
+        intersect=lambda a, b: (
+            min_x,
+            a[1] + (b[1] - a[1]) * (min_x - a[0]) / (b[0] - a[0]),
+        ),
+    )
+    polygon = _sutherland_hodgman_pass(
+        polygon,
+        inside=lambda p: p[0] <= max_x,
+        intersect=lambda a, b: (
+            max_x,
+            a[1] + (b[1] - a[1]) * (max_x - a[0]) / (b[0] - a[0]),
+        ),
+    )
+    polygon = _sutherland_hodgman_pass(
+        polygon,
+        inside=lambda p: p[1] >= min_y,
+        intersect=lambda a, b: (
+            a[0] + (b[0] - a[0]) * (min_y - a[1]) / (b[1] - a[1]),
+            min_y,
+        ),
+    )
+    polygon = _sutherland_hodgman_pass(
+        polygon,
+        inside=lambda p: p[1] <= max_y,
+        intersect=lambda a, b: (
+            a[0] + (b[0] - a[0]) * (max_y - a[1]) / (b[1] - a[1]),
+            max_y,
+        ),
+    )
+    if len(polygon) < 3:
+        return None
+    return polygon
+
+
+def _clip_overlay_candidates(
+    candidates: Iterable[_Candidate], window: tuple[float, float, float, float]
+) -> list[_Candidate]:
+    """Every `(bucket, ring)` candidate `_flat_candidates` produced, each
+    ring clipped to `window` (`_parcels_clip_window`) via
+    `_clip_ring_to_bbox`; a ring that clips away to nothing is dropped
+    outright (contributes no evidence, matching every other "not a real
+    polygon" ring this project already refuses rather than mishandles).
+
+    **Correctness, by construction.** `window` is built to contain every
+    sample point `classify_parcels` will ever test against the result
+    (`_parcels_clip_window`'s own docstring): each sample is generated by
+    `_sample_points` strictly inside some parcel ring, and every parcel
+    ring `classify_parcels` is ever called with is one `window` was built
+    from. Take any point p strictly inside `window`, and any ring R this
+    function clips to R' = R INTERSECT window:
+      * If p is in R, then p is in R (given) and p is in window (given),
+        so p is in R INTERSECT window, i.e. p is in R'.
+      * If p is in R', then p is in R INTERSECT window, which means p is
+        in R (one of the two things being intersected).
+    So "p in R" and "p in R'" are the same fact for every p this module
+    will ever ask about, which is exactly the property `_OverlayIndex`'s
+    own ray casts depend on: classifying against the clipped candidates
+    gives IDENTICAL answers to classifying against the originals, for
+    every real query, regardless of whether R itself was convex, huge, or
+    partly outside `window` to begin with.
+
+    A giant, real-world ring (an Overture "sea" polygon spanning most of
+    the planet) clips down to whatever small sliver of it actually
+    crosses `window`, typically a short coastline fragment for a real
+    survey extent, or nothing at all for an inland one: this is what
+    keeps `GIANT_RING_CELLS`'s own overflow path (`_OverlayIndex`) from
+    ever engaging on real data once this clip runs; it stays in place as
+    a second line of defence for a ring this clip cannot shrink enough
+    (one whose own bbox already sits inside `window`) or a case this
+    project has not seen in real data yet.
+
+    **Honest caveat on non-convex subjects.** Sutherland-Hodgman clips
+    any subject polygon against a CONVEX window correctly in the sense
+    the argument above needs (every point's own in/out answer is
+    preserved), but a concave subject can produce a result with a
+    degenerate "seam" edge running along `window`'s own boundary, where
+    the algorithm stitches two separate visible pieces of the original
+    ring back into one output loop (a real, well-known property of the
+    algorithm, not a bug in this implementation: see this module's own
+    test suite for a worked concave case). This never changes an
+    INTERIOR point's own classification: the even-odd ray cast
+    (`point_in_ring`) still answers correctly for any point not exactly
+    ON that seam, and a real grid sample sits exactly on a seam only if
+    it sits exactly on `window`'s own boundary, which `_parcels_clip_
+    window`'s own padding margin makes unreachable by any real sample
+    point at all.
+    """
+    clipped: list[_Candidate] = []
+    for bucket, ring in candidates:
+        result = _clip_ring_to_bbox(ring, window)
+        if result is not None:
+            clipped.append((bucket, result))
+    return clipped
+
+
+def _build_overlay_index(rings: Sequence[Ring], overlays: OverlaySets) -> _OverlayIndex:
+    """The one shared spatial hash `classify_parcels` builds and uses,
+    factored out on its own: every overlay candidate `overlays` produces
+    (`_flat_candidates`), clipped to the parcels' own padded extent
+    (`_parcels_clip_window`, `_clip_overlay_candidates`) before it is
+    ever bucketed, then handed to `_OverlayIndex`.
+
+    A caller (this module's own test suite, in particular) can inspect
+    the returned index directly, which is what makes `_OverlayIndex.
+    _overflow`'s own length after this call the read-only signal for
+    "did the clip do its job": a real overlay ring should clip down to
+    something small enough that it never needs `GIANT_RING_CELLS`'s own
+    overflow path at all once this function is what builds the index,
+    which task-3-review.md's own round 2 asks to see proven rather than
+    assumed.
+    """
+    window = _parcels_clip_window(rings)
+    candidates = _flat_candidates(overlays)
+    if window is not None:
+        candidates = _clip_overlay_candidates(candidates, window)
+    return _OverlayIndex(candidates)
+
+
 def classify_parcels(rings: list[Ring], overlays: OverlaySets) -> list[tuple[str, int]]:
     """`(category, sample_count)` per ring in `rings`, in order, against
-    ONE shared spatial hash built over `overlays`' own rings (the plan
-    header's "one shared spatial hash... so N parcels do not rebuild it
-    N times"). Agrees with `classify_parcel` exactly for every ring: see
-    `_classify_samples`'s own docstring for why that is a property of
-    the shared decision code, not of this function's own lookup source.
+    ONE shared spatial hash built over `overlays`' own rings, clipped to
+    the parcels' own padded extent first (`_build_overlay_index`; the
+    plan header's "one shared spatial hash... so N parcels do not rebuild
+    it N times"). Agrees with `classify_parcel` exactly for every ring:
+    see `_classify_samples`'s own docstring for why that is a property of
+    the shared decision code, not of this function's own lookup source,
+    and `_clip_overlay_candidates`'s own docstring for why clipping the
+    index's own candidates first changes no classification answer either.
     """
-    index = _OverlayIndex(_flat_candidates(overlays))
+    index = _build_overlay_index(rings, overlays)
     results: list[tuple[str, int]] = []
     for ring in rings:
         samples = _sample_points(ring)
