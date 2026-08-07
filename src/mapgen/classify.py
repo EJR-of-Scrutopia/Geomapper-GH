@@ -277,6 +277,23 @@ _SPACING_MAX_M = 20.0
 _SPACING_AREA_DIVISOR = 8.0
 _MIN_GRID_SAMPLES = 4
 
+# task-2-review.md's own Important finding: `clamp(..., 2.0, 20.0)` bounds
+# sample DENSITY, not sample COUNT. Past ~2.56 ha the spacing ceiling (20m)
+# stops scaling with area, so sample count grows unbounded with area: the
+# review measured 19,119,210 samples in ~10s for a 1deg x 1deg ring (this
+# module's own test reproduces that exact shape). A realistic large single
+# INSPIRE title (10 km2, a genuinely large agricultural/estate parcel)
+# needs only ~25,000 samples; 40,000 is comfortably above that, and still
+# small enough to classify in well under a second, which is what this
+# constant documents rather than any survey-grade sample-density claim.
+# `_grid_spacing_m`'s caller widens spacing toward this cap when a bbox is
+# large enough to need it (see `_sample_points`); `_grid_samples` itself
+# also stops outright at this many interior points, which is what actually
+# guarantees the bound (the widened spacing alone approximates it well for
+# a roughly square bbox, but does not itself bound an extreme, elongated
+# aspect ratio a malformed ring could produce).
+SAMPLE_CAP = 40_000
+
 
 def _grid_spacing_m(area_m2: float) -> float:
     """task-2-rules.md's own `clamp(sqrt(parcel_area_m2) / 8, 2.0, 20.0)`,
@@ -286,6 +303,19 @@ def _grid_spacing_m(area_m2: float) -> float:
     moment later and fall to the representative-point sampling instead.
     """
     return min(_SPACING_MAX_M, max(_SPACING_MIN_M, math.sqrt(area_m2) / _SPACING_AREA_DIVISOR))
+
+
+def _bbox_area_m2(bbox: tuple[float, float, float, float], lat0: float) -> float:
+    """`bbox`'s own area in local square metres, the same cos-latitude
+    projection everywhere else in this module uses: not the parcel's own
+    (possibly much smaller) area `_parcel_area_m2` computes, but the
+    bounding box the grid actually scans over, which is what the sample
+    COUNT (rather than density) is bounded against in `_sample_points`.
+    """
+    min_x, min_y, max_x, max_y = bbox
+    width_m = (max_x - min_x) * _metres_per_degree_lon(lat0)
+    height_m = (max_y - min_y) * _METRES_PER_DEGREE_LAT
+    return width_m * height_m
 
 
 def _grid_samples(
@@ -300,6 +330,16 @@ def _grid_samples(
     (`point_in_ring`, the ray cast `buildings.py` already promoted for
     this): the "square grid... keeping only points inside the parcel
     ring" the rules file specifies, in that order.
+
+    Stops outright once `SAMPLE_CAP` interior points have been collected,
+    the hard guarantee behind that constant's own docstring: the caller
+    widens `spacing_m` first so this stop is rarely the acting mechanism
+    for an ordinary oversized-but-proportioned ring, but it is what
+    actually bounds both the returned count and the wall time for a
+    ring whose bbox is large in one dimension and tiny in the other (an
+    antimeridian wraparound, a coordinate-order bug), where the area-based
+    widening alone would under-shrink one axis while over-shrinking
+    nothing about the other.
     """
     min_x, min_y, max_x, max_y = bbox
     dx = spacing_m / _metres_per_degree_lon(lat0)
@@ -313,6 +353,8 @@ def _grid_samples(
             x = min_x + col * dx
             if point_in_ring(x, y, ring):
                 points.append((x, y))
+                if len(points) >= SAMPLE_CAP:
+                    return points
     return points
 
 
@@ -344,16 +386,37 @@ def _fallback_samples(
 def _sample_points(ring: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
     """The parcel's own interior sample points: the grid path when it
     catches at least `_MIN_GRID_SAMPLES`, the representative-point
-    fallback otherwise. Never returns an empty list (see
-    `_fallback_samples`'s own docstring), which is what keeps every
-    later majority computation free of a division by a zero sample
-    count.
+    fallback otherwise. Never returns an empty list for any real
+    geometry (see `_fallback_samples`'s own docstring), which is what
+    keeps every later majority computation free of a division by a zero
+    sample count.
+
+    A genuinely empty `ring` (`[]`) is the one input that is not real
+    geometry at all: `_bbox` would otherwise crash on `min()`/`max()` of
+    an empty sequence (task-2-review.md's own Minor finding). Returning
+    `[]` here, before `_bbox` is ever called, is the only way this
+    function returns zero samples; `classify_parcel`/`_classify_samples`
+    read a zero-sample list as `unclassified` (no evidence, honestly,
+    since there was no geometry to sample in the first place), the same
+    zero-hits path an empty `OverlaySets` already takes. Not reachable
+    from a real Task 1 parcel ring (an INSPIRE polygon always has real
+    area and at least 3 vertices); defensive only.
     """
     open_points = _open_ring(ring)
-    bbox = _bbox(open_points) if open_points else _bbox(ring)
+    if not open_points:
+        return []
+    bbox = _bbox(open_points)
     lat0 = (bbox[1] + bbox[3]) / 2.0
     area_m2 = _parcel_area_m2(open_points, lat0)
     spacing_m = _grid_spacing_m(area_m2)
+    # Widen spacing toward the point where the FULL bbox grid (not just
+    # the parcel's own smaller area) would land near SAMPLE_CAP: this is
+    # the density-based approximation of the cap; `_grid_samples`'s own
+    # hard stop at SAMPLE_CAP is what actually guarantees it (see that
+    # constant's own docstring for why the two are both needed).
+    bbox_area_m2 = _bbox_area_m2(bbox, lat0)
+    if bbox_area_m2 > 0:
+        spacing_m = max(spacing_m, math.sqrt(bbox_area_m2 / SAMPLE_CAP))
     grid_points = _grid_samples(ring, bbox, spacing_m, lat0)
     if len(grid_points) >= _MIN_GRID_SAMPLES:
         return grid_points

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from mapgen.classify import OverlaySets, classify_parcel, classify_parcels
+import time
+
+from mapgen.classify import SAMPLE_CAP, OverlaySets, classify_parcel, classify_parcels
 
 # --------------------------------------------------------------------------
 # Shared synthetic geometry. All coordinates WGS84 [lon, lat]; degrees at
@@ -314,3 +316,50 @@ def test_classify_parcels_returns_one_result_per_ring_in_order() -> None:
     assert len(results) == 2
     assert results[0][0] == "greenspace"
     assert results[1][0] == "unclassified"
+
+
+# --------------------------------------------------------------------------
+# Robustness (task-2-review.md: one Important, one Minor, both
+# input-hardening against a ring this classifier should never trust
+# blindly, real Task 1 output or not).
+# --------------------------------------------------------------------------
+
+
+def test_pathological_huge_ring_classifies_in_bounded_time_with_capped_samples() -> None:
+    """The review's own reproduction case: a 1deg x 1deg ring (the 20m
+    spacing ceiling stops scaling with area past ~2.56 ha, so an
+    unbounded, malformed, or oversized ring could otherwise drive sample
+    count arbitrarily high; the review measured 19,119,210 samples in
+    ~10s for this exact shape before the fix). Bounded time AND a sample
+    count that never exceeds SAMPLE_CAP are both asserted: the spacing
+    widening alone approximates the cap for a roughly square bbox, the
+    hard stop in `_grid_samples` is what actually guarantees it."""
+    huge = _rect(-1.0, 50.0, 0.0, 51.0)
+    start = time.monotonic()
+    category, sample_count = classify_parcel(huge, _empty_overlays())
+    elapsed = time.monotonic() - start
+    assert sample_count <= SAMPLE_CAP
+    assert elapsed < 5.0
+    assert category == "unclassified"
+
+
+def test_empty_ring_returns_unclassified_with_zero_samples() -> None:
+    """A genuinely empty ring (`[]`) used to crash `_bbox`'s own
+    `min()`/`max()` on an empty sequence; every other degenerate ring
+    (a single repeated point, collinear points, 2 vertices) already
+    degrades gracefully to `("unclassified", 1)` via the representative-
+    point fallback. Zero samples is the honest count for no geometry at
+    all, and is only ever reachable this one way."""
+    assert classify_parcel([], _empty_overlays()) == ("unclassified", 0)
+
+
+def test_classify_parcels_tolerates_an_empty_ring_alongside_real_ones() -> None:
+    overlays = OverlaySets(
+        buildings=[],
+        landuse=[("grass", _PARCEL)],
+        water=[],
+        greenspace=[],
+        woodland=[],
+    )
+    results = classify_parcels([_PARCEL, []], overlays)
+    assert results == [("greenspace", results[0][1]), ("unclassified", 0)]
