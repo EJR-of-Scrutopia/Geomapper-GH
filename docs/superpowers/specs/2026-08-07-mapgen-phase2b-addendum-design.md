@@ -104,7 +104,14 @@ codebase's optional-extension convention). Implementations:
   mirrors) and returns `1 m at this extent` or `2 m at this extent
   (extents under about 4 x 4 km come back at 1 m)`, or 4 m etc for the
   genuinely huge. The number is computed, never guessed.
-- elevation: `30 m (Copernicus GLO-30)`.
+- elevation: `30 m (Copernicus GLO-30)` for the default model; a
+  configured instance names ITS OWN model's resolution and label
+  (`90 m (Copernicus GLO-90)` for COP90, and so on), because the
+  Settings DEM dropdown is a first-class path and a fixed string would
+  lie there. Ruled during item C's build (review of 2026-08-07): this
+  spec's purpose, a truthful quality preview, governs over any literal
+  example string in it. Item D and later implementers: do not re-copy
+  the fixed-literal pattern for sources with per-request configuration.
 - os_open: `1:10,000 scale, generalized footprints (OS OpenMap Local)`.
 - osm/overture: `traced footprints and centrelines, typically 1 to 5 m
   positional accuracy`.

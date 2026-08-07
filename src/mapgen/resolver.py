@@ -85,10 +85,12 @@ entries carry no `"detail"` key at all, rather than one holding `None`,
 which is what keeps every entry this module produced before this
 extension existed exactly the shape it already was. Most sources answer a
 fixed string regardless of `bbox` (their own detail is a property of the
-dataset, not of where in it a given survey happens to land);
-`lidar_wales.py`'s own `detail()` is the one exception, naming the actual
-pixel size a real download would come back at for THIS extent, which
-does depend on `bbox`. Never touches the network, by the same rule as
+dataset, not of where in it a given survey happens to land); the two
+exceptions are `lidar_wales.py`'s `detail()`, naming the actual pixel
+size a real download would come back at for THIS extent, and
+`elevation.py`'s, naming the CONFIGURED model rather than the default
+(a COP90 instance says 90 m: truth about the configured dataset beats
+a fixed example string). Never touches the network, by the same rule as
 `covers()`.
 
 Nesting by category, rather than returning one flat list of entries each

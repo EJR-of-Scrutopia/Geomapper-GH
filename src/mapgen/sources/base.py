@@ -412,10 +412,14 @@ class LayerSource(Protocol):
     covers()/tier() contributing no entry at all. lidar_wales.py's own
     detail() genuinely depends on bbox (it names the pixel size a real
     download would come back at over this extent, see its own
-    docstring); elevation.py's and the other five sources' own detail()
-    each return one fixed string regardless of bbox, since what they
-    have to say about their own resolution is a property of the dataset,
-    not of where in it a given survey happens to land. Never touches the
+    docstring); elevation.py's depends on the CONFIGURED model rather
+    than on bbox (a COP90 instance must say 90 m, not the default
+    model's 30 m: truth about the configured dataset beats a fixed
+    example string, the phase 2b item C review's own ruling); the other
+    five sources' detail() each return one fixed string regardless of
+    bbox, since what they have to say about their own resolution is a
+    property of the dataset, not of where in it a given survey happens
+    to land. Never touches the
     network, under the same rule as covers() above, for the same reason:
     a settings panel may call /api/estimate long before any survey has
     fetched anything.
