@@ -1571,7 +1571,7 @@ def test_register_default_sources_registers_the_five_default_sources():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_wales", "osm", "overture",
+        "elevation", "inspire", "lidar_wales", "os_open", "osm", "overture",
     ]
 
 
@@ -1583,7 +1583,7 @@ def test_register_default_sources_called_twice_is_a_no_op():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_wales", "osm", "overture",
+        "elevation", "inspire", "lidar_wales", "os_open", "osm", "overture",
     ]
 
 
@@ -2897,6 +2897,36 @@ def test_a_complete_run_sweeps_stale_merged_outputs_and_nothing_else(tmp_path):
         e["name"] for e in log.events if e["event"] == "stale_output_removed"
     )
     assert removed == [f"{stem}_water.geojson", "layers/water.geojson"]
+
+
+def test_a_complete_run_sweeps_a_stale_os_open_output_from_an_earlier_wider_attempt(tmp_path):
+    """Task 4 of the OS Open pack plan: register_default_sources() now adds
+    a real OsOpenSource to the registry, and `_sweep_stale_outputs` iterates
+    every REGISTERED source's own `possible_outputs(stem)` (see that
+    function's own docstring), not only the ones a request actually
+    selects. A `<stem>_os_buildings.geojson` an earlier, wider attempt left
+    behind must be swept on a complete run even when THIS run never
+    selects "os_open" at all, exactly the shape
+    `test_a_complete_run_sweeps_stale_merged_outputs_and_nothing_else`
+    above already proves generically with `SweepingStubSource`; this pins
+    the same mechanism against the real source this task adds.
+    """
+    register_default_sources()
+    register(StubSource())
+    root = tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront"
+    root.mkdir(parents=True)
+    stem = "Barry-Waterfront_2026-08-01"
+    stale = root / f"{stem}_os_buildings.geojson"
+    stale.write_text("stale os_open buildings from an earlier, wider attempt", encoding="utf-8")
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert result.paths.root == root
+    assert not stale.exists()
+    removed = {e["name"] for e in log.events if e["event"] == "stale_output_removed"}
+    assert f"{stem}_os_buildings.geojson" in removed
 
 
 def test_an_incomplete_run_keeps_every_leftover(tmp_path):

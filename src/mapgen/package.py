@@ -68,6 +68,7 @@ from mapgen.sources.base import (
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.inspire import BOUNDARY_INDICATIVE_NOTE, InspireSource
 from mapgen.sources.lidar_wales import LidarWalesSource
+from mapgen.sources.os_open import OsOpenSource
 from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
     LAYER_ORDER,
@@ -315,10 +316,17 @@ def register_default_sources() -> None:
     download the owner chooses, not a default), and registering it here is
     what makes "Property boundaries (INSPIRE)" appear in the layer
     checklist at all.
+
+    OsOpenSource (Task 4 of the OS Open pack plan) joins the same way too:
+    opt-in (a Great-Britain-wide, but still large, three-product download
+    the owner chooses rather than gets by default), and registering it
+    here is what makes "OS Open map data (GB)" appear in the layer
+    checklist at all.
     """
     by_id = {source.id: source for source in available_sources()}
     for source in (
         OsmSource(), OvertureSource(), ElevationSource(), LidarWalesSource(), InspireSource(),
+        OsOpenSource(),
     ):
         existing = by_id.get(source.id)
         if existing is not None and type(existing) is type(source):
