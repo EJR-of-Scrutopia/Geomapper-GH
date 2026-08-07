@@ -277,10 +277,17 @@ def build_geometry(path, step=2, frame="urbano", mapgen_src=None):
     if step is None or int(step) < 1:
         step = 1
     step = int(step)
-    frame = (frame or "urbano").lower()
+    frame = str(frame or "urbano").lower()
+    # A Grasshopper File Path parameter turns the text "urbano" into a
+    # full path ending in \urbano (it resolves relative to the document
+    # folder). The intent is unambiguous either way, so take the last
+    # path segment rather than erroring on a wiring choice.
+    frame = frame.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip()
     if frame not in ("urbano", "bng"):
         raise MapgenTiffError(
-            f"frame '{frame}' is not one this script knows: urbano or bng."
+            f"frame '{frame}' is not one this script knows: urbano or bng "
+            f"(feed it from a text panel, or leave it unconnected for "
+            f"urbano)."
         )
     (width, height, pixel_size, pixel_height,
      e_origin, n_top, values) = read_mapgen_tif(path)
