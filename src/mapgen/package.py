@@ -22,7 +22,9 @@ from mapgen.boundary_curves import boundary_curves_with_counts
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
 from mapgen.buildings import (
     _candidate_rings,
+    _existing_building_footprints,
     _exterior_ring,
+    _relation_building_member_way_ids,
     _resolve_way_ring,
     fuse_missing_buildings,
 )
@@ -2814,10 +2816,11 @@ def _osm_node_positions(osm_root: ET.Element) -> dict[str, tuple[float, float]]:
     """`osm_root`'s own `<node>` elements as `{id: (lon, lat)}`, the exact
     small collection loop `buildings._existing_building_footprints` builds
     inline, for the identical reason: `_resolve_way_ring` needs it to turn
-    a way's `nd ref` list into real coordinates, and this step needs it for
-    TWO different tag filters (`building=*` and `natural=water`) over the
-    SAME file, so it is built once here rather than twice, or pulled out of
-    a function whose own return value is scoped to buildings alone.
+    a way's `nd ref` list into real coordinates. Used only by `_osm_water_
+    rings` now (the building side reuses `_existing_building_footprints`
+    outright, which builds its own copy internally): kept as its own
+    function regardless, since `_osm_water_rings` still needs it standing
+    alone for its own two passes (plain ways, then relation members).
     """
     nodes: dict[str, tuple[float, float]] = {}
     for element in osm_root:
@@ -2835,45 +2838,110 @@ def _osm_node_positions(osm_root: ET.Element) -> dict[str, tuple[float, float]]:
     return nodes
 
 
-def _osm_building_and_water_rings(osm_root: ET.Element) -> tuple[list[Ring], list[Ring]]:
-    """Every `building=*` way and every CLOSED `natural=water` way already
-    in `osm_root`, resolved to rings via `_resolve_way_ring`
-    (`buildings.py`'s own node-ref resolver, shared with
-    `_existing_building_footprints` rather than re-walked here): building
-    ways regardless of their own `source=` tag, an owner's real OSM way or
-    one `_fuse_buildings_step` already injected from Overture or OS
-    OpenMapLocal read identically (the controller's own "regardless of
-    source tag" ruling). Plain ways only, no relations: the controller's
-    own wording names "ways", not "ways or relations", and every building
-    this step needs is one already, since a footprint `_fuse_buildings_step`
-    injects is always a plain way.
+def _osm_building_rings(osm_root: ET.Element) -> list[Ring]:
+    """Every building already in `osm_root`, as rings, via `buildings.
+    _existing_building_footprints` outright rather than a second,
+    hand-rolled reader: a review finding (task-3-review.md, Important)
+    caught this step's own first version reading plain `<way
+    building=*>` elements only, missing a building represented as a
+    multipolygon relation (tags on the relation, its own member ways
+    carrying none of their own) exactly the real-OSM shape task-6-
+    review.md's own Important I1 already fixed once for buildings
+    fusion. Calling the SAME function `_fuse_buildings_step` runs just
+    before this step (via `fuse_missing_buildings`) means a building this
+    package already knows about is seen identically by both: whatever
+    `_existing_building_footprints` accepts as a footprint for the dedup
+    rules there is exactly what feeds the housing gate here, with no
+    second opinion about what counts as a building.
 
-    A `natural=water` way is only read when its own `nd` list is closed
-    (first ref equal to last): an open way is a river centreline rather
-    than a lake outline, real OSM data this classifier has no use for and
-    no way to sample a ring from. `_resolve_way_ring`'s own closing-
-    duplicate drop only removes a repeat that IS there, so this checks the
-    way was closed to begin with rather than trusting an accidental
-    coincidence between an open way's first and last node ids.
+    `_existing_building_footprints` also returns `total` (how many
+    buildings exist whether or not a usable ring could be resolved for
+    them); this function drops it; it means nothing to classification,
+    only to buildings fusion's own `kept_existing` count.
+    """
+    footprints, _total = _existing_building_footprints(osm_root)
+    return [footprint.ring for footprint in footprints]
+
+
+def _closed_way_ring(
+    way: ET.Element, nodes: dict[str, tuple[float, float]]
+) -> Ring | None:
+    """`way`'s own ring via `_resolve_way_ring`, but ONLY if `way`'s own
+    `nd` list is closed to begin with (first ref equal to last): an open
+    way is a line (a river centreline, a coastline fragment), not an
+    area, real OSM data this classifier has no use for and no way to
+    sample a ring from. `_resolve_way_ring`'s own closing-duplicate drop
+    only removes a repeat that IS there, so this checks closure
+    explicitly rather than trusting an accidental coincidence between an
+    open way's own first and last node ids.
+    """
+    refs = [nd.get("ref") for nd in way.findall("nd")]
+    if len(refs) <= 1 or refs[0] != refs[-1]:
+        return None
+    return _resolve_way_ring(way, nodes)
+
+
+def _osm_water_rings(osm_root: ET.Element) -> list[Ring]:
+    """Every CLOSED `natural=water` way already in `osm_root`, plus every
+    outer member way of a `natural=water` RELATION that is itself closed:
+    the relation half mirrors `buildings._existing_building_footprints`'s
+    own building-relation handling (task-3-review.md's own Important
+    finding, addressed here for water the same way it already reuses that
+    function outright for buildings), reusing `buildings.
+    _relation_building_member_way_ids` for the outer/inner member split
+    even though its own name says "building": that function's own logic
+    never inspects the relation's tag at all, only its members' `role`
+    attributes, so it is exactly as correct for a `natural=water`
+    relation as for a `building=*` one, and reusing it here is what makes
+    this extension cheap rather than a reason to leave it undone (the
+    review's own conditional).
+
+    Residual, honestly named rather than silently accepted: a real
+    multipolygon whose own outer ring is split across SEVERAL member
+    ways that are not each individually closed (joined only by sharing
+    endpoints, real OSM practice for a large lake or coastline) is not
+    resolved by this function, because `_resolve_way_ring` (and
+    `_existing_building_footprints`'s own identical building-relation
+    handling) never attempts real multipolygon ring assembly, only reads
+    each member way on its own. The real Cowbridge package's own two
+    `natural=water` relations are both simple, single-outer-way
+    multipolygons this function does resolve; a residual case would
+    silently lose ONLY that one relation's own water evidence, and
+    `classify.py`'s own `water` bucket already draws on Overture's
+    `_water.geojson` too (real, separate redundancy on any UK survey,
+    since Overture's water layer is not sourced from OSM), so the
+    record this step writes is unaffected either way.
     """
     nodes = _osm_node_positions(osm_root)
-    buildings: list[Ring] = []
+    ways_by_id: dict[str, ET.Element] = {}
+    for element in osm_root:
+        if element.tag == "way":
+            way_id = element.get("id")
+            if way_id is not None:
+                ways_by_id[way_id] = element
+
     water: list[Ring] = []
     for element in osm_root:
-        if element.tag != "way":
-            continue
-        tags = {tag.get("k"): tag.get("v") for tag in element.findall("tag")}
-        if "building" in tags:
-            ring = _resolve_way_ring(element, nodes)
-            if ring is not None:
-                buildings.append(ring)
-        elif tags.get("natural") == "water":
-            refs = [nd.get("ref") for nd in element.findall("nd")]
-            if len(refs) > 1 and refs[0] == refs[-1]:
-                ring = _resolve_way_ring(element, nodes)
+        if element.tag == "way":
+            tags = {tag.get("k"): tag.get("v") for tag in element.findall("tag")}
+            if tags.get("natural") == "water":
+                ring = _closed_way_ring(element, nodes)
                 if ring is not None:
                     water.append(ring)
-    return buildings, water
+        elif element.tag == "relation":
+            tags = element.findall("tag")
+            if not any(
+                tag.get("k") == "natural" and tag.get("v") == "water" for tag in tags
+            ):
+                continue
+            for way_id in _relation_building_member_way_ids(element):
+                member_way = ways_by_id.get(way_id)
+                if member_way is None:
+                    continue
+                ring = _closed_way_ring(member_way, nodes)
+                if ring is not None:
+                    water.append(ring)
+    return water
 
 
 def _load_categorise_overlays(root: Path, stem: str) -> OverlaySets:
@@ -2891,7 +2959,8 @@ def _load_categorise_overlays(root: Path, stem: str) -> OverlaySets:
     osm_path = root / f"{stem}.osm"
     if osm_path.is_file():
         osm_root = ET.fromstring(osm_path.read_text(encoding="utf-8"))
-        building_rings, water_rings = _osm_building_and_water_rings(osm_root)
+        building_rings = _osm_building_rings(osm_root)
+        water_rings = _osm_water_rings(osm_root)
 
     water_rings = water_rings + _load_polygon_overlay_rings(root / f"{stem}_water.geojson")
 
@@ -2994,7 +3063,17 @@ def _categorise_boundaries_step(root: Path, stem: str, sink: ProgressSink) -> di
     so reading `.osm` after it has run sees every building this package
     knows about, sourced from OSM itself or injected, with no need for this
     step to separately open two more candidate files and reconcile them
-    against what buildings fusion already decided to keep.
+    against what buildings fusion already decided to keep. Buildings are
+    read via `buildings._existing_building_footprints` outright (`_osm_
+    building_rings`), the exact function `_fuse_buildings_step` itself
+    relies on, so a building represented as a plain way or as a
+    multipolygon relation is seen identically here and there (see that
+    function's own docstring for why a relation-tagged building is the
+    ordinary real-OSM shape, not a hypothetical). Water reads plain
+    `natural=water` ways and, for the same reason, `natural=water`
+    relations too (`_osm_water_rings`), with one honestly-documented
+    residual for a multi-way, not-individually-closed relation ring; see
+    that function's own docstring.
 
     Idempotent by full recomputation, not by tag detection: unlike
     `_fuse_boundaries_step`/`_fuse_buildings_step`, which mutate `.osm` in

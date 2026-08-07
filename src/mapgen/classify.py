@@ -547,11 +547,80 @@ def _cells_for_bbox(bbox: tuple[float, float, float, float]) -> list[tuple[int, 
     `representative_point` and `point_in_ring` for reuse out of that
     module), so a ring registered here is found by a query point
     anywhere inside its bounding box, not only near its own centroid.
+
+    Never called on a ring `_cell_span` has already flagged as GIANT (see
+    `_OverlayIndex.__init__`): building this list at all is the cost that
+    needed avoiding, not merely iterating it once built.
     """
     min_x, min_y, max_x, max_y = bbox
     col_min, row_min = _cell(min_x, min_y)
     col_max, row_max = _cell(max_x, max_y)
     return [(col, row) for row in range(row_min, row_max + 1) for col in range(col_min, col_max + 1)]
+
+
+# A package-review finding against the owner's own real Cowbridge data:
+# Overture's water layer is not clipped to the query bbox, so a
+# `class: "sea"` feature arrives as its own real-world polygon merely
+# intersecting the survey extent, not cut down to it. One such feature,
+# 19,902 vertices, had a bounding box of 12.63 deg x 10.05 deg;
+# `_cells_for_bbox` alone enumerated 507,817,242 `CELL_SIZE_DEGREES`
+# cells for that ONE ring (measured directly, ~35s and on the order of
+# 40 GB just for the returned list), and feeding it through
+# `_OverlayIndex.__init__` unmodified never completed at all (killed
+# after ~6 minutes of climbing memory).
+#
+# `GIANT_RING_CELLS` is the line a ring's own cell SPAN (`_cell_span`,
+# columns times rows, computed from its two corner cells without ever
+# enumerating the cells themselves) must cross before this module
+# refuses to bucket it at all: past this many cells, the ring joins
+# `_OverlayIndex`'s own overflow list instead (see that class), tested
+# against every sample point directly rather than through the grid.
+# 10,000 cells is 100 x 100 at `CELL_SIZE_DEGREES` (0.0005 deg, ~55 m),
+# an approximately 5.5 km square: comfortably larger than any real
+# overlay feature this classifier is meant to bucket finely (a field, an
+# estate, a park), so no ordinary land_use, greenspace or woodland
+# polygon this project has seen in real data crosses it, while a
+# continent- or sea-scale feature crosses it by many orders of
+# magnitude. The real overflow SET this produces in practice is tiny by
+# ring COUNT (the real Cowbridge package's own `_water.geojson` has 4 of
+# 96 features cross this line, all coastline/sea-scale), which is what
+# this fix's own correctness and MEMORY bound rest on: `_by_cell` never
+# grows past what ordinary, small overlay features put there, whatever a
+# giant ring's own bbox is. Ring count alone does not bound WALL TIME,
+# though, and this is measured, not assumed: those same 4 real rings
+# carry 121 + 12,833 + 102 + 19,902 = 32,958 vertices between them, each
+# tested by a full `point_in_ring` ray cast against every sample point
+# whose OWN bbox pre-check (`_OverlayIndex.near`) cannot reject it, which
+# it rarely can for a feature whose bbox already covers most of Great
+# Britain. Run end to end over the real, un-defanged Cowbridge package
+# (204,023 samples, task-3-report.md's own addendum), this step measured
+# 283.27 seconds, against 6.25 seconds for the same package with those 4
+# features removed: correct and BOUNDED (it finishes, in bounded memory,
+# where the unfixed code never did), but not fast, when the overflow set
+# is this vertex-heavy. A further optimisation (simplifying an overflow
+# ring's own vertex count before it is ever ray-cast, which this
+# classifier's own "indicative, not survey-grade" standard would tolerate
+# readily) is a real option for a later task; it is not implemented here,
+# since fixing the correctness/memory defect is this fix's own scope and
+# the wall time, while worse than the defanged baseline, is bounded and
+# was the number this fix was asked to report, not to optimise further.
+GIANT_RING_CELLS = 10_000
+
+
+def _cell_span(bbox: tuple[float, float, float, float]) -> int:
+    """How many `CELL_SIZE_DEGREES` cells `bbox` reaches into, WITHOUT
+    ever enumerating them: the same two corner cells `_cells_for_bbox`
+    itself computes, multiplied rather than expanded into a list. This is
+    what lets a ring's own bbox be recognised as GIANT (see
+    `GIANT_RING_CELLS`) before a single cell entry is built, which is the
+    actual cost that needed avoiding: `_cells_for_bbox`'s own list is the
+    507-million-entry object this function exists so nothing ever
+    constructs.
+    """
+    min_x, min_y, max_x, max_y = bbox
+    col_min, row_min = _cell(min_x, min_y)
+    col_max, row_max = _cell(max_x, max_y)
+    return (col_max - col_min + 1) * (row_max - row_min + 1)
 
 
 class _OverlayIndex:
@@ -562,17 +631,58 @@ class _OverlayIndex:
     `classify_parcels` call and shared across every parcel it classifies,
     which is the whole point of the plural entry point (N parcels do not
     each rebuild this).
+
+    A ring whose own bbox spans more than `GIANT_RING_CELLS` cells (see
+    that constant's own docstring for the real, executed Cowbridge
+    finding this responds to) is never bucketed at all: it joins
+    `_overflow` instead, a plain list every query tests directly, which
+    is what keeps this class's own memory bounded regardless of how
+    large a single overlay ring's bbox is. Correctness is unaffected
+    either way: every sample point is still ray-cast against every
+    overlay ring that could plausibly contain it, whether that ring was
+    found through a cell lookup or through this fallback list.
     """
 
     def __init__(self, candidates: Iterable[_Candidate]) -> None:
         self._by_cell: dict[tuple[int, int], list[_Candidate]] = defaultdict(list)
+        # (bucket, ring, bbox) triples, not bare (bucket, ring) pairs:
+        # `near`'s own bbox pre-check (see its docstring) needs the bbox
+        # too, and every candidate here is rare enough in practice that
+        # recomputing it per query, rather than storing it once here,
+        # would be the wrong place to economise.
+        self._overflow: list[tuple[str, Ring, tuple[float, float, float, float]]] = []
         for bucket, ring in candidates:
             bbox = _bbox(ring)
+            if _cell_span(bbox) > GIANT_RING_CELLS:
+                self._overflow.append((bucket, ring, bbox))
+                continue
             for cell in _cells_for_bbox(bbox):
                 self._by_cell[cell].append((bucket, ring))
 
     def near(self, point: tuple[float, float]) -> list[_Candidate]:
-        return self._by_cell.get(_cell(point[0], point[1]), [])
+        """Every candidate `point` could plausibly hit: its own grid
+        cell's own bucketed candidates, plus every overflow candidate
+        whose own bbox actually contains `point` (a plain, four-
+        comparison rectangle test, cheap enough to run unconditionally
+        and skip the full ray cast for any overflow ring `point` cannot
+        possibly be inside, which is every ordinary query against a
+        real overlay's own overflow set: a giant ring's bbox usually
+        covers far more ground than any one survey extent, so this
+        rarely rejects anything for THAT specific shape, but it is a
+        correct, cheap filter for any smaller overflow candidate whose
+        bbox point genuinely falls outside, and it costs nothing when
+        `_overflow` is empty, the ordinary case).
+        """
+        local = self._by_cell.get(_cell(point[0], point[1]))
+        candidates = list(local) if local is not None else []
+        if not self._overflow:
+            return candidates
+        x, y = point
+        for bucket, ring, bbox in self._overflow:
+            min_x, min_y, max_x, max_y = bbox
+            if min_x <= x <= max_x and min_y <= y <= max_y:
+                candidates.append((bucket, ring))
+        return candidates
 
 
 def classify_parcels(rings: list[Ring], overlays: OverlaySets) -> list[tuple[str, int]]:

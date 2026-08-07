@@ -7394,9 +7394,8 @@ def _write_categorise_geojson(out_dir, name, features):
 def _cc_osm_way(way_id, start_node_id, ring, tags):
     """One `<way>` plus its own fresh `<node>` elements, real-OSM style:
     the way's own `nd` list closes by repeating the FIRST node's id,
-    never a second node sharing its coordinates, since `_osm_building_
-    and_water_rings`'s own closed-way check reads node ids, not
-    coordinates.
+    never a second node sharing its coordinates, since `_osm_water_
+    rings`'s own closed-way check reads node ids, not coordinates.
     """
     node_ids = list(range(start_node_id, start_node_id + len(ring)))
     node_xml = "".join(
@@ -7410,15 +7409,34 @@ def _cc_osm_way(way_id, start_node_id, ring, tags):
     return node_xml + way_xml, start_node_id + len(ring)
 
 
-def _write_categorise_osm(out_dir, stem, ways):
+def _cc_osm_relation(relation_id, members, tags):
+    """One `<relation>` element, real-OSM style: `members` a list of
+    `(way_id, role)` pairs (`"outer"`/`"inner"`/`""`), `tags` a list of
+    `(k, v)` pairs on the RELATION itself, never on its own member ways
+    (the courtyard-building shape the review's own Important finding
+    names: a building's tags live on the relation, its outer and inner
+    member ways carry none of their own).
+    """
+    members_xml = "".join(
+        f'<member type="way" ref="{way_id}" role="{role}"/>' for way_id, role in members
+    )
+    tags_xml = "".join(f'<tag k="{k}" v="{v}"/>' for k, v in tags)
+    return f'<relation id="{relation_id}">{members_xml}{tags_xml}</relation>\n'
+
+
+def _write_categorise_osm(out_dir, stem, ways, relations=()):
     """`ways`: a list of `(way_id, ring, tags)`, `ring` open (no closing
-    repeat), `tags` a list of `(k, v)` pairs.
+    repeat), `tags` a list of `(k, v)` pairs. `relations`: a list of
+    `(relation_id, members, tags)`, `members` a list of `(way_id, role)`
+    pairs referencing ids already written by `ways` above.
     """
     body = []
     next_id = 1
     for way_id, ring, tags in ways:
         xml, next_id = _cc_osm_way(way_id, next_id, ring, tags)
         body.append(xml)
+    for relation_id, members, tags in relations:
+        body.append(_cc_osm_relation(relation_id, members, tags))
     text = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<osm version="0.6" generator="mapgen-test">\n'
@@ -7822,6 +7840,55 @@ def test_a_categorise_boundaries_failure_is_recorded_and_the_survey_still_finish
     assert names.index("boundaries_categories_started") < names.index(
         "boundaries_categories_failed"
     )
+
+
+class BuildingRelationCategoriseStubSource(StubSource):
+    """A single parcel, 100% residential land_use, whose only OSM
+    building representation is a courtyard-style multipolygon relation:
+    an outer and an inner member way, NEITHER carrying a `building` tag
+    of its own (the tag lives on the relation instead), the exact real-
+    OSM shape task-3-review.md's own Important finding names, and the
+    shape `buildings._existing_building_footprints` already reads
+    correctly for buildings fusion (task-6-review.md's own Important I1).
+    """
+
+    def merge(self, parts, out_dir, stem):
+        parcel = _cc_cell(0)
+        outer = _cc_inner(parcel, shrink=0.3)
+        inner = _cc_inner(parcel, shrink=0.4)
+        parcels = _write_categorise_geojson(
+            out_dir, f"{stem}_parcels.geojson", [_cc_parcel_feature(parcel)]
+        )
+        land_use = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_land_use.geojson",
+            [_cc_polygon_feature(parcel, {"class": "residential"})],
+        )
+        osm_path = _write_categorise_osm(
+            out_dir,
+            stem,
+            ways=[(801, outer, []), (802, inner, [])],
+            relations=[(701, [(801, "outer"), (802, "inner")], [("building", "yes")])],
+        )
+        return [parcels, land_use, osm_path]
+
+
+def test_categorise_boundaries_reads_a_building_relation_as_housing_evidence(tmp_path):
+    """The review's own executed proof, reproduced here: a parcel that is
+    100% residential land-use, containing a real building whose ONLY OSM
+    representation is a courtyard-style multipolygon relation, classified
+    `garden` before this fix (the plain-ways-only reader never saw the
+    relation's own footprint at all) and must classify `housing` now that
+    building evidence is read via `buildings._existing_building_
+    footprints`, the same function buildings fusion itself relies on.
+    """
+    register(BuildingRelationCategoriseStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["boundaries_categories"]
+    assert record["error"] is None
+    assert record["counts"] == {"housing": 1}
 
 
 class BuildingsAndParcelsStubSource(StubSource):

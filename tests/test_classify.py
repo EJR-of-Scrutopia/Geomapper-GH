@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import time
 
-from mapgen.classify import SAMPLE_CAP, OverlaySets, classify_parcel, classify_parcels
+from mapgen.classify import (
+    GIANT_RING_CELLS,
+    SAMPLE_CAP,
+    OverlaySets,
+    _flat_candidates,
+    _OverlayIndex,
+    classify_parcel,
+    classify_parcels,
+)
 
 # --------------------------------------------------------------------------
 # Shared synthetic geometry. All coordinates WGS84 [lon, lat]; degrees at
@@ -341,6 +349,44 @@ def test_pathological_huge_ring_classifies_in_bounded_time_with_capped_samples()
     assert sample_count <= SAMPLE_CAP
     assert elapsed < 5.0
     assert category == "unclassified"
+
+
+def test_giant_ring_bbox_skips_per_cell_bucketing_and_classifies_correctly() -> None:
+    """The package review's own real-Cowbridge finding: a real Overture
+    `water` feature (`class: "sea"`) is not clipped to the query bbox and
+    arrives as its own real-world polygon, bbox 12.63 deg x 10.05 deg.
+    Bucketed the ordinary way that enumerates 507,817,242 `CELL_SIZE_
+    DEGREES` cells for that ONE ring (measured directly against the real
+    package), multiple GB just for the list, and the step never
+    completed (killed after ~6 minutes). A 10 deg x 10 deg synthetic ring
+    here reproduces the same order of magnitude (about 400,000,000
+    cells) with a plain 4-vertex rectangle, so this stays a fast unit
+    test: `_OverlayIndex` must recognise it as GIANT and route it to the
+    overflow list instead of ever building that cell list, which is what
+    keeps `_by_cell` itself small regardless of how large a single
+    overlay ring's bbox is, and a real classification against it must
+    still complete, correctly, in bounded time.
+    """
+    giant_water = _rect(-5.0, 45.0, 5.0, 55.0)
+    overlays = OverlaySets(
+        buildings=[], landuse=[], water=[giant_water], greenspace=[], woodland=[],
+    )
+
+    start = time.monotonic()
+    index = _OverlayIndex(_flat_candidates(overlays))
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0
+    assert len(index._by_cell) < GIANT_RING_CELLS, (
+        "a giant ring's own bbox must never be bucketed cell by cell"
+    )
+    assert len(index._overflow) == 1
+
+    # A small, ordinary parcel sitting inside the giant ring's own area
+    # still classifies correctly: the overflow list is tested exactly
+    # like the bucketed candidates, never skipped.
+    results = classify_parcels([_PARCEL], overlays)
+    assert results == [("water", results[0][1])]
 
 
 def test_empty_ring_returns_unclassified_with_zero_samples() -> None:
