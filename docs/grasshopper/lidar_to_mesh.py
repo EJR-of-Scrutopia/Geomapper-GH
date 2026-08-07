@@ -2,19 +2,20 @@
 
 Reads the `<stem>_lidar_dtm.tif` / `<stem>_lidar_dsm.tif` a mapgen package
 carries and builds a terrain mesh, with no libraries beyond the Python
-standard one. It reads exactly the TIFF dialect mapgen's own writer
-produces (classic little-endian, one directory, 256 px deflate tiles,
-float32, nodata -9999) and refuses anything else by name, so a random
-GeoTIFF failing here is the script being honest, not broken.
+standard one (numpy is used automatically when present; Rhino 8 ships it).
+It reads exactly the TIFF dialect mapgen's own writer produces (classic
+little-endian, one directory, 256 px deflate tiles, float32, nodata -9999)
+and refuses anything else by name, so a random GeoTIFF failing here is the
+script being honest, not broken.
 
-Grasshopper use (Rhino 8, GHPython 3 component):
+Grasshopper use (Rhino 8, Python 3 component):
   paste this whole file into the component and add these inputs
   (names matter, types in brackets, all except path optional):
 
+    run        (bool) gate: nothing computes until True. Default True
+                      when the input is not added at all.
     path       (str)  full path to the _lidar_dtm.tif or _lidar_dsm.tif
-    step       (int)  sample every Nth pixel; 1 = native 1 m, default 2.
-                      A whole town at step 1 is millions of vertices;
-                      start at 2 or 4 and refine once it works.
+    step       (int)  sample every Nth pixel; 1 = native, default 2.
     frame      (str)  "urbano" (default) or "bng".
                       urbano: vertices in the same absolute UTM metres
                         Urbano places the package's layers in, so the
@@ -26,8 +27,8 @@ Grasshopper use (Rhino 8, GHPython 3 component):
                       Example: C:\\Users\\Param\\mapgen-phase1\\src
     at_origin  (bool) translate the mesh so its min corner sits at 0,0
                       (the true offset is reported in `origin`). Default
-                      False. Useful for standalone studies; leave False
-                      when aligning with Urbano layers.
+                      False. Leave False when aligning with Urbano
+                      layers.
 
   and outputs: mesh, info, origin.
 
@@ -48,12 +49,17 @@ transforms over the real Cowbridge raster (200 random samples), the
 worst interpolation error was 0.7 mm (2026-08-07).
 """
 
+import bisect
 import json
-import math
 import struct
 import sys
 import zlib
 from pathlib import Path
+
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
 
 _NODATA = -9999.0
 _TILE = 256
@@ -79,17 +85,11 @@ class MapgenTiffError(ValueError):
     """This is not a raster mapgen wrote, and the message says why."""
 
 
-def read_mapgen_tif(path):
-    """Parse a mapgen-packaged LiDAR GeoTIFF.
-
-    Returns (width, height, pixel_size, pixel_height, e_origin, n_top,
-    values) with values a flat row-major list of floats, NaN for nodata.
-    """
-    data = Path(path).read_bytes()
+def _read_tags(data, name):
     if data[:4] != b"II\x2a\x00":
         raise MapgenTiffError(
-            f"{Path(path).name} is not a little-endian classic TIFF; "
-            f"this script reads only the rasters mapgen itself writes."
+            f"{name} is not a little-endian classic TIFF; this script "
+            f"reads only the rasters mapgen itself writes."
         )
     (ifd_offset,) = struct.unpack_from("<I", data, 4)
     (entry_count,) = struct.unpack_from("<H", data, ifd_offset)
@@ -107,7 +107,7 @@ def read_mapgen_tif(path):
             tags[tag] = list(
                 struct.unpack_from("<" + code * count, data, value_offset)
             )
-    for wanted, name in (
+    for wanted, label in (
         (_T_WIDTH, "image width"),
         (_T_HEIGHT, "image height"),
         (_T_TILE_OFFSETS, "tile offsets"),
@@ -116,28 +116,49 @@ def read_mapgen_tif(path):
     ):
         if wanted not in tags:
             raise MapgenTiffError(
-                f"{Path(path).name} is missing its {name} tag; this "
-                f"script reads only the rasters mapgen itself writes."
+                f"{name} is missing its {label} tag; this script reads "
+                f"only the rasters mapgen itself writes."
             )
     if tags.get(_T_BITS, [0])[0] != 32 or tags.get(_T_SAMPLE_FORMAT, [0])[0] != 3:
-        raise MapgenTiffError(
-            f"{Path(path).name} is not float32; mapgen's LiDAR rasters are."
-        )
+        raise MapgenTiffError(f"{name} is not float32; mapgen's LiDAR rasters are.")
     if tags.get(_T_COMPRESSION, [0])[0] != 8:
-        raise MapgenTiffError(
-            f"{Path(path).name} is not deflate-compressed; mapgen's are."
-        )
+        raise MapgenTiffError(f"{name} is not deflate-compressed; mapgen's are.")
+    return tags
+
+
+def read_mapgen_tif(path):
+    """Parse a mapgen-packaged LiDAR GeoTIFF.
+
+    Returns (width, height, pixel_size, pixel_height, e_origin, n_top,
+    values): values is a numpy float32 (height, width) array when numpy
+    is present, else a flat row-major list; nodata is NaN either way.
+    """
+    data = Path(path).read_bytes()
+    tags = _read_tags(data, Path(path).name)
     width = tags[_T_WIDTH][0]
     height = tags[_T_HEIGHT][0]
     tile_w = tags.get(_T_TILE_WIDTH, [_TILE])[0]
     tile_h = tags.get(_T_TILE_LENGTH, [_TILE])[0]
     pixel_size, pixel_height = tags[_T_PIXEL_SCALE][0], tags[_T_PIXEL_SCALE][1]
     e_origin, n_top = tags[_T_TIEPOINT][3], tags[_T_TIEPOINT][4]
-
     across = (width + tile_w - 1) // tile_w
-    values = [float("nan")] * (width * height)
     offsets = tags[_T_TILE_OFFSETS]
     counts = tags[_T_TILE_COUNTS]
+
+    if _np is not None:
+        grid = _np.full((height, width), _np.nan, dtype=_np.float32)
+        for tile_index, (offset, count) in enumerate(zip(offsets, counts)):
+            raw = zlib.decompress(data[offset:offset + count])
+            block = _np.frombuffer(raw, dtype="<f4").reshape(tile_h, tile_w)
+            tile_x = (tile_index % across) * tile_w
+            tile_y = (tile_index // across) * tile_h
+            rows = min(tile_h, height - tile_y)
+            span = min(tile_w, width - tile_x)
+            grid[tile_y:tile_y + rows, tile_x:tile_x + span] = block[:rows, :span]
+        grid[grid == _NODATA] = _np.nan
+        return width, height, pixel_size, pixel_height, e_origin, n_top, grid
+
+    values = [float("nan")] * (width * height)
     for tile_index, (offset, count) in enumerate(zip(offsets, counts)):
         raw = zlib.decompress(data[offset:offset + count])
         floats = struct.unpack("<" + "f" * (tile_w * tile_h), raw)
@@ -198,15 +219,15 @@ def _zone_for(path, bng_module, utm_module, grid, e_origin, n_top):
     return utm_module.utm_zone(lat, lon)
 
 
-def _urbano_lattice(width, height, pixel_size, pixel_height, e_origin,
-                    n_top, step, mapgen_src, tif_path):
-    """Exact BNG-to-UTM transform on an anchor lattice, for interpolation.
+def _anchor_lattice(width, height, pixel_size, pixel_height, e_origin,
+                    n_top, mapgen_src, tif_path):
+    """Exact BNG-to-UTM transforms on an anchor lattice every 128 samples.
 
-    Anchors every 128 samples in each direction (plus the far edge).
     Between anchors the mapping is bilinear; the worst measured error
     against exact per-point transforms is 0.7 mm (Cowbridge raster,
     2026-08-07), so the mesh is Urbano-exact for every practical
-    purpose.
+    purpose. Returns (anchor_cols, anchor_rows, eastings, northings,
+    zone) with eastings/northings indexed [row][col].
     """
     bng_module, utm_module = _load_mapgen(mapgen_src)
     grid = bng_module.load_ostn15()
@@ -216,49 +237,42 @@ def _urbano_lattice(width, height, pixel_size, pixel_height, e_origin,
             "survey once (it downloads the grid), then retry."
         )
     zone = _zone_for(tif_path, bng_module, utm_module, grid, e_origin, n_top)
-
     lattice = 128
-    cols = list(range(0, width, step))
-    rows = list(range(0, height, step))
-    anchor_cols = sorted(set(list(range(0, width, lattice)) + [cols[-1]]))
-    anchor_rows = sorted(set(list(range(0, height, lattice)) + [rows[-1]]))
-    exact = {}
+    anchor_cols = sorted(set(list(range(0, width, lattice)) + [width - 1]))
+    anchor_rows = sorted(set(list(range(0, height, lattice)) + [height - 1]))
+    eastings = []
+    northings = []
     for row in anchor_rows:
         northing = n_top - (row + 0.5) * pixel_height
+        e_row = []
+        n_row = []
         for col in anchor_cols:
             easting = e_origin + (col + 0.5) * pixel_size
             lat, lon = bng_module.from_bng(easting, northing, grid)
-            exact[(col, row)] = utm_module.project(lat, lon, zone)
-
-    def locate(seq, value):
-        for index in range(len(seq) - 1):
-            if seq[index] <= value <= seq[index + 1]:
-                return seq[index], seq[index + 1]
-        return seq[-2], seq[-1]
-
-    def transform(col, row):
-        c0, c1 = locate(anchor_cols, col)
-        r0, r1 = locate(anchor_rows, row)
-        fc = 0.0 if c1 == c0 else (col - c0) / float(c1 - c0)
-        fr = 0.0 if r1 == r0 else (row - r0) / float(r1 - r0)
-        e00, n00 = exact[(c0, r0)]
-        e10, n10 = exact[(c1, r0)]
-        e01, n01 = exact[(c0, r1)]
-        e11, n11 = exact[(c1, r1)]
-        top_e = e00 + (e10 - e00) * fc
-        bot_e = e01 + (e11 - e01) * fc
-        top_n = n00 + (n10 - n00) * fc
-        bot_n = n01 + (n11 - n01) * fc
-        return top_e + (bot_e - top_e) * fr, top_n + (bot_n - top_n) * fr
-
-    return transform, zone
+            e_utm, n_utm = utm_module.project(lat, lon, zone)
+            e_row.append(e_utm)
+            n_row.append(n_utm)
+        eastings.append(e_row)
+        northings.append(n_row)
+    return anchor_cols, anchor_rows, eastings, northings, zone
 
 
-def build_grid(path, step=2, frame="urbano", mapgen_src=None):
-    """Everything Rhino-free: sampled vertex grid plus stats.
+def _brackets(anchors, samples):
+    """Per sample: (lower anchor index, blend fraction toward the upper)."""
+    out = []
+    for value in samples:
+        upper = bisect.bisect_right(anchors, value)
+        low = min(max(upper - 1, 0), len(anchors) - 2)
+        span = anchors[low + 1] - anchors[low]
+        out.append((low, 0.0 if span == 0 else (value - anchors[low]) / span))
+    return out
 
-    Returns (points, cols, rows, info, origin) where points is a
-    row-major list of (x, y, z) or None per sampled cell.
+
+def build_geometry(path, step=2, frame="urbano", mapgen_src=None):
+    """Everything Rhino-free: vertices, quad faces, stats.
+
+    Returns (vertices, faces, info, origin): vertices is a list of
+    (x, y, z), faces a list of (a, b, c, d) vertex indices.
     """
     if step is None or int(step) < 1:
         step = 1
@@ -270,75 +284,160 @@ def build_grid(path, step=2, frame="urbano", mapgen_src=None):
         )
     (width, height, pixel_size, pixel_height,
      e_origin, n_top, values) = read_mapgen_tif(path)
+    cols = list(range(0, width, step))
+    rows = list(range(0, height, step))
 
     if frame == "urbano":
-        transform, zone = _urbano_lattice(
-            width, height, pixel_size, pixel_height, e_origin, n_top,
-            step, mapgen_src, path)
+        (anchor_cols, anchor_rows, lattice_e, lattice_n,
+         zone) = _anchor_lattice(width, height, pixel_size, pixel_height,
+                                 e_origin, n_top, mapgen_src, path)
     else:
         zone = None
 
-        def transform(col, row):
-            return (e_origin + (col + 0.5) * pixel_size,
-                    n_top - (row + 0.5) * pixel_height)
-
-    cols = list(range(0, width, step))
-    rows = list(range(0, height, step))
-    points = []
-    z_min, z_max = float("inf"), float("-inf")
-    kept = 0
-    for row in rows:
-        for col in cols:
-            z = values[row * width + col]
-            if z != z:
-                points.append(None)
-                continue
-            x, y = transform(col, row)
-            points.append((x, y, z))
-            kept += 1
-            if z < z_min:
-                z_min = z
-            if z > z_max:
-                z_max = z
+    if _np is not None:
+        vertices, faces, kept, z_min, z_max = _geometry_numpy(
+            values, cols, rows, frame, pixel_size, pixel_height,
+            e_origin, n_top,
+            None if frame == "bng" else (anchor_cols, anchor_rows,
+                                         lattice_e, lattice_n))
+    else:
+        vertices, faces, kept, z_min, z_max = _geometry_pure(
+            values, width, cols, rows, frame, pixel_size, pixel_height,
+            e_origin, n_top,
+            None if frame == "bng" else (anchor_cols, anchor_rows,
+                                         lattice_e, lattice_n))
     if kept == 0:
         raise MapgenTiffError(
             f"{Path(path).name} has no data samples at step {step}; "
             f"nothing to mesh."
         )
-    origin = (
-        min(p[0] for p in points if p),
-        min(p[1] for p in points if p),
-    )
+    origin = (min(v[0] for v in vertices), min(v[1] for v in vertices))
     info = (
         f"{Path(path).name}: {width} x {height} px at "
         f"{pixel_size:g} m, sampled every {step} px, frame {frame}"
-        f"{' zone ' + zone if zone else ''}; {kept:,} data points, "
-        f"z {z_min:.2f} to {z_max:.2f} m"
+        f"{' zone ' + zone if zone else ''}; {kept:,} vertices, "
+        f"{len(faces):,} faces, z {z_min:.2f} to {z_max:.2f} m"
+        f"{'' if _np is not None else ' (numpy not found: slow path)'}"
     )
-    return points, len(cols), len(rows), info, origin
+    return vertices, faces, info, origin
 
 
-def build_rhino_mesh(points, cols, rows, at_origin, origin):
-    """The Rhino half: only importable inside Rhino/Grasshopper."""
+def _geometry_numpy(grid, cols, rows, frame, pixel_size, pixel_height,
+                    e_origin, n_top, lattice):
+    np = _np
+    ci = np.asarray(cols)
+    ri = np.asarray(rows)
+    z = grid[np.ix_(ri, ci)].astype(np.float64)
+    mask = np.isfinite(z)
+    kept = int(mask.sum())
+    if kept == 0:
+        return [], [], 0, 0.0, 0.0
+
+    if frame == "bng":
+        x_line = e_origin + (ci + 0.5) * pixel_size
+        y_line = n_top - (ri + 0.5) * pixel_height
+        x = np.broadcast_to(x_line, z.shape)
+        y = np.broadcast_to(y_line[:, None], z.shape)
+    else:
+        anchor_cols, anchor_rows, lattice_e, lattice_n = lattice
+        ac = np.asarray(anchor_cols)
+        ar = np.asarray(anchor_rows)
+        le = np.asarray(lattice_e)
+        ln = np.asarray(lattice_n)
+        c_low = np.clip(np.searchsorted(ac, ci, side="right") - 1, 0, len(ac) - 2)
+        r_low = np.clip(np.searchsorted(ar, ri, side="right") - 1, 0, len(ar) - 2)
+        c_span = ac[c_low + 1] - ac[c_low]
+        r_span = ar[r_low + 1] - ar[r_low]
+        fc = np.where(c_span == 0, 0.0, (ci - ac[c_low]) / c_span)
+        fr = np.where(r_span == 0, 0.0, (ri - ar[r_low]) / r_span)
+        FC = fc[None, :]
+        FR = fr[:, None]
+        x = (le[np.ix_(r_low, c_low)] * (1 - FC) * (1 - FR)
+             + le[np.ix_(r_low, c_low + 1)] * FC * (1 - FR)
+             + le[np.ix_(r_low + 1, c_low)] * (1 - FC) * FR
+             + le[np.ix_(r_low + 1, c_low + 1)] * FC * FR)
+        y = (ln[np.ix_(r_low, c_low)] * (1 - FC) * (1 - FR)
+             + ln[np.ix_(r_low, c_low + 1)] * FC * (1 - FR)
+             + ln[np.ix_(r_low + 1, c_low)] * (1 - FC) * FR
+             + ln[np.ix_(r_low + 1, c_low + 1)] * FC * FR)
+
+    index = np.full(z.shape, -1, dtype=np.int64)
+    index[mask] = np.arange(kept)
+    stacked = np.column_stack((
+        np.asarray(x)[mask], np.asarray(y)[mask], z[mask]))
+    vertices = list(map(tuple, stacked))
+    corner = (mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, 1:] & mask[1:, :-1])
+    a = index[:-1, :-1][corner]
+    b = index[:-1, 1:][corner]
+    c = index[1:, 1:][corner]
+    d = index[1:, :-1][corner]
+    faces = list(map(tuple, np.column_stack((a, b, c, d))))
+    return vertices, faces, kept, float(np.nanmin(z)), float(np.nanmax(z))
+
+
+def _geometry_pure(values, width, cols, rows, frame, pixel_size,
+                   pixel_height, e_origin, n_top, lattice):
+    if frame == "urbano":
+        anchor_cols, anchor_rows, lattice_e, lattice_n = lattice
+        col_bracket = _brackets(anchor_cols, cols)
+        row_bracket = _brackets(anchor_rows, rows)
+    vertices = []
+    index = [[-1] * len(cols) for _ in rows]
+    z_min, z_max = float("inf"), float("-inf")
+    for r_pos, row in enumerate(rows):
+        base = row * width
+        for c_pos, col in enumerate(cols):
+            z = values[base + col]
+            if z != z:
+                continue
+            if frame == "bng":
+                x = e_origin + (col + 0.5) * pixel_size
+                y = n_top - (row + 0.5) * pixel_height
+            else:
+                c0, fc = col_bracket[c_pos]
+                r0, fr = row_bracket[r_pos]
+                def blend(table):
+                    top = table[r0][c0] + (table[r0][c0 + 1] - table[r0][c0]) * fc
+                    bot = (table[r0 + 1][c0]
+                           + (table[r0 + 1][c0 + 1] - table[r0 + 1][c0]) * fc)
+                    return top + (bot - top) * fr
+                x = blend(lattice_e)
+                y = blend(lattice_n)
+            index[r_pos][c_pos] = len(vertices)
+            vertices.append((x, y, z))
+            if z < z_min:
+                z_min = z
+            if z > z_max:
+                z_max = z
+    faces = []
+    for r_pos in range(len(rows) - 1):
+        top_row = index[r_pos]
+        bottom_row = index[r_pos + 1]
+        for c_pos in range(len(cols) - 1):
+            a = top_row[c_pos]
+            b = top_row[c_pos + 1]
+            c = bottom_row[c_pos + 1]
+            d = bottom_row[c_pos]
+            if a >= 0 and b >= 0 and c >= 0 and d >= 0:
+                faces.append((a, b, c, d))
+    return vertices, faces, len(vertices), z_min, z_max
+
+
+def build_rhino_mesh(vertices, faces, at_origin, origin):
+    """The Rhino half: only importable inside Rhino/Grasshopper.
+
+    Batched adds: one interop call for all vertices and one for all
+    faces, instead of one per element, which is where the old version
+    spent most of its time.
+    """
     import Rhino.Geometry as rg
 
     shift_x, shift_y = (origin if at_origin else (0.0, 0.0))
     mesh = rg.Mesh()
-    index_of = [-1] * len(points)
-    for position, point in enumerate(points):
-        if point is None:
-            continue
-        index_of[position] = mesh.Vertices.Add(
-            point[0] - shift_x, point[1] - shift_y, point[2]
-        )
-    for row in range(rows - 1):
-        for col in range(cols - 1):
-            a = index_of[row * cols + col]
-            b = index_of[row * cols + col + 1]
-            c = index_of[(row + 1) * cols + col + 1]
-            d = index_of[(row + 1) * cols + col]
-            if -1 not in (a, b, c, d):
-                mesh.Faces.AddFace(a, b, c, d)
+    mesh.Vertices.AddVertices(
+        [rg.Point3d(x - shift_x, y - shift_y, z) for (x, y, z) in vertices]
+    )
+    mesh.Faces.AddFaces([rg.MeshFace(a, b, c, d) for (a, b, c, d) in faces])
     mesh.Normals.ComputeNormals()
     mesh.Compact()
     return mesh
@@ -346,17 +445,19 @@ def build_rhino_mesh(points, cols, rows, at_origin, origin):
 
 def _run_component():
     """Grasshopper entry: reads the component's inputs from globals."""
+    if "run" in globals() and not globals().get("run"):
+        return None, "run is False; set it to True to compute", None
     tif_path = globals().get("path")
     if not tif_path:
         return None, "connect path: the packaged _lidar_dtm.tif or _lidar_dsm.tif", None
-    points, cols, rows, info, origin = build_grid(
+    vertices, faces, info, origin = build_geometry(
         tif_path,
         step=globals().get("step") or 2,
         frame=globals().get("frame") or "urbano",
         mapgen_src=globals().get("mapgen_src"),
     )
     shift = bool(globals().get("at_origin"))
-    built = build_rhino_mesh(points, cols, rows, shift, origin)
+    built = build_rhino_mesh(vertices, faces, shift, origin)
     if shift:
         info += f"; moved to origin, true min corner at {origin[0]:.2f}, {origin[1]:.2f}"
     return built, info, "{:.3f}, {:.3f}".format(*origin)
@@ -381,24 +482,15 @@ elif __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-    arg_path = sys.argv[1]
-    arg_step = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    arg_frame = sys.argv[3] if len(sys.argv) > 3 else "bng"
-    arg_src = sys.argv[4] if len(sys.argv) > 4 else None
-    grid_points, grid_cols, grid_rows, grid_info, grid_origin = build_grid(
-        arg_path, arg_step, arg_frame, arg_src)
-    faces = sum(
-        1
-        for row in range(grid_rows - 1)
-        for col in range(grid_cols - 1)
-        if all(
-            grid_points[r * grid_cols + c] is not None
-            for r, c in (
-                (row, col), (row, col + 1),
-                (row + 1, col + 1), (row + 1, col),
-            )
-        )
+    import time
+    started = time.perf_counter()
+    cli_vertices, cli_faces, cli_info, cli_origin = build_geometry(
+        sys.argv[1],
+        int(sys.argv[2]) if len(sys.argv) > 2 else 2,
+        sys.argv[3] if len(sys.argv) > 3 else "bng",
+        sys.argv[4] if len(sys.argv) > 4 else None,
     )
-    print(grid_info)
-    print(f"mesh would carry {faces:,} quad faces; "
-          f"min corner {grid_origin[0]:.2f}, {grid_origin[1]:.2f}")
+    elapsed = time.perf_counter() - started
+    print(cli_info)
+    print(f"built in {elapsed:.2f}s; min corner "
+          f"{cli_origin[0]:.2f}, {cli_origin[1]:.2f}")
