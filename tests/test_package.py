@@ -7954,11 +7954,14 @@ def test_boundaries_categories_run_between_buildings_and_heights_fusion_in_bridg
 def test_bridge_package_re_runs_boundaries_categories_idempotently_and_byte_identically(
     tmp_path,
 ):
-    """The reason this matters, exactly as it does for buildings fusion
-    and boundaries fusion above: every package the owner already has was
-    downloaded before this task existed, so every one of them can now
-    have its categorised curves produced by a plain re-bridge, agreeing
-    exactly with what the download itself already computed.
+    """A re-bridge of a package that ALREADY HAS its parcels file must
+    reproduce the categorised curves byte-identically, never drifting
+    from what the download computed. Deliberately NOT claimed here:
+    that a pre-item-A package gains categorised curves from a plain
+    re-bridge. It cannot: bridge never re-runs a source's merge, so a
+    package downloaded before parcels persisted has no _parcels.geojson
+    and its record stays honestly all-zero; only a fresh survey
+    produces the parcels and the categories.
     """
     register(CategoriseFixtureStubSource())
 

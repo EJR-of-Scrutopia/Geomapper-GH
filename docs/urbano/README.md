@@ -232,8 +232,12 @@ record.
 ## The categorised boundaries file: filtering by category in Import Geojson File
 
 Phase 2b item A's `<stem>_boundaries_categorised.geojson` (`src/mapgen/package.py`,
-`_categorise_boundaries_step`) is packaged whenever `inspire` is selected,
-beside the plain `<stem>_boundaries.geojson` item 2 already writes. Read it
+`_categorise_boundaries_step`) is packaged whenever `inspire` is selected
+on a FRESH survey, beside the plain `<stem>_boundaries.geojson` item 2
+already writes. A package downloaded before item A has no
+`<stem>_parcels.geojson`, and `mapgen bridge` cannot conjure one (bridge
+never re-runs a source's merge): re-survey the extent to get categories
+for an older package. Read it
 the same way as every other GeoJSON in this README, straight into **Import
 Geojson File** (see "Import Geojson File: the Z ordinate is discarded, not
 merely unread" above), and the owner's own workflow from there is the same
