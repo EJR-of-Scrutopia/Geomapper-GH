@@ -111,6 +111,7 @@ from mapgen.os_downloads import (
     product_cache_dir,
     product_downloads,
     product_version,
+    safe_download_filename,
     sweep_old_versions,
 )
 from mapgen.os_gml import iter_greenspace_features, iter_oml_features, iter_road_features
@@ -424,7 +425,7 @@ def _shard_zip_download_square(
             kind="parse",
         )
     raw_dir = product_dir / "raw"
-    dest = raw_dir / (entry.get("fileName") or f"{product}_{square}.zip")
+    dest = raw_dir / safe_download_filename(entry)
     try:
         download_entry(entry, dest, progress=progress)
         with zipfile.ZipFile(dest) as archive:
@@ -444,9 +445,25 @@ def _shard_zip_download_square(
 
 def _shard_openroads_square(zip_reader: ZipReader, square: str, shard_dir: Path, product_dir: Path) -> None:
     """OpenRoads: pull `data/OSOpenRoads_<SQ>.gml` out of the shared
-    ranged `zip_reader`, spool it to a temp file under `<cache>/raw/`
-    (never held whole in memory: the ST member alone is 428.6 MB
-    uncompressed), and stream that file into `write_shards`.
+    ranged `zip_reader`, spool it to a temp file under `<cache>/raw/`,
+    and stream that file into `write_shards`.
+
+    Final review, Minor N1: this docstring used to claim the member is
+    "never held whole in memory", which is false as written.
+    `ZipReader.read_member` (os_downloads.py) returns the entire
+    decompressed member as one `bytes` object; for the ST square that is
+    428,635,342 bytes resident before this function's own
+    `temp_path.write_bytes(data)` call ever runs. What the spool to a
+    temp file actually avoids is holding that member whole in memory
+    DURING the GML parse that follows (`write_shards(iter_road_features
+    (handle), ...)` streams the temp file back off disk one `xml.etree.
+    ElementTree.iterparse` chunk at a time, rather than parsing the same
+    428 MB `bytes` object a second time in memory), not during the read
+    itself. Streaming `read_member`'s own decompression output straight
+    to disk, rather than returning it as one `bytes` object first, would
+    close this gap for real; not done here, since it is not needed for
+    merge() to work today and would mean widening `ZipReader`'s own
+    return shape.
 
     The temp file is deleted in a `finally`, the same "no reason to keep
     it either way" logic `_shard_zip_download_square` follows.
@@ -722,6 +739,49 @@ class OsOpenSource:
         # Reset at the top of every fetch(); see sources/base.py's own
         # documentation of this optional LayerSource extension.
         self.tile_failures: list[TileFailure] = []
+        # Final review, Important I1: every product this fetch() call
+        # resolved AND finished shard-complete under, keyed by product
+        # name (e.g. {"OpenMapLocal": "2026-04"}). package.py's
+        # `_enrich_os_open_provenance` reads this to substitute
+        # `attribution`'s own "[year]" placeholder in survey.json, the
+        # enrichment Task 4's own report deferred as "Task 6 wires the
+        # record" and which never actually got wired anywhere. Given a
+        # real consumer at the same moment it is added (this task's own
+        # restraint argument, see the module docstring's "Attribution"
+        # section), unlike a speculative attribute nothing yet reads.
+        #
+        # NOT reset inside fetch(): the exact `endpoints_used` lesson
+        # InspireSource.fetch() documents at length applies here
+        # unchanged. package.py's retry pass calls fetch() again on this
+        # SAME instance after a partial failure, and a pass 2 that finds
+        # OpenMapLocal already shard-complete (from pass 1) never touches
+        # this dict again, so resetting it at the top of fetch() would
+        # wipe pass 1's own record the moment pass 2 ran. What gives each
+        # SEPARATE survey a clean start instead is `configure()` below,
+        # the same seam InspireSource uses for the identical reason.
+        self.versions_used: dict[str, str] = {}
+
+    def configure(self) -> "OsOpenSource":
+        """Returns a fresh OsOpenSource sharing this instance's transport
+        and cache configuration, never mutating self.
+
+        Mirrors `InspireSource.configure()` exactly, for the identical
+        reason: this source has no per-request SELECTION to pass through
+        (every request that chooses "os_open" wants the same three
+        products), but `versions_used`'s own new lifetime (see `__init__`'s
+        own comment beside it) needs a fresh copy per survey, not per
+        fetch() call, and `register_default_sources()` builds and
+        registers exactly one `OsOpenSource` for the life of the whole
+        process. Without this seam, that one registered instance would go
+        on accumulating `versions_used` entries across every survey ever
+        run through it.
+
+        `type(self)(...)`, not `OsOpenSource(...)`, for the same reason
+        `ElevationSource.configure`/`InspireSource.configure` both give at
+        length: a subclass built to fail in a specific, reproducible way
+        for a test must stay that subclass through `configure()`.
+        """
+        return type(self)(session=self.session, ostn15_cache_dir=self._ostn15_cache_dir)
 
     # category -> tier, this source's own row of mapgen.resolver's shared
     # table (the phase 2 spec's tier tables).
@@ -1024,6 +1084,7 @@ class OsOpenSource:
                     )
 
             if all(shards_complete(product_dir / "shards" / square) for square in needed_squares):
+                self.versions_used[product] = version
                 sweep_old_versions(product, version)
                 work_parts.append(_write_work_part(product, product_dir, needed_squares, extent, work_dir))
 

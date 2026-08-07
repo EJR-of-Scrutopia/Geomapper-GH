@@ -410,18 +410,21 @@ def _configured_sources(request: SurveyRequest) -> list:
     is used exactly as registered, with no id-specific branch needed for
     it to keep working unchanged.
 
-    inspire (the INSPIRE curves review's own fix) joins the dispatch for
-    a different reason than the three above: it has no per-request
-    selection to pass through at all, so its own `configure()` takes no
-    argument beyond self. What it needs a fresh copy FOR is
-    `endpoints_used`'s new lifetime (see InspireSource.fetch()'s own
-    docstring): that list now accumulates across every fetch() call one
-    instance ever serves, which package.py's retry pass depends on
-    within a single survey, but would otherwise go on accumulating
-    across every survey ever run through the one InspireSource
-    register_default_sources() builds for the whole process. Calling
-    `configure()` with no arguments at all is what a source needs when
-    "give me a clean, request-scoped copy" is the whole ask.
+    inspire (the INSPIRE curves review's own fix), os_open and os_uprn
+    (final review of the OS Open pack plan, Important I1) all join the
+    dispatch for the same reason, distinct from the three above: none of
+    the three has a per-request selection to pass through at all, so each
+    one's own `configure()` takes no argument beyond self. What each needs
+    a fresh copy FOR is a per-run attribute's own lifetime (InspireSource's
+    `endpoints_used`; os_open's and os_uprn's own `versions_used`, added
+    when Important I1's provenance enrichment gave it a real consumer):
+    that attribute accumulates across every fetch() call one instance ever
+    serves, which package.py's retry pass depends on within a single
+    survey, but would otherwise go on accumulating across every survey
+    ever run through the one instance register_default_sources() builds
+    for the whole process. Calling `configure()` with no arguments at all
+    is what a source needs when "give me a clean, request-scoped copy" is
+    the whole ask.
     """
     configured = []
     for source_id in request.source_ids:
@@ -434,7 +437,7 @@ def _configured_sources(request: SurveyRequest) -> list:
                 source = configure(request.effective_categories)
             elif source_id == "elevation":
                 source = configure(request.elevation_demtype)
-            elif source_id == "inspire":
+            elif source_id in ("inspire", "os_open", "os_uprn"):
                 source = configure()
         configured.append(source)
     return configured
@@ -2243,6 +2246,94 @@ def _enrich_inspire_provenance(
         entry["conditions_url"] = conditions_url
 
 
+_VERSION_YEAR_RE = re.compile(r"^(\d{4})-")
+
+
+def _version_year(version: str) -> int | None:
+    """The 4-digit year an OS Open `"YYYY-MM"` version string starts
+    with, or `None` for anything else: defensive, since this reads a
+    string a source object handed over, not a value this module itself
+    validated when it was set.
+    """
+    match = _VERSION_YEAR_RE.match(version)
+    return int(match.group(1)) if match else None
+
+
+def _enrich_os_product_provenance(
+    sources_entries: list, source_id: str, versions_by_product: Mapping[str, str] | None
+) -> None:
+    """Substitutes `[year]` in the `source_id` entry of survey.json's own
+    `sources` list (`"os_open"` or `"os_uprn"`) using the LATEST product
+    version year this run actually used, and records the exact per-product
+    versions alongside as `"products"`, in place, when that entry is
+    there and `versions_by_product` is non-empty.
+
+    Final review, Important I1: Task 4's own brief deferred this exact
+    substitution to "Task 6 wires the record", and Task 6 (the buildings
+    fusion) never carried it; no `_enrich_os_open_provenance` existed
+    anywhere on the branch, and every survey.json selecting os_open or
+    os_uprn shipped the literal, unsubstituted `"[year]"`.
+
+    Mirrors `_enrich_inspire_provenance`'s own shape (a small,
+    source-specific enrichment pass over already-built dict entries, not
+    a generic `_source_provenance` extension: see that function's own
+    docstring for why) at a coarser grain, and covers BOTH os_open and
+    os_uprn with one function rather than two near-identical copies,
+    since the shape of what each needs is identical: a mapping of product
+    name to the version string that product was actually sharded under.
+
+    Unlike `_enrich_inspire_provenance`, which reads its year back off
+    the merged `<stem>_boundaries.geojson` file itself (a fact that file
+    happens to carry as a feature property), os_open's and os_uprn's own
+    merged GeoJSON outputs never carry a "year" property at all (the
+    brief's own closed, per-file property lists never name one; see
+    os_open.py's module docstring, "Attribution"), so there is no file on
+    disk this function could read a year back out of. The SOURCE
+    OBJECT's own `versions_used` attribute (set at fetch() time, the
+    moment each product's needed squares all reach `shards_complete`
+    under one resolved version) is the one thing that knows which real OS
+    Open publication this survey's data actually came from, and that
+    fact exists only on the LIVE source object a fresh run holds.
+    Consequently, a `bridge_package` re-run over an existing survey.json
+    (no live source object at all, only its own prior JSON payload)
+    cannot recover it either, and this function is not called from there:
+    it leaves the placeholder exactly as it found it, the same as the
+    "versions_by_product empty or None" branch below does for a run where
+    the source was selected but never actually produced a versioned
+    product (every unit failed, or the source was never selected at all
+    and has no entry to find).
+
+    Version skew (final review, seam trace 2): `versions_by_product` can
+    legitimately name more than one distinct year when a survey straddles
+    an OS monthly re-publication (OpenMapLocal resolved under N,
+    OpenRoads under N+1, say). The LATEST year among them is substituted,
+    since Crown copyright and database right attribution cares about the
+    most recent publication date this package's data falls under, not the
+    oldest; every individual product's own version is still recorded
+    verbatim in `"products"`, so a skewed run is never hidden, only
+    resolved to the one year an attribution STATEMENT can actually hold.
+    """
+    entry = next(
+        (
+            item
+            for item in sources_entries
+            if isinstance(item, dict) and item.get("id") == source_id
+        ),
+        None,
+    )
+    if entry is None or not versions_by_product:
+        return
+    entry["products"] = dict(versions_by_product)
+    attribution = entry.get("attribution")
+    if isinstance(attribution, str) and "[year]" in attribution:
+        years = [
+            year for year in (_version_year(version) for version in versions_by_product.values())
+            if year is not None
+        ]
+        if years:
+            entry["attribution"] = attribution.replace("[year]", str(max(years)))
+
+
 def _write_project_setting_step(
     bbox: BBox, root: Path, stem: str, sink: ProgressSink
 ) -> dict[str, object]:
@@ -3792,6 +3883,19 @@ def _build_survey_json(
         paths.stem,
         getattr(inspire_source, "conditions_url", None),
     )
+    # Final review, Important I1. Same shape as the inspire enrichment
+    # immediately above (a live source object's own per-run fact, folded
+    # into the already-built dict entry), but reading `versions_used`
+    # rather than a merged file back off disk; see
+    # `_enrich_os_product_provenance`'s own docstring for why the two
+    # differ there and why this is not also called from `bridge_package`.
+    for source_id in ("os_open", "os_uprn"):
+        matching_source = next(
+            (source for source in sources if getattr(source, "id", None) == source_id), None
+        )
+        _enrich_os_product_provenance(
+            sources_provenance, source_id, getattr(matching_source, "versions_used", None)
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": __version__,

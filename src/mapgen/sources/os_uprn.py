@@ -101,6 +101,7 @@ from mapgen.os_downloads import (
     product_cache_dir,
     product_downloads,
     product_version,
+    safe_download_filename,
     sweep_old_versions,
 )
 from mapgen.os_shards import GB_SQUARES, shards_complete, squares_for, uprn_in, write_uprn_shards
@@ -316,7 +317,7 @@ def _shard_uprn(product_dir: Path, shard_dir: Path, progress: ProgressSink) -> N
             kind="parse",
         )
     raw_dir = product_dir / "raw"
-    dest = raw_dir / (entry.get("fileName") or f"{PRODUCT}.zip")
+    dest = raw_dir / safe_download_filename(entry)
     try:
         download_entry(entry, dest, progress=progress)
         with zipfile.ZipFile(dest) as archive:
@@ -330,6 +331,23 @@ def _shard_uprn(product_dir: Path, shard_dir: Path, progress: ProgressSink) -> N
             f"file.",
             kind="parse",
         ) from exc
+    except OsOpenError:
+        # Final review, Important I2. `OsOpenError` subclasses `ValueError`
+        # (os_downloads.py), and the `except ValueError` clause immediately
+        # below this one was written ONLY for `write_uprn_shards`' own
+        # header-shape check, which raises a plain `ValueError`. Without
+        # this guard, that same clause also caught `download_entry`'s and
+        # `_sole_csv_member`'s own `OsOpenError`s (a 503 mid-download,
+        # say) and re-wrapped them as kind "parse", status_code None, with
+        # a misleading "did not look like an OS Open UPRN file" message,
+        # destroying the real kind/status a caller needs to decide whether
+        # a retry is worth it (`fetch()`'s own `except OsOpenError`, and
+        # package.py's retry pass beyond it). Re-raised unchanged, before
+        # the broader `except ValueError` below ever gets a look at it:
+        # the exact `except OsOpenError: raise` pattern commit 1e99afb
+        # established for os_downloads.py itself, applied here to close
+        # the same class of bug one module over.
+        raise
     except ValueError as exc:
         # write_uprn_shards' own header-shape check (os_shards.py) raises
         # plain ValueError, not OsOpenError: the one place a caller of it
@@ -387,6 +405,29 @@ class OsUprnSource:
         # Reset at the top of every fetch(); see sources/base.py's own
         # documentation of this optional LayerSource extension.
         self.tile_failures: list[TileFailure] = []
+        # Final review, Important I1. Mirrors os_open.py's own
+        # `versions_used` exactly, at this source's single-product grain
+        # (`{"OpenUPRN": version}` once fetch() confirms the national
+        # shard set complete under that version): package.py's
+        # `_enrich_os_open_provenance` reads this to substitute
+        # `attribution`'s own "[year]" placeholder. Not reset inside
+        # fetch(), for the identical reason os_open.py's own comment
+        # gives (package.py's retry pass calling fetch() again on this
+        # same instance must not lose a prior pass's record); `configure()`
+        # below is what gives each SEPARATE survey a clean start instead.
+        self.versions_used: dict[str, str] = {}
+
+    def configure(self) -> "OsUprnSource":
+        """Returns a fresh OsUprnSource sharing this instance's transport
+        and cache configuration, never mutating self. Mirrors
+        `OsOpenSource.configure()`/`InspireSource.configure()` exactly,
+        for the identical reason: no per-request selection to pass
+        through, but `versions_used` needs a fresh lifetime per survey,
+        not per fetch() call, and `register_default_sources()` builds and
+        registers exactly one `OsUprnSource` for the life of the whole
+        process.
+        """
+        return type(self)(session=self.session, ostn15_cache_dir=self._ostn15_cache_dir)
 
     # -- optional LayerSource extensions --------------------------------
 
@@ -575,6 +616,7 @@ class OsUprnSource:
             for tile in tiles:
                 progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
 
+        self.versions_used[PRODUCT] = version
         sweep_old_versions(PRODUCT, version)
 
         if cancel is not None:

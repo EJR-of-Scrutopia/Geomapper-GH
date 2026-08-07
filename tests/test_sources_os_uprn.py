@@ -49,6 +49,7 @@ from mapgen.sources.os_uprn import (
     SECONDS_FLOOR,
     UPRN_BYTES_ONE_TIME,
     OsUprnSource,
+    _shard_uprn,
 )
 from tests.fixtures.ostn15 import make_fixture
 from tests.test_os_downloads import _FakeHTTPResponse
@@ -380,6 +381,87 @@ def test_fetch_with_a_fully_warm_cache_touches_neither_listing_nor_download(
     parts = source.fetch(NEAR_TP06_BBOX, _tiles("r00_c00"), work_dir, NullProgress())
 
     assert [p.name for p in parts] == ["os_uprn.csv"]
+
+
+# --------------------------------------------------------------------------
+# _shard_uprn: final review findings I2 and I3.
+# --------------------------------------------------------------------------
+
+
+def test_shard_uprn_lets_a_503s_kind_and_status_survive_the_header_check_guard(
+    tmp_path, monkeypatch
+):
+    """Final review, Important I2. `_shard_uprn`'s `except ValueError`
+    clause, written for `write_uprn_shards`' own header-shape check, used
+    to also catch `OsOpenError` (a `ValueError` subclass: os_downloads.py)
+    raised by `download_entry` or `_sole_csv_member` earlier in the SAME
+    try block, and re-wrap it as kind "parse", status_code None, with a
+    misleading "did not look like an OS Open UPRN file" message. A 503
+    mid-download is retryable (`FAILURE_SERVICE_ERROR`); wrapped this way
+    it was reported as `FAILURE_UNKNOWN` and never retried. This is
+    exactly the double-wrap rule commit 1e99afb established for
+    os_downloads.py itself, regressed one module over.
+    """
+    import urllib.error
+
+    zip_bytes = _zip_bytes("osopenuprn_202608.csv", _uprn_csv_bytes([]))
+    opener = _RoutedOpener(
+        {
+            _UPRN_LISTING_URL: _listing_response([_uprn_entry(size=len(zip_bytes))]),
+            _UPRN_ZIP_URL: urllib.error.HTTPError(
+                _UPRN_ZIP_URL, 503, "Service Unavailable", {}, None
+            ),
+        }
+    )
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: opener)
+    product_dir = os_downloads.product_cache_dir(PRODUCT, "2026-08")
+    shard_dir = product_dir / "shards"
+
+    with pytest.raises(OsOpenError) as excinfo:
+        _shard_uprn(product_dir, shard_dir, NullProgress())
+
+    assert excinfo.value.kind == "download"
+    assert excinfo.value.status_code == 503
+
+
+def test_shard_uprn_refuses_a_traversal_filename_before_any_download(tmp_path, monkeypatch):
+    """Final review, Important I3. `dest = raw_dir / entry.get("fileName")`
+    joined the listing's own fileName with no separator validation: a
+    compromised or corrupted listing naming "..\\..\\evil.zip" resolves
+    outside the cache root entirely
+    (`Path(".../OpenUPRN_2026-08/raw") / "..\\..\\evil.zip"` ==
+    `.../evil.zip`, one level above `cache_root()`), and `download_entry`
+    then streams the entry's own URL body to that attacker-chosen path.
+
+    The zip route below is a REAL, valid zip carrying a real (empty) CSV
+    member: before the fix, the escaped download succeeds completely and
+    `_shard_uprn` shards it without ever raising at all (the vulnerability
+    is not "an error happens", it is "nothing stops it", which is why this
+    proves the point far better than a deliberately-broken zip would).
+    After the fix, `safe_download_filename` refuses before `download_
+    entry` is ever called: no shard is ever written, and the zip route is
+    never hit (registering it at all is what makes this comparison fair;
+    a test with no route for it would only prove SOME exception happens,
+    not which one, or why).
+    """
+    zip_bytes = _zip_bytes("osopenuprn_202608.csv", _uprn_csv_bytes([]))
+    hostile_entry = _uprn_entry(size=len(zip_bytes))
+    hostile_entry["fileName"] = "..\\..\\evil.zip"
+    opener = _RoutedOpener(
+        {
+            _UPRN_LISTING_URL: _listing_response([hostile_entry]),
+            _UPRN_ZIP_URL: _zip_response(zip_bytes),
+        }
+    )
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: opener)
+    product_dir = os_downloads.product_cache_dir(PRODUCT, "2026-08")
+    shard_dir = product_dir / "shards"
+
+    with pytest.raises(OsOpenError) as excinfo:
+        _shard_uprn(product_dir, shard_dir, NullProgress())
+
+    assert excinfo.value.kind == "download"
+    assert not shards_complete(shard_dir)
 
 
 def test_fetch_respects_cancel_before_starting(tmp_path, ostn15_fixture_grid, monkeypatch):

@@ -311,6 +311,43 @@ def test_download_entry_wraps_an_http_error_as_download_kind_with_no_url(tmp_pat
     assert list(dest.parent.glob("*.part")) == []
 
 
+# --------------------------------------------------------------------------
+# safe_download_filename (final review, Important I3): a hostile listing's
+# own fileName must never resolve outside a raw-download directory.
+# --------------------------------------------------------------------------
+
+
+def test_safe_download_filename_accepts_a_real_shaped_name():
+    assert os_downloads.safe_download_filename({"fileName": "opgrsp_gml3_ss.zip"}) == "opgrsp_gml3_ss.zip"
+
+
+def test_safe_download_filename_refuses_a_backslash_traversal_name():
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.safe_download_filename({"fileName": "..\\..\\evil.zip"})
+    assert excinfo.value.kind == "download"
+
+
+def test_safe_download_filename_refuses_a_forward_slash_subdirectory_name():
+    with pytest.raises(os_downloads.OsOpenError) as excinfo:
+        os_downloads.safe_download_filename({"fileName": "sub/dir.zip"})
+    assert excinfo.value.kind == "download"
+
+
+def test_safe_download_filename_refuses_an_absolute_windows_path():
+    with pytest.raises(os_downloads.OsOpenError):
+        os_downloads.safe_download_filename({"fileName": "C:\\evil.zip"})
+
+
+def test_safe_download_filename_refuses_an_empty_name():
+    with pytest.raises(os_downloads.OsOpenError):
+        os_downloads.safe_download_filename({"fileName": "   "})
+
+
+def test_safe_download_filename_refuses_a_missing_filename():
+    with pytest.raises(os_downloads.OsOpenError):
+        os_downloads.safe_download_filename({})
+
+
 def test_download_entry_emits_progress_events(tmp_path, monkeypatch):
     body = b"y" * 40
     opener = _FakeOpener([_FakeHTTPResponse(200, body)])

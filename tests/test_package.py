@@ -31,6 +31,8 @@ from mapgen.package import (
 )
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.inspire import INSPIRE_DOWNLOAD_URL_TEMPLATE, InspireSource
+from mapgen.sources.os_open import OsOpenSource
+from mapgen.sources.os_uprn import OsUprnSource
 from mapgen.sources.base import (
     DuplicateSourceError,
     Estimate,
@@ -6650,6 +6652,81 @@ def test_the_inspire_provenance_entry_keeps_the_placeholder_with_no_curves_to_re
     entry = next(s for s in result.survey["sources"] if s["id"] == "inspire")
     assert "[year]" in entry["attribution"]
     assert entry["conditions_url"] == InspireSource.conditions_url
+
+
+class OsOpenProvenanceStubSource(StubSource):
+    """A stub whose `id` and `attribution` match the real `OsOpenSource`
+    (mapgen.sources.os_open), so a package-level test can check
+    `_build_survey_json`'s own `[year]` substitution and `"products"`
+    record (final review, Important I1) without a real, network-backed
+    `OsOpenSource`. `versions_used` is set directly here, the same live
+    attribute `OsOpenSource.fetch()` itself populates during a real
+    fetch(), rather than exercised through one.
+    """
+
+    def __init__(self, versions_used=None, **kwargs):
+        super().__init__(source_id="os_open", **kwargs)
+        self.attribution = OsOpenSource.attribution
+        self.versions_used = (
+            versions_used
+            if versions_used is not None
+            else {"OpenMapLocal": "2026-04", "OpenRoads": "2025-11", "OpenGreenspace": "2026-04"}
+        )
+
+
+def test_the_os_open_provenance_entry_substitutes_the_latest_product_year_and_records_versions(
+    tmp_path,
+):
+    """Final review, Important I1: survey.json used to ship the literal,
+    unsubstituted "[year]" for every survey selecting os_open, since no
+    enrichment for it existed anywhere on the branch (only inspire's had
+    one). Also pins the version-skew rule (seam trace 2): OpenMapLocal at
+    2026-04 and OpenRoads at 2025-11 both used in the same run substitutes
+    the LATEST year, 2026, and every individual product's own version is
+    still recorded verbatim in "products" so the skew is never hidden.
+    """
+    register(OsOpenProvenanceStubSource())
+    result = run_survey(_request(tmp_path, source_ids=("os_open",), run_bridge_step=False))
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "os_open")
+    assert "[year]" not in entry["attribution"]
+    assert entry["attribution"] == OsOpenSource.attribution.replace("[year]", "2026")
+    assert entry["products"] == {
+        "OpenMapLocal": "2026-04", "OpenRoads": "2025-11", "OpenGreenspace": "2026-04",
+    }
+
+
+def test_the_os_open_provenance_entry_keeps_the_placeholder_with_no_versions_used(tmp_path):
+    """Nothing fabricated: a run where os_open never actually completed
+    any product (every unit failed, or the source has simply never been
+    asked to fetch anything) has no real version to substitute honestly,
+    so the placeholder stays and no "products" key is added at all,
+    mirroring inspire's own zero-curve convention.
+    """
+    register(OsOpenProvenanceStubSource(versions_used={}))
+    result = run_survey(_request(tmp_path, source_ids=("os_open",), run_bridge_step=False))
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "os_open")
+    assert "[year]" in entry["attribution"]
+    assert "products" not in entry
+
+
+def test_the_os_uprn_provenance_entry_substitutes_the_product_year_and_records_versions(
+    tmp_path,
+):
+    class OsUprnProvenanceStubSource(StubSource):
+        def __init__(self):
+            super().__init__(source_id="os_uprn")
+            self.attribution = OsUprnSource.attribution
+            self.versions_used = {"OpenUPRN": "2026-08"}
+
+    register(OsUprnProvenanceStubSource())
+    result = run_survey(_request(tmp_path, source_ids=("os_uprn",), run_bridge_step=False))
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "os_uprn")
+    assert "[year]" not in entry["attribution"]
+    assert entry["attribution"] == OsUprnSource.attribution.replace("[year]", "2026")
+    assert entry["products"] == {"OpenUPRN": "2026-08"}
 
 
 def test_the_inspire_provenance_entry_carries_endpoints_used_through_the_generic_getattr(

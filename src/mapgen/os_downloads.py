@@ -132,21 +132,36 @@ _RAW_DEFLATE_WBITS = -15
 
 
 class OsOpenError(ValueError):
-    """Raised for anything this module cannot fetch, verify, or parse.
+    """Raised for anything this module, or a caller built on top of it,
+    cannot fetch, verify, or parse.
 
     `kind` is one of `"listing"` (the downloads-or-product-info catalog
     calls could not be reached, or answered a non-2xx status), `"parse"`
-    (a catalog call answered but its body was not the JSON shape expected),
-    `"download"` (an entry's own bytes could not be fetched, or arrived the
-    wrong length), or `"range"` (the ranged zip reader). `status_code` is
-    the HTTP status when one is known (an `HTTPError`, or a `CogError` that
-    carried one from `HttpByteSource`), and None otherwise: a transport
-    failure, a JSON decode failure, or a zip structure failure never had a
-    status to carry.
+    (a catalog call answered but its body was not the JSON shape expected,
+    OR, one layer up, a downloaded file did not parse: os_gml.py raises
+    this kind for malformed GML, os_open.py for an unreadable or
+    wrong-shaped zip, and os_uprn.py for a CSV that does not look like OS
+    Open UPRN's own shape; this class is the one exception vocabulary
+    every one of those modules wraps its own failures in, not a catalog-
+    only concern the way this sentence used to describe it), `"download"`
+    (an entry's own bytes could not be fetched, arrived the wrong length,
+    or named an unsafe local file name; see `safe_download_filename`), or
+    `"range"` (the ranged zip reader). `status_code` is the HTTP status
+    when one is known (an `HTTPError`, or a `CogError` that carried one
+    from `HttpByteSource`), and None otherwise: a transport failure, a
+    JSON decode failure, or a zip/CSV structure failure never had a status
+    to carry.
 
     Every message is composed here, in English, from a fixed vocabulary
     plus a product id or file name, never from `str()` on the exception
-    this wraps: see the module docstring's "no-URL rule".
+    this wraps: see the module docstring's "no-URL rule". `OsOpenError`
+    subclasses `ValueError`: a caller with its OWN, unrelated `except
+    ValueError` clause in the same try block (os_uprn.py's own
+    `write_uprn_shards` header check being the exact case a review found
+    this catches by accident) must place `except OsOpenError: raise`
+    BEFORE that clause, or risk silently re-wrapping this exception,
+    losing its real `kind`/`status_code`, the same rule commit 1e99afb
+    established for `os_downloads.py`'s own catch-alls.
     """
 
     def __init__(self, message: str, *, kind: str, status_code: int | None = None) -> None:
@@ -287,6 +302,47 @@ def product_version(product: str) -> str:
             kind="parse",
         )
     return data["version"]
+
+
+def safe_download_filename(entry: dict) -> str:
+    """`entry["fileName"]`, verified safe to join onto a local cache
+    directory before any caller does so.
+
+    The OS Data Hub's own listing is a network response, the same trust
+    boundary `ZipReader`'s zip64/decompression-cap defences already treat
+    as hostile (a listing-supplied size or member shape that lies): a
+    review found no call site validated `fileName` at all before joining
+    it onto a raw-download directory (`raw_dir / entry.get("fileName")`,
+    both `os_open.py`'s `_shard_zip_download_square` and `os_uprn.py`'s
+    `_shard_uprn`), so a compromised or corrupted listing naming
+    `"..\\..\\evil.zip"` writes OUTSIDE the cache root entirely (executed
+    proof in the review: `Path("C:/cache/.../raw") / "..\\..\\..\\evil.zip"`
+    resolves to `C:\\evil.zip`), and `download_entry` would then happily
+    stream the entry's own URL body to that attacker-chosen path. Extracted
+    here, in the one module that already owns every listing-supplied fact
+    this project trusts or refuses to, rather than duplicated once per
+    call site, so both callers refuse the identical shape the identical
+    way.
+
+    Refuses (`OsOpenError` kind `"download"`, the offending name quoted
+    verbatim, never a URL) a `fileName` that is missing, not a string,
+    empty once stripped, or contains a path separator (`/` or `\\`), a
+    bare `.`/`..` segment, or a `:` (a Windows drive letter or an
+    alternate-data-stream marker): every real OS Open `fileName` this
+    project has ever seen, live or fixture (`opgrsp_gml3_ss.zip`,
+    `oproad_gml3_gb.zip`, `osopenuprn_202608_csv.zip`), is a bare file
+    name with none of these, so this refuses a shape no real entry has
+    ever needed, not narrowing a real one.
+    """
+    raw_name = entry.get("fileName")
+    name = raw_name.strip() if isinstance(raw_name, str) else ""
+    if not name or "/" in name or "\\" in name or ":" in name or name in (".", ".."):
+        raise OsOpenError(
+            f"This OS Open download entry's fileName ({name!r}) is not a "
+            f"safe, bare local file name; refusing to build a path from it.",
+            kind="download",
+        )
+    return name
 
 
 def download_entry(entry: dict, dest: Path, progress: ProgressSink | None = None) -> Path:

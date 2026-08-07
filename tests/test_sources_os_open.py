@@ -632,6 +632,40 @@ def test_fetch_respects_cancel_before_starting(tmp_path, ostn15_fixture_grid, mo
         source.fetch(NEAR_TP06_BBOX, _tiles("r00_c00"), work_dir, NullProgress(), cancel=cancel)
 
 
+def test_shard_zip_download_square_refuses_a_traversal_filename_before_any_download(tmp_path, monkeypatch):
+    """Final review, Important I3. `dest = raw_dir / entry.get("fileName")`
+    joined the listing's own fileName with no separator validation: a
+    compromised or corrupted listing naming "..\\..\\evil.zip" resolves
+    outside the cache root entirely
+    (`Path(".../OpenMapLocal_2026-04/raw") / "..\\..\\evil.zip"` ==
+    `.../evil.zip`, one level above `cache_root()`), and `download_entry`
+    then streams the entry's own URL body to that attacker-chosen path.
+
+    The zip route below is a REAL, valid zip carrying a real (empty)
+    OpenMapLocal GML member: before the fix, the escaped download
+    succeeds completely and `_shard_zip_download_square` shards it
+    without ever raising at all (the vulnerability is not "an error
+    happens", it is "nothing stops it"). After the fix, `safe_download_
+    filename` refuses before `download_entry` is ever called: no shard is
+    ever written.
+    """
+    from mapgen.sources.os_open import _shard_zip_download_square
+
+    zip_bytes = _zip_bytes("data/SS.gml", _oml_gml([]))
+    hostile_entry = _oml_entry(size=len(zip_bytes))
+    hostile_entry["fileName"] = "..\\..\\evil.zip"
+    opener = _RoutedOpener({_OML_ZIP_URL: _zip_response(zip_bytes)})
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: opener)
+    product_dir = os_downloads.product_cache_dir("OpenMapLocal", "2026-04")
+    shard_dir = product_dir / "shards" / "SS"
+
+    with pytest.raises(OsOpenError) as excinfo:
+        _shard_zip_download_square("OpenMapLocal", [hostile_entry], "SS", shard_dir, product_dir, NullProgress())
+
+    assert excinfo.value.kind == "download"
+    assert not shards_complete(shard_dir)
+
+
 # --------------------------------------------------------------------------
 # merge(): fixture work parts (the raw {"id","type","geometry","properties"}
 # shape os_shards.features_in itself yields, built by hand here rather than
