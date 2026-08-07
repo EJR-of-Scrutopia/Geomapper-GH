@@ -53,6 +53,7 @@ from mapgen.naming import (
     slugify,
     tiling_fingerprint,
 )
+from mapgen.resolver import resolve
 from mapgen.sources.base import (
     FAILURE_NO_OUTPUT,
     FAILURE_UNKNOWN,
@@ -491,7 +492,8 @@ def estimate_survey(request: SurveyRequest) -> dict[str, object]:
     total_seconds = 0.0
     source_summaries: list[dict[str, object]] = []
     warnings: list[str] = []
-    for source in _configured_sources(request):
+    configured_sources = _configured_sources(request)
+    for source in configured_sources:
         estimate = source.estimate(request.bbox, tiles)
         total_bytes += estimate.bytes_estimate
         total_seconds += estimate.seconds_estimate
@@ -538,6 +540,14 @@ def estimate_survey(request: SurveyRequest) -> dict[str, object]:
     result["seconds_estimate"] = total_seconds
     result["sources"] = source_summaries
     result["warnings"] = warnings
+    # Task 7 of the tier resolver plan: which source resolves each
+    # category for this exact bbox and selection, computed once here over
+    # the same configured_sources the loop above already estimated
+    # against, never a second, separately-configured list that could
+    # disagree with it. run_survey/_build_survey_json compute the
+    # identical structure from resolve() the same way, over its own
+    # request-scoped `sources`, for survey.json's own "resolution" key.
+    result["resolution"] = resolve(request.bbox, configured_sources)
     # The real path build_package_paths composed for this exact request,
     # not a guess: the interface reads this straight into a folder-path
     # preview that Grasshopper depends on being right, so it must come
@@ -3811,6 +3821,16 @@ def _build_survey_json(
         # says what it contains without the reader having to separately
         # know that None means everything.
         "categories": request.effective_categories,
+        # Task 7 of the tier resolver plan: which source resolves each
+        # category for this exact bbox, computed from the same
+        # configured, selected `sources` this run actually fetched from
+        # (never the registry), so a source the owner did not select
+        # never appears here either. estimate_survey computes the
+        # identical structure the same way, over its own request-scoped
+        # configured sources, for the estimate HTTP response's own
+        # "resolution" key; both call sites share resolve() rather than
+        # each assembling the list by hand.
+        "resolution": resolve(request.bbox, sources),
         "tiles": state.as_tile_records(),
         # Task 30, section 5: which tiles are missing, for which source,
         # and why, in the package's own record, because "if nothing then

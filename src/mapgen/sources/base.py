@@ -377,6 +377,32 @@ class LayerSource(Protocol):
     it defers the decision until after the retry pass instead of ending
     the layer on the first bad tile.
 
+    covers(bbox) -> str and tier(category) -> int | None are the same
+    optional-extension convention again, for the tier resolver
+    (mapgen.resolver, the phase 2 spec's own "per-extent category
+    resolution"). covers() answers a bbox-scoped coverage question,
+    "full" | "partial" | "none", ignoring which categories this source
+    serves at all; tier() answers a category-scoped quality question, 1
+    being the best per-feature quality among every source that can serve
+    it, or None when this source does not serve that category at all,
+    ignoring the bbox entirely. Both are read the same defensive way as
+    every extension above, called only if present: a source that defines
+    neither (a test stub, a future source that has not caught up yet)
+    simply never appears in any category's resolution, the same as a
+    source with no readiness_problem contributing no warning. See
+    mapgen.resolver's own module docstring for CATEGORIES, ROLES, the
+    resolve() output shape, and the one place this pair's contract
+    diverges from the phase 2 spec's literal text (a bare bool where this
+    project's own three-string answer is more honest about a mosaic that
+    genuinely ends mid-country). Neither ever touches the network, under
+    any circumstance: a source with a real coverage edge to check
+    (lidar_wales.py's Welsh LiDAR mosaic, os_open.py's/os_uprn.py's OS
+    National Grid squares) reads a committed fixture or a cache-only
+    OSTN15 grid with a gridless fallback (bng.approx_padded_bng_extent),
+    never a live lookup; a source with none (osm.py, overture.py,
+    elevation.py: every one of them answers any extent worldwide) returns
+    a fixed "full" unconditionally.
+
     fetch()'s own `cancel` parameter (Task 22) is different in kind from
     everything above: those are all optional EXTENSIONS, read defensively
     with getattr because a source that has no opinion on them can simply

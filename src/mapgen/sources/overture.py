@@ -413,6 +413,32 @@ class OvertureSource:
         self._runner = runner
         self._find = executable_finder
 
+    # category -> tier, this source's own row of mapgen.resolver's shared
+    # table (the phase 2 spec's tier tables). A category absent here is
+    # one Overture never serves, and tier() answers None for it.
+    _TIERS = {
+        "heights": 2,
+        "buildings": 2,
+        "land_use": 1,
+        "water": 1,
+        "places": 1,
+        "greenspace": 2,
+        "land": 2,
+    }
+
+    def covers(self, bbox: BBox) -> str:
+        """Overture Maps has no coverage edge at all: its releases are
+        global, so this is always "full". See sources/base.py's own
+        docstring on this optional extension.
+        """
+        return "full"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier for `category`, or None when Overture
+        does not serve it. See _TIERS above.
+        """
+        return self._TIERS.get(category)
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """Bytes per type, seconds per BATCH of concurrent types.
 

@@ -88,7 +88,7 @@ from typing import Sequence
 
 import requests
 
-from mapgen.bng import BngError, ensure_ostn15, padded_bng_extent
+from mapgen.bng import BngError, best_effort_padded_bng_extent, ensure_ostn15, padded_bng_extent
 from mapgen.egrid import PAD_METRES
 from mapgen.fsutil import atomic_write_bytes, atomic_write_text
 from mapgen.geo import BBox, Tile
@@ -103,7 +103,7 @@ from mapgen.os_downloads import (
     product_version,
     sweep_old_versions,
 )
-from mapgen.os_shards import shards_complete, uprn_in, write_uprn_shards
+from mapgen.os_shards import GB_SQUARES, shards_complete, squares_for, uprn_in, write_uprn_shards
 from mapgen.sources.base import (
     FAILURE_NO_OUTPUT,
     FAILURE_UNKNOWN,
@@ -398,6 +398,43 @@ class OsUprnSource:
         if _any_complete_uprn_cache():
             return None
         return _ROUTING_NOTE
+
+    def covers(self, bbox: BBox) -> str:
+        """"full" when every 100 km square the padded extent touches is
+        one OS Open UPRN's own national file actually covers (`GB_
+        SQUARES`, os_shards.py, the same set `os_open.py`'s own `covers()`
+        checks against: see this module's own docstring, "One national
+        file", and `GB_SQUARES`'s own comment for why one probe of
+        OpenMapLocal's per-square listing already answers for this
+        source's national one too), "partial" when some are, "none"
+        otherwise.
+
+        Never touches the network, and never touches the (potentially
+        619 MB, not-yet-downloaded) national shard cache either:
+        `bng.best_effort_padded_bng_extent` reads a cached OSTN15 grid
+        when one exists and falls back to a gridless projection
+        otherwise, exactly like `os_open.py`'s own `covers()`; `squares_
+        for` is pure arithmetic over the projected extent alone.
+        """
+        e_min, n_min, e_max, n_max = best_effort_padded_bng_extent(
+            bbox, PAD_METRES, cache_dir=self._ostn15_cache_dir
+        )
+        squares = squares_for(e_min, n_min, e_max, n_max)
+        if not squares:
+            return "none"
+        served = [square in GB_SQUARES for square in squares]
+        if not any(served):
+            return "none"
+        if all(served):
+            return "full"
+        return "partial"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier, mapgen.resolver's shared table:
+        addresses only, at tier 1 (the one source in this project that
+        serves it at all).
+        """
+        return 1 if category == "addresses" else None
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """Bytes and seconds for the one-time national UPRN download,

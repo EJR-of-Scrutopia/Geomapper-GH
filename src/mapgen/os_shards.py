@@ -200,6 +200,51 @@ _METRES_PER_10KM_CELL = 10_000
 _MAX_EASTING = 700_000
 _MAX_NORTHING = 1_300_000
 
+# Every 100 km National Grid square an OS Open per-square product actually
+# serves: the tier resolver plan's own Task 7, for `os_open.py`'s and
+# `os_uprn.py`'s `covers()`. `squares_for` above answers "which squares
+# does this RECTANGLE touch" from pure arithmetic and knows nothing about
+# which of those are real land OS actually publishes for; a rectangle
+# entirely over open sea, still well inside the technical 700 km by
+# 1300 km envelope, returns real two-letter codes that OS has never
+# published a single feature for (the National Grid's own lettering
+# scheme is denser than Great Britain's own coastline). GB_SQUARES is
+# what `covers()` checks a square against to tell "OS actually serves
+# this square" apart from "this square is arithmetically representable".
+#
+# Generated, not typed by hand, from the one live, keyless listing every
+# OS Open per-square product in this project already reads through
+# (os_downloads.py's own module docstring): `GET https://api.os.uk/
+# downloads/v1/products/OpenMapLocal/downloads`, kept to the `"GML"`
+# format entries only (the one format `os_open.py`/`os_uprn.py` ever
+# download), probed live 2026-08-07: 56 GML entries, one of them named
+# area `"GB"` (the whole-country bundle, not a 100 km square), leaving
+# these 55. The generator, `tests/fixtures/osopen/make_gb_squares.py`,
+# is committed alongside this constant and run by hand whenever OS adds
+# or drops a square, the same "hits a real service once, output
+# committed" shape `tests/fixtures/inspire/make_authority_index.py`
+# already establishes for its own 318-authority index; unlike that
+# index, 55 short codes are a plain literal here rather than a second
+# committed data file this module would otherwise need to open, parse
+# and defend against a missing or malformed read on every import.
+#
+# `os_uprn.py`'s own `covers()` reads this same constant, not a second,
+# independently probed one: OS Open UPRN publishes one national CSV
+# covering the whole of Great Britain (see that module's own docstring,
+# "One national file, not one per square"), which is exactly the same 55
+# squares OpenMapLocal's own per-square listing tiles Great Britain into,
+# not a coincidence this module needs to reconcile two live probes to
+# confirm.
+GB_SQUARES = frozenset(
+    {
+        "HP", "HT", "HU", "HW", "HX", "HY", "HZ", "NA", "NB", "NC", "ND",
+        "NF", "NG", "NH", "NJ", "NK", "NL", "NM", "NN", "NO", "NR", "NS",
+        "NT", "NU", "NW", "NX", "NY", "NZ", "OV", "SD", "SE", "SH", "SJ",
+        "SK", "SM", "SN", "SO", "SP", "SR", "SS", "ST", "SU", "SV", "SW",
+        "SX", "SY", "SZ", "TA", "TF", "TG", "TL", "TM", "TQ", "TR", "TV",
+    }
+)
+
 
 def _grid_letter(row: int, col: int) -> str:
     if not (0 <= row <= 4 and 0 <= col <= 4):

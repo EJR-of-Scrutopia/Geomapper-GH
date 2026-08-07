@@ -453,6 +453,35 @@ class OsmSource:
             "own rate limits."
         )
 
+    # category -> tier (mapgen.resolver's own "1 = best per-feature
+    # quality" table, this source's own row of it, from the phase 2 spec's
+    # tier tables). A category this dict does not name is one OSM never
+    # serves at all, and tier() below answers None for it, never 0 or a
+    # made-up low rank.
+    _TIERS = {
+        "buildings": 1,
+        "roads": 1,
+        "rail": 1,
+        "greenspace": 3,
+        "land_use": 2,
+    }
+
+    def covers(self, bbox: BBox) -> str:
+        """OpenStreetMap has no coverage edge at all: the map API and
+        Overpass both answer any extent worldwide, so this is always
+        "full", never "partial" or "none". See sources/base.py's own
+        docstring on this optional extension, and mapgen.resolver's for
+        what the three strings mean.
+        """
+        return "full"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier for `category`, or None when OSM does
+        not serve it at all. See _TIERS above and mapgen.resolver's own
+        module docstring for the shared tier table this is one row of.
+        """
+        return self._TIERS.get(category)
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """Per tile, unlike OvertureSource: this source really is tiled,
         really does make one request per tile, and really does pay for

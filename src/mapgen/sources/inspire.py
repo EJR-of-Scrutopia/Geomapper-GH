@@ -1089,6 +1089,54 @@ class InspireSource:
             inspire_cache_dir=self._inspire_cache_dir,
         )
 
+    # -- covers / tier (mapgen.resolver) --------------------------------------
+
+    def covers(self, bbox: BBox) -> str:
+        """"full" when every one of `bbox`'s four corners falls inside at
+        least one indexed authority's own padded bbox, "partial" when at
+        least one corner does, "none" when none does.
+
+        A bbox-level approximation of "does INSPIRE actually cover this
+        ground", not an exact one: a genuinely irregular authority
+        boundary could, in principle, leave a corner inside the
+        authority's own bbox but outside its real shape, or the reverse.
+        Safe at survey scale because every stored bbox is already 1 km
+        padded (`make_authority_index.py`'s own module docstring), the
+        same margin `authorities_for` itself relies on for its own
+        rectangle-intersection test; this is that same committed index,
+        read directly rather than through `authorities_for`, because
+        `authorities_for` answers "does this AUTHORITY'S bbox intersect
+        the survey bbox at all", a different, coarser question than "is
+        this specific CORNER inside one", and a `BBox` cannot express a
+        single point to ask `authorities_for` that question through
+        (`BBox` refuses west == east or south == north as degenerate).
+        `load_authority_index()` is a committed file read, never the
+        network, matching `authorities_for`'s own "no network" guarantee.
+        """
+        index = load_authority_index()
+        corners = (
+            (bbox.west, bbox.south),
+            (bbox.east, bbox.south),
+            (bbox.west, bbox.north),
+            (bbox.east, bbox.north),
+        )
+        covered = [
+            any(west <= lon <= east and south <= lat <= north for west, south, east, north in index.values())
+            for lon, lat in corners
+        ]
+        if all(covered):
+            return "full"
+        if any(covered):
+            return "partial"
+        return "none"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier, mapgen.resolver's shared table:
+        boundaries only, at tier 1 (the one source in this project that
+        serves it at all).
+        """
+        return 1 if category == "boundaries" else None
+
     # -- estimate ------------------------------------------------------------
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:

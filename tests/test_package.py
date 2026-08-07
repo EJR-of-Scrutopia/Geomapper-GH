@@ -92,6 +92,28 @@ class StubSource:
         return [out]
 
 
+class ResolvableStubSource(StubSource):
+    """Like StubSource, but defines covers()/tier(), the tier resolver's
+    own optional LayerSource extensions (mapgen.resolver), so a run
+    selecting it actually resolves one category through it.
+
+    Every plain StubSource in this file defines neither, on purpose:
+    resolve() must skip a source missing either one silently (see
+    sources/base.py's own documented convention), which is why the
+    ordinary run_survey tests below pin survey.json's own "resolution"
+    key as an empty list. This class exists to pin the non-empty side of
+    that same contract, so the shape is checked against real data at
+    least once rather than only against the trivial "nothing resolves"
+    case every other stub here happens to produce.
+    """
+
+    def covers(self, bbox):
+        return "full"
+
+    def tier(self, category):
+        return 1 if category == "buildings" else None
+
+
 class CallRecordingStubSource:
     """Like StubSource, but records which tile ids each fetch() call
     receives. Used to prove pending is recomputed rather than inherited
@@ -433,6 +455,34 @@ def test_estimate_lists_each_selected_source(tmp_path):
     assert [s["id"] for s in estimate["sources"]] == ["stub"]
 
 
+def test_estimate_carries_a_resolution_list(tmp_path):
+    # A plain StubSource defines neither covers() nor tier(), so it
+    # resolves nothing (see test_run_writes_survey_json_with_the_expected_
+    # shape's identical assertion for run_survey's own copy of this key).
+    register(StubSource())
+    estimate = estimate_survey(_request(tmp_path))
+    assert estimate["resolution"] == []
+
+
+def test_estimate_resolution_reflects_a_source_that_actually_resolves(tmp_path):
+    register(ResolvableStubSource())
+    estimate = estimate_survey(_request(tmp_path))
+    assert estimate["resolution"] == [
+        {
+            "category": "buildings",
+            "sources": [
+                {
+                    "id": "stub",
+                    "display_name": "Stub stub",
+                    "tier": 1,
+                    "coverage": "full",
+                    "role": "base",
+                }
+            ],
+        }
+    ]
+
+
 def test_estimate_rejects_a_path_that_would_be_too_long(tmp_path):
     register(StubSource())
     deep = Path("C:/") / ("x" * 200)
@@ -681,6 +731,32 @@ def test_run_writes_survey_json_with_the_expected_shape(tmp_path):
     assert payload["complete"] is True
     assert payload["started_at"].endswith("Z")
     assert payload["finished_at"].endswith("Z")
+    # StubSource defines neither covers() nor tier() (the tier resolver's
+    # own optional LayerSource extensions), so resolve() skips it
+    # silently and every category is omitted: see
+    # test_run_writes_survey_json_with_a_non_trivial_resolution below for
+    # the non-empty shape this key can also carry.
+    assert payload["resolution"] == []
+
+
+def test_run_writes_survey_json_with_a_non_trivial_resolution(tmp_path):
+    register(ResolvableStubSource())
+    result = run_survey(_request(tmp_path))
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["resolution"] == [
+        {
+            "category": "buildings",
+            "sources": [
+                {
+                    "id": "stub",
+                    "display_name": "Stub stub",
+                    "tier": 1,
+                    "coverage": "full",
+                    "role": "base",
+                }
+            ],
+        }
+    ]
 
 
 def test_survey_json_records_licence_and_attribution_per_source(tmp_path):

@@ -89,7 +89,14 @@ from typing import Mapping, Sequence
 
 import requests
 
-from mapgen.bng import BngError, ensure_ostn15, from_bng, load_ostn15, padded_bng_extent
+from mapgen.bng import (
+    BngError,
+    best_effort_padded_bng_extent,
+    ensure_ostn15,
+    from_bng,
+    load_ostn15,
+    padded_bng_extent,
+)
 from mapgen.cog import HttpByteSource
 from mapgen.egrid import PAD_METRES
 from mapgen.fsutil import atomic_write_bytes, atomic_write_text, ensure_dir
@@ -107,7 +114,7 @@ from mapgen.os_downloads import (
     sweep_old_versions,
 )
 from mapgen.os_gml import iter_greenspace_features, iter_oml_features, iter_road_features
-from mapgen.os_shards import features_in, shards_complete, squares_for, write_shards
+from mapgen.os_shards import GB_SQUARES, features_in, shards_complete, squares_for, write_shards
 from mapgen.sources.base import (
     FAILURE_NO_OUTPUT,
     FAILURE_UNKNOWN,
@@ -694,6 +701,61 @@ class OsOpenSource:
         # Reset at the top of every fetch(); see sources/base.py's own
         # documentation of this optional LayerSource extension.
         self.tile_failures: list[TileFailure] = []
+
+    # category -> tier, this source's own row of mapgen.resolver's shared
+    # table (the phase 2 spec's tier tables).
+    _TIERS = {
+        "buildings": 3,
+        "roads": 2,
+        "rail": 2,
+        "greenspace": 1,
+        "sites": 1,
+        "land": 1,
+        "water": 2,
+        "places": 2,
+    }
+
+    # -- covers / tier (mapgen.resolver) --------------------------------------
+
+    def covers(self, bbox: BBox) -> str:
+        """"full" when every 100 km square the padded extent touches is
+        one OS Open's own per-square products actually serve (`GB_
+        SQUARES`, os_shards.py), "partial" when some are, "none" when the
+        extent touches no square OS Open serves at all (including
+        touching no square on the National Grid whatsoever).
+
+        Never touches the network: `bng.best_effort_padded_bng_extent`
+        reads a cached OSTN15 grid when one exists and falls back to a
+        gridless projection otherwise, exactly like `lidar_wales.py`'s own
+        `covers()`; `squares_for` is pure arithmetic. `squares_for` can
+        return real, arithmetically valid two-letter codes for a rectangle
+        that is technically inside the National Grid's own 700 km by
+        1300 km envelope but genuinely over open sea, past every coastline
+        OS actually publishes for (the letter grid is denser than Great
+        Britain's own coastline): a square OS never served is treated as
+        no coverage there at all, the same as a square outside the
+        envelope altogether, which is why "none of the touched squares are
+        served" answers "none" here rather than "partial", even though
+        `squares_for` itself returned a non-empty list.
+        """
+        e_min, n_min, e_max, n_max = best_effort_padded_bng_extent(
+            bbox, PAD_METRES, cache_dir=self._ostn15_cache_dir
+        )
+        squares = squares_for(e_min, n_min, e_max, n_max)
+        if not squares:
+            return "none"
+        served = [square in GB_SQUARES for square in squares]
+        if not any(served):
+            return "none"
+        if all(served):
+            return "full"
+        return "partial"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier for `category`, or None when this
+        source does not serve it. See _TIERS above.
+        """
+        return self._TIERS.get(category)
 
     # -- estimate ------------------------------------------------------------
 

@@ -350,6 +350,26 @@ def test_estimate_endpoint_returns_tile_count(server, tmp_path):
     assert payload["tiles"] >= 1
 
 
+def test_estimate_endpoint_carries_a_resolution_list(server, tmp_path):
+    # Task 7 of the tier resolver plan: the estimate payload always has a
+    # "resolution" key, even when, as here, the only selected source
+    # (StubSource) defines neither covers() nor tier() and so resolves no
+    # category at all.
+    status, payload = _post(
+        server,
+        "/api/estimate",
+        {
+            "bbox": "-3.29,51.38,-3.28,51.39",
+            "region": "South Wales",
+            "site": "Barry",
+            "output_root": str(tmp_path),
+            "sources": ["stub"],
+        },
+    )
+    assert status == 200
+    assert payload["resolution"] == []
+
+
 def test_estimate_returns_400_for_a_bad_bbox(server, tmp_path):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _post(

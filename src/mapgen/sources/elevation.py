@@ -549,6 +549,24 @@ class ElevationSource:
             return str(exc)
         return None
 
+    def covers(self, bbox: BBox) -> str:
+        """OpenTopography's DEM catalogue is global, so this is always
+        "full": there is no extent this source refuses on coverage
+        grounds alone (a missing API key is readiness_problem's own job,
+        not a coverage question). See sources/base.py's own docstring on
+        this optional extension.
+        """
+        return "full"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier, mapgen.resolver's shared table: terrain
+        only, at tier 2 (lidar_wales.py's own 1 m Welsh LiDAR outranks
+        this coarser global DEM wherever both cover the same ground).
+        Every other category is None: this source has no contours,
+        heights or anything else to offer.
+        """
+        return 2 if category == "terrain" else None
+
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """One whole-area request, so nothing here counts tiles.
 

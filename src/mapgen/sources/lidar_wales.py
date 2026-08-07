@@ -76,7 +76,13 @@ from typing import Sequence
 
 import requests
 
-from mapgen.bng import BngError, ensure_ostn15, load_ostn15, padded_bng_extent
+from mapgen.bng import (
+    BngError,
+    best_effort_padded_bng_extent,
+    ensure_ostn15,
+    load_ostn15,
+    padded_bng_extent,
+)
 from mapgen.cog import (
     CogError,
     CogReader,
@@ -313,6 +319,52 @@ class LidarWalesSource:
         # recorded against every tile the caller handed in, the same
         # reasoning ElevationSource applies for its own single request.
         self.tile_failures: list[TileFailure] = []
+
+    # category -> tier, this source's own row of mapgen.resolver's shared
+    # table: 1 m Welsh LiDAR is the best available terrain, contour and
+    # building-height source wherever it covers at all.
+    _TIERS = {"terrain": 1, "contours": 1, "heights": 1}
+
+    # -- covers / tier (mapgen.resolver) ------------------------------------
+
+    def covers(self, bbox: BBox) -> str:
+        """"full" when the padded extent sits wholly inside MOSAIC_BOUNDS,
+        "partial" when it overlaps the mosaic's own edge, "none" when it
+        is wholly outside.
+
+        Never touches the network, matching every other `covers()` in this
+        project: `bng.best_effort_padded_bng_extent` reads a cached OSTN15
+        grid when one is already on disk and falls back to a gridless
+        projection when none is (the ordinary case for a settings panel
+        calling `/api/estimate` before a single survey has fetched one),
+        one step further from the National Grid than `estimate()`'s own
+        no-grid branch above (no OSTN15 shift at all, rather than an
+        unprojected equirectangular approximation): see that helper's own
+        docstring for why the difference, a few tens of metres almost
+        everywhere in Great Britain, does not matter at the whole-mosaic
+        granularity this decides "full", "partial" or "none" at.
+        """
+        e_min, n_min, e_max, n_max = best_effort_padded_bng_extent(
+            bbox, PAD_METRES, cache_dir=self._ostn15_cache_dir
+        )
+        mosaic_e_min, mosaic_n_min, mosaic_e_max, mosaic_n_max = self.MOSAIC_BOUNDS
+        if (
+            e_max <= mosaic_e_min or e_min >= mosaic_e_max
+            or n_max <= mosaic_n_min or n_min >= mosaic_n_max
+        ):
+            return "none"
+        if (
+            e_min >= mosaic_e_min and e_max <= mosaic_e_max
+            and n_min >= mosaic_n_min and n_max <= mosaic_n_max
+        ):
+            return "full"
+        return "partial"
+
+    def tier(self, category: str) -> int | None:
+        """This source's own tier for `category`, or None when this
+        source does not serve it. See _TIERS above.
+        """
+        return self._TIERS.get(category)
 
     # -- estimate ----------------------------------------------------------
 

@@ -631,3 +631,82 @@ def padded_bng_extent(
     e_min, e_max = min(e1, e2) - pad_metres, max(e1, e2) + pad_metres
     n_min, n_max = min(n1, n2) - pad_metres, max(n1, n2) + pad_metres
     return e_min, n_min, e_max, n_max
+
+
+def approx_padded_bng_extent(
+    bbox: BBox, pad_metres: float
+) -> tuple[float, float, float, float]:
+    """`bbox`'s two corners projected to the PSEUDO-grid alone (`tm_forward`,
+    with no OSTN15 shift at all), padded by `pad_metres` on every side, as
+    `(e_min, n_min, e_max, n_max)`. Never touches the network and never
+    needs an `Ostn15Grid`, unlike `padded_bng_extent` above.
+
+    For a caller that must answer "roughly where does this WGS84 extent
+    sit on the National Grid" with no grid cached and no network call
+    allowed at all: `covers()` on `lidar_wales.py`, `os_open.py` and
+    `os_uprn.py` (the tier resolver plan's own Task 7) is exactly that
+    caller, since `covers()`/`tier()` are documented, project-wide, to
+    never touch the network under any circumstance (the resolver's own
+    poisoned-seam tests), which rules out `ensure_ostn15` outright; a
+    settings panel can also call `/api/estimate`, which reads `covers()`
+    indirectly through `resolve()`, before a single survey has ever
+    fetched a grid to cache. Each of those three call sites tries a real,
+    cache-only `load_ostn15()` first and falls back to this function only
+    when that returns `None`, mirroring `lidar_wales.py`'s own `estimate()`
+    (its docstring's "an unprojected approximation" paragraph is the same
+    reasoning one step further from the National Grid, applied here to
+    the projection this module owns instead of to `geo.extent_metres`).
+
+    OSTN15's own shift is a matter of tens of metres almost everywhere in
+    Great Britain (see this module's own docstring): irrelevant at the
+    granularity `covers()` decides "full", "partial" or "none" at, a
+    100 km square or which side of a whole mosaic edge a survey extent
+    falls on, and the phase 2 spec's own item 2 already accepts WGS84 read
+    directly as ETRS89 for the same reason. This is never accurate enough
+    to filter a real FEATURE by: `fetch()`/`merge()` on every source that
+    reasons in BNG still call `padded_bng_extent` with a real, downloaded
+    grid for that, and this function has no part in either.
+
+    Raises nothing for any real `BBox`: `tm_forward` only raises for a
+    non-finite latitude or longitude, which `BBox`'s own validation
+    already excludes before one ever reaches here.
+    """
+    e1, n1 = tm_forward(bbox.south, bbox.west)
+    e2, n2 = tm_forward(bbox.north, bbox.east)
+    e_min, e_max = min(e1, e2) - pad_metres, max(e1, e2) + pad_metres
+    n_min, n_max = min(n1, n2) - pad_metres, max(n1, n2) + pad_metres
+    return e_min, n_min, e_max, n_max
+
+
+def best_effort_padded_bng_extent(
+    bbox: BBox, pad_metres: float, cache_dir: Path | None = None
+) -> tuple[float, float, float, float]:
+    """`padded_bng_extent` with a real, cache-loaded `Ostn15Grid` when one
+    is already on disk, `approx_padded_bng_extent` when none is, and
+    never a network call either way.
+
+    The one helper `covers()` on `lidar_wales.py`, `os_open.py` and
+    `os_uprn.py` (the tier resolver plan's own Task 7) all call, rather
+    than each repeating the same "try `load_ostn15`, fall back to the
+    gridless projection" shape independently: `lidar_wales.py`'s own
+    `estimate()` established this exact two-tier fallback first, for its
+    own no-grid branch, and this is that same shape promoted here so
+    three separate `covers()` implementations do not each carry their own
+    copy of it.
+
+    A cached grid that exists but cannot place this particular bbox
+    (`BngError` from `padded_bng_extent`, the same shape a point OSTN15's
+    own 701 by 1251 rectangle does not cover raises) falls back to the
+    approximation exactly like a missing grid does, rather than
+    propagating: `covers()` callers need an extent to compare against
+    their own bounds either way, and the approximation is the same
+    "good enough at 100 km-square or whole-mosaic granularity" answer
+    this function exists to provide.
+    """
+    grid = load_ostn15(cache_dir=cache_dir)
+    if grid is not None:
+        try:
+            return padded_bng_extent(bbox, grid, pad_metres)
+        except BngError:
+            pass
+    return approx_padded_bng_extent(bbox, pad_metres)
