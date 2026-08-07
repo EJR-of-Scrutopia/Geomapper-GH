@@ -331,6 +331,40 @@ def _rewrite_osm(osm_path: Path, declaration: str, root: ET.Element) -> None:
     atomic_write_bytes(osm_path, ("\n".join(lines) + "\n").encode("utf-8"))
 
 
+def _minimum_existing_id(root: ET.Element) -> int:
+    """The smallest id any `<node>`, `<way>` or `<relation>` in `root`
+    already carries, or 0 if none carries a parseable one.
+
+    Moved here from `package.py` (this module's own home for `.osm`
+    id-and-rewrite plumbing, alongside `_declaration_line`/`_rewrite_osm`
+    above) so `mapgen.buildings` can share this exact function too,
+    without `package.py` and `buildings.py` importing one another: every
+    module in this pair that touches raw `.osm` mechanics reaches into
+    `heights.py` for it, never sideways into each other.
+
+    Collision safety, not merely readability, is why the counter a
+    caller derives from this is never simply hard-coded to start at -1
+    (see `package.py`'s `_fuse_boundaries_step`, "collision safety"
+    section, for the full reasoning, still accurate at this function's
+    new address). This function is the fix: it looks at every element
+    the file actually holds, of any type and either sign, rather than
+    assuming nothing already sits at or below -1.
+    """
+    minimum = 0
+    for element in root:
+        if element.tag not in ("node", "way", "relation"):
+            continue
+        raw_id = element.get("id")
+        if raw_id is None:
+            continue
+        try:
+            value = int(raw_id)
+        except ValueError:
+            continue
+        minimum = min(minimum, value)
+    return minimum
+
+
 def fuse_building_heights(
     osm_path: Path, dtm: BngWindow, dsm: BngWindow, grid: Ostn15Grid
 ) -> HeightsRecord:

@@ -18,6 +18,7 @@ from typing import Mapping, Sequence
 from mapgen import __version__
 from mapgen.bng import BngError, ensure_ostn15, load_ostn15
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
+from mapgen.buildings import fuse_missing_buildings
 from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
 from mapgen.cog import CogError, CogReader, FileByteSource, read_full_window
 from mapgen.egrid import (
@@ -36,7 +37,13 @@ from mapgen.fsutil import (
 )
 from mapgen.geo import BBox, Tile, build_tiles, extent_metres
 from mapgen.geotiff import GeoTiffError, read_dem
-from mapgen.heights import HeightsError, _declaration_line, _rewrite_osm, fuse_building_heights
+from mapgen.heights import (
+    HeightsError,
+    _declaration_line,
+    _minimum_existing_id,
+    _rewrite_osm,
+    fuse_building_heights,
+)
 from mapgen.jobs import FAILED, OK, PENDING, CancelToken, Cancelled, JobState
 from mapgen.merge import assert_inputs_present
 from mapgen.naming import (
@@ -937,6 +944,18 @@ def run_survey(
             produced.update(layer.resolve() for layer in layer_files)
             _sweep_stale_outputs(produced, paths, sink)
 
+        # Task 6 of the OS Open pack plan. BEFORE heights fusion and,
+        # transitively, BEFORE the bridge: a footprint this step injects
+        # with no height of its own is exactly the shape heights fusion
+        # already knows how to fill in, so it has to already be in the
+        # `.osm` by the time that pass runs. Gated only on `<stem>.osm`
+        # being in the package at all (see `_fuse_buildings_step`'s own
+        # docstring for why neither candidate file being there is a
+        # normal outcome, not a skip), not on `stopped` or `unrecoverable`,
+        # for the identical reason heights fusion below is not gated on
+        # them either.
+        buildings_fusion = _fuse_buildings_step(root=paths.root, stem=paths.stem, sink=sink)
+
         # Task 7. BEFORE the bridge, unconditionally, exactly like the
         # elevation grid and project setting steps below: the bridge
         # converts <stem>.osm into Urbano's own formats, so the heights
@@ -1066,6 +1085,7 @@ def run_survey(
         elevation_grid,
         lidar_heights,
         inspire_boundaries,
+        buildings_fusion,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -1521,6 +1541,178 @@ def _no_usable_raster_message(
     )
 
 
+# --------------------------------------------------------------------------
+# Task 6 of the OS Open pack plan: fusing Overture and OS OpenMap Local
+# building footprints into <stem>.osm, BEFORE _fuse_heights_step so an
+# injected footprint with no height of its own still gets a DSM-minus-DTM
+# one when lidar_wales ran (see both call sites below).
+# --------------------------------------------------------------------------
+
+BUILDINGS_SOURCE_OVERTURE = "overture"
+BUILDINGS_SOURCE_OS_OPEN = "os_openmap_local"
+
+
+class BuildingsFusionError(RuntimeError):
+    """Raised when `<stem>_building.geojson` or `<stem>_os_buildings.geojson`
+    is not the shape `OvertureSource.merge`/`OsOpenSource.merge` themselves
+    write: not a FeatureCollection, or a `features` value that is not a
+    list.
+
+    Matches `BoundariesFusionError`'s own reasoning exactly: this class
+    exists only for the shape this step's OWN new inputs can get wrong.
+    `<stem>.osm` reading and rewriting failures raise `heights.HeightsError`
+    instead, because `buildings.fuse_missing_buildings` already raises
+    that type for them (it does its own full read/parse of the `.osm`,
+    the same delegation `_fuse_heights_step` already relies on for
+    `fuse_building_heights`, rather than `_fuse_boundaries_step`'s own
+    inline `ET.fromstring` call).
+    """
+
+
+def _buildings_record(
+    written: int = 0,
+    from_overture: int = 0,
+    from_os: int = 0,
+    kept_existing: int = 0,
+    skipped_overlap: int = 0,
+    error: str | None = None,
+) -> dict[str, object]:
+    """survey.json's `buildings_fusion` block, in ONE shape whatever
+    happened: six keys, always.
+
+    Deliberately NOT the `int | None` convention `_heights_record`/
+    `_boundaries_record` both use for "this step never ran at all": the
+    brief's own ruling for this step is that a package with neither
+    `<stem>_building.geojson` nor `<stem>_os_buildings.geojson` is an
+    ordinary, uneventful outcome (the owner's own default today, with
+    `os_open` unselected), not a reader-visible "unknown" the way no
+    Welsh LiDAR or no INSPIRE boundaries is. `written: 0` here always
+    means "zero footprints were missing, or there was nothing to check
+    at all"; only a non-null `error` means the step actually tried and
+    could not finish.
+    """
+    return {
+        "written": written,
+        "from_overture": from_overture,
+        "from_os": from_os,
+        "kept_existing": kept_existing,
+        "skipped_overlap": skipped_overlap,
+        "error": error,
+    }
+
+
+def _load_building_features(geojson_path: Path) -> list:
+    """Every feature `<stem>_building.geojson` or
+    `<stem>_os_buildings.geojson` holds, in file order, following
+    `_load_boundary_features`'s own shape check exactly: both are
+    mapgen's own merge output (`OvertureSource.merge`, `OsOpenSource.merge`),
+    never hand edited, so a wrong top level shape here is this project's
+    own bug and is raised rather than silently read as zero features.
+
+    Each feature's own geometry is validated later, per feature, inside
+    `buildings.fuse_missing_buildings` itself: an invalid or empty
+    footprint is skipped and counted there (the plan's own "nothing
+    fabricated" rule), never raised here, since one malformed feature
+    among thousands is real upstream data, not a shape this project's own
+    writer got wrong.
+    """
+    try:
+        text = geojson_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BuildingsFusionError(
+            f"{geojson_path.name} could not be read: {exc}"
+        ) from None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise BuildingsFusionError(
+            f"{geojson_path.name} is not valid JSON: {exc}"
+        ) from None
+    if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
+        raise BuildingsFusionError(
+            f"{geojson_path.name} is not a GeoJSON FeatureCollection."
+        )
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise BuildingsFusionError(f"{geojson_path.name} has no features list.")
+    return features
+
+
+def _fuse_buildings_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, object]:
+    """Inject `<stem>_building.geojson` (Overture) and
+    `<stem>_os_buildings.geojson` (OS OpenMap Local) footprints into
+    `<stem>.osm`, in that priority order, reported as a record, in the
+    same one-shape-whatever-happened style as `_fuse_heights_step` and
+    `_fuse_boundaries_step`.
+
+    Unlike those two, this step is never "skipped" as a distinct outcome:
+    `<stem>.osm` missing, neither candidate file present, or both present
+    with nothing left for either to add are all the same ordinary,
+    all-zero record (see `_buildings_record`'s own docstring for why),
+    and every one of those still emits `buildings_fusion_started` then
+    `buildings_fusion_finished`, never a third event name. Only a genuine
+    failure partway through (a malformed `.osm`, a malformed candidate
+    GeoJSON, a disk write failure) emits `buildings_fusion_failed`
+    instead.
+
+    Runs BEFORE `_fuse_heights_step` in both of its own callers
+    (`run_survey` and `bridge_package`): a footprint this step injects
+    with no `height` property of its own is exactly the shape
+    `fuse_building_heights` already knows how to fill in (any
+    `building=*` way with no `height` tag yet, whatever `source=` it
+    carries), so the injection has to land first for the heights pass to
+    see it in the same run.
+
+    The geometry dedup itself (`buildings.fuse_missing_buildings`) is
+    this step's own idempotence guard: a way this step injected on an
+    earlier run is, by the next run, just another existing OSM building,
+    so re-offering the same candidates fails the dedup rule against it
+    and is skipped rather than duplicated. See that function's own module
+    docstring for why this is judged equivalent to, rather than a
+    departure from, `_fuse_boundaries_step`'s coarser "already tagged,
+    skip the whole step" guard.
+    """
+    osm_path = Path(root) / f"{stem}.osm"
+    overture_path = Path(root) / f"{stem}_building.geojson"
+    os_path = Path(root) / f"{stem}_os_buildings.geojson"
+
+    sink.emit("buildings_fusion_started")
+    if not osm_path.is_file():
+        result = _buildings_record()
+        sink.emit("buildings_fusion_finished", **result)
+        return result
+
+    try:
+        candidates: list[tuple[str, list]] = []
+        if overture_path.is_file():
+            candidates.append(
+                (BUILDINGS_SOURCE_OVERTURE, _load_building_features(overture_path))
+            )
+        if os_path.is_file():
+            candidates.append(
+                (BUILDINGS_SOURCE_OS_OPEN, _load_building_features(os_path))
+            )
+        if not candidates:
+            result = _buildings_record()
+            sink.emit("buildings_fusion_finished", **result)
+            return result
+        record = fuse_missing_buildings(osm_path, candidates)
+    except (HeightsError, BuildingsFusionError, OSError) as exc:
+        error = str(exc)
+        sink.emit("buildings_fusion_failed", error=error)
+        return _buildings_record(error=error)
+
+    result = _buildings_record(
+        written=record.written,
+        from_overture=record.per_source.get(BUILDINGS_SOURCE_OVERTURE, 0),
+        from_os=record.per_source.get(BUILDINGS_SOURCE_OS_OPEN, 0),
+        kept_existing=record.kept_existing,
+        skipped_overlap=record.skipped_overlap,
+    )
+    sink.emit("buildings_fusion_finished", **result)
+    return result
+
+
 def _heights_record(
     written: int | None = None,
     buildings: int | None = None,
@@ -1766,32 +1958,6 @@ def _boundary_coordinates(feature: object, index: int) -> list[tuple[float, floa
             ) from exc
         points.append((longitude, latitude))
     return points
-
-
-def _minimum_existing_id(root: ET.Element) -> int:
-    """The smallest id any `<node>`, `<way>` or `<relation>` in `root`
-    already carries, or 0 if none carries a parseable one.
-
-    Collision safety, not merely readability, is why this step's own
-    negative counter is not simply hard-coded to start at -1 (see
-    `_fuse_boundaries_step`'s own docstring, "collision safety" section,
-    for the full reasoning). This function is the fix: it looks at every
-    element the file actually holds, of any type and either sign, rather
-    than assuming nothing already sits at or below -1.
-    """
-    minimum = 0
-    for element in root:
-        if element.tag not in ("node", "way", "relation"):
-            continue
-        raw_id = element.get("id")
-        if raw_id is None:
-            continue
-        try:
-            value = int(raw_id)
-        except ValueError:
-            continue
-        minimum = min(minimum, value)
-    return minimum
 
 
 def _existing_boundary_way_count(root: ET.Element) -> int:
@@ -2390,6 +2556,13 @@ def bridge_package(
             f"Run the survey again over the same extent to fetch what is missing, "
             f"then run this again."
         )
+
+    # Task 6 of the OS Open pack plan. Same ordering as run_survey's own
+    # call site: BEFORE heights fusion, unconditionally before the bridge
+    # attempt below, so an injected footprint with no height of its own
+    # is already in the `.osm` by the time heights fusion runs immediately
+    # after it.
+    payload["buildings_fusion"] = _fuse_buildings_step(root=root, stem=stem, sink=sink)
 
     # Task 7. BEFORE the bridge, unconditionally, same as run_survey's own
     # ordering and for the same reason: the bridge converts <stem>.osm into
@@ -3565,6 +3738,7 @@ def _build_survey_json(
     elevation_grid=None,
     lidar_heights=None,
     inspire_boundaries=None,
+    buildings_fusion=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
@@ -3582,6 +3756,7 @@ def _build_survey_json(
     inspire_boundaries = inspire_boundaries or {
         "written": None, "curves": None, "kept_existing": None, "error": None,
     }
+    buildings_fusion = buildings_fusion or _buildings_record()
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
@@ -3756,6 +3931,14 @@ def _build_survey_json(
         # apart from the coarser 30 m fallback without diffing `covered`
         # against a run from before `lidar_wales` was selected.
         "elevation_grid": elevation_grid,
+        # Task 6 of the OS Open pack plan. `written` is 0, never None, on
+        # a package with neither candidate footprint file at all (see
+        # `_buildings_record`'s own docstring for why this one step does
+        # not follow `lidar_heights`/`inspire_boundaries`'s None-means-
+        # never-ran convention): a survey with `os_open` unselected and no
+        # Overture layer either is an ordinary, complete package, not one
+        # missing something it tried for.
+        "buildings_fusion": buildings_fusion,
         # Task 7. `written` is None, not 0 or False, on a package this step
         # never ran on at all (no `.osm`, or no Welsh LiDAR selected):
         # `int | None` throughout, matching the brief's own record shape, so

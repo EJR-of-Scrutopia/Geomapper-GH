@@ -46,6 +46,7 @@ from mapgen.sources.overture import (
     OvertureError,
     OvertureSource,
 )
+from tests.test_buildings import _polygon_feature
 from tests.test_heights import (
     _BOX_BNG,
     _constant_window,
@@ -3546,16 +3547,18 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # not there for the download. complete and stopped describe that
     # download and nothing else; so do tiles, sources and both timestamps.
     #
-    # Four blocks are the exception rather than one, and each was added by
+    # Five blocks are the exception rather than one, and each was added by
     # the task that made this command produce something: `bridge`;
     # `project_setting` (task 35), which mapgen now writes whether or not the
     # bridge is working; `elevation_grid` (task 39), the DEM converted
     # into the format Urbano reads terrain from, which every package
     # downloaded before that task is missing; `lidar_heights` (task 7),
     # which re-runs the same fusion the download itself may already have
-    # done; and `inspire_boundaries` (task 5 of the INSPIRE curves plan),
-    # the same re-run shape for property boundary curves. Everything else
-    # is still read and never written.
+    # done; `inspire_boundaries` (task 5 of the INSPIRE curves plan), the
+    # same re-run shape for property boundary curves; and `buildings_fusion`
+    # (task 6 of the OS Open pack plan), the same re-run shape one step
+    # earlier in the pipeline. Everything else is still read and never
+    # written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
     before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
@@ -3567,7 +3570,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     assert after["stopped"] is True
     for changed in (
         "bridge", "project_setting", "elevation_grid", "lidar_heights",
-        "inspire_boundaries",
+        "inspire_boundaries", "buildings_fusion",
     ):
         before.pop(changed, None)
         after.pop(changed, None)
@@ -3584,12 +3587,17 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
 
     # The project setting is written after the bridge attempt and regardless
     # of it, which is exactly what run_survey does, so the two commands go
-    # on emitting the same vocabulary in the same order (task 35). The
-    # heights fusion runs first of all (task 7), then boundaries fusion
-    # (task 5 of the INSPIRE curves plan): this package has no packaged
-    # LiDAR rasters and no boundaries GeoJSON, so both are skipped rather
-    # than attempted.
+    # on emitting the same vocabulary in the same order (task 35). Buildings
+    # fusion runs first of all (task 6 of the OS Open pack plan): this
+    # package has neither candidate footprint file, which is buildings
+    # fusion's own ordinary, all-zero outcome (started/finished, never a
+    # skip), then heights fusion (task 7), then boundaries fusion (task 5 of
+    # the INSPIRE curves plan): this package has no packaged LiDAR rasters
+    # and no boundaries GeoJSON, so both of those are skipped rather than
+    # attempted.
     assert [e["event"] for e in log.events] == [
+        "buildings_fusion_started",
+        "buildings_fusion_finished",
         "heights_fusion_skipped",
         "boundaries_fusion_skipped",
         "bridge_started",
@@ -3597,7 +3605,7 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
         "project_setting_started",
         "project_setting_written",
     ]
-    assert "exit code 1" in log.events[3]["error"]
+    assert "exit code 1" in log.events[5]["error"]
 
 
 def test_a_stop_that_landed_at_the_very_end_can_have_its_urbano_files_afterwards(tmp_path):
@@ -5707,6 +5715,296 @@ def test_a_failed_conversion_is_announced_and_not_only_written_down(tmp_path):
     assert len(failed) == 1
     assert "byte order mark" in failed[0]["error"]
     assert not any(e["event"] == "elevation_grid_written" for e in log.snapshot())
+
+
+# --------------------------------------------------------------------------
+# Task 6 of the OS Open pack plan: Overture and OS OpenMap Local building
+# footprints fused into <stem>.osm, BEFORE heights fusion.
+#
+# `_BOX_BNG`/`_write_single_building_osm` reused straight from
+# tests/test_heights.py, same as the heights-fusion suite below: one
+# existing building at a known BNG location is enough to prove
+# `kept_existing`, and candidate footprints live well away from it in
+# plain lon/lat degrees, since this module never projects at all.
+# --------------------------------------------------------------------------
+
+_NEW_BUILDING_RING_LONLAT = [
+    (-3.10, 51.60), (-3.0999, 51.60), (-3.0999, 51.5999), (-3.10, 51.5999),
+]
+
+
+def _write_overture_buildings_geojson(out_dir: Path, stem: str, features) -> Path:
+    path = out_dir / f"{stem}_building.geojson"
+    path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features}), encoding="utf-8"
+    )
+    return path
+
+
+def _write_os_buildings_geojson(out_dir: Path, stem: str, features) -> Path:
+    path = out_dir / f"{stem}_os_buildings.geojson"
+    path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features}), encoding="utf-8"
+    )
+    return path
+
+
+class BuildingsStubSource(StubSource):
+    """Writes a real `.osm` (one flat-roofed building, the same fixture
+    `LidarHeightsStubSource` uses below) and, when asked, real
+    `<stem>_building.geojson`/`<stem>_os_buildings.geojson` beside it: the
+    exact files `_fuse_buildings_step` looks for, so a run through
+    `run_survey` and `bridge_package` exercises the real
+    `fuse_missing_buildings` rather than a stand-in for it.
+    """
+
+    def __init__(self, source_id="stub", overture_features=None, os_features=None, **kwargs):
+        super().__init__(source_id=source_id, **kwargs)
+        self._overture_features = overture_features
+        self._os_features = os_features
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        outputs = [osm_path]
+        if self._overture_features is not None:
+            outputs.append(
+                _write_overture_buildings_geojson(out_dir, stem, self._overture_features)
+            )
+        if self._os_features is not None:
+            outputs.append(_write_os_buildings_geojson(out_dir, stem, self._os_features))
+        return outputs
+
+
+class OsmOnlyStubSource(StubSource):
+    """Writes only `.osm`, neither candidate footprint file at all: the
+    owner's own package shape whenever `overture` was never selected
+    either (not merely `os_open` unselected).
+    """
+
+    def merge(self, parts, out_dir, stem):
+        return [_write_single_building_osm(out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm")]
+
+
+class MalformedBuildingsStubSource(StubSource):
+    """Writes a real `.osm` but a `<stem>_building.geojson` that is not a
+    GeoJSON FeatureCollection at all: a package this step must refuse
+    rather than guess at, exactly as `_fuse_boundaries_step`/
+    `_fuse_heights_step` refuse input they cannot parse.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        geojson_path = out_dir / f"{stem}_building.geojson"
+        geojson_path.write_text("not json at all {{{", encoding="utf-8")
+        return [osm_path, geojson_path]
+
+
+class BuildingsAndHeightsStubSource(StubSource):
+    """Writes everything BOTH fusion steps look for: `LidarHeightsStubSource`'s
+    own building-plus-rasters, plus a real `<stem>_building.geojson`
+    beside them, so the ordering between the two real steps (and the
+    bridge after them) can be checked against real events rather than a
+    skip.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dsm_path = out_dir / f"{stem}_lidar_dsm.tif"
+        write_bng_geotiff(dtm_path, _constant_window(100.0))
+        write_bng_geotiff(dsm_path, _constant_window(106.0))
+        geojson_path = _write_overture_buildings_geojson(
+            out_dir, stem, [_polygon_feature(_NEW_BUILDING_RING_LONLAT)]
+        )
+        return [osm_path, dtm_path, dsm_path, geojson_path]
+
+
+def _buildings_ways(osm_root: ET.Element, source_value: str) -> list[ET.Element]:
+    return [
+        element
+        for element in osm_root
+        if element.tag == "way"
+        and any(
+            tag.get("k") == "source" and tag.get("v") == source_value
+            for tag in element.findall("tag")
+        )
+    ]
+
+
+def test_buildings_fusion_injects_overture_and_os_footprints_before_heights_would_run(
+    tmp_path,
+):
+    overture_features = [_polygon_feature(_NEW_BUILDING_RING_LONLAT, {"height": 7.42})]
+    os_ring = [(lon + 1.0, lat + 1.0) for lon, lat in _NEW_BUILDING_RING_LONLAT]
+    os_features = [
+        _polygon_feature(os_ring, {"source": "os_openmap_local", "class": "Agricultural"})
+    ]
+    register(BuildingsStubSource(overture_features=overture_features, os_features=os_features))
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["buildings_fusion"] == {
+        "written": 2, "from_overture": 1, "from_os": 1,
+        "kept_existing": 1, "skipped_overlap": 0, "error": None,
+    }
+    osm_root = ET.fromstring(
+        (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    )
+    overture_ways = _buildings_ways(osm_root, "overture")
+    assert len(overture_ways) == 1
+    assert any(
+        t.get("k") == "height" and t.get("v") == "7.4" for t in overture_ways[0].findall("tag")
+    )
+    os_ways = _buildings_ways(osm_root, "os_openmap_local")
+    assert len(os_ways) == 1
+    assert any(t.get("k") == "class" and t.get("v") == "Agricultural" for t in os_ways[0].findall("tag"))
+    assert any(t.get("k") == "building" and t.get("v") == "yes" for t in os_ways[0].findall("tag"))
+    all_ids = [int(e.get("id")) for e in osm_root if e.tag in ("node", "way")]
+    assert len(all_ids) == len(set(all_ids)), "every id, old and new, must be unique"
+
+
+def test_buildings_fusion_records_all_zero_with_neither_candidate_file_present(tmp_path):
+    register(OsmOnlyStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    # All zero, never None (see `_buildings_record`'s own docstring): the
+    # owner's own default today, `os_open` unselected and no `overture`
+    # layer either, is an ordinary, complete package, not one this step
+    # tried and failed at.
+    assert result.survey["buildings_fusion"] == {
+        "written": 0, "from_overture": 0, "from_os": 0,
+        "kept_existing": 0, "skipped_overlap": 0, "error": None,
+    }
+    names = [e["event"] for e in log.snapshot()]
+    assert names.count("buildings_fusion_started") == 1
+    assert names.count("buildings_fusion_finished") == 1
+    assert "buildings_fusion_skipped" not in names, (
+        "no third event name: this step is never skipped, only started then "
+        "finished or failed"
+    )
+    assert "buildings_fusion_failed" not in names
+
+
+def test_buildings_fusion_works_with_overture_only_the_owners_default_today(tmp_path):
+    overture_features = [_polygon_feature(_NEW_BUILDING_RING_LONLAT, {"height": 5.0})]
+    register(BuildingsStubSource(overture_features=overture_features))
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["buildings_fusion"] == {
+        "written": 1, "from_overture": 1, "from_os": 0,
+        "kept_existing": 1, "skipped_overlap": 0, "error": None,
+    }
+
+
+def test_a_buildings_fusion_failure_is_recorded_and_the_survey_still_finishes(tmp_path):
+    register(MalformedBuildingsStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.complete is True
+    record = result.survey["buildings_fusion"]
+    assert record["written"] == 0
+    assert record["error"] is not None
+    names = [e["event"] for e in log.snapshot()]
+    assert names.index("buildings_fusion_started") < names.index("buildings_fusion_failed")
+    # The rest of the package is untouched by this step's own failure.
+    assert (result.paths.root / f"{result.paths.stem}.osm").is_file()
+
+
+def test_buildings_fusion_runs_before_heights_fusion_and_before_the_bridge_in_run_survey(
+    tmp_path, monkeypatch
+):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(BuildingsAndHeightsStubSource())
+    log = EventLog()
+
+    run_survey(
+        _request(tmp_path, run_bridge_step=True),
+        progress=log,
+        bridge_runner=FakeBridgeRunner(returncode=0),
+    )
+
+    names = [e["event"] for e in log.snapshot()]
+    assert (
+        names.index("buildings_fusion_started")
+        < names.index("buildings_fusion_finished")
+        < names.index("heights_fusion_started")
+        < names.index("heights_fusion_written")
+        < names.index("bridge_started")
+    )
+
+
+def test_buildings_fusion_runs_before_heights_fusion_and_before_the_bridge_in_bridge_package(
+    tmp_path, monkeypatch
+):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(BuildingsAndHeightsStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    bridge_package(result.paths.root, progress=log, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    names = [e["event"] for e in log.snapshot()]
+    assert (
+        names.index("buildings_fusion_started")
+        < names.index("buildings_fusion_finished")
+        < names.index("heights_fusion_started")
+        < names.index("heights_fusion_written")
+        < names.index("bridge_started")
+    )
+
+
+def test_bridge_package_re_runs_buildings_fusion_idempotently_and_byte_identically(tmp_path):
+    """The reason this matters: every package the owner already has can
+    now have its missing buildings fused in place by a plain re-bridge,
+    same as `test_bridge_package_re_runs_boundaries_fusion_idempotently_and_byte_identically`
+    proves for boundaries. A package the DOWNLOAD already fused must not
+    be re-fused into a duplicate way either, which is the idempotence
+    half of this same test, checked at the byte level: the previously
+    injected way is, on this second pass, just another existing OSM
+    building, so the identical candidate fails the dedup rule against it
+    and `_rewrite_osm` is never called a second time (see
+    `buildings.fuse_missing_buildings`'s own `written > 0` guard).
+    """
+    overture_features = [_polygon_feature(_NEW_BUILDING_RING_LONLAT, {"height": 5.0})]
+    register(BuildingsStubSource(overture_features=overture_features))
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    downloaded = result.survey["buildings_fusion"]
+    assert downloaded == {
+        "written": 1, "from_overture": 1, "from_os": 0,
+        "kept_existing": 1, "skipped_overlap": 0, "error": None,
+    }
+    osm_path = result.paths.root / f"{result.paths.stem}.osm"
+    first_bytes = osm_path.read_bytes()
+
+    payload = bridge_package(result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    rebridged = payload["buildings_fusion"]
+    assert rebridged == {
+        "written": 0, "from_overture": 0, "from_os": 0,
+        "kept_existing": 2, "skipped_overlap": 1, "error": None,
+    }
+    second_bytes = osm_path.read_bytes()
+    assert second_bytes == first_bytes, "a second run must leave the file byte-identical"
+    osm_root = ET.fromstring(second_bytes.decode("utf-8"))
+    assert len(_buildings_ways(osm_root, "overture")) == 1, (
+        "a second run must not duplicate the injected way"
+    )
 
 
 # --------------------------------------------------------------------------
