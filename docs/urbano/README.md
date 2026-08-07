@@ -163,6 +163,72 @@ item2, elevationGrid)` (confirms `.Z` is never passed);
 `LatLonToRhinoPoint` itself hardcodes `Z = 0.0` unless the US-only
 `ElevationGrid` path overwrites it.
 
+## The OS Open GeoJSON files: filtering by key and value in Import Geojson File
+
+Phase 2 item 3's `os_open` source (`src/mapgen/sources/os_open.py`) writes up
+to six GeoJSON files into the package root, each read the same way as any
+other GeoJSON here: straight into **Import Geojson File**, whose component
+this README's own "Import Geojson File" section above already covers for Z
+handling. Every feature in every one of them carries `"source"` plus
+whichever of the properties below OS's own data actually supplied (a
+property with no value on a given feature is simply absent from it, never
+written as `null` or an empty string), which is what makes filtering by key
+and value in the component's own property mapping work at all: a feature
+missing the key you filter on just does not match, rather than matching
+emptily.
+
+| File | Feature kind | `source` | Other properties to filter on |
+| --- | --- | --- | --- |
+| `<stem>_os_buildings.geojson` | Building polygons | `os_openmap_local` | `code`, `theme`, `class` |
+| `<stem>_os_roads.geojson` | RoadLink lines | `os_open_roads` | `class`, `function`, `form`, `name`, `number`, `trunk`, `primary` |
+| `<stem>_os_rail.geojson` | Railway lines | `os_openmap_local` | `class` |
+| `<stem>_os_greenspace.geojson` | Greenspace polygons and access points | `os_open_greenspace` | `function`, `access`, `name` |
+| `<stem>_os_sites.geojson` | Functional sites, stations, named places | `os_openmap_local` | `theme`, `class`, `name` |
+| `<stem>_os_land.geojson` | Woodland and water | `os_openmap_local` | `kind` (`woodland`, `water_area`, `water_line`, `tidal_water`, `foreshore`) |
+
+The filtering workflow the owner already uses elsewhere in Urbano applies
+here directly: `os_roads` by `class` (OS's own road classification, e.g.
+Motorway/A Road/Local Road) or `function` (e.g. Restricted Local Access) to
+pull out a specific road grade rather than every RoadLink at once; `os_sites`
+by `theme` to separate, say, education sites from transport ones; `os_land`
+by `kind` to pull woodland out from tidal water. A file with no features for
+this extent (Cowbridge's own closed railway branch is the standing example:
+`os_rail` genuinely writes no file there, see `os_open.py`'s own module
+docstring) is simply absent from the package; Import Geojson File is never
+pointed at a name that is not there.
+
+**`<stem>_os_roads.geojson` is a reference layer, deliberately never fused
+into `<stem>.osm`.** Every other OS Open candidate (buildings) can be fused
+because the base OSM layer is often genuinely missing footprints it never
+had; OSM's own road network, by contrast, is close to complete over most of
+Great Britain already, so fusing OS Open's roads on top of it would double
+almost every road the `.osm` already carries rather than filling a real gap.
+`os_roads.geojson` exists for comparison and for the owner's own selective
+import instead: read it straight into Grasshopper through Import Geojson
+File, filtered by `class` or `function` as above, alongside the `.osm`'s own
+streets, never as a replacement for them. The same reasoning applies to
+`os_rail`, kept as its own file for the same reason rather than merged into
+the road one.
+
+**Fused buildings do not arrive as a separate file at all: they arrive
+inside `<stem>.osm` itself.** `src/mapgen/buildings.py`'s fusion step
+(`_fuse_buildings_step`, `package.py`) reads `<stem>_building.geojson`
+(Overture) and `<stem>_os_buildings.geojson` (this source) as CANDIDATES,
+injects whichever footprints the base OSM layer is genuinely missing
+straight into `<stem>.osm` as ordinary `building=*` ways tagged
+`source=overture` or `source=os_openmap_local`, and runs before the LiDAR
+heights fusion step, so an injected footprint with no height of its own
+picks up a real DSM-minus-DTM `height` the same way an original OSM building
+does whenever `lidar_wales` was selected and the extent falls inside Wales.
+`<stem>_os_buildings.geojson` itself is left on disk afterwards exactly as
+`os_open.py`'s `merge()` wrote it: every OS OpenMap Local building over the
+extent, including the ones fusion recognised as already present and skipped,
+useful for the owner's own direct GeoJSON import of OS's own building set
+independent of the `.osm`, but not itself the record of what fusion actually
+added. `survey.json`'s own `buildings_fusion` block (`written`,
+`from_overture`, `from_os`, `kept_existing`, `skipped_overlap`) is that
+record.
+
 ## The elevation grid, which is how terrain reaches Grasshopper
 
 `<stem>.egrid` (task 39, `src/mapgen/egrid.py`) is the DEM in the only format

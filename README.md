@@ -722,12 +722,27 @@ including drawing sheets.
 | Copernicus DEM, via OpenTopography | Free for any use, with attribution | (c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH |
 | Welsh LiDAR (`lidar_wales`) | Open Government Licence v3.0 | Contains Welsh Government and Natural Resources Wales information licensed under the Open Government Licence v3.0 |
 | HM Land Registry INSPIRE Index Polygons (`inspire`) | Open Government Licence v3.0 | This information is subject to Crown copyright and database rights [year] and is reproduced with the permission of HM Land Registry. The polygons (including the associated geometry, namely x, y co-ordinates) are subject to Crown copyright and database rights [year] Ordnance Survey AC0000851063. |
+| OS Open map data (`os_open`): OpenMap Local, Open Roads, Open Greenspace | Open Government Licence v3.0 | Contains OS data © Crown copyright and database right [year] |
+| Addresses (`os_uprn`): OS Open UPRN | Open Government Licence v3.0 | Contains OS data © Crown copyright and database right [year] |
 | OSTN15 transformation (`bng.py`) | Ordnance Survey, Open Source Initiative BSD Licence | Copyright and database rights Ordnance Survey Limited 2016, Crown copyright and database rights Land & Property Services 2016 and/or Ordnance Survey Ireland, 2016. All rights reserved. |
 
 Every package with a Welsh LiDAR layer or an `.egrid` derived from it carries
 its coordinates through the OSTN15 transformation (`src/mapgen/bng.py`), so
 that row's licence and attribution carry forward too, even though OSTN15
 never appears as a `LayerSource` of its own.
+
+**OS Open's downloads are cached once, not repeated per survey.** `os_open`
+parses OpenMap Local, Open Roads and Open Greenspace once per 100km National
+Grid square and keeps the result under `~/.mapgen/osopen`; a first survey
+touching south Wales' SS and ST squares downloads roughly 170 MB of OpenMap
+Local zips between the two of them, plus Open Greenspace's own few MB, and
+Open Roads reads only the squares it needs, at roughly 50 MB per area, out of
+the OS Data Hub's single 608 MB national zip through a ranged read rather
+than downloading the whole file. `os_uprn`'s address layer is a single 619 MB
+national CSV, downloaded once, ever, and cached for every later survey
+regardless of where in Great Britain it runs. Every later survey over ground
+already cached this way costs nothing further to download, and `mapgen
+estimate` says so through each source's own `routing_note`.
 
 **Both** attribution statements above are required for `inspire`, not one or
 the other: the first covers the underlying INSPIRE data, the second the
@@ -883,10 +898,33 @@ publication year substituted in, plus the conditions link. See "Data
 sources, licences and attribution" and the `inspire_boundaries` row of the
 `survey.json` schema above for the detail.
 
-Still to come, in build order: an OS Open pack (roads, OpenMap Local, UPRN)
-behind a per-extent tier resolver next, then DataMapWales constraints and
-Cadw designations together with planning.data.gov.uk for England,
-Sentinel-2 context imagery via Earth Search, England LiDAR as its own task
-(the discovery API is open but bulk raster download there has no
-documented route yet), PlanIt planning history, and BGS boreholes. See
-`docs/superpowers/specs/` for the full design record.
+**Build item 3, an OS Open pack and a buildings fusion step, has shipped.**
+`os_open` packages OS OpenMap Local, OS Open Roads and OS Open Greenspace as
+six GeoJSON files (`_os_buildings`, `_os_roads`, `_os_rail`, `_os_greenspace`,
+`_os_sites`, `_os_land`; see `docs/urbano/README.md` for what each holds and
+how to filter it in Urbano), and `os_uprn` packages OS Open UPRN addresses as
+`_os_uprn.geojson`. A per-extent tier resolver (`src/mapgen/resolver.py`)
+records, for every category a selected source can serve, which source this
+extent will actually use and which others are along for backup or reference
+only; the estimate panel and `survey.json`'s own `resolution` key both carry
+it. The buildings fusion step (`src/mapgen/buildings.py`) is the owner's own
+missing-buildings fix: it injects Overture and OS OpenMap Local footprints
+the OSM base lacks straight into `<stem>.osm`, fusion only, never replacing
+an existing OSM building, and it runs whether or not `os_open` itself is
+selected. OS Open Roads is deliberately never fused (fusing it would double
+every road OSM already carries); it ships as a reference layer instead,
+filtered by key and value in Urbano's own GeoJSON import. **Boundary-Line**
+(OS's own administrative boundaries product) is deferred from this pack:
+nothing in the owner's workflow consumes it yet, and it joins later through
+the same OS Data Hub client in a short task if wanted.
+
+Still to come, in build order: categorised property boundaries, roof forms
+read off the DSM, canopy positions, and a Grasshopper GeoTIFF reader script,
+all owner-approved additions to the phase 2 spec; an OS benchmark comparing
+mapgen's own output against OS's paid developer tooling in dev mode, to
+calibrate the tier resolver's own tier tables against a second opinion; then
+DataMapWales constraints and Cadw designations together with
+planning.data.gov.uk for England, Sentinel-2 context imagery via Earth
+Search, England LiDAR as its own task (the discovery API is open but bulk
+raster download there has no documented route yet), PlanIt planning history,
+and BGS boreholes. See `docs/superpowers/specs/` for the full design record.

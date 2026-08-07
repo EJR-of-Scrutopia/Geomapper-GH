@@ -396,6 +396,182 @@ def test_the_whole_inspire_boundaries_chain_proves_itself_over_llantwit_major(tm
     )
 
 
+# --- Phase 2, item 3 (OS Open pack + buildings fusion): the whole chain,
+# proven live end to end --------------------------------------------------
+#
+# The same Cowbridge extent test_sources_os_open.py's own live test
+# (_COWBRIDGE_BBOX) already uses, reused rather than a fresh one: this
+# machine's OS Open cache is already warm for OpenMapLocal, OpenRoads and
+# OpenGreenspace over the SS and ST squares this exact extent touches
+# (that test's own earlier live runs built it), so this run measures the
+# warm-cache path end to end, real listing checks and shard reads against
+# the real OS Data Hub but zero bytes actually downloaded. That is a
+# genuine proof of the pipeline, not a weaker one: what this test cannot
+# honestly claim is a cold download's own byte/rate constants, which is
+# why those are refit from a cold run's own numbers elsewhere (see
+# os_open.py's own BYTES_PER_SECOND_ESTIMATE comment) and this run's own
+# numbers feed only SECONDS_FLOOR, the warm-path overhead constant.
+#
+# os_uprn is deliberately excluded: its own national shard cache does not
+# exist on this machine, and building it here would mean this
+# "prove the pipeline end to end" test forcing a real 619 MB one-time
+# download that neither the pipeline proof nor this task's own constants
+# refit needs. Its own live test already skips itself the same way when
+# the cache is not there.
+
+_OS_OPEN_BBOX = "-3.460,51.455,-3.438,51.468"  # Cowbridge; see test_sources_os_open.py
+
+
+def _building_way_count(osm_path: Path) -> int:
+    """Every `<way>` in `osm_path` carrying a `building=*` tag: the same
+    fusion-visible fact `buildings_fusion`'s own `written` count and
+    `lidar_heights`'s own `buildings` count both key off (see
+    `mapgen.buildings`/`mapgen.heights`). A plain tag scan, not a geometry
+    check, since the question here is how many building ways exist, not
+    whether their footprints are well formed.
+    """
+    root = ET.parse(osm_path).getroot()
+    count = 0
+    for way in root.findall("way"):
+        for tag in way.findall("tag"):
+            if tag.get("k") == "building":
+                count += 1
+                break
+    return count
+
+
+class _StageTimingProgress:
+    """Records every progress event `run_survey` emits, timestamped, the
+    same technique `test_sources_os_open.py`'s own `_TimingProgress` uses
+    to time OS Open's own products directly, applied here across a whole
+    `run_survey` call: `OsOpenSource.fetch` receives this exact sink (see
+    `package.py`'s per-source fetch call, which always passes its own
+    `sink` straight through), so every `tile_done`/`tile_skipped` event it
+    emits, each carrying a `product` field, lands in `events` indistinguishable
+    from any other source's own events except by that field.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[float, str, dict]] = []
+
+    def emit(self, event: str, **fields: object) -> None:
+        self.events.append((time.monotonic(), event, fields))
+
+
+@pytest.mark.live
+def test_the_whole_os_open_pack_and_buildings_fusion_prove_themselves_over_cowbridge(tmp_path):
+    """Phase 2 item 3's end-to-end proof: one real `run_survey`, osm +
+    overture + os_open, over the Cowbridge extent whose OS Open cache is
+    already warm (see the module comment above for why os_uprn is not
+    here too).
+
+    A separate, osm-only baseline run over the IDENTICAL extent gives the
+    pre-fusion building-way count. `run_survey` has no seam that would let
+    this test read `<stem>.osm` mid-pipeline, after the osm source's own
+    merge but before `_fuse_buildings_step` runs, so a second, otherwise
+    identical run (same bbox, same tiling, only `source_ids` narrowed to
+    `("osm",)`) is the honest way to measure "strictly more building ways
+    after fusion than before" rather than assuming a number: the osm
+    source's own fetch/merge is deterministic over the same real ground,
+    so its own building-way count does not depend on which other sources
+    ran alongside it in the full run below.
+    """
+    register_default_sources()
+    bbox = BBox.parse(_OS_OPEN_BBOX)
+
+    baseline_request = SurveyRequest(
+        bbox=bbox,
+        region="South Wales",
+        site="Cowbridge Buildings Baseline",
+        output_root=tmp_path / "baseline",
+        tile_size_m=1000.0,
+        overlap_m=50.0,
+        source_ids=("osm",),
+        run_bridge_step=False,
+    )
+    baseline_result = run_survey(baseline_request)
+    assert baseline_result.complete is True
+    baseline_osm = baseline_result.paths.root / f"{baseline_result.paths.stem}.osm"
+    assert baseline_osm.exists() and baseline_osm.stat().st_size > 0
+    baseline_building_count = _building_way_count(baseline_osm)
+
+    request = SurveyRequest(
+        bbox=bbox,
+        region="South Wales",
+        site="Cowbridge OS Open End To End",
+        output_root=tmp_path / "full",
+        tile_size_m=1000.0,
+        overlap_m=50.0,
+        source_ids=("osm", "overture", "os_open"),
+        run_bridge_step=False,
+    )
+    timing = _StageTimingProgress()
+
+    started = time.monotonic()
+    result = run_survey(request, progress=timing)
+    elapsed = time.monotonic() - started
+
+    assert result.complete is True
+    root, stem = result.paths.root, result.paths.stem
+
+    names = {p.name for p in root.iterdir()}
+    for suffix in ("buildings", "roads", "greenspace", "sites", "land"):
+        assert f"{stem}_os_{suffix}.geojson" in names, f"no {suffix} output for the Cowbridge extent"
+    # Cowbridge's own branch line closed to freight in 1965
+    # (test_sources_os_open.py's own live test records the same absence
+    # over this identical extent): OS Open's RailwayTrack/RailwayTunnel
+    # genuinely have nothing to report here today, and the honest record
+    # of that is no file on disk AND no mention in survey.json's own
+    # sources entry, not a fabricated empty one.
+    assert f"{stem}_os_rail.geojson" not in names
+    os_open_entry = next(s for s in result.survey["sources"] if s["id"] == "os_open")
+    assert not any(name.endswith("_os_rail.geojson") for name in os_open_entry["merged_files"])
+
+    osm_path = root / f"{stem}.osm"
+    assert osm_path.exists() and osm_path.stat().st_size > 0
+    full_building_count = _building_way_count(osm_path)
+    assert full_building_count > baseline_building_count, (
+        f"fusion added no building ways: {full_building_count} after vs "
+        f"{baseline_building_count} before, over the identical Cowbridge extent"
+    )
+
+    buildings_fusion = result.survey["buildings_fusion"]
+    assert buildings_fusion["error"] is None
+    assert buildings_fusion["written"] > 400
+
+    resolution = result.survey["resolution"]
+    resolved_categories = {entry["category"] for entry in resolution}
+    assert {"buildings", "roads", "greenspace"} <= resolved_categories
+
+    # Per-product warm-path timing: every event carrying a "product" field
+    # is os_open's own (see _StageTimingProgress's own docstring); a
+    # (product, square) unit already shard-complete emits "tile_skipped",
+    # never "tile_done" (os_open.py's own fetch() docstring, "A (product,
+    # square) unit already shards_complete is skipped with no network
+    # call"), which is the expected, warm-cache shape here. Printed for
+    # this task's own SECONDS_FLOOR refit; see the task report for the
+    # arithmetic, since fetch() processes PRODUCTS strictly in order and
+    # merge() itself is not progress-instrumented at all, so this is the
+    # per-square-loop portion of the warm path only, not the whole os_open
+    # contribution to `elapsed`.
+    os_open_events = [(t, event, fields) for t, event, fields in timing.events if "product" in fields]
+    per_product_done_at: dict[str, float] = {}
+    for t, event, fields in os_open_events:
+        product = fields["product"]
+        per_product_done_at[product] = max(per_product_done_at.get(product, t), t)
+
+    print(
+        f"\nPhase 2 item 3 end-to-end proof: {elapsed:.2f}s wall, "
+        f"baseline_building_count={baseline_building_count}, "
+        f"full_building_count={full_building_count}, "
+        f"buildings_fusion={buildings_fusion}, "
+        f"resolved_categories={sorted(resolved_categories)}, "
+        f"os_open_square_events={len(os_open_events)}, "
+        f"os_open_per_product_done_at={per_product_done_at}, "
+        f"output_files={sorted(names)}"
+    )
+
+
 # --- overturemaps 0.20.0 specifically ----------------------------------
 #
 # The unit tests for both 0.20.0 defects drive a stand-in built from what

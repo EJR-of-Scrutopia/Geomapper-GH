@@ -1,4 +1,4 @@
-# mapgen handoff, updated 2026-08-06
+# mapgen handoff, updated 2026-08-07
 
 Read this first when resuming. It is tracked in git deliberately, because the
 detailed ledger is not.
@@ -8,18 +8,21 @@ detailed ledger is not.
 - Worktree: `C:\Users\Param\mapgen-phase1`, branch `feat/phase1`
 - Main worktree: `.../VS code/Rhino Plugins/mapgen`, branch `main`
 - Remote: `https://github.com/EJR-of-Scrutopia/Geomapper-GH.git`
-- **The first push happened.** Both remote branches sit at `3748225`.
-  `feat/phase1` is now **164 commits ahead** of the remote (as of this
-  task's own last commit, 2026-08-06; count with
-  `git rev-list --count origin/feat/phase1..HEAD`) and `main` is 1 ahead.
-  The permission layer denies `git push` from the assistant's shells, so
-  the owner runs it.
+- **A second push has landed since the first.** `origin/feat/phase1` now
+  sits at `5207585` (item 2's own INSPIRE rate-floor fix) and `origin/main`
+  at `e2ae377`, both well past the `3748225` this file used to name.
+  `feat/phase1` is now **24 commits ahead** of the remote (as of this
+  task's own last commit, 2026-08-07, all of it phase 2 item 3; count with
+  `git rev-list --count origin/feat/phase1..HEAD`). The permission layer
+  denies `git push` from the assistant's shells, so the owner runs it.
 - Run tests: `.venv\Scripts\python.exe -m pytest -q` and
   `node tests/js/test_app.js`. Add `-m live` for the network tests.
-- Last known green: **1506 Python (12 deselected `live`), 273 Node**, from
-  this task's own full offline run; only the one live test this task added
-  was rerun this pass, not the other 11. Use the venv python, not the
-  system one, or every import fails.
+- Last known green: **1733 Python (16 deselected `live`), 281 Node**, from
+  this task's own full offline run. All 16 deselected live tests were also
+  run this pass (`-m live`): 15 passed, 1 skipped (`os_uprn`'s own live
+  test skips itself honestly, since its national address cache does not
+  exist on this machine yet). Use the venv python, not the system one, or
+  every import fails.
 
 ## The ledger, and why it matters
 
@@ -335,18 +338,77 @@ substituted plus the HMLR conditions link. This is pending the
 whole-branch review that has closed every prior build item before it
 shipped; nothing here should be treated as final until that review runs.
 
-**Watch-items for build item 2 onward, carried from Wales LiDAR's own
-review.** The int16 GDAL_METADATA scale/offset refusal deferred at Task 3
-(`cog.py`) needs to land before any 16-bit mosaic path is pointed at: right
-now a decimetre-scaled 16-bit source would read 10x tall, unrefused.
-Retry-After plumbing through `CogError` deferred at Task 6 pays off once a
-rate-limited OGC source arrives, which INSPIRE and the DataMapWales
-constraints layers both are; and `estimate()` still has no contour-seconds
-term, invisible so far only because Wales LiDAR is the only source that
-generates contours at all.
+**Build item 3, an OS Open pack, buildings fusion and the tier resolver, is
+built and proven end to end (2026-08-07).**
+`docs/superpowers/plans/2026-08-07-mapgen-phase2-03-os-open-tier-resolver.md`'s
+nine tasks are all complete: `os_open` is a registered source packaging OS
+OpenMap Local, OS Open Roads and OS Open Greenspace as six GeoJSON files
+(buildings, roads, rail, greenspace, sites, land), each square parsed once
+into a derive-once shard cache under `~/.mapgen/osopen` so a later survey
+over the same ground pays nothing further; `os_uprn` packages OS Open UPRN
+addresses as a national, once-ever 619 MB download, opt-in and never in the
+default selection. `src/mapgen/buildings.py`'s fusion step is the owner's
+own missing-buildings fix: it injects Overture and OS footprints the OSM
+base genuinely lacks straight into `<stem>.osm`, fusion only, runs whether
+or not `os_open` itself is selected, and runs before the LiDAR heights
+fusion step so an injected footprint still picks up a real height where
+LiDAR covers it. `src/mapgen/resolver.py` is the per-extent tier resolver
+the phase 2 spec named as this build's architectural centrepiece: `covers()`
+and `tier()` on every source, a `resolution` record in both the estimate
+response and `survey.json`, and a rendered tier list in the web UI before
+Download. Boundary-Line (OS's own administrative boundaries product) is
+deferred from this pack, flagged to the owner in the plan's own header: no
+consumer exists for it in the owner's workflow yet.
 
-Next action: plan build item 3, an OS Open pack (roads, OpenMap Local,
-UPRN) behind a per-extent tier resolver, from the phase 2 spec.
+Task 9's live `run_survey` over a real Cowbridge extent (osm, overture,
+os_open together, the same extent test_sources_os_open.py's own live test
+already warmed the OS Open cache for) confirms the whole chain on disk at
+once: the five OS Open outputs this extent genuinely has data for (Cowbridge's
+own branch line closed in 1965, so `os_rail.geojson` is honestly absent, on
+disk and from `survey.json`'s own `os_open` entry alike), a `buildings_fusion`
+block reporting 958 written (706 from Overture, 252 from OS, 883 already
+kept, 1,853 candidates recognised as duplicates and skipped), a
+`.osm` building-way count of 1,841 against an 883-way osm-only baseline over
+the identical extent, and a `resolution` record naming a source for
+buildings, roads and greenspace among others. `os_uprn` was excluded from
+this run: its own national shard cache does not exist on this machine, and
+the pipeline proof does not need a manufactured 619 MB cold download to
+stand. This is pending the whole-branch review that has closed every prior
+build item before it shipped; nothing here should be treated as final until
+that review runs.
+
+**Watch-items, carried forward and added to.** The int16 GDAL_METADATA
+scale/offset refusal deferred at Wales LiDAR's own Task 3 (`cog.py`) still
+needs to land before any 16-bit mosaic path is pointed at: right now a
+decimetre-scaled 16-bit source would read 10x tall, unrefused. Retry-After
+plumbing through `CogError`, deferred at Wales LiDAR's own Task 6, now has a
+THIRD would-be consumer beside INSPIRE and the DataMapWales constraints
+layers: `os_downloads.py`'s own OS Data Hub listing and download calls have
+no Retry-After handling of their own either, and a keyless, high-traffic
+public API is exactly the shape that starts answering 429 under load.
+`estimate()` still has no contour-seconds term, invisible so far only
+because Wales LiDAR is the only source that generates contours at all. New
+this task: `inspire.py`'s own cache self-heal (`_raise_corrupt_cache_file`,
+also see `ParcelStream._walk`'s own `OSError` branch) only unlinks a cache
+file that failed a CONTENT check (a bad zip header, a CRC failure, malformed
+GML); an ACCESS failure (permission denied, a file gone in a race) is left
+exactly as it was, deliberately, and that narrow split has never been
+re-examined against `os_downloads.py`'s own cache, which has real corruption
+surfaces of its own (a truncated zip, a shard write interrupted mid-flight)
+that a future task should decide about on purpose rather than copying this
+scope blindly. And `os_uprn`'s own `SECONDS_FLOOR`/byte constants are still
+the pre-measurement placeholders `os_open.py`'s own siblings were before
+Task 4's cold run: the first real owner run that ticks addresses is what
+will measure them, the same way Task 4's own cold Cowbridge run measured
+`os_open`'s.
+
+Next action, in the order the owner has approved: (a) the spec addendum
+items, categorised property boundaries, roof forms read off the DSM, canopy
+positions, and a Grasshopper GeoTIFF reader script; (b) an OS benchmark, a
+dev-mode comparison against OS's own paid developer tooling, to calibrate
+the tier resolver's own tier tables against a second opinion; then (c) phase
+2 item 4, DataMapWales constraints and Cadw designations together with
+planning.data.gov.uk for England.
 
 ## Standing constraints
 

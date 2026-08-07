@@ -196,11 +196,32 @@ GREENSPACE_BYTES_PER_SQUARE = 3_000_000
 # rather than trusting a second, still-thin sample.
 BYTES_PER_SECOND_ESTIMATE = 850_000.0
 
-# Placeholder until Task 9 refits this from a live run's own measured wall
-# time (this task's own Step 9 live test measures real numbers and prints
-# them for that refit, but does not feed them back into this constant
-# itself; see the task report for what was actually measured).
-SECONDS_FLOOR = 3.0
+# Task 9's own refit, 2026-08-07, from this machine's OS Open cache
+# already being warm for OpenMapLocal/OpenRoads/OpenGreenspace over the SS
+# and ST squares this task's own Cowbridge extent touches (Task 4's own
+# live runs built it): a warm run downloads nothing, so the honest thing
+# left to measure and price a floor from is the listing-check-and-shard-
+# read overhead itself, not a transfer rate.
+#
+# Six isolated `fetch()`+`merge()` trials over that exact extent, a fresh
+# `OsOpenSource` each time: three with no per-product breakdown (total
+# 0.997s, 1.107s, 0.968s) and three with `PRODUCTS`-ordered timestamps
+# (OpenMapLocal/OpenRoads/OpenGreenspace: 1.402/0.429/0.199s = 2.190s
+# total; 0.256/0.436/0.270s = 1.122s; 0.256/0.427/0.272s = 1.116s). Five of
+# the six cluster at 0.97-1.12s; the outlier, 2.190s, is the first trial of
+# a fresh process, OpenMapLocal alone taking 1.40s of it, consistent with
+# a first request paying a TLS handshake to the OS Data Hub that later
+# requests in the same process reuse. `test_live_smoke.py`'s own full-
+# pipeline live test (`test_the_whole_os_open_pack_and_buildings_fusion_
+# prove_themselves_over_cowbridge`) corroborates the same order of
+# magnitude from inside a real `run_survey`: its own OpenMapLocal-to-
+# OpenRoads and OpenRoads-to-OpenGreenspace deltas were 0.45s and 1.41s.
+#
+# 2.5 sits above the highest of the six isolated totals (2.190s) with real
+# margin for a slower listing round trip on a given day, while being a
+# genuine measurement rather than the untested, round-number 3.0
+# placeholder it replaces.
+SECONDS_FLOOR = 2.5
 
 # The OSTN15 developers pack itself: bng.py's own module docstring names it
 # "a 41 MB CSV of one row per node" (OSTN15_URL). lidar_wales.py's own

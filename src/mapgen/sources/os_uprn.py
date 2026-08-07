@@ -140,10 +140,18 @@ UPRN_BYTES_ONE_TIME = 618_494_417
 # the one service underneath both of them actually is.
 BYTES_PER_SECOND_ESTIMATE = 850_000.0
 
-# Placeholder until Task 9 refits this from a live run's own measured
-# wall time, the same status os_open.py's own SECONDS_FLOOR carries (see
-# its comment): this task's own live test measures a real number but
-# does not feed it back into this constant; see the task report.
+# Still a placeholder after Task 9 (2026-08-07), and deliberately not
+# refit alongside os_open.py's own SECONDS_FLOOR: this product's national
+# shard cache does not exist on this machine at all, so there is no warm
+# path here yet to measure honestly, only the cold, one-time, 619 MB
+# national download `UPRN_BYTES_ONE_TIME` already prices. Task 9's own
+# live test (`test_live_smoke.py`) excludes `os_uprn` from its selection
+# for exactly this reason, rather than triggering that real download
+# inside a test suite just to have a number. This will be refit from the
+# first real owner run that ticks addresses, whenever that happens (see
+# `docs/superpowers/HANDOFF.md`), the same way `os_open.py`'s own byte
+# constants were refit from Task 4's first real cold run rather than a
+# manufactured one.
 SECONDS_FLOOR = 3.0
 
 # An extent OSTN15 has no shift value for at all (genuinely outside
