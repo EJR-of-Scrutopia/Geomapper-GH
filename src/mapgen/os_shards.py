@@ -73,16 +73,37 @@ out of `write_shards` unchanged (never swallowed, never reported as a
 different, wrapping error), and no `meta.json` is left behind, so
 `shards_complete` reports the directory as incomplete and a caller that
 checks it before trusting the cache rebuilds rather than serving a
-partially-written survey silently. A stale `meta.json` left over from a
-PREVIOUS, successful run into the same directory is removed at the very
-start of `write_shards`, before any cell file is touched, for the same
-reason: without that, a rebuild-in-place that fails partway could leave
-an old, now-stale `meta.json` sitting beside newly truncated cell files,
-falsely reporting completeness. In this task's own real call sites (Task
-4/5's "ensure shards once per version" callers) a rebuild always targets
-a fresh, version-stamped directory rather than an existing complete one,
-so this case is not expected to fire in practice; it costs one `unlink`
-to close anyway.
+partially-written survey silently.
+
+That guarantee alone is not enough for a RETRY into the same directory,
+which review round 1 found and this module now closes (Critical
+finding): a failed first attempt can leave perfectly valid, readable
+cell files behind for whatever cells it reached before raising, and a
+second, corrected attempt that happens to touch a DIFFERENT set of cells
+(the realistic shape of "the malformed feature that killed the first
+attempt is now fixed or dropped, so the stream's own cell membership
+shifted") never revisits the first attempt's own cells at all, because a
+cell's own gzip handle is opened, `"wb"` truncate-on-open, lazily, only
+the first time THIS run actually needs it. The first attempt's orphaned
+file then survives, untouched, invisible to `shards_complete` (which
+only ever checks what the SUCCESSFUL run's own `meta.json` names, never
+what else happens to sit beside it in the directory) and, before this
+fix, directly readable by `features_in`/`uprn_in` regardless of whether
+the current generation's own data ever put anything there. `_clear_shard_
+dir` closes this at the writer: every existing shard file of the type
+this call writes, not only `meta.json`, is removed before anything new
+is written, so a shard directory holds exactly one generation's data at
+a time, replaced whole on every call rather than merged into whatever an
+earlier attempt, successful or not, left behind. `features_in`/`uprn_in`
+close it again, independently, at the reader (`_listed_keys`): a
+cell/square file is only ever opened when it is BOTH reachable by the
+query's own `cells_for`/`squares_for` walk AND named in `shard_dir/meta.
+json`'s own list, so a file present on disk that the manifest does not
+name is never read regardless of how it got there or whether the writer's
+own sweep should have already removed it. Belt and braces, per the
+review's own recommendation: either mechanism alone closes the reviewer's
+reproduced fail-then-retry leak; both together mean the reader's own
+correctness never actually depends on the writer's sweep having run.
 
 `gzip.GzipFile(..., mtime=0)` is used throughout (both here and in
 `write_uprn_shards`), not the ordinary `gzip.open`, specifically to force
@@ -160,6 +181,25 @@ _METRES_PER_500KM_SQUARE = 500_000
 _METRES_PER_100KM_SQUARE = 100_000
 _METRES_PER_10KM_CELL = 10_000
 
+# The National Grid's own usable coordinate envelope: 700 km east by
+# 1,300 km north, covering the whole of the H/J, N/O and S/T 500 km
+# square rows this module's own "Grid maths" section describes (Scilly
+# in the south-west corner, Shetland and the sea beyond it in the
+# north-east), the extent Ordnance Survey's own reference system is
+# defined over. Review round 1 (Important finding) found that without
+# this check, `_grid_letter`'s own [0, 4] bound alone lets a negative or
+# moderately out-of-range coordinate still land inside the 5x5 letter
+# grid by floor division, silently returning a plausible-looking,
+# fabricated two-letter code (for example (300000, -50000) -> "XD",
+# (300000, 1400000) -> "HD") instead of failing loud. Checked here, up
+# front, rather than relying on `_grid_letter`'s own narrower check to
+# catch it: `_grid_letter`'s check is left in place anyway as a second,
+# independent guard on the row/col arithmetic itself, not removed just
+# because this wider check now makes it unreachable for every input that
+# passes here.
+_MAX_EASTING = 700_000
+_MAX_NORTHING = 1_300_000
+
 
 def _grid_letter(row: int, col: int) -> str:
     if not (0 <= row <= 4 and 0 <= col <= 4):
@@ -175,7 +215,26 @@ def grid_square(easting: float, northing: float) -> str:
     """The two-letter, 100 km OS National Grid square containing
     (easting, northing), for example "SS" or "HP". See the module
     docstring's "Grid maths" section for the derivation.
+
+    Raises ValueError for a coordinate outside the National Grid's own
+    usable envelope (0 <= easting < 700,000, 0 <= northing < 1,300,000):
+    a caller error (a sign error, a unit mixup, a bbox built from the
+    wrong projection), never something this module papers over with a
+    plausible-looking letter pair for ground that letter pair does not
+    actually name. See `_MAX_EASTING`/`_MAX_NORTHING`'s own comment.
     """
+    if not (0 <= easting < _MAX_EASTING):
+        raise ValueError(
+            f"Easting {easting} is outside the National Grid's own usable "
+            f"envelope (0 <= easting < {_MAX_EASTING}); this is not a "
+            f"coordinate the two-letter grid can honestly place."
+        )
+    if not (0 <= northing < _MAX_NORTHING):
+        raise ValueError(
+            f"Northing {northing} is outside the National Grid's own usable "
+            f"envelope (0 <= northing < {_MAX_NORTHING}); this is not a "
+            f"coordinate the two-letter grid can honestly place."
+        )
     row1 = 3 - int(northing // _METRES_PER_500KM_SQUARE)
     col1 = int(easting // _METRES_PER_500KM_SQUARE) + 2
     row2 = 4 - (int(northing // _METRES_PER_100KM_SQUARE) % 5)
@@ -191,34 +250,58 @@ def cell_10km(easting: float, northing: float) -> str:
     return f"{square}{e_digit}{n_digit}"
 
 
+def _clamped_index_range(v_min: float, v_max: float, step: int, max_value: int) -> range:
+    """The inclusive range of `step`-sized grid indices between `v_min`
+    and `v_max`, clamped to `[0, max_value)`.
+
+    `grid_square` (see its own docstring) raises for a single point
+    outside the National Grid's own usable envelope, because a caller
+    asking "what square is THIS point in" has no honest answer there.
+    `squares_for`/`cells_for` ask a different question, "what squares
+    does this RECTANGLE touch", and a rectangle (or query bbox) that
+    extends beyond the envelope, or lies entirely outside it, has an
+    honest answer too: no squares out there, the same "nothing
+    fabricated" principle applied at the coordinate system's own edges
+    rather than at grid_square's single-point contract. Clamping the
+    walk here, instead of calling grid_square on every raw candidate and
+    letting an out-of-envelope one raise, is what lets a query bbox that
+    happens to reach past GB (or sit entirely outside it, exercised by
+    `test_features_in_over_a_missing_cell_yields_nothing` and its UPRN
+    sibling) answer "no data here" rather than crash on a question this
+    module can answer honestly either way.
+    """
+    lo = max(0, int(v_min // step))
+    hi = min((max_value - 1) // step, int(v_max // step))
+    return range(lo, hi + 1)
+
+
 def squares_for(e_min: float, n_min: float, e_max: float, n_max: float) -> list[str]:
     """Every 100 km square the rectangle [e_min, e_max] x [n_min, n_max]
-    touches, sorted and deduplicated.
+    touches, sorted and deduplicated. The portion of the rectangle (if
+    any) outside the National Grid's own usable envelope contributes no
+    squares, rather than raising; see `_clamped_index_range`'s docstring.
     """
-    e_lo = int(e_min // _METRES_PER_100KM_SQUARE)
-    e_hi = int(e_max // _METRES_PER_100KM_SQUARE)
-    n_lo = int(n_min // _METRES_PER_100KM_SQUARE)
-    n_hi = int(n_max // _METRES_PER_100KM_SQUARE)
+    e_range = _clamped_index_range(e_min, e_max, _METRES_PER_100KM_SQUARE, _MAX_EASTING)
+    n_range = _clamped_index_range(n_min, n_max, _METRES_PER_100KM_SQUARE, _MAX_NORTHING)
     squares = {
         grid_square(e100k * _METRES_PER_100KM_SQUARE, n100k * _METRES_PER_100KM_SQUARE)
-        for e100k in range(e_lo, e_hi + 1)
-        for n100k in range(n_lo, n_hi + 1)
+        for e100k in e_range
+        for n100k in n_range
     }
     return sorted(squares)
 
 
 def cells_for(e_min: float, n_min: float, e_max: float, n_max: float) -> list[str]:
     """Every 10 km cell the rectangle [e_min, e_max] x [n_min, n_max]
-    touches, sorted and deduplicated.
+    touches, sorted and deduplicated. Same clamping as `squares_for`, one
+    grid size finer; see `_clamped_index_range`'s docstring.
     """
-    e_lo = int(e_min // _METRES_PER_10KM_CELL)
-    e_hi = int(e_max // _METRES_PER_10KM_CELL)
-    n_lo = int(n_min // _METRES_PER_10KM_CELL)
-    n_hi = int(n_max // _METRES_PER_10KM_CELL)
+    e_range = _clamped_index_range(e_min, e_max, _METRES_PER_10KM_CELL, _MAX_EASTING)
+    n_range = _clamped_index_range(n_min, n_max, _METRES_PER_10KM_CELL, _MAX_NORTHING)
     cells = {
         cell_10km(e10k * _METRES_PER_10KM_CELL, n10k * _METRES_PER_10KM_CELL)
-        for e10k in range(e_lo, e_hi + 1)
-        for n10k in range(n_lo, n_hi + 1)
+        for e10k in e_range
+        for n10k in n_range
     }
     return sorted(cells)
 
@@ -276,6 +359,70 @@ def _write_meta(meta_path: Path, meta: dict) -> None:
     atomic_write_text(meta_path, json.dumps(meta, separators=(",", ":")))
 
 
+def _clear_shard_dir(shard_dir: Path, suffix: str) -> None:
+    """Removes every existing `*<suffix>` shard file in `shard_dir`, plus
+    any `meta.json`, before a fresh write begins.
+
+    Review round 1 (Critical finding): the front-of-function `meta.json`
+    unlink alone (this module's own first pass) only protects a rebuild
+    over an already-COMPLETE directory. It does nothing for two attempts
+    into a directory that was never complete to begin with: a first
+    attempt writes cells A and B, then the feature iterator raises (Task
+    2's own fail-whole-stream shape) before `meta.json` is ever written,
+    leaving A and B's own files, valid and readable, on disk; a second,
+    corrected attempt writes only cell A and succeeds, and now `meta.
+    json` lists only A. Because a cell/square is opened `"wb"` (truncate-
+    on-open) lazily, only the first time THIS run actually needs it, B's
+    file from the first attempt is never touched by the second and
+    survives, invisible to `shards_complete` (which only ever checks
+    what the SUCCESSFUL run's own `meta.json` lists, never what else sits
+    beside it) and, before this fix, readable straight off disk by
+    `features_in`/`uprn_in` regardless. Reproduced by the reviewer with a
+    fail-then-retry pair whose two attempts touch differing cells, and
+    fixed here at the writer: a shard directory is one generation's data
+    at a time, "derive-once" meaning replaced whole on every call, not
+    merged into whatever an earlier attempt, successful or not, happened
+    to leave. Paired with `features_in`/`uprn_in`'s own manifest-only
+    reading below (belt and braces, per the review's own suggestion): even
+    if this sweep were ever bypassed, a file `meta.json` does not name is
+    still never opened.
+    """
+    for path in shard_dir.glob(f"*{suffix}"):
+        path.unlink()
+    (shard_dir / "meta.json").unlink(missing_ok=True)
+
+
+def _listed_keys(shard_dir: Path, list_field: str) -> set[str]:
+    """The set of cell/square names `shard_dir/meta.json` actually lists
+    under `list_field` ("cells" or "squares"), or an empty set when
+    `meta.json` is absent, unreadable, or does not carry that field.
+
+    `features_in`/`uprn_in` intersect this against their own query-driven
+    `cells_for`/`squares_for` walk so that a file present on disk but NOT
+    named in the current `meta.json` (an orphan from an earlier, failed
+    or superseded attempt; see `_clear_shard_dir`'s own docstring) is
+    never opened, even if something upstream of this module (a sweep
+    that did not run, a file dropped in by hand) left one sitting there.
+    An empty set on any failure to read `meta.json` is deliberate, not a
+    best-effort fallback to reading whatever files happen to exist: a
+    shard directory this function cannot positively confirm the manifest
+    of has nothing this module will vouch for, matching the project-wide
+    "nothing fabricated" rule at the level of "which files are trusted",
+    not just "which values are computed".
+    """
+    meta_path = shard_dir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(meta, dict):
+        return set()
+    keys = meta.get(list_field)
+    if not isinstance(keys, dict):
+        return set()
+    return set(keys)
+
+
 # --------------------------------------------------------------------------
 # The OsFeature shard store: write_shards, shards_complete, features_in.
 # --------------------------------------------------------------------------
@@ -295,11 +442,10 @@ def write_shards(features: Iterable[OsFeature], shard_dir: Path) -> dict:
     """
     ensure_dir(shard_dir)
     meta_path = shard_dir / "meta.json"
-    # Removed first, not last: see the module docstring's own paragraph on
-    # why a stale meta.json from a previous successful run must not be
-    # left standing while this run's cell files are being truncated and
-    # rewritten underneath it.
-    meta_path.unlink(missing_ok=True)
+    # Cleared first, not last: see _clear_shard_dir's own docstring for
+    # why removing only meta.json is not enough (review round 1,
+    # Critical finding).
+    _clear_shard_dir(shard_dir, ".ndjson.gz")
 
     handles: dict[str, gzip.GzipFile] = {}
     counts: dict[str, int] = {}
@@ -385,9 +531,18 @@ def features_in(
     (`feature_id == ""`, Task 2's own reading of a feature with no
     `gml:id`) is never deduped against another empty id. See the module
     docstring's "dedup contract" section for why.
+
+    Only reads a cell that is BOTH in the query's own `cells_for` walk
+    AND named in `shard_dir/meta.json`'s own `"cells"` list; a file
+    sitting in `shard_dir` that meta.json does not list (an orphan from
+    an earlier, failed or superseded write; see `_clear_shard_dir`'s own
+    docstring) is never opened, regardless of whether it exists on disk.
     """
+    listed_cells = _listed_keys(shard_dir, "cells")
     seen_ids: set[str] = set()
     for cell in cells_for(e_min, n_min, e_max, n_max):
+        if cell not in listed_cells:
+            continue
         path = shard_dir / f"{cell}.ndjson.gz"
         if not path.exists():
             continue
@@ -437,7 +592,7 @@ def write_uprn_shards(text_stream: TextIO, shard_dir: Path) -> dict:
     """
     ensure_dir(shard_dir)
     meta_path = shard_dir / "meta.json"
-    meta_path.unlink(missing_ok=True)  # Same reasoning as write_shards.
+    _clear_shard_dir(shard_dir, ".csv.gz")  # Same reasoning as write_shards.
 
     reader = csv.reader(_strip_bom_from_first_line(text_stream))
     header = next(reader, None)
@@ -484,8 +639,16 @@ def uprn_in(
     """Every `(uprn, easting, northing, latitude, longitude)` row whose
     easting/northing falls inside [e_min, e_max] x [n_min, n_max], read
     from only the 100 km squares the rectangle touches.
+
+    Only reads a square that is BOTH in the query's own `squares_for`
+    walk AND named in `shard_dir/meta.json`'s own `"squares"` list, the
+    same manifest-only discipline `features_in` applies; see that
+    function's own docstring and `_clear_shard_dir`'s.
     """
+    listed_squares = _listed_keys(shard_dir, "squares")
     for square in squares_for(e_min, n_min, e_max, n_max):
+        if square not in listed_squares:
+            continue
         path = shard_dir / f"{square}.csv.gz"
         if not path.exists():
             continue

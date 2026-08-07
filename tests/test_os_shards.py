@@ -96,6 +96,41 @@ def test_grid_square_out_of_the_representable_grid_raises():
 
 
 # --------------------------------------------------------------------------
+# Review round 1, Important: grid_square must validate against the National
+# Grid's own usable envelope (0 <= easting < 700000, 0 <= northing <
+# 1300000), not only against the arithmetic 5x5 super-grid. Floor division
+# on a moderately out-of-range or negative coordinate frequently still
+# lands inside the letter grid's own [0, 4] bounds and produces a
+# plausible-looking, fabricated two-letter code instead of raising.
+# --------------------------------------------------------------------------
+
+
+def test_grid_square_negative_northing_raises():
+    with pytest.raises(ValueError):
+        os_shards.grid_square(300000, -50000)
+
+
+def test_grid_square_northing_past_the_grid_raises():
+    with pytest.raises(ValueError):
+        os_shards.grid_square(300000, 1400000)
+
+
+def test_grid_square_negative_easting_raises():
+    with pytest.raises(ValueError):
+        os_shards.grid_square(-50000, 300000)
+
+
+def test_grid_square_valid_low_corner_is_sv():
+    assert os_shards.grid_square(0, 0) == "SV"
+
+
+def test_grid_square_valid_high_corner_does_not_raise():
+    # The highest coordinate still inside the envelope on both axes
+    # (700000, 1300000 are themselves the exclusive upper bounds).
+    assert os_shards.grid_square(699999, 1299999) == "JM"
+
+
+# --------------------------------------------------------------------------
 # Fixtures for the shard store tests: five OsFeature records, two 10km
 # cells (SS47, SS57), one polygon straddling both.
 # --------------------------------------------------------------------------
@@ -282,6 +317,124 @@ def test_a_mid_stream_failure_leaves_the_shard_dir_incomplete(tmp_path):
     with pytest.raises(OsOpenError):
         os_shards.write_shards(_features_that_fail_partway(), tmp_path)
     assert os_shards.shards_complete(tmp_path) is False
+
+
+# --------------------------------------------------------------------------
+# Review round 1, Critical: a fail-then-retry pair whose two attempts touch
+# DIFFERING cells must never let the failed attempt's own orphaned cell
+# file leak through a later, successful attempt's features_in/uprn_in, even
+# though shards_complete only ever checks what the SUCCESSFUL attempt's own
+# meta.json lists. Reproduces the reviewer's own repro exactly: first
+# attempt writes into SS57 then raises (no meta.json, SS57.ndjson.gz stays
+# on disk); retry into the SAME shard_dir writes only into SS47 and
+# succeeds. Before the fix, shards_complete answered True and features_in
+# over a bbox covering both cells returned the retry's own feature AND the
+# first attempt's orphaned "phantom1".
+# --------------------------------------------------------------------------
+
+
+def _one_feature_in_ss57(feature_id: str) -> OsFeature:
+    return _feature(
+        feature_id,
+        "Building",
+        [[251000, 171000], [252000, 171000], [252000, 172000], [251000, 172000], [251000, 171000]],
+    )
+
+
+def _one_feature_in_ss47(feature_id: str) -> OsFeature:
+    return _feature(
+        feature_id,
+        "Building",
+        [[241000, 171000], [242000, 171000], [242000, 172000], [241000, 172000], [241000, 171000]],
+    )
+
+
+def _failed_first_attempt():
+    yield _one_feature_in_ss57("phantom1")
+    raise OsOpenError("this stream is corrupt partway through", kind="parse")
+
+
+def test_retry_with_differing_cells_leaves_no_orphan_file_on_disk(tmp_path):
+    with pytest.raises(OsOpenError):
+        os_shards.write_shards(_failed_first_attempt(), tmp_path)
+    assert (tmp_path / "SS57.ndjson.gz").exists()  # the failed attempt's own leftover
+
+    os_shards.write_shards(iter([_one_feature_in_ss47("keepme")]), tmp_path)
+
+    # The retry never touches SS57 at all; its own leftover file from the
+    # failed attempt must not survive the retry's own fresh write.
+    assert not (tmp_path / "SS57.ndjson.gz").exists()
+
+
+def test_retry_with_differing_cells_reports_complete_and_leaks_no_phantom(tmp_path):
+    with pytest.raises(OsOpenError):
+        os_shards.write_shards(_failed_first_attempt(), tmp_path)
+
+    meta = os_shards.write_shards(iter([_one_feature_in_ss47("keepme")]), tmp_path)
+    assert meta == {"total": 1, "cells": {"SS47": 1}}
+    assert os_shards.shards_complete(tmp_path) is True
+
+    results = list(os_shards.features_in(tmp_path, 240000, 170000, 260000, 172000))
+    ids = [record["id"] for record in results]
+    assert ids == ["keepme"]
+    assert "phantom1" not in ids
+
+
+def test_features_in_ignores_a_cell_file_present_on_disk_but_not_listed_in_meta(tmp_path):
+    # Isolates the READER's own half of the belt-and-braces fix from the
+    # WRITER's own sweep: this file is planted directly, after a normal,
+    # complete write_shards call, so no write_shards sweep ever runs
+    # again to clear it. features_in must still refuse it purely because
+    # meta.json does not name it, even though cells_for's own lattice walk
+    # would otherwise find it and its bytes are perfectly valid gzip.
+    os_shards.write_shards(iter([_one_feature_in_ss47("keepme")]), tmp_path)
+    phantom_record = json.dumps(
+        {"id": "phantom-planted", "type": "Building", "geometry": _one_feature_in_ss57("x").geometry, "properties": {}},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    with gzip.open(tmp_path / "SS57.ndjson.gz", "wb") as handle:
+        handle.write(phantom_record)
+
+    results = list(os_shards.features_in(tmp_path, 240000, 170000, 260000, 172000))
+    ids = [record["id"] for record in results]
+    assert ids == ["keepme"]
+    assert "phantom-planted" not in ids
+
+
+def _failed_first_uprn_attempt():
+    yield "UPRN,X_COORDINATE,Y_COORDINATE,LATITUDE,LONGITUDE\n"
+    yield "999,251000.0,171500.0,51.0,-3.0\n"  # square SS
+    raise RuntimeError("this stream failed partway through")
+
+
+def test_uprn_retry_with_differing_squares_leaves_no_orphan_file(tmp_path):
+    with pytest.raises(RuntimeError):
+        os_shards.write_uprn_shards(_failed_first_uprn_attempt(), tmp_path)
+    assert (tmp_path / "SS.csv.gz").exists()  # the failed attempt's own leftover
+
+    retry_text = (
+        "UPRN,X_COORDINATE,Y_COORDINATE,LATITUDE,LONGITUDE\n"
+        "1,358260.99,172796.83,51.4526038,-2.6020703\n"  # square ST only
+    )
+    os_shards.write_uprn_shards(iter(retry_text.splitlines(keepends=True)), tmp_path)
+
+    assert not (tmp_path / "SS.csv.gz").exists()
+
+
+def test_uprn_retry_with_differing_squares_reports_complete_and_leaks_no_phantom(tmp_path):
+    with pytest.raises(RuntimeError):
+        os_shards.write_uprn_shards(_failed_first_uprn_attempt(), tmp_path)
+
+    retry_text = (
+        "UPRN,X_COORDINATE,Y_COORDINATE,LATITUDE,LONGITUDE\n"
+        "1,358260.99,172796.83,51.4526038,-2.6020703\n"
+    )
+    meta = os_shards.write_uprn_shards(iter(retry_text.splitlines(keepends=True)), tmp_path)
+    assert meta == {"total": 1, "squares": {"ST": 1}}
+    assert os_shards.shards_complete(tmp_path) is True
+
+    rows = list(os_shards.uprn_in(tmp_path, 0, 0, 900000, 900000))
+    assert [row[0] for row in rows] == [1]
 
 
 # --------------------------------------------------------------------------
