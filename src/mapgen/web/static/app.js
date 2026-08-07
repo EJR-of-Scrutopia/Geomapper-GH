@@ -2295,12 +2295,106 @@ function recordSizing(tileSizeM, tiles, seconds, sources) {
   renderTileSize();
 }
 
+// --- tier list -------------------------------------------------------
+//
+// Task 8 of the OS Open tier resolver plan. resolve() (resolver.py) has
+// already worked out, for this exact extent and this exact selection,
+// which source serves each category and which others are along for
+// backup or reference only; this is that answer read out in one line
+// per category, in the estimate panel beside the numbers, so the owner
+// sees it before clicking Download rather than discovering it in
+// survey.json afterwards.
+//
+// Category labels humanised per the brief's own table; every other
+// category renders as its own string (resolver.py's CATEGORIES entries
+// are otherwise already the word an owner would use: "terrain",
+// "buildings", "roads", and so on).
+const TIER_CATEGORY_LABELS = {
+  land_use: "land use",
+  heights: "building heights",
+  land: "woodland and water",
+  sites: "functional sites",
+  places: "place names",
+};
+
+function tierCategoryLabel(category) {
+  return TIER_CATEGORY_LABELS[category] || category;
+}
+
+// A partial entry says so in its own name, not as a separate clause: the
+// caveat belongs to the ONE source it is true of, and a category with
+// three sources where only one is partial must not read as though the
+// whole line were in doubt.
+function tierSourceName(source) {
+  return source.coverage === "partial"
+    ? `${source.display_name} (partial coverage here)`
+    : source.display_name;
+}
+
+// One category's own line. resolve()'s own contract (resolver.py) sorts
+// `sources` tier-ascending, so `sources[0]` is always the best entry
+// PRESENT for this bbox and this selection, never a fixed "the base
+// source" read off some other list: when the true base is unselected
+// (osm deselected, say) the next best tier steps up into this slot, and
+// the copy has no prefix for it either way, "filled by" and "reference:"
+// being reserved for what follows it. See resolver.py's own ROLES
+// section for the one case sources[0] is not called "base": a role
+// override (os_open's roads/rail) can make the best-tier entry
+// "reference" even though nothing beat its tier, and a category with no
+// entry at all outside that override has ONLY a reference line to show,
+// which the first branch below states directly rather than searching for
+// a "base" that role never assigns it.
+function tierLineText(entry) {
+  const label = tierCategoryLabel(entry.category);
+  const sources = entry.sources || [];
+  if (!sources.length) return "";
+  const [first, ...rest] = sources;
+  let line =
+    first.role === "reference"
+      ? `${label}: reference: ${tierSourceName(first)}`
+      : `${label}: ${tierSourceName(first)}`;
+  for (const source of rest) {
+    line +=
+      source.role === "reference"
+        ? `, reference: ${tierSourceName(source)}`
+        : `, filled by ${tierSourceName(source)}`;
+  }
+  return line;
+}
+
+// Absent and empty read as the same fact, deliberately: an older cached
+// response with no `resolution` key at all and a genuinely empty list
+// both mean "nothing to say here", and a stale list left standing from
+// the PREVIOUS estimate beside a fresh one that has moved on (a redrawn
+// extent, a changed selection) would claim a fact about sources that no
+// longer holds. Called from every place refreshEstimate clears the
+// estimate panel itself (see showEstimateError and refreshEstimate's own
+// early returns), so the tier list can never outlive the numbers beside
+// it.
+function renderResolution(resolution) {
+  const box = $("tier-list");
+  if (!box) return;
+  if (!resolution || !resolution.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = resolution.map((entry) => `<div>${escapeHtml(tierLineText(entry))}</div>`).join("");
+}
+
 function showEstimateError(message) {
   const box = $("estimate");
   box.className = "estimate error";
   box.textContent = message;
   $("download").disabled = true;
   hideFolderPreview();
+  // The tier list is exactly as much this failed estimate's business as
+  // the tile grid and the tile-size readout it already clears below: a
+  // tiling or extent problem invalidates whatever sources a PREVIOUS,
+  // successful estimate resolved for this box, same reasoning as
+  // renderTileGrid([]) two lines down.
+  renderResolution(null);
   // A tiling or extent problem invalidates whatever grid was last drawn:
   // showing rectangles for a configuration that just failed would
   // mislead rather than help.
@@ -2340,6 +2434,7 @@ async function refreshEstimate() {
     renderTileGrid([]);
     lastSizing = null;
     renderTileSize();
+    renderResolution(null);
     return;
   }
 
@@ -2364,6 +2459,11 @@ async function refreshEstimate() {
       $("estimate").innerHTML = `${formatGeometryLine(geometry)}<br />${escapeHtml(missing)}`;
       renderTileGrid(geometry.tile_grid);
       recordSizing(requestedTileSizeM, geometry.tiles, 0, []);
+      // /api/extent answers geometry alone (see naming.build_package_paths's
+      // own caller here): it never calls resolve(), so it never carries a
+      // `resolution` key, and a region/site still being typed must not go
+      // on showing which sources a PREVIOUS, full estimate resolved.
+      renderResolution(null);
     } catch (error) {
       // A genuine problem with the extent or tiling itself (an absurd
       // tiling, a zero-area box that slipped through some other path, a
@@ -2376,6 +2476,7 @@ async function refreshEstimate() {
       $("estimate").innerHTML = `${escapeHtml(error.message)}<br />${escapeHtml(missing)}`;
       lastSizing = null;
       renderTileSize();
+      renderResolution(null);
     }
     return;
   }
@@ -2405,6 +2506,14 @@ async function refreshEstimate() {
     // stays exactly as the Download handler left it until the run ends.
     $("download").disabled = jobRunning;
     renderTileGrid(data.tile_grid);
+    // Task 8 of the OS Open tier resolver plan: which source resolve()
+    // (resolver.py) picked for each category, over this exact extent and
+    // this exact selection. Rendered after the warnings above, in the
+    // same estimate panel, and read straight off data.resolution rather
+    // than recomputed here, for the same "one source of truth" reason
+    // every other number on this panel comes from `data` and not from a
+    // second guess at it.
+    renderResolution(data.resolution);
     // The exact path naming.build_package_paths composed for this request,
     // not a guess assembled here: this is read straight into Grasshopper,
     // so it has to be the same path the download itself will create, from

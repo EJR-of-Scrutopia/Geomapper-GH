@@ -338,6 +338,14 @@ legend { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; opa
   font-weight: 600;
 }
 
+/* Task 8 of the tier resolver plan. One line per category (see
+   renderResolution in app.js); .estimate already gives the box its
+   border, padding and background, and this is the one rule that box did
+   not already carry: spacing between the category lines it renders. */
+.tier-list div + div {
+  margin-top: 4px;
+}
+
 .folder-preview {
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);

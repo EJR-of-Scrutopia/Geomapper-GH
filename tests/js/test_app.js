@@ -2527,6 +2527,285 @@ function ok(condition, message) {
     );
   });
 
+  // =======================================================================
+  // Task 8 of the OS Open tier resolver plan: the tier list, rendering
+  // resolve()'s own output (resolver.py) as one line per category beside
+  // the estimate's numbers.
+  // =======================================================================
+
+  await test(
+    "renderResolution renders one line per category: a bare base name, a filled-by partial entry, and a reference entry",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      sandbox.renderResolution([
+        {
+          category: "buildings",
+          sources: [
+            { id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" },
+            { id: "os_open", display_name: "OS Open", tier: 2, coverage: "partial", role: "fill" },
+          ],
+        },
+        {
+          category: "roads",
+          sources: [
+            { id: "os_open", display_name: "OS Open Roads", tier: 1, coverage: "full", role: "reference" },
+          ],
+        },
+      ]);
+      const box = sandbox.document.getElementById("tier-list");
+      ok(box.hidden === false, "expected the tier list to be shown");
+      const expected =
+        "<div>buildings: OpenStreetMap, filled by OS Open (partial coverage here)</div>" +
+        "<div>roads: reference: OS Open Roads</div>";
+      ok(box.innerHTML === expected, `unexpected tier list markup:\n  got:      ${box.innerHTML}\n  expected: ${expected}`);
+    }
+  );
+
+  await test(
+    "category labels are humanised per the brief's table; any other category renders as its own string",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      const oneEntry = (category) => ({
+        category,
+        sources: [{ id: "os_open", display_name: "OS Open", tier: 1, coverage: "full", role: "base" }],
+      });
+      sandbox.renderResolution([
+        oneEntry("land_use"),
+        oneEntry("heights"),
+        oneEntry("land"),
+        oneEntry("sites"),
+        oneEntry("places"),
+        oneEntry("terrain"),
+      ]);
+      const html = sandbox.document.getElementById("tier-list").innerHTML;
+      ok(html.includes("<div>land use: OS Open</div>"), `land_use not humanised, got: ${html}`);
+      ok(html.includes("<div>building heights: OS Open</div>"), `heights not humanised, got: ${html}`);
+      ok(html.includes("<div>woodland and water: OS Open</div>"), `land not humanised, got: ${html}`);
+      ok(html.includes("<div>functional sites: OS Open</div>"), `sites not humanised, got: ${html}`);
+      ok(html.includes("<div>place names: OS Open</div>"), `places not humanised, got: ${html}`);
+      ok(html.includes("<div>terrain: OS Open</div>"), `expected an unlisted category to render as-is, got: ${html}`);
+    }
+  );
+
+  await test(
+    "renderResolution renders nothing for an empty list or an absent one, clearing any previous list identically",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      const oneCategory = [
+        {
+          category: "buildings",
+          sources: [{ id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" }],
+        },
+      ];
+
+      sandbox.renderResolution(oneCategory);
+      ok(sandbox.document.getElementById("tier-list").hidden === false, "expected a rendered list first");
+
+      sandbox.renderResolution([]);
+      let box = sandbox.document.getElementById("tier-list");
+      ok(box.hidden === true, "an empty list must hide the box");
+      ok(box.innerHTML === "", `an empty list must clear the previous markup, got: ${box.innerHTML}`);
+
+      sandbox.renderResolution(oneCategory);
+      ok(sandbox.document.getElementById("tier-list").hidden === false, "expected a rendered list again");
+
+      sandbox.renderResolution(undefined);
+      box = sandbox.document.getElementById("tier-list");
+      ok(box.hidden === true, "an absent resolution must hide the box exactly as an empty one does");
+      ok(box.innerHTML === "", `an absent resolution must clear the previous markup, got: ${box.innerHTML}`);
+    }
+  );
+
+  await test(
+    "a degraded selection: the best PRESENT entry renders bare even when its own role field says \"fill\", " +
+      "and a category left with only reference entries reads as reference alone",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      sandbox.renderResolution([
+        {
+          // osm deselected: os_open is the best entry PRESENT for this
+          // bbox and this selection, but its own role field still reads
+          // "fill" (task-8-brief.md's degraded-selection case). The tier
+          // list's own "base" is POSITIONAL, sources[0], never a search
+          // for role === "base", so this still renders with no prefix on
+          // itself and the remaining entries as fills after it.
+          category: "buildings",
+          sources: [
+            { id: "os_open", display_name: "OS Open", tier: 2, coverage: "full", role: "fill" },
+            { id: "overture", display_name: "Overture", tier: 3, coverage: "full", role: "fill" },
+          ],
+        },
+        {
+          // roads with osm deselected and os_open's role forced to
+          // "reference" by resolver.py's own ROLES table: the only entry
+          // left IS a reference, and the line says so rather than
+          // inventing a base name role never assigned this category.
+          category: "roads",
+          sources: [
+            { id: "os_open", display_name: "OS Open Roads", tier: 1, coverage: "full", role: "reference" },
+          ],
+        },
+      ]);
+      const html = sandbox.document.getElementById("tier-list").innerHTML;
+      ok(
+        html.includes("<div>buildings: OS Open, filled by Overture</div>"),
+        `expected the degraded base with no "filled by" on itself, got: ${html}`
+      );
+      ok(
+        html.includes("<div>roads: reference: OS Open Roads</div>"),
+        `expected an all-reference category to read as reference alone, got: ${html}`
+      );
+    }
+  );
+
+  function estimateResponse(resolution) {
+    return {
+      tiles: 1,
+      rows: 1,
+      cols: 1,
+      extent_km: { width: 1, height: 1 },
+      bytes_estimate: 1000,
+      seconds_estimate: 60,
+      warnings: [],
+      folder: "C:\\Surveys\\R\\2026-08-06_S",
+      ...(resolution === undefined ? {} : { resolution }),
+    };
+  }
+
+  await test("refreshEstimate populates the tier list from the estimate response's own resolution field", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(
+          200,
+          estimateResponse([
+            {
+              category: "buildings",
+              sources: [{ id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" }],
+            },
+          ])
+        );
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "R");
+    setField(sandbox, "site", "S");
+    await flush(10);
+    const box = sandbox.document.getElementById("tier-list");
+    ok(box.hidden === false, "expected the tier list populated from a successful estimate");
+    ok(
+      box.innerHTML === "<div>buildings: OpenStreetMap</div>",
+      `unexpected tier list markup: ${box.innerHTML}`
+    );
+  });
+
+  await test("a new estimate replaces the tier list rather than appending to it", async () => {
+    let call = 0;
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/estimate") {
+        call += 1;
+        const source =
+          call === 1
+            ? { id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" }
+            : { id: "os_open", display_name: "OS Open", tier: 1, coverage: "full", role: "base" };
+        return jsonResponse(200, estimateResponse([{ category: "buildings", sources: [source] }]));
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "R");
+    setField(sandbox, "site", "S");
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("tier-list").innerHTML === "<div>buildings: OpenStreetMap</div>",
+      `unexpected markup after the first estimate: ${sandbox.document.getElementById("tier-list").innerHTML}`
+    );
+
+    setField(sandbox, "overlap", "250");
+    await flush(10);
+    const html = sandbox.document.getElementById("tier-list").innerHTML;
+    ok(
+      html === "<div>buildings: OS Open</div>",
+      `expected the first estimate's entry replaced, not kept alongside the second, got: ${html}`
+    );
+  });
+
+  await test(
+    "an estimate with no resolution key clears a tier list a previous estimate drew (absent and empty read the same)",
+    async () => {
+      let call = 0;
+      const { sandbox } = await bootedSandbox((url) => {
+        if (url.pathname === "/api/estimate") {
+          call += 1;
+          return jsonResponse(
+            200,
+            estimateResponse(
+              call === 1
+                ? [
+                    {
+                      category: "buildings",
+                      sources: [
+                        { id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" },
+                      ],
+                    },
+                  ]
+                : undefined
+            )
+          );
+        }
+        return null;
+      });
+      setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+      await flush(10);
+      setField(sandbox, "region", "R");
+      setField(sandbox, "site", "S");
+      await flush(10);
+      ok(sandbox.document.getElementById("tier-list").hidden === false, "expected the first estimate to populate it");
+
+      setField(sandbox, "overlap", "250");
+      await flush(10);
+      const box = sandbox.document.getElementById("tier-list");
+      ok(box.hidden === true, "an older-shaped response with no resolution key must clear the list, not keep the stale one");
+      ok(box.innerHTML === "", `expected the stale markup cleared, got: ${box.innerHTML}`);
+    }
+  );
+
+  await test("a failed estimate clears the tier list a previous successful estimate drew", async () => {
+    let call = 0;
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/estimate") {
+        call += 1;
+        if (call === 1) {
+          return jsonResponse(
+            200,
+            estimateResponse([
+              {
+                category: "buildings",
+                sources: [{ id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" }],
+              },
+            ])
+          );
+        }
+        return jsonResponse(400, { error: "tiling is absurd for this extent" });
+      }
+      return null;
+    });
+    setField(sandbox, "bbox", "-3.29,51.38,-3.28,51.39");
+    await flush(10);
+    setField(sandbox, "region", "R");
+    setField(sandbox, "site", "S");
+    await flush(10);
+    ok(sandbox.document.getElementById("tier-list").hidden === false, "expected the first estimate to populate it");
+
+    setField(sandbox, "overlap", "250");
+    await flush(10);
+    const box = sandbox.document.getElementById("tier-list");
+    ok(box.hidden === true, "a failed re-estimate must clear a tier list the last successful one drew");
+    ok(box.innerHTML === "", `expected the stale markup cleared, got: ${box.innerHTML}`);
+  });
+
   await test("the OpenTopography API key is never included in a job's start payload", async () => {
     const SECRET = "sk-test-secret-should-never-leak";
     const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {
