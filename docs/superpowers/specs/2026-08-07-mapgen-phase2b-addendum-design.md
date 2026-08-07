@@ -87,6 +87,21 @@ pretending species knowledge.
 package-time, Wales-covered extents only (they consume the lidar
 rasters; the resolver already knows coverage).
 
+**Resolution gate and the spike problem (owner requirement,
+2026-08-07).** Roof fitting runs ONLY when the package's LiDAR raster
+is at the 1 m level (level 0): fitting planes to a 2 m overview is
+fabrication and the step must skip with a clear record and UI-visible
+reason, pointing at the detail preview's own guidance about extent
+size. And because real DSMs carry spikes and outliers (the owner has
+seen both in LiDAR meshes), the plan MUST include a validation task
+before any roof tag ships: outlier-robust fitting (trimmed residuals,
+never a plain least squares), a per-building fit-quality score
+recorded in the output, and a live check over buildings the owner can
+verify against reality, with the failure mode being NO tags rather
+than bad tags. If validation shows the 1 m DSM cannot support a roof
+class reliably, that class is dropped from the vocabulary rather than
+guessed.
+
 ## Item C: per-source detail preview in the UI (owner ask 2026-08-07)
 
 **Problem.** The owner drew a 6.7 x 3.1 km extent over Port Talbot and
