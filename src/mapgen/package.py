@@ -10,6 +10,7 @@ import inspect
 import json
 import re
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -17,9 +18,23 @@ from typing import Mapping, Sequence
 
 from mapgen import __version__
 from mapgen.bng import BngError, ensure_ostn15, load_ostn15
+from mapgen.boundary_curves import boundary_curves_with_counts
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
-from mapgen.buildings import fuse_missing_buildings
+from mapgen.buildings import (
+    _candidate_rings,
+    _exterior_ring,
+    _resolve_way_ring,
+    fuse_missing_buildings,
+)
 from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
+from mapgen.classify import (
+    OverlaySets,
+    Ring,
+    SAMPLE_CAP,
+    _METRES_PER_DEGREE_LAT,
+    _metres_per_degree_lon,
+    classify_parcels,
+)
 from mapgen.cog import CogError, CogReader, FileByteSource, read_full_window
 from mapgen.egrid import (
     ElevationGridError,
@@ -30,6 +45,7 @@ from mapgen.egrid import (
 )
 from mapgen.elevation_models import DEFAULT_DEMTYPE, validate_demtype
 from mapgen.fsutil import (
+    atomic_write_bytes,
     atomic_write_text,
     best_effort_rmtree,
     ensure_dir,
@@ -969,6 +985,20 @@ def run_survey(
         # them either.
         buildings_fusion = _fuse_buildings_step(root=paths.root, stem=paths.stem, sink=sink)
 
+        # Task 3 of the categorised boundaries plan. Immediately after
+        # buildings fusion, unconditionally, for the identical reason
+        # heights fusion below is not gated on `stopped` or
+        # `unrecoverable` either: gated only on `<stem>_parcels.geojson`
+        # being in the package at all (see this step's own docstring).
+        # Runs BEFORE heights fusion and the .osm boundary injection below
+        # because it reads the FUSED `.osm` for its own building-way
+        # evidence, which buildings fusion has already written by this
+        # point, and neither of the two steps after it touches anything
+        # this one reads.
+        boundaries_categories = _categorise_boundaries_step(
+            root=paths.root, stem=paths.stem, sink=sink
+        )
+
         # Task 7. BEFORE the bridge, unconditionally, exactly like the
         # elevation grid and project setting steps below: the bridge
         # converts <stem>.osm into Urbano's own formats, so the heights
@@ -1099,6 +1129,7 @@ def run_survey(
         lidar_heights,
         inspire_boundaries,
         buildings_fusion,
+        boundaries_categories,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -2562,6 +2593,523 @@ def _every_elevation_tile_failed(payload: dict) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------
+# Task 3 of the 2026-08-07 categorised boundaries plan: classifying every
+# parcel `<stem>_parcels.geojson` persisted (Task 1) against the package's
+# own overlay layers (`classify.py`, Task 2), and writing
+# `<stem>_boundaries_categorised.geojson`: the same pinch-point-safe curve
+# machinery `InspireSource.merge` already uses (`boundary_curves.
+# boundary_curves_with_counts`), run once PER CATEGORY, so a shared wall
+# between a garden parcel and a field parcel survives once under EACH
+# category rather than being deduplicated away between them (the plan's
+# own point: filtering Grasshopper's import to one category stays a
+# complete, closed set of outlines).
+# --------------------------------------------------------------------------
+
+BOUNDARY_CATEGORIES_NOTE = "derived from map overlay, indicative"
+
+
+class BoundaryCategoriesError(RuntimeError):
+    """Raised when `<stem>_parcels.geojson`, or one of the optional overlay
+    files this step reads (`<stem>_land_use.geojson`, `<stem>_water.geojson`,
+    `<stem>_os_greenspace.geojson`, `<stem>_os_land.geojson`), is not the
+    shape its own writer produces: not a FeatureCollection, a `features`
+    value that is not a list, or (parcels only) a feature whose geometry is
+    not a Polygon.
+
+    Matches `BoundariesFusionError`'s and `BuildingsFusionError`'s own
+    reasoning exactly: every one of these files is mapgen's own merged
+    output, never hand edited, so a wrong shape here is this project's own
+    bug and is raised rather than silently read as empty. `<stem>.osm`
+    reading failures raise `xml.etree.ElementTree.ParseError` instead,
+    caught alongside this one in `_categorise_boundaries_step`'s own try
+    block, the same split `_fuse_boundaries_step` already keeps between its
+    own new-input errors and its inline `ET.fromstring` call.
+    """
+
+
+def _categories_record(
+    parcels: int = 0,
+    counts: dict[str, int] | None = None,
+    samples: int = 0,
+    capped: int = 0,
+    error: str | None = None,
+) -> dict[str, object]:
+    """survey.json's `boundaries_categories` block, in ONE shape whatever
+    happened, following `_buildings_record`'s own "always the same keys"
+    ruling: six keys, always, so a reader can index any of them on a
+    package with no `inspire` layer at all the same way it does on one this
+    step actually classified.
+
+    `note` breaks from every other value here on purpose: it is the fixed
+    sentence the plan's own "Not promised" clause requires wherever a
+    category appears (`BOUNDARY_CATEGORIES_NOTE`), never `None`, because the
+    caveat is true of this record's own existence, not of whatever this run
+    happened to find. `parcels`, `counts`, `samples` and `capped` all read
+    as zero, not `None`, when this step never ran at all (no
+    `<stem>_parcels.geojson`): a package without `inspire` selected simply
+    has no parcels, a fact rather than a gap, matching the brief's own
+    ruling for that exact case.
+    """
+    return {
+        "parcels": parcels,
+        "counts": dict(counts) if counts else {},
+        "samples": samples,
+        "capped": capped,
+        "note": BOUNDARY_CATEGORIES_NOTE,
+        "error": error,
+    }
+
+
+def _read_categorised_feature_collection(path: Path) -> list:
+    """Every feature `path` holds, in file order: the one shape check every
+    GeoJSON `_categorise_boundaries_step` reads shares (parcels, land_use,
+    water, os_greenspace, os_land), following `_load_boundary_features`'s
+    and `_load_building_features`'s own identical ruling: each of these
+    files is mapgen's own merged output, never hand edited, so a wrong top
+    level shape here is this project's own bug and is raised rather than
+    silently read as zero features.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BoundaryCategoriesError(f"{path.name} could not be read: {exc}") from None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise BoundaryCategoriesError(f"{path.name} is not valid JSON: {exc}") from None
+    if not isinstance(payload, dict) or payload.get("type") != "FeatureCollection":
+        raise BoundaryCategoriesError(f"{path.name} is not a GeoJSON FeatureCollection.")
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise BoundaryCategoriesError(f"{path.name} has no features list.")
+    return features
+
+
+def _read_optional_categorised_feature_collection(path: Path) -> list:
+    """`_read_categorised_feature_collection(path)`, or `[]` if `path` is
+    not there at all: every overlay file this step reads is optional (the
+    controller's own ruling: "every file optional; absence contributes an
+    empty set"), unlike `<stem>_parcels.geojson` itself, whose presence is
+    what gates this step running at all (see `_categorise_boundaries_step`).
+    """
+    return _read_categorised_feature_collection(path) if path.is_file() else []
+
+
+@dataclass(frozen=True)
+class _ParcelPolygon:
+    """One `<stem>_parcels.geojson` feature: its own exterior ring (WGS84
+    lon/lat, unclosed) plus the three properties `_boundaries_categorised.
+    geojson`'s own features carry through verbatim (`source`, `note`,
+    `year`): read once here rather than retyped as a literal string
+    anywhere in this step, so a future change to `InspireSource`'s own
+    wording, or a different survey's own `year`, never needs a second edit
+    here to match.
+    """
+
+    ring: Ring
+    source: object
+    note: object
+    year: object
+
+
+def _load_parcel_polygons(path: Path) -> list[_ParcelPolygon]:
+    """Every parcel `<stem>_parcels.geojson` holds, in file order.
+
+    Every feature's geometry is a Polygon: Task 1 writes exterior-only
+    Polygons, a MultiPolygon parcel does not exist in this file at all, so
+    this makes no attempt to accept one, and raises on anything else (the
+    same strict, per-feature standard `_boundary_coordinates` already holds
+    `<stem>_boundaries.geojson`'s own LineString features to, since both
+    files are mapgen's own single-authorial output, not third-party
+    geometry merely copied through). Read via `buildings._exterior_ring`,
+    the identical helper `_fuse_buildings_step`'s own candidate loader
+    relies on, rather than a second copy of "read a GeoJSON Polygon's own
+    exterior ring, drop its closing duplicate, refuse fewer than 3 distinct
+    vertices".
+    """
+    parcels: list[_ParcelPolygon] = []
+    for index, feature in enumerate(_read_categorised_feature_collection(path)):
+        geometry = feature.get("geometry") if isinstance(feature, dict) else None
+        if not isinstance(geometry, dict) or geometry.get("type") != "Polygon":
+            raise BoundaryCategoriesError(f"Feature {index} in {path.name} is not a Polygon.")
+        ring = _exterior_ring(geometry.get("coordinates"))
+        if ring is None:
+            raise BoundaryCategoriesError(
+                f"Feature {index} in {path.name} has no usable exterior ring."
+            )
+        properties = feature.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        parcels.append(
+            _ParcelPolygon(
+                ring=ring,
+                source=properties.get("source"),
+                note=properties.get("note"),
+                year=properties.get("year"),
+            )
+        )
+    return parcels
+
+
+def _load_polygon_overlay_rings(path: Path) -> list[Ring]:
+    """Every exterior ring an optional Polygon/MultiPolygon overlay file
+    holds (`<stem>_water.geojson`, `<stem>_os_greenspace.geojson`), via
+    `buildings._candidate_rings`, the identical Polygon-or-MultiPolygon
+    reader `fuse_missing_buildings` already uses for a candidate footprint:
+    a Point feature (`_os_greenspace.geojson`'s own `AccessPoint` rows)
+    contributes nothing at all, since that function only ever recognises
+    `"Polygon"`/`"MultiPolygon"` geometry, which is what keeps an access
+    point out of the greenspace overlay without a second, geometry-type
+    check of its own here (the controller's own "only Polygon features
+    (skip AccessPoint points)" ruling, satisfied by reuse rather than a
+    restated check).
+    """
+    rings: list[Ring] = []
+    for feature in _read_optional_categorised_feature_collection(path):
+        feature_rings, _invalid = _candidate_rings(feature)
+        rings.extend(feature_rings)
+    return rings
+
+
+def _load_landuse_pairs(path: Path) -> list[tuple[str, Ring]]:
+    """`<stem>_land_use.geojson`'s own features as `(class_name, ring)`
+    pairs, `class_name` read from each feature's own `class` property,
+    falling back to `subtype` when `class` is absent (the controller's own
+    ruling for this file): a feature with neither contributes no pair at
+    all, the identical "no entry, not a bucket that loses" treatment
+    `classify.py`'s own `_flat_candidates` already gives an unrecognised
+    raw class string.
+    """
+    pairs: list[tuple[str, Ring]] = []
+    for feature in _read_optional_categorised_feature_collection(path):
+        properties = feature.get("properties") if isinstance(feature, dict) else None
+        class_name = None
+        if isinstance(properties, dict):
+            class_name = properties.get("class") or properties.get("subtype")
+        if not isinstance(class_name, str) or not class_name:
+            continue
+        feature_rings, _invalid = _candidate_rings(feature)
+        pairs.extend((class_name, ring) for ring in feature_rings)
+    return pairs
+
+
+def _load_woodland_rings(path: Path) -> list[Ring]:
+    """`<stem>_os_land.geojson`'s own `kind == "woodland"` features, as
+    exterior rings: every other `kind` this file can hold (`water_area`,
+    `water_line`, `tidal_water`, `foreshore`; see `os_open.
+    _LAND_KIND_BY_TYPE`) is OS OpenMapLocal Land theme data this plan's own
+    priority order never asks for, and is left unread.
+    """
+    rings: list[Ring] = []
+    for feature in _read_optional_categorised_feature_collection(path):
+        properties = feature.get("properties") if isinstance(feature, dict) else None
+        if not isinstance(properties, dict) or properties.get("kind") != "woodland":
+            continue
+        feature_rings, _invalid = _candidate_rings(feature)
+        rings.extend(feature_rings)
+    return rings
+
+
+def _osm_node_positions(osm_root: ET.Element) -> dict[str, tuple[float, float]]:
+    """`osm_root`'s own `<node>` elements as `{id: (lon, lat)}`, the exact
+    small collection loop `buildings._existing_building_footprints` builds
+    inline, for the identical reason: `_resolve_way_ring` needs it to turn
+    a way's `nd ref` list into real coordinates, and this step needs it for
+    TWO different tag filters (`building=*` and `natural=water`) over the
+    SAME file, so it is built once here rather than twice, or pulled out of
+    a function whose own return value is scoped to buildings alone.
+    """
+    nodes: dict[str, tuple[float, float]] = {}
+    for element in osm_root:
+        if element.tag != "node":
+            continue
+        node_id = element.get("id")
+        lat = element.get("lat")
+        lon = element.get("lon")
+        if node_id is None or lat is None or lon is None:
+            continue
+        try:
+            nodes[node_id] = (float(lon), float(lat))
+        except ValueError:
+            continue
+    return nodes
+
+
+def _osm_building_and_water_rings(osm_root: ET.Element) -> tuple[list[Ring], list[Ring]]:
+    """Every `building=*` way and every CLOSED `natural=water` way already
+    in `osm_root`, resolved to rings via `_resolve_way_ring`
+    (`buildings.py`'s own node-ref resolver, shared with
+    `_existing_building_footprints` rather than re-walked here): building
+    ways regardless of their own `source=` tag, an owner's real OSM way or
+    one `_fuse_buildings_step` already injected from Overture or OS
+    OpenMapLocal read identically (the controller's own "regardless of
+    source tag" ruling). Plain ways only, no relations: the controller's
+    own wording names "ways", not "ways or relations", and every building
+    this step needs is one already, since a footprint `_fuse_buildings_step`
+    injects is always a plain way.
+
+    A `natural=water` way is only read when its own `nd` list is closed
+    (first ref equal to last): an open way is a river centreline rather
+    than a lake outline, real OSM data this classifier has no use for and
+    no way to sample a ring from. `_resolve_way_ring`'s own closing-
+    duplicate drop only removes a repeat that IS there, so this checks the
+    way was closed to begin with rather than trusting an accidental
+    coincidence between an open way's first and last node ids.
+    """
+    nodes = _osm_node_positions(osm_root)
+    buildings: list[Ring] = []
+    water: list[Ring] = []
+    for element in osm_root:
+        if element.tag != "way":
+            continue
+        tags = {tag.get("k"): tag.get("v") for tag in element.findall("tag")}
+        if "building" in tags:
+            ring = _resolve_way_ring(element, nodes)
+            if ring is not None:
+                buildings.append(ring)
+        elif tags.get("natural") == "water":
+            refs = [nd.get("ref") for nd in element.findall("nd")]
+            if len(refs) > 1 and refs[0] == refs[-1]:
+                ring = _resolve_way_ring(element, nodes)
+                if ring is not None:
+                    water.append(ring)
+    return buildings, water
+
+
+def _load_categorise_overlays(root: Path, stem: str) -> OverlaySets:
+    """This package's own `OverlaySets`, read off whatever the package
+    actually holds: every file named here is optional (the controller's
+    own ruling, "every file optional; absence contributes an empty set"),
+    so a survey that never selected `overture` or `os_open` classifies
+    every parcel `unclassified` rather than failing (`classify_parcels`
+    itself already reads "nothing to compare against" as "no evidence",
+    never a guess).
+    """
+    root = Path(root)
+    building_rings: list[Ring] = []
+    water_rings: list[Ring] = []
+    osm_path = root / f"{stem}.osm"
+    if osm_path.is_file():
+        osm_root = ET.fromstring(osm_path.read_text(encoding="utf-8"))
+        building_rings, water_rings = _osm_building_and_water_rings(osm_root)
+
+    water_rings = water_rings + _load_polygon_overlay_rings(root / f"{stem}_water.geojson")
+
+    return OverlaySets(
+        buildings=building_rings,
+        landuse=_load_landuse_pairs(root / f"{stem}_land_use.geojson"),
+        water=water_rings,
+        greenspace=_load_polygon_overlay_rings(root / f"{stem}_os_greenspace.geojson"),
+        woodland=_load_woodland_rings(root / f"{stem}_os_land.geojson"),
+    )
+
+
+def _rings_lat0(rings: Sequence[Ring]) -> float:
+    """The one reference latitude every ring `_categorise_boundaries_step`
+    projects to local metres against (see that function's own docstring
+    for why a SHARED value, not one computed per ring, is what makes a
+    vertex two neighbouring parcels both carry project to the identical
+    point): the mean of each ring's own bounding-box mid-latitude. `0.0`
+    for empty `rings`, never actually reached in practice (this step
+    already refuses to run at all with zero parcels; see its own "no
+    parcels" branch), kept only so this function has a total, honest
+    answer for an input it is never asked about for real.
+    """
+    midpoints = [
+        (min(lat for _lon, lat in ring) + max(lat for _lon, lat in ring)) / 2.0
+        for ring in rings
+        if ring
+    ]
+    return sum(midpoints) / len(midpoints) if midpoints else 0.0
+
+
+def _to_local_metres(point: tuple[float, float], lat0: float) -> tuple[float, float]:
+    """`point` (lon, lat) projected to an approximate local metric plane:
+    the identical cos-latitude approximation `classify.py`'s own sampling
+    grid already uses (`classify._METRES_PER_DEGREE_LAT`, `classify.
+    _metres_per_degree_lon`, imported rather than restated, so the two
+    modules' idea of "how many metres in a degree here" can never drift
+    apart), reused here for a different reason: `boundary_curves.py`'s own
+    rounding (1 cm) and collinear tolerance (5 cm) are metre-scale
+    constants, and handing `boundary_curves_with_counts` raw WGS84 degrees
+    directly would round every parcel's own vertices to the nearest
+    HUNDREDTH OF A DEGREE, on the order of a kilometre at this latitude,
+    collapsing every real parcel to fewer than 3 distinct points before
+    stage 1 of that pipeline ever runs. Projecting first, and projecting
+    every parcel this step ever hands to that pipeline through the SAME
+    `lat0` (never a per-parcel one), is what lets that unmodified,
+    metre-tuned function be reused at all here rather than reimplemented at
+    a different scale: Task 3's own brief calls for exactly the one
+    function, not a second copy of it at a different tolerance. Not a
+    survey-grade transform, matching every other approximation this plan's
+    own header already accepts (see classify.py's module docstring,
+    "Sampling"): this whole file is explicitly labelled `derived from map
+    overlay, indicative` wherever it appears.
+    """
+    longitude, latitude = point
+    return (longitude * _metres_per_degree_lon(lat0), latitude * _METRES_PER_DEGREE_LAT)
+
+
+def _from_local_metres(point: tuple[float, float], lat0: float) -> tuple[float, float]:
+    """The exact algebraic inverse of `_to_local_metres`, at the same
+    `lat0`: unlike `bng.from_bng`'s own OSTN15 fixed-point iteration, this
+    projection is a plain linear scale with no grid lookup, so its inverse
+    is exact (to floating-point precision) rather than approximate, and
+    needs no network access or cached grid file at all, which is what keeps
+    this whole step inside the plan's own "no network in any package step"
+    global constraint.
+    """
+    x, y = point
+    return (x / _metres_per_degree_lon(lat0), y / _METRES_PER_DEGREE_LAT)
+
+
+def _categorise_boundaries_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, object]:
+    """Classify every `<stem>_parcels.geojson` parcel (Task 1) against this
+    package's own overlay layers (`classify.classify_parcels`, Task 2),
+    group the parcels by the category that comes back, and write
+    `<stem>_boundaries_categorised.geojson`: EACH category's own group run
+    once through `boundary_curves.boundary_curves_with_counts` (item 2),
+    separately, so a shared wall between two DIFFERENT categories' parcels
+    survives once under EACH of them rather than being deduplicated away
+    between them (the plan's own point: filtering Grasshopper's import to
+    one category alone stays a complete, closed set of outlines).
+
+    Runs only when `<stem>_parcels.geojson` is in the package at all (Task
+    1 never writes it for a survey that never selected `inspire`, or that
+    selected it and kept zero parcels in this extent): the all-zero record
+    and no output file, matching `_fuse_buildings_step`'s own "started then
+    finished, never a third event name" convention exactly, is this step's
+    ordinary, uneventful outcome for that case, not a failure.
+
+    Every overlay file this step reads (`<stem>_land_use.geojson`,
+    `<stem>_water.geojson`, `<stem>_os_greenspace.geojson`,
+    `<stem>_os_land.geojson`) is optional, and its own absence contributes
+    an empty set to `OverlaySets` rather than a refusal.
+
+    Building and water rings are read out of the FUSED `.osm`, deliberately
+    not `<stem>_building.geojson`: `_fuse_buildings_step` runs immediately
+    before this step in both `run_survey` and `bridge_package` (see both
+    call sites), and its whole job is folding Overture's and OS
+    OpenMapLocal's own footprints into `.osm` as plain `building=*` ways,
+    so reading `.osm` after it has run sees every building this package
+    knows about, sourced from OSM itself or injected, with no need for this
+    step to separately open two more candidate files and reconcile them
+    against what buildings fusion already decided to keep.
+
+    Idempotent by full recomputation, not by tag detection: unlike
+    `_fuse_boundaries_step`/`_fuse_buildings_step`, which mutate `.osm` in
+    place and must recognise their own earlier work to avoid re-injecting
+    it, this step's own output is a fresh, standalone file, deterministic
+    in every input it reads (`boundary_curves`'s own "Deterministic output"
+    guarantee, `classify_parcels`'s agreement with `classify_parcel`, and
+    this step's own single shared `lat0`), so simply overwriting it every
+    run already IS byte-identical for byte-identical inputs, with no
+    "already done" guard needed at all.
+
+    `source`/`note`/`year` on every written feature come from the FIRST
+    parcel `<stem>_parcels.geojson` itself carries, never retyped as a
+    literal string here: every parcel in one package's own file shares the
+    identical triple (Task 1 writes it from one INSPIRE download's own
+    single `year` and the one constant HMLR attribution/caveat), so any one
+    of them is the whole file's own answer.
+
+    A failure anywhere on this path (a malformed `<stem>_parcels.geojson`
+    or overlay file, a malformed `.osm`, a disk write failure) is caught
+    here and recorded rather than raised, matching every other post-step in
+    this module: a package without a categorised file is exactly the
+    package the owner already had, and losing the survey's real data over
+    this step would be the same mistake Task 20 already fixed once for the
+    bridge. The rest of the package, including a PRIOR run's own
+    `<stem>_boundaries_categorised.geojson`, is left untouched on a failure
+    here, the same "untouched" guarantee `_fuse_boundaries_step`'s own
+    tests already pin for `.osm`.
+    """
+    root = Path(root)
+    parcels_path = root / f"{stem}_parcels.geojson"
+    output_path = root / f"{stem}_boundaries_categorised.geojson"
+
+    sink.emit("boundaries_categories_started")
+    if not parcels_path.is_file():
+        # No inspire parcels in this package: an ordinary outcome (the
+        # owner never selected `inspire`, or selected it and kept none in
+        # this extent), not a failure, matching Task 1's own "zero parcels
+        # -> no file" rule. A stale file a PRIOR run of this same package
+        # left behind no longer describes data this package still has, so
+        # it goes, the identical stale-output discipline `InspireSource.
+        # merge` itself already applies to its own two files when its own
+        # inputs go missing.
+        output_path.unlink(missing_ok=True)
+        result = _categories_record()
+        sink.emit("boundaries_categories_finished", **result)
+        return result
+
+    try:
+        parcels = _load_parcel_polygons(parcels_path)
+        if not parcels:
+            # Defensive only: Task 1 never writes this file with zero
+            # features (it unlinks it instead, the same convention this
+            # branch itself follows), so a real package never reaches this,
+            # but nothing downstream (`parcels[0]`, `_rings_lat0`) is safe
+            # to call over an empty list, and the honest reading of "zero
+            # parcels" is the same either way.
+            output_path.unlink(missing_ok=True)
+            result = _categories_record()
+            sink.emit("boundaries_categories_finished", **result)
+            return result
+
+        overlays = _load_categorise_overlays(root, stem)
+        rings = [parcel.ring for parcel in parcels]
+        classifications = classify_parcels(rings, overlays)
+
+        groups: dict[str, list[int]] = defaultdict(list)
+        samples_total = 0
+        capped = 0
+        for index, (category, sample_count) in enumerate(classifications):
+            groups[category].append(index)
+            samples_total += sample_count
+            if sample_count == SAMPLE_CAP:
+                capped += 1
+
+        lat0 = _rings_lat0(rings)
+        first = parcels[0]
+        features: list[dict] = []
+        for category in sorted(groups):
+            parcel_groups = [
+                [[_to_local_metres(point, lat0) for point in rings[index]]]
+                for index in groups[category]
+            ]
+            for curve in boundary_curves_with_counts(parcel_groups).curves:
+                coordinates = [list(_from_local_metres(point, lat0)) for point in curve]
+                features.append(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "category": category,
+                            "source": first.source,
+                            "note": first.note,
+                            "year": first.year,
+                        },
+                        "geometry": {"type": "LineString", "coordinates": coordinates},
+                    }
+                )
+
+        payload = {"type": "FeatureCollection", "features": features}
+        atomic_write_bytes(
+            output_path, json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+    except (BoundaryCategoriesError, ET.ParseError, OSError) as exc:
+        error = str(exc)
+        sink.emit("boundaries_categories_failed", error=error)
+        return _categories_record(error=error)
+
+    counts = {category: len(groups[category]) for category in sorted(groups)}
+    result = _categories_record(
+        parcels=len(parcels), counts=counts, samples=samples_total, capped=capped
+    )
+    sink.emit("boundaries_categories_finished", **result)
+    return result
+
+
 def bridge_package(
     package_dir: Path | str,
     progress: ProgressSink | None = None,
@@ -2664,6 +3212,19 @@ def bridge_package(
     # is already in the `.osm` by the time heights fusion runs immediately
     # after it.
     payload["buildings_fusion"] = _fuse_buildings_step(root=root, stem=stem, sink=sink)
+
+    # Task 3 of the categorised boundaries plan. Same ordering as
+    # run_survey's own call site: immediately after buildings fusion,
+    # unconditionally, so this reads the FUSED `.osm`'s own building
+    # evidence (see `_categorise_boundaries_step`'s own docstring). Fully
+    # recomputed every call, so a re-run over a package this already
+    # classified once overwrites `<stem>_boundaries_categorised.geojson`
+    # with an identical file rather than needing its own idempotence
+    # guard (see that step's own docstring, "Idempotent by full
+    # recomputation").
+    payload["boundaries_categories"] = _categorise_boundaries_step(
+        root=root, stem=stem, sink=sink
+    )
 
     # Task 7. BEFORE the bridge, unconditionally, same as run_survey's own
     # ordering and for the same reason: the bridge converts <stem>.osm into
@@ -3840,6 +4401,7 @@ def _build_survey_json(
     lidar_heights=None,
     inspire_boundaries=None,
     buildings_fusion=None,
+    boundaries_categories=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
@@ -3858,6 +4420,7 @@ def _build_survey_json(
         "written": None, "curves": None, "kept_existing": None, "error": None,
     }
     buildings_fusion = buildings_fusion or _buildings_record()
+    boundaries_categories = boundaries_categories or _categories_record()
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
@@ -4063,6 +4626,16 @@ def _build_survey_json(
         # Overture layer either is an ordinary, complete package, not one
         # missing something it tried for.
         "buildings_fusion": buildings_fusion,
+        # Task 3 of the categorised boundaries plan. `parcels`, `counts`,
+        # `samples` and `capped` all read as zero, never `None`, on a
+        # package with no `<stem>_parcels.geojson` at all (no `inspire`
+        # layer, or zero parcels kept in this extent): the identical
+        # always-zero-not-unknown discipline `buildings_fusion` above
+        # already follows, and for the same reason (see `_categories_
+        # record`'s own docstring). `note` is the one key that is never
+        # `None` on any branch, since the caveat is true of this record's
+        # own existence rather than of what this run happened to find.
+        "boundaries_categories": boundaries_categories,
         # Task 7. `written` is None, not 0 or False, on a package this step
         # never ran on at all (no `.osm`, or no Welsh LiDAR selected):
         # `int | None` throughout, matching the brief's own record shape, so

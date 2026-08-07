@@ -4,6 +4,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from array import array
+from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
@@ -3663,7 +3664,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # not there for the download. complete and stopped describe that
     # download and nothing else; so do tiles, sources and both timestamps.
     #
-    # Five blocks are the exception rather than one, and each was added by
+    # Six blocks are the exception rather than one, and each was added by
     # the task that made this command produce something: `bridge`;
     # `project_setting` (task 35), which mapgen now writes whether or not the
     # bridge is working; `elevation_grid` (task 39), the DEM converted
@@ -3671,9 +3672,12 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # downloaded before that task is missing; `lidar_heights` (task 7),
     # which re-runs the same fusion the download itself may already have
     # done; `inspire_boundaries` (task 5 of the INSPIRE curves plan), the
-    # same re-run shape for property boundary curves; and `buildings_fusion`
+    # same re-run shape for property boundary curves; `buildings_fusion`
     # (task 6 of the OS Open pack plan), the same re-run shape one step
-    # earlier in the pipeline. Everything else is still read and never
+    # earlier in the pipeline; and `boundaries_categories` (task 3 of the
+    # categorised boundaries plan), which this fixture's own package,
+    # written long before that key existed, never carried at all until
+    # this very run adds it. Everything else is still read and never
     # written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
@@ -3686,7 +3690,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     assert after["stopped"] is True
     for changed in (
         "bridge", "project_setting", "elevation_grid", "lidar_heights",
-        "inspire_boundaries", "buildings_fusion",
+        "inspire_boundaries", "buildings_fusion", "boundaries_categories",
     ):
         before.pop(changed, None)
         after.pop(changed, None)
@@ -3707,13 +3711,18 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
     # fusion runs first of all (task 6 of the OS Open pack plan): this
     # package has neither candidate footprint file, which is buildings
     # fusion's own ordinary, all-zero outcome (started/finished, never a
-    # skip), then heights fusion (task 7), then boundaries fusion (task 5 of
-    # the INSPIRE curves plan): this package has no packaged LiDAR rasters
-    # and no boundaries GeoJSON, so both of those are skipped rather than
-    # attempted.
+    # skip), then boundary categorisation (task 3 of the categorised
+    # boundaries plan): this package has no `<stem>_parcels.geojson`
+    # either, which is that step's own ordinary, all-zero outcome
+    # (started/finished, never a skip), then heights fusion (task 7), then
+    # boundaries fusion (task 5 of the INSPIRE curves plan): this package
+    # has no packaged LiDAR rasters and no boundaries GeoJSON, so both of
+    # those are skipped rather than attempted.
     assert [e["event"] for e in log.events] == [
         "buildings_fusion_started",
         "buildings_fusion_finished",
+        "boundaries_categories_started",
+        "boundaries_categories_finished",
         "heights_fusion_skipped",
         "boundaries_fusion_skipped",
         "bridge_started",
@@ -3721,7 +3730,7 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
         "project_setting_started",
         "project_setting_written",
     ]
-    assert "exit code 1" in log.events[5]["error"]
+    assert "exit code 1" in log.events[7]["error"]
 
 
 def test_a_stop_that_landed_at_the_very_end_can_have_its_urbano_files_afterwards(tmp_path):
@@ -7281,3 +7290,621 @@ def test_both_rasters_present_but_unreadable_is_a_recorded_failure_not_a_crash(
     assert record["source"] is None
     assert record["error"] is not None
     assert result.complete is True
+
+
+# --------------------------------------------------------------------------
+# Task 3 of the 2026-08-07 categorised boundaries plan: `_categorise_
+# boundaries_step`, writing `<stem>_boundaries_categorised.geojson` from
+# `<stem>_parcels.geojson` (Task 1) classified against the package's own
+# overlay layers (`classify.py`, Task 2).
+# --------------------------------------------------------------------------
+
+_CATEGORISE_SOURCE = "HM Land Registry INSPIRE Index Polygons TEST"
+_CATEGORISE_NOTE = "Test caveat: not for reliance on this fixture."
+_CATEGORISE_YEAR = 2024
+
+_CC_BASE_LON = -3.600
+_CC_BASE_LAT = 51.500
+_CC_GAP = 0.02
+
+
+def _cc_ring(lon0, lat0, size_lon=0.002, size_lat=0.002):
+    """A rectangle's own OPEN ring (four distinct corners, no closing
+    repeat), `size_lon` x `size_lat` degrees from its own south-west
+    corner: about 140 m x 220 m at this fixture's latitude by default,
+    comfortably larger than `classify.py`'s own 20 m maximum grid
+    spacing, so every cell below is classified from a real interior
+    sampling grid, never the small-parcel representative-point fallback.
+    """
+    return [
+        (lon0, lat0),
+        (lon0 + size_lon, lat0),
+        (lon0 + size_lon, lat0 + size_lat),
+        (lon0, lat0 + size_lat),
+    ]
+
+
+def _cc_cell(col):
+    """One of a row of well-separated test cells, `_CC_GAP` degrees
+    (about 2.2 km) apart so no two cells' own overlay evidence can ever
+    reach into a neighbour's: every category this plan's own priority
+    order can produce gets its own cell, isolated from every other one.
+    """
+    return _cc_ring(_CC_BASE_LON + col * _CC_GAP, _CC_BASE_LAT)
+
+
+def _cc_inner(ring, shrink=0.2):
+    """A smaller rectangle nested inside `ring`'s own bounding box,
+    `shrink` fraction in from each edge: the housing test's own building
+    footprint, well clear of the parcel's own boundary so it is never
+    near the ray cast's own on-edge tie-break.
+    """
+    lons = [p[0] for p in ring]
+    lats = [p[1] for p in ring]
+    lon0, lon1 = min(lons), max(lons)
+    lat0, lat1 = min(lats), max(lats)
+    dx = (lon1 - lon0) * shrink
+    dy = (lat1 - lat0) * shrink
+    return [
+        (lon0 + dx, lat0 + dy),
+        (lon1 - dx, lat0 + dy),
+        (lon1 - dx, lat1 - dy),
+        (lon0 + dx, lat1 - dy),
+    ]
+
+
+def _cc_closed(ring):
+    return [*ring, ring[0]]
+
+
+def _cc_parcel_feature(
+    ring, source=_CATEGORISE_SOURCE, note=_CATEGORISE_NOTE, year=_CATEGORISE_YEAR
+):
+    return {
+        "type": "Feature",
+        "properties": {"source": source, "note": note, "year": year},
+        "geometry": {"type": "Polygon", "coordinates": [[list(p) for p in _cc_closed(ring)]]},
+    }
+
+
+def _cc_polygon_feature(ring, properties=None):
+    return {
+        "type": "Feature",
+        "properties": properties or {},
+        "geometry": {"type": "Polygon", "coordinates": [[list(p) for p in _cc_closed(ring)]]},
+    }
+
+
+def _cc_point_feature(point, properties=None):
+    return {
+        "type": "Feature",
+        "properties": properties or {},
+        "geometry": {"type": "Point", "coordinates": list(point)},
+    }
+
+
+def _write_categorise_geojson(out_dir, name, features):
+    path = out_dir / name
+    path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features}), encoding="utf-8"
+    )
+    return path
+
+
+def _cc_osm_way(way_id, start_node_id, ring, tags):
+    """One `<way>` plus its own fresh `<node>` elements, real-OSM style:
+    the way's own `nd` list closes by repeating the FIRST node's id,
+    never a second node sharing its coordinates, since `_osm_building_
+    and_water_rings`'s own closed-way check reads node ids, not
+    coordinates.
+    """
+    node_ids = list(range(start_node_id, start_node_id + len(ring)))
+    node_xml = "".join(
+        f'<node id="{nid}" lat="{lat:.7f}" lon="{lon:.7f}"/>\n'
+        for nid, (lon, lat) in zip(node_ids, ring)
+    )
+    refs = node_ids + [node_ids[0]]
+    refs_xml = "".join(f'<nd ref="{nid}"/>' for nid in refs)
+    tags_xml = "".join(f'<tag k="{k}" v="{v}"/>' for k, v in tags)
+    way_xml = f'<way id="{way_id}">{refs_xml}{tags_xml}</way>\n'
+    return node_xml + way_xml, start_node_id + len(ring)
+
+
+def _write_categorise_osm(out_dir, stem, ways):
+    """`ways`: a list of `(way_id, ring, tags)`, `ring` open (no closing
+    repeat), `tags` a list of `(k, v)` pairs.
+    """
+    body = []
+    next_id = 1
+    for way_id, ring, tags in ways:
+        xml, next_id = _cc_osm_way(way_id, next_id, ring, tags)
+        body.append(xml)
+    text = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<osm version="0.6" generator="mapgen-test">\n'
+        + "".join(body)
+        + "</osm>\n"
+    )
+    path = out_dir / f"{stem}.osm"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _cc_read_output(root, stem):
+    path = root / f"{stem}_boundaries_categorised.geojson"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _cc_features_by_category(payload):
+    grouped = defaultdict(list)
+    for feature in payload["features"]:
+        grouped[feature["properties"]["category"]].append(feature)
+    return grouped
+
+
+def _cc_rounded(point, ndigits=5):
+    return (round(point[0], ndigits), round(point[1], ndigits))
+
+
+def _cc_edges(coordinates):
+    points = [_cc_rounded(p) for p in coordinates]
+    return {frozenset((points[i], points[i + 1])) for i in range(len(points) - 1)}
+
+
+class CategoriseFixtureStubSource(StubSource):
+    """Nine parcels, one well-separated cell each, one for every category
+    `classify.py`'s own priority order can produce, plus the `class`/
+    `subtype` fallback the controller's own ruling adds for `_land_use.
+    geojson`: `_categorise_boundaries_step`'s own overlay-loading wiring
+    (not `classify.py`'s classification logic, already Task 2's own
+    responsibility) is what this exercises, against every file type it
+    reads at least once: `.osm` (a `building=*` way and a closed
+    `natural=water` way), `_land_use.geojson` (`class` and the `subtype`
+    fallback), `_water.geojson`, `_os_greenspace.geojson` (a Polygon plus
+    a decoy Point, the `AccessPoint` shape that must contribute nothing),
+    and `_os_land.geojson` (`kind == "woodland"` plus a decoy non-woodland
+    `kind` that must contribute nothing either).
+    """
+
+    def merge(self, parts, out_dir, stem):
+        garden = _cc_cell(0)
+        field = _cc_cell(1)
+        housing = _cc_cell(2)
+        osm_water = _cc_cell(3)
+        overture_water = _cc_cell(4)
+        greenspace = _cc_cell(5)
+        woodland = _cc_cell(6)
+        unclassified = _cc_cell(7)
+        garden_subtype = _cc_cell(8)
+
+        parcels = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_parcels.geojson",
+            [
+                _cc_parcel_feature(garden),
+                _cc_parcel_feature(field),
+                _cc_parcel_feature(housing),
+                _cc_parcel_feature(osm_water),
+                _cc_parcel_feature(overture_water),
+                _cc_parcel_feature(greenspace),
+                _cc_parcel_feature(woodland),
+                _cc_parcel_feature(unclassified),
+                _cc_parcel_feature(garden_subtype),
+            ],
+        )
+        osm_path = _write_categorise_osm(
+            out_dir,
+            stem,
+            [
+                (901, _cc_inner(housing), [("building", "yes")]),
+                (902, osm_water, [("natural", "water")]),
+            ],
+        )
+        land_use = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_land_use.geojson",
+            [
+                _cc_polygon_feature(garden, {"class": "residential"}),
+                _cc_polygon_feature(field, {"class": "farmland"}),
+                _cc_polygon_feature(housing, {"class": "residential"}),
+                _cc_polygon_feature(garden_subtype, {"subtype": "residential"}),
+            ],
+        )
+        water = _write_categorise_geojson(
+            out_dir, f"{stem}_water.geojson", [_cc_polygon_feature(overture_water)]
+        )
+        greenspace_file = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_os_greenspace.geojson",
+            [
+                _cc_polygon_feature(greenspace, {"function": "Public Park"}),
+                _cc_point_feature(greenspace[0], {"access": "pedestrian"}),
+            ],
+        )
+        land_file = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_os_land.geojson",
+            [
+                _cc_polygon_feature(woodland, {"kind": "woodland"}),
+                _cc_polygon_feature(unclassified, {"kind": "water_area"}),
+            ],
+        )
+        return [parcels, osm_path, land_use, water, greenspace_file, land_file]
+
+
+def test_categorise_boundaries_classifies_every_overlay_path_and_writes_grouped_curves(
+    tmp_path,
+):
+    register(CategoriseFixtureStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["boundaries_categories"]
+    assert record["parcels"] == 9
+    assert record["counts"] == {
+        "garden": 2, "field": 1, "housing": 1, "water": 2,
+        "greenspace": 1, "woodland": 1, "unclassified": 1,
+    }
+    assert record["capped"] == 0
+    assert record["samples"] > 0
+    assert record["note"] == "derived from map overlay, indicative"
+    assert record["error"] is None
+
+    payload = _cc_read_output(result.paths.root, result.paths.stem)
+    grouped = _cc_features_by_category(payload)
+    assert set(grouped) == {
+        "garden", "field", "housing", "water", "greenspace", "woodland", "unclassified",
+    }
+    # The two garden cells are far apart (never touching), so they stay
+    # two separate outlines rather than merging into one.
+    assert len(grouped["garden"]) == 2
+    for features in grouped.values():
+        for feature in features:
+            assert feature["properties"]["source"] == _CATEGORISE_SOURCE
+            assert feature["properties"]["note"] == _CATEGORISE_NOTE
+            assert feature["properties"]["year"] == _CATEGORISE_YEAR
+            assert feature["geometry"]["type"] == "LineString"
+
+    # Category groups land in the file sorted by category name (the
+    # controller's own determinism ruling), which is what byte-identical
+    # re-runs depend on: a category's own INSERTION order into `groups`
+    # otherwise follows whichever parcel the classifier happened to visit
+    # first, which is real, but incidental, ordering.
+    categories_in_file = [feature["properties"]["category"] for feature in payload["features"]]
+    assert categories_in_file == sorted(categories_in_file)
+
+
+def test_categorise_boundaries_records_the_degraded_input_signal_when_a_parcel_hits_the_sample_cap(
+    tmp_path, monkeypatch
+):
+    """`capped` is the reviewer-requested signal that a parcel's own
+    `sample_count` hit `classify.SAMPLE_CAP` (task-2's own deferred minor
+    finding, picked up here): real geometry that actually reaches 40,000
+    samples is far too slow to build for a unit test (see classify.py's
+    own module docstring for the "19,119,210 samples... in ~10s" shape
+    that construction takes), so this pins the wiring alone by having a
+    stand-in `classify_parcels` report the capped count directly, exactly
+    as the real one would for a genuinely oversized parcel.
+    """
+    import mapgen.package as package_module
+    from mapgen.classify import SAMPLE_CAP
+
+    def fake_classify_parcels(rings, overlays):
+        return [("garden", SAMPLE_CAP), ("field", 12)]
+
+    monkeypatch.setattr(package_module, "classify_parcels", fake_classify_parcels)
+    register(ParcelsOnlyStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["boundaries_categories"]
+    assert record["capped"] == 1
+    assert record["samples"] == SAMPLE_CAP + 12
+    assert record["counts"] == {"garden": 1, "field": 1}
+
+
+class SharedEdgeCategoriseStubSource(StubSource):
+    """Two adjacent parcels of DIFFERENT categories sharing exactly one
+    wall: garden west of field. `boundary_curves.py`'s own module
+    docstring makes the point this pins: two different parcels sharing a
+    wall are not ring-level duplicates of each other, only their shared
+    EDGE is, and that edge belongs to BOTH parcels' own rings.
+    `_categorise_boundaries_step` groups by category BEFORE calling
+    `boundary_curves_with_counts`, so this wall is deduplicated only
+    WITHIN each category's own, single-parcel group here, which is a
+    no-op: it must survive, once, in each of the two output curves.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        unit = 0.002
+        garden = _cc_ring(_CC_BASE_LON, _CC_BASE_LAT, unit, unit)
+        field = _cc_ring(_CC_BASE_LON + unit, _CC_BASE_LAT, unit, unit)
+        parcels = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_parcels.geojson",
+            [_cc_parcel_feature(garden), _cc_parcel_feature(field)],
+        )
+        land_use = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_land_use.geojson",
+            [
+                _cc_polygon_feature(garden, {"class": "residential"}),
+                _cc_polygon_feature(field, {"class": "farmland"}),
+            ],
+        )
+        return [parcels, land_use]
+
+
+def test_categorise_boundaries_keeps_a_shared_edge_once_under_each_category(tmp_path):
+    register(SharedEdgeCategoriseStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    payload = _cc_read_output(result.paths.root, result.paths.stem)
+    grouped = _cc_features_by_category(payload)
+    assert len(grouped["garden"]) == 1
+    assert len(grouped["field"]) == 1
+
+    garden_edges = _cc_edges(grouped["garden"][0]["geometry"]["coordinates"])
+    field_edges = _cc_edges(grouped["field"][0]["geometry"]["coordinates"])
+    shared = garden_edges & field_edges
+    assert len(shared) == 1, (
+        "the wall between the two parcels must survive once in EACH "
+        "category's own curves, not be deduplicated away between them"
+    )
+
+
+class StackedSameCategoryStubSource(StubSource):
+    """Two adjacent parcels of the SAME category (garden), stacked so
+    they share one wall: `boundary_curves_with_counts` runs once over
+    BOTH of them together (they land in the same group), so the shared
+    wall is drawn once rather than twice, the ordinary within-category
+    dedup `boundary_curves.py` already exists for.
+
+    This does NOT merge the pair into one 4-sided outline: `boundary_
+    curves.py`'s own edge dedup collapses a wall two rings BOTH record
+    (that shared wall's two endpoints then have a third edge meeting
+    them, on top of each rectangle's own other two sides) to ONE copy of
+    it, never erases it outright, so the result is three curves stopping
+    at the two junctions those endpoints become (the module's own "stops
+    wherever three or more edges meet"): the lower rectangle's own other
+    three sides, the upper rectangle's own other three sides, and the
+    shared wall itself, drawn exactly once. If the two parcels were
+    instead classified into SEPARATE groups, or processed one
+    `boundary_curves_with_counts` call at a time instead of one call for
+    the whole group, the wall would be drawn TWICE (once from each
+    rectangle's own complete, independent 4-sided outline) instead of
+    once, which is the distinction this fixture's own test pins.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        unit = 0.002
+        lower = _cc_ring(_CC_BASE_LON, _CC_BASE_LAT, unit, unit)
+        upper = _cc_ring(_CC_BASE_LON, _CC_BASE_LAT + unit, unit, unit)
+        residential = _cc_ring(_CC_BASE_LON, _CC_BASE_LAT, unit, unit * 2)
+        parcels = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_parcels.geojson",
+            [_cc_parcel_feature(lower), _cc_parcel_feature(upper)],
+        )
+        land_use = _write_categorise_geojson(
+            out_dir,
+            f"{stem}_land_use.geojson",
+            [_cc_polygon_feature(residential, {"class": "residential"})],
+        )
+        return [parcels, land_use]
+
+
+def test_categorise_boundaries_dedupes_the_shared_wall_within_one_category(tmp_path):
+    register(StackedSameCategoryStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["boundaries_categories"]
+    assert record["counts"] == {"garden": 2}
+
+    payload = _cc_read_output(result.paths.root, result.paths.stem)
+    grouped = _cc_features_by_category(payload)
+    garden_curves = grouped["garden"]
+
+    # Three curves stopping at the two junctions the shared wall's own
+    # endpoints become (see the fixture's own docstring): the lower
+    # rectangle's other three sides, the upper rectangle's other three
+    # sides, and the wall itself. None of the three closes into its own
+    # separate loop, unlike the two whole, independent 4-sided squares a
+    # BROKEN grouping (each parcel handed to `boundary_curves_with_counts`
+    # on its own) would produce instead.
+    assert len(garden_curves) == 3
+    for feature in garden_curves:
+        coordinates = feature["geometry"]["coordinates"]
+        assert coordinates[0] != coordinates[-1], (
+            "a closed loop here would mean the two parcels were never "
+            "actually deduplicated against each other"
+        )
+
+    # The decisive count: 7 distinct edges (6 outer sides plus the one
+    # shared wall, drawn once), never 8 (which is what two entirely
+    # independent, undeduplicated rectangles would total instead).
+    all_edges: set = set()
+    for feature in garden_curves:
+        all_edges |= _cc_edges(feature["geometry"]["coordinates"])
+    assert len(all_edges) == 7, (
+        "the wall shared between the two parcels must be counted once, "
+        "not once per parcel"
+    )
+
+
+def test_categorise_boundaries_records_all_zero_with_no_parcels_file(tmp_path):
+    register(OsmOnlyStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.survey["boundaries_categories"] == {
+        "parcels": 0, "counts": {}, "samples": 0, "capped": 0,
+        "note": "derived from map overlay, indicative", "error": None,
+    }
+    names = [e["event"] for e in log.snapshot()]
+    assert names.count("boundaries_categories_started") == 1
+    assert names.count("boundaries_categories_finished") == 1
+    assert "boundaries_categories_failed" not in names, (
+        "no third event name: this step is never skipped, only started "
+        "then finished or failed"
+    )
+    output_path = (
+        result.paths.root / f"{result.paths.stem}_boundaries_categorised.geojson"
+    )
+    assert not output_path.is_file()
+
+
+class ParcelsOnlyStubSource(StubSource):
+    """Writes `<stem>_parcels.geojson` alone: no `.osm`, no Overture or OS
+    Open overlay file at all, matching a package that selected `inspire`
+    but neither `overture` nor `os_open`. Every parcel must classify
+    `unclassified` (nothing fabricated), and the categorised file must
+    still be written: an unclassified curve is still a curve.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        ring_a = _cc_cell(0)
+        ring_b = _cc_cell(1)
+        return [
+            _write_categorise_geojson(
+                out_dir,
+                f"{stem}_parcels.geojson",
+                [_cc_parcel_feature(ring_a), _cc_parcel_feature(ring_b)],
+            )
+        ]
+
+
+def test_categorise_boundaries_with_no_overlay_files_everything_unclassified(tmp_path):
+    register(ParcelsOnlyStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    record = result.survey["boundaries_categories"]
+    assert record["parcels"] == 2
+    assert record["counts"] == {"unclassified": 2}
+    assert record["error"] is None
+
+    payload = _cc_read_output(result.paths.root, result.paths.stem)
+    grouped = _cc_features_by_category(payload)
+    assert set(grouped) == {"unclassified"}
+    assert len(grouped["unclassified"]) == 2
+
+
+class MalformedParcelsStubSource(StubSource):
+    """Writes a `<stem>_parcels.geojson` that is not a GeoJSON
+    FeatureCollection at all: a package this step must refuse rather than
+    guess at, exactly as `_fuse_boundaries_step`/`_fuse_buildings_step`
+    refuse input they cannot parse.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        path = out_dir / f"{stem}_parcels.geojson"
+        path.write_text("not json at all {{{", encoding="utf-8")
+        return [path]
+
+
+def test_a_categorise_boundaries_failure_is_recorded_and_the_survey_still_finishes(
+    tmp_path,
+):
+    register(MalformedParcelsStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.complete is True
+    record = result.survey["boundaries_categories"]
+    assert record["parcels"] == 0
+    assert record["error"] is not None
+    names = [e["event"] for e in log.snapshot()]
+    assert names.index("boundaries_categories_started") < names.index(
+        "boundaries_categories_failed"
+    )
+
+
+class BuildingsAndParcelsStubSource(StubSource):
+    """Writes everything `_fuse_buildings_step` looks for (a real `.osm`
+    plus `<stem>_building.geojson`) AND `<stem>_parcels.geojson`, so the
+    ordering between buildings fusion and boundary categorisation (task 3
+    of the categorised boundaries plan) can be checked against real
+    events in both `run_survey` and `bridge_package`.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        overture_geojson = _write_overture_buildings_geojson(
+            out_dir, stem, [_polygon_feature(_NEW_BUILDING_RING_LONLAT, {"height": 5.0})]
+        )
+        parcels = _write_categorise_geojson(
+            out_dir, f"{stem}_parcels.geojson", [_cc_parcel_feature(_cc_cell(0))]
+        )
+        return [osm_path, overture_geojson, parcels]
+
+
+def test_boundaries_categories_run_between_buildings_and_heights_fusion_in_run_survey(
+    tmp_path,
+):
+    register(BuildingsAndParcelsStubSource())
+    log = EventLog()
+
+    run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    names = [e["event"] for e in log.snapshot()]
+    assert (
+        names.index("buildings_fusion_started")
+        < names.index("buildings_fusion_finished")
+        < names.index("boundaries_categories_started")
+        < names.index("boundaries_categories_finished")
+        < names.index("heights_fusion_skipped")
+    )
+
+
+def test_boundaries_categories_run_between_buildings_and_heights_fusion_in_bridge_package(
+    tmp_path,
+):
+    register(BuildingsAndParcelsStubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    log = EventLog()
+
+    bridge_package(
+        result.paths.root, progress=log, bridge_runner=FakeBridgeRunner(returncode=0)
+    )
+
+    names = [e["event"] for e in log.snapshot()]
+    assert (
+        names.index("buildings_fusion_started")
+        < names.index("buildings_fusion_finished")
+        < names.index("boundaries_categories_started")
+        < names.index("boundaries_categories_finished")
+        < names.index("heights_fusion_skipped")
+    )
+
+
+def test_bridge_package_re_runs_boundaries_categories_idempotently_and_byte_identically(
+    tmp_path,
+):
+    """The reason this matters, exactly as it does for buildings fusion
+    and boundaries fusion above: every package the owner already has was
+    downloaded before this task existed, so every one of them can now
+    have its categorised curves produced by a plain re-bridge, agreeing
+    exactly with what the download itself already computed.
+    """
+    register(CategoriseFixtureStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    downloaded = result.survey["boundaries_categories"]
+    output_path = (
+        result.paths.root / f"{result.paths.stem}_boundaries_categorised.geojson"
+    )
+    first_bytes = output_path.read_bytes()
+
+    payload = bridge_package(result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0))
+
+    rebridged = payload["boundaries_categories"]
+    assert rebridged == downloaded
+    second_bytes = output_path.read_bytes()
+    assert second_bytes == first_bytes, "a re-run must produce a byte-identical file"
