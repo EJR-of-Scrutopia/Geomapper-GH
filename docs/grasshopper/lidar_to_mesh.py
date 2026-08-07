@@ -365,13 +365,17 @@ def _geometry_numpy(grid, cols, rows, frame, pixel_size, pixel_height,
     index[mask] = np.arange(kept)
     stacked = np.column_stack((
         np.asarray(x)[mask], np.asarray(y)[mask], z[mask]))
-    vertices = list(map(tuple, stacked))
     corner = (mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, 1:] & mask[1:, :-1])
     a = index[:-1, :-1][corner]
     b = index[:-1, 1:][corner]
     c = index[1:, 1:][corner]
     d = index[1:, :-1][corner]
-    faces = list(map(tuple, np.column_stack((a, b, c, d))))
+    # .tolist() matters: it yields NATIVE Python ints and floats. Rhino's
+    # MeshFace constructor refuses numpy int64 outright (numpy floats pass
+    # only because np.float64 subclasses float), so handing numpy scalars
+    # onward breaks exactly and only inside Grasshopper.
+    vertices = [tuple(v) for v in stacked.tolist()]
+    faces = [tuple(f) for f in np.column_stack((a, b, c, d)).tolist()]
     return vertices, faces, kept, float(np.nanmin(z)), float(np.nanmax(z))
 
 
