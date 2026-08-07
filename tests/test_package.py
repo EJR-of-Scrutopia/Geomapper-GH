@@ -3019,6 +3019,33 @@ def test_a_complete_run_sweeps_a_stale_os_open_output_from_an_earlier_wider_atte
     assert f"{stem}_os_buildings.geojson" in removed
 
 
+def test_a_complete_run_sweeps_a_stale_inspire_parcels_output_from_an_earlier_wider_attempt(tmp_path):
+    """Task 1 of Phase 2b item A (categorised boundaries): InspireSource's
+    own `possible_outputs(stem)` now names `<stem>_parcels.geojson`
+    alongside `<stem>_boundaries.geojson`, and `_sweep_stale_outputs`
+    iterates every REGISTERED source's own declaration regardless of
+    whether THIS run selects it, the identical mechanism
+    `test_a_complete_run_sweeps_a_stale_os_open_output_from_an_earlier_wider_attempt`
+    above already pins for `os_open`'s own real source.
+    """
+    register_default_sources()
+    register(StubSource())
+    root = tmp_path / "South-Wales" / "2026-08-01_Barry-Waterfront"
+    root.mkdir(parents=True)
+    stem = "Barry-Waterfront_2026-08-01"
+    stale = root / f"{stem}_parcels.geojson"
+    stale.write_text("stale inspire parcels from an earlier, wider attempt", encoding="utf-8")
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path), progress=log)
+
+    assert result.complete is True
+    assert result.paths.root == root
+    assert not stale.exists()
+    removed = {e["name"] for e in log.events if e["event"] == "stale_output_removed"}
+    assert f"{stem}_parcels.geojson" in removed
+
+
 def test_an_incomplete_run_keeps_every_leftover(tmp_path):
     # Deleting the only merged copy of anything mid-failure helps nobody:
     # survey.json already says complete false, and the resume that finishes

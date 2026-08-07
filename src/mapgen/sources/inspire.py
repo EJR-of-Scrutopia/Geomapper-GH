@@ -1448,17 +1448,23 @@ class InspireSource:
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
         """Runs `boundary_curves` over every kept parcel `PARCELS_WORK_NAME`
         holds and writes `<stem>_boundaries.geojson`: a FeatureCollection of
-        LineStrings, each carrying the brief's exact properties.
+        LineStrings, each carrying the brief's exact properties. Alongside
+        it, in the SAME pass over those same parcels, writes `<stem>_
+        parcels.geojson`: a FeatureCollection of closed Polygons, one per
+        parcel, exterior ring only, in work-part order. Task 1 of Phase 2b
+        item A (categorised boundaries): later tasks classify these rings;
+        this is only their faithful persistence.
 
         Picks its two work files out of `parts` BY NAME, never by position
         (the ElevationSource.merge lesson). Unlike LidarWalesSource.merge
         (two independent rasters, each with its own output), this source's
-        ONE output needs BOTH work files together (the parcel geometry AND
-        the collection year), so "missing work files" here is all-or-
-        nothing: either name absent from `parts` means nothing coherent can
-        be written, the stale package copy of `<stem>_boundaries.geojson`
-        is unlinked (the same I8 stale-output discipline every other
-        source's merge follows), and this returns `[]`.
+        two outputs both need BOTH work files together (the parcel
+        geometry AND the collection year), so "missing work files" here is
+        all-or-nothing: either name absent from `parts` means nothing
+        coherent can be written, the stale package copies of both
+        `<stem>_boundaries.geojson` and `<stem>_parcels.geojson` are
+        unlinked (the same I8 stale-output discipline every other source's
+        merge follows), and this returns `[]`.
 
         The OSTN15 grid needed to unproject curves back to lon/lat is
         acquired `load_ostn15()` first (cache-only; fetch()'s own
@@ -1473,14 +1479,34 @@ class InspireSource:
         skips its own contour generation when no grid is available: a
         package without boundaries beats a crash over something the
         package's other outputs do not depend on.
+
+        `_read_parcels_jsonl(parcels_part)` is called exactly ONCE: the
+        parcels file's own work-part read is not repeated for the second
+        output. `_parcels_with_capture` below wraps that one generator,
+        handing every parcel on to `boundary_curves` (which consumes it in
+        one top-of-pipeline `for` loop, see `boundary_curves_with_counts`)
+        while also, as a side effect of that same iteration, projecting
+        each parcel's own exterior ring through `from_bng` with the exact
+        same grid and the exact same call shape the curves loop below uses
+        on its own edge vertices, so a vertex shared between the two files
+        agrees to the last digit rather than risking a second, independently
+        rounded transform. Every exterior ring read out of a real INSPIRE
+        zip is already closed (GML's own LinearRing requirement; see
+        `parcels_in`'s module docstring), so the explicit close below
+        (appending the first projected vertex again when it does not
+        already equal the last) is a defensive no-op on real data and
+        never fabricates a vertex that was not already the ring's own
+        first one.
         """
         out_dir = Path(out_dir)
         output_path = out_dir / f"{stem}_boundaries.geojson"
+        parcels_output_path = out_dir / f"{stem}_parcels.geojson"
 
         parcels_part = next((part for part in parts if part.name == PARCELS_WORK_NAME), None)
         meta_part = next((part for part in parts if part.name == META_WORK_NAME), None)
         if parcels_part is None or meta_part is None:
             output_path.unlink(missing_ok=True)
+            parcels_output_path.unlink(missing_ok=True)
             return []
 
         try:
@@ -1492,6 +1518,7 @@ class InspireSource:
             # the same "package without X beats a crash" principle applies
             # rather than raising over a file the owner never touched.
             output_path.unlink(missing_ok=True)
+            parcels_output_path.unlink(missing_ok=True)
             return []
 
         grid = load_ostn15(cache_dir=self._ostn15_cache_dir)
@@ -1500,10 +1527,34 @@ class InspireSource:
                 grid = ensure_ostn15(cache_dir=self._ostn15_cache_dir, session=self.session)
             except (requests.RequestException, BngError):
                 output_path.unlink(missing_ok=True)
+                parcels_output_path.unlink(missing_ok=True)
                 return []
 
-        parcels = _read_parcels_jsonl(parcels_part)
-        curves = boundary_curves(parcels)
+        parcel_features: list[dict] = []
+
+        def _parcels_with_capture():
+            for rings in _read_parcels_jsonl(parcels_part):
+                exterior = rings[0]
+                coordinates = []
+                for easting, northing in exterior:
+                    latitude, longitude = from_bng(easting, northing, grid)
+                    coordinates.append([longitude, latitude])
+                if coordinates and coordinates[0] != coordinates[-1]:
+                    coordinates.append(coordinates[0])
+                parcel_features.append(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "source": BOUNDARY_SOURCE_LABEL,
+                            "note": BOUNDARY_INDICATIVE_NOTE,
+                            "year": year,
+                        },
+                        "geometry": {"type": "Polygon", "coordinates": [coordinates]},
+                    }
+                )
+                yield rings
+
+        curves = boundary_curves(_parcels_with_capture())
 
         features = []
         for curve in curves:
@@ -1526,9 +1577,24 @@ class InspireSource:
         atomic_write_bytes(
             output_path, json.dumps(payload, separators=(",", ":")).encode("utf-8")
         )
-        return [output_path]
+        written = [output_path]
+
+        # Zero parcels means zero rings to persist: os_open.py's own
+        # per-bucket "no features, no file" convention (see its merge()),
+        # applied here rather than writing an always-empty FeatureCollection
+        # that could never hold anything for this stem.
+        if parcel_features:
+            parcels_payload = {"type": "FeatureCollection", "features": parcel_features}
+            atomic_write_bytes(
+                parcels_output_path,
+                json.dumps(parcels_payload, separators=(",", ":")).encode("utf-8"),
+            )
+            written.append(parcels_output_path)
+        else:
+            parcels_output_path.unlink(missing_ok=True)
+        return written
 
     def possible_outputs(self, stem: str) -> list[str]:
         """Every root file merge() could ever write for this stem. Read by
         package.py's stale-output sweep; see sources/base.py."""
-        return [f"{stem}_boundaries.geojson"]
+        return [f"{stem}_boundaries.geojson", f"{stem}_parcels.geojson"]

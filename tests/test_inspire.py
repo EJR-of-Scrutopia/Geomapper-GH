@@ -1741,7 +1741,9 @@ def test_merge_produces_the_boundaries_geojson_with_exact_properties_and_dedup(t
 
     written = source.merge([work_dir / PARCELS_WORK_NAME, work_dir / META_WORK_NAME], out_dir, stem)
 
-    assert [p.name for p in written] == [f"{stem}_boundaries.geojson"]
+    assert [p.name for p in written] == [
+        f"{stem}_boundaries.geojson", f"{stem}_parcels.geojson"
+    ]
     payload = json.loads(written[0].read_text(encoding="utf-8"))
     assert payload["type"] == "FeatureCollection"
     assert len(payload["features"]) == len(expected_curves)
@@ -1760,6 +1762,70 @@ def test_merge_produces_the_boundaries_geojson_with_exact_properties_and_dedup(t
         for lon, lat in feature["geometry"]["coordinates"]:
             assert -180.0 <= lon <= 180.0
             assert -90.0 <= lat <= 90.0
+
+    # Task 1 of Phase 2b item A: the sibling <stem>_parcels.geojson, one
+    # closed Polygon per parcel, exterior ring only, in work-part order
+    # (square_a then square_b), never deduplicated the way the curves
+    # above are. Neither square_a nor square_b is closed as written above
+    # (first vertex != last), so this also pins the writer's own explicit
+    # close.
+    parcels_payload = json.loads(written[1].read_text(encoding="utf-8"))
+    assert parcels_payload["type"] == "FeatureCollection"
+    assert len(parcels_payload["features"]) == 2
+    for feature, ring in zip(parcels_payload["features"], (square_a[0], square_b[0])):
+        assert feature["type"] == "Feature"
+        assert feature["properties"] == {
+            "source": "HM Land Registry INSPIRE Index Polygons",
+            "note": (
+                "The extent of the land contained in any registered title "
+                "cannot be established from the INSPIRE Index Polygons."
+            ),
+            "year": 2026,
+        }
+        assert feature["geometry"]["type"] == "Polygon"
+        expected_coordinates = []
+        for easting, northing in ring:
+            latitude, longitude = tm_inverse(easting, northing)
+            expected_coordinates.append([longitude, latitude])
+        expected_coordinates.append(expected_coordinates[0])  # explicit close
+        assert feature["geometry"]["coordinates"] == [expected_coordinates]
+        assert feature["geometry"]["coordinates"][0][0] == feature["geometry"]["coordinates"][0][-1]
+
+
+def test_merge_with_zero_parcels_writes_no_parcels_geojson(tmp_path):
+    # The sibling zero-feature convention os_open.py's own per-bucket
+    # writer already establishes (see that module's merge()): zero
+    # parcels means zero rings to persist, so this file is not written at
+    # all, and any stale copy an earlier, wider attempt left behind is
+    # swept, exactly like <stem>_boundaries.geojson's own existing skip
+    # paths below already do for themselves.
+    cache_dir = tmp_path / "ostn15-cache"
+    _seed_ostn15_cache(cache_dir, _zero_shift_grid())
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    _write_parcels_jsonl(work_dir / PARCELS_WORK_NAME, [])
+    _write_meta_json(
+        work_dir / META_WORK_NAME,
+        authorities=[
+            {"name": "Test_Authority", "parcels_seen": 0, "parcels_kept": 0, "parcels_skipped_malformed": 0, "timestamp_year": 2026}
+        ],
+        year=2026,
+    )
+
+    source = InspireSource(ostn15_cache_dir=cache_dir)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    stem = "Barry-Waterfront_2026-08-06"
+    stale_parcels = out_dir / f"{stem}_parcels.geojson"
+    stale_parcels.write_bytes(b"stale parcels from an earlier, wider attempt")
+
+    written = source.merge([work_dir / PARCELS_WORK_NAME, work_dir / META_WORK_NAME], out_dir, stem)
+
+    assert [p.name for p in written] == [f"{stem}_boundaries.geojson"]
+    assert not stale_parcels.exists()
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert payload["features"] == []
 
 
 def test_merge_over_the_real_fixture_produces_curves_matching_boundary_curves(tmp_path):
@@ -1805,6 +1871,31 @@ def test_merge_over_the_real_fixture_produces_curves_matching_boundary_curves(tm
     payload = json.loads(written[0].read_text(encoding="utf-8"))
     assert len(payload["features"]) == len(expected_curves)
 
+    # The sibling parcels file: one closed Polygon per parcel, exterior
+    # ring only, in the SAME order `parcels_in` itself yielded them (work-
+    # part order), read from the real fixture rather than hand-built
+    # squares, and transformed with the exact same `tm_inverse` this
+    # zero-shift grid makes `from_bng` equal to, so the known fixture
+    # coordinate below is a real, checkable number rather than a shape
+    # assertion alone.
+    parcels_payload = json.loads(written[1].read_text(encoding="utf-8"))
+    assert len(parcels_payload["features"]) == len(parcels)
+    for feature, parcel in zip(parcels_payload["features"], parcels):
+        assert feature["geometry"]["type"] == "Polygon"
+        exterior = parcel[0]
+        expected_coordinates = [
+            [longitude, latitude]
+            for latitude, longitude in (tm_inverse(e, n) for e, n in exterior)
+        ]
+        if expected_coordinates[0] != expected_coordinates[-1]:
+            expected_coordinates.append(expected_coordinates[0])
+        assert feature["geometry"]["coordinates"] == [expected_coordinates]
+    # The fixture's first member's own first vertex (E 313526.5, N
+    # 168920.2, see FIXTURE_BBOX_ALL's own comment above), pinned as a
+    # concrete number rather than trusting the loop above alone.
+    first_lat, first_lon = tm_inverse(313_526.5, 168_920.2)
+    assert parcels_payload["features"][0]["geometry"]["coordinates"][0][0] == [first_lon, first_lat]
+
 
 def test_merge_missing_both_work_files_returns_nothing_and_unlinks_stale(tmp_path):
     source = InspireSource()
@@ -1813,11 +1904,14 @@ def test_merge_missing_both_work_files_returns_nothing_and_unlinks_stale(tmp_pat
     stem = "Barry-Waterfront_2026-08-06"
     stale = out_dir / f"{stem}_boundaries.geojson"
     stale.write_bytes(b"stale")
+    stale_parcels = out_dir / f"{stem}_parcels.geojson"
+    stale_parcels.write_bytes(b"stale parcels")
 
     written = source.merge([], out_dir, stem)
 
     assert written == []
     assert not stale.exists()
+    assert not stale_parcels.exists()
 
 
 def test_merge_missing_meta_json_returns_nothing_and_unlinks_stale(tmp_path):
@@ -1832,11 +1926,14 @@ def test_merge_missing_meta_json_returns_nothing_and_unlinks_stale(tmp_path):
     stem = "Barry-Waterfront_2026-08-06"
     stale = out_dir / f"{stem}_boundaries.geojson"
     stale.write_bytes(b"stale")
+    stale_parcels = out_dir / f"{stem}_parcels.geojson"
+    stale_parcels.write_bytes(b"stale parcels")
 
     written = source.merge(parcels_only, out_dir, stem)
 
     assert written == []
     assert not stale.exists()
+    assert not stale_parcels.exists()
 
 
 def test_merge_skips_with_stale_unlink_when_ostn15_grid_is_unavailable(tmp_path):
@@ -1858,17 +1955,22 @@ def test_merge_skips_with_stale_unlink_when_ostn15_grid_is_unavailable(tmp_path)
     stem = "Barry-Waterfront_2026-08-06"
     stale = out_dir / f"{stem}_boundaries.geojson"
     stale.write_bytes(b"stale")
+    stale_parcels = out_dir / f"{stem}_parcels.geojson"
+    stale_parcels.write_bytes(b"stale parcels")
 
     written = source.merge([work_dir / PARCELS_WORK_NAME, work_dir / META_WORK_NAME], out_dir, stem)
 
     assert written == []
     assert not stale.exists()
+    assert not stale_parcels.exists()
 
 
-def test_possible_outputs_is_the_closed_list_of_one_name():
+def test_possible_outputs_is_the_closed_list_of_both_names():
     source = InspireSource()
     stem = "Barry-Waterfront_2026-08-06"
-    assert source.possible_outputs(stem) == [f"{stem}_boundaries.geojson"]
+    assert source.possible_outputs(stem) == [
+        f"{stem}_boundaries.geojson", f"{stem}_parcels.geojson"
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -1896,5 +1998,17 @@ def test_live_fetch_and_merge_over_llantwit_major(tmp_path):
     payload = json.loads(written[0].read_text(encoding="utf-8"))
     assert len(payload["features"]) > 0
     for feature in payload["features"]:
+        assert 2020 <= feature["properties"]["year"] <= 2030
+        assert feature["properties"]["source"] == "HM Land Registry INSPIRE Index Polygons"
+
+    parcels_payload = json.loads(written[1].read_text(encoding="utf-8"))
+    assert len(parcels_payload["features"]) > 0
+    for feature in parcels_payload["features"]:
+        assert feature["geometry"]["type"] == "Polygon"
+        ring = feature["geometry"]["coordinates"][0]
+        assert ring[0] == ring[-1]
+        for lon, lat in ring:
+            assert -180.0 <= lon <= 180.0
+            assert -90.0 <= lat <= 90.0
         assert 2020 <= feature["properties"]["year"] <= 2030
         assert feature["properties"]["source"] == "HM Land Registry INSPIRE Index Polygons"
