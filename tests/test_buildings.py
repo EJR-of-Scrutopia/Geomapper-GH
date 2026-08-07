@@ -10,7 +10,6 @@ from mapgen.buildings import (
     CELL_SIZE_DEGREES,
     BuildingsFusionRecord,
     _Footprint,
-    _ring_centroid,
     _SpatialIndex,
     _point_in_ring,
     fuse_missing_buildings,
@@ -131,6 +130,41 @@ def _multipolygon_feature(rings, properties=None) -> dict:
     }
 
 
+def _u_shape(lon0: float, lat0: float, size: float = _SQUARE_SIZE) -> list[tuple[float, float]]:
+    """A concave, 8-vertex "U" (opening upward), the review's own minimal
+    repro shape: an entirely ordinary real footprint (a courtyard block,
+    a dormitory wing, an agricultural building with a covered walkway
+    removed), whose vertex-average centroid provably falls in the notch,
+    outside the ring itself.
+    """
+    third = size / 3.0
+    return [
+        (lon0, lat0),
+        (lon0 + size, lat0),
+        (lon0 + size, lat0 + size),
+        (lon0 + size - third, lat0 + size),
+        (lon0 + size - third, lat0 + third),
+        (lon0 + third, lat0 + third),
+        (lon0 + third, lat0 + size),
+        (lon0, lat0 + size),
+    ]
+
+
+def _relation_el(relation_id: int, members, tags) -> ET.Element:
+    element = ET.Element("relation")
+    element.set("id", str(relation_id))
+    for member_type, ref, role in members:
+        member = ET.SubElement(element, "member")
+        member.set("type", member_type)
+        member.set("ref", str(ref))
+        member.set("role", role)
+    for key, value in tags:
+        tag = ET.SubElement(element, "tag")
+        tag.set("k", key)
+        tag.set("v", value)
+    return element
+
+
 def _all_ids(root: ET.Element) -> list[int]:
     return [
         int(element.get("id"))
@@ -183,18 +217,6 @@ def test_point_in_ring_does_not_need_the_ring_explicitly_closed():
     assert _point_in_ring(15.0, 5.0, closed) is False
 
 
-def test_centroid_of_a_square_is_its_middle():
-    assert _ring_centroid(_SQUARE) == pytest.approx((5.0, 5.0))
-
-
-def test_centroid_drops_the_last_equals_first_vertex_before_averaging():
-    closed = [*_SQUARE, _SQUARE[0]]
-    # Averaging all 5 points (the duplicate corner counted twice) would
-    # pull the result away from (5, 5); the brief's own rule ("last-equals-
-    # first vertex dropped") is what keeps it exact.
-    assert _ring_centroid(closed) == pytest.approx((5.0, 5.0))
-
-
 def test_spatial_hash_finds_a_footprint_across_a_cell_border():
     """A footprint whose bounding box spans two grid cells must be found
     by a query landing in EITHER cell, not only the one its own centroid
@@ -224,6 +246,59 @@ def test_spatial_hash_does_not_find_a_footprint_in_an_unrelated_cell():
     index.add(_Footprint(ring=ring))
     far_away = (CELL_SIZE_DEGREES * 10, CELL_SIZE_DEGREES * 10)
     assert index.candidate_centroid_is_covered(far_away) is False
+
+
+# --------------------------------------------------------------------------
+# Code review (task-6-review.md), Critical C1's own fix: `_representative_
+# point` replaces the vertex-average centroid everywhere it served rules
+# (a)/(b), with the one property that actually matters: the point it
+# returns is GUARANTEED interior to the ring, including a concave one.
+# Imported locally in each test (not at module level) so, before this
+# function exists, only these tests fail, not the whole module's collection.
+# --------------------------------------------------------------------------
+
+# A concave "L" whose bounding-box vertical midpoint (y=5.0) lands EXACTLY
+# on two of its own vertices ((10, 5) and (5, 5)): the scanline-grazing
+# case the brief's own fix direction names explicitly.
+_GRAZING_L_SHAPE = [
+    (0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (5.0, 5.0), (5.0, 10.0), (0.0, 10.0),
+]
+
+
+def test_representative_point_of_a_square_is_its_middle():
+    from mapgen.buildings import _representative_point
+
+    assert _representative_point(_SQUARE) == pytest.approx((5.0, 5.0))
+
+
+def test_representative_point_drops_the_last_equals_first_vertex_first():
+    from mapgen.buildings import _representative_point
+
+    closed = [*_SQUARE, _SQUARE[0]]
+    assert _representative_point(closed) == pytest.approx((5.0, 5.0))
+
+
+def test_representative_point_of_a_concave_u_shape_is_guaranteed_interior():
+    from mapgen.buildings import _representative_point
+
+    u_ring = _u_shape(0.0, 0.0, size=12.0)
+    point = _representative_point(u_ring)
+    assert _point_in_ring(point[0], point[1], u_ring) is True
+
+
+def test_representative_point_avoids_a_grazing_scanline_and_stays_interior():
+    """The naive bbox-vertical-midpoint (y=5.0) sits exactly on two of
+    this ring's own vertices; a scanline cast there would either miss
+    those edges or double count them. The fix direction's own nudge (a
+    line strictly between two ADJACENT distinct vertex y-values) must
+    dodge this by construction, landing on y=2.5 instead, still squarely
+    inside the shape's bottom band.
+    """
+    from mapgen.buildings import _representative_point
+
+    point = _representative_point(_GRAZING_L_SHAPE)
+    assert point == pytest.approx((5.0, 2.5))
+    assert _point_in_ring(point[0], point[1], _GRAZING_L_SHAPE) is True
 
 
 # --------------------------------------------------------------------------
@@ -401,6 +476,125 @@ def test_an_osm_with_no_xml_declaration_is_refused(tmp_path):
 
     with pytest.raises(HeightsError):
         fuse_missing_buildings(osm_path, [])
+
+
+# --------------------------------------------------------------------------
+# Code review (task-6-review.md), Critical C1: a vertex-average centroid is
+# not guaranteed interior to a concave ring, so rules (a)/(b) can miss a
+# genuine duplicate, on the first run AND on every rerun. Reproduced here
+# with the review's own minimal U-shape before the fix, then re-asserted
+# after it (see `_representative_point`'s own geometry-core tests below for
+# the replacement mechanism's guarantee).
+# --------------------------------------------------------------------------
+
+
+def test_a_concave_existing_building_duplicated_by_an_exact_retrace_is_deduped_on_the_first_run(
+    tmp_path,
+):
+    """The review's own first-run repro: an EXISTING OSM building that is
+    concave, and an Overture candidate that exactly retraces it (the
+    ordinary "sources: OpenStreetMap" case the module docstring's own
+    "no special-casing by dataset" section claims is handled). Before the
+    fix, the U-shape's own vertex-average centroid sits in its own notch,
+    outside its own ring, so neither rule (a) nor rule (b) ever fires and
+    the retrace is injected as a phantom duplicate.
+    """
+    u_ring = _u_shape(BASE_LON, BASE_LAT)
+    nodes = [_node_el(index + 1, lon, lat) for index, (lon, lat) in enumerate(u_ring)]
+    refs = list(range(1, len(u_ring) + 1)) + [1]
+    way = _way_el(501, refs, [("building", "yes")])
+    osm_path = tmp_path / "site.osm"
+    osm_path.write_text(_dump_osm([*nodes, way]), encoding="utf-8")
+
+    record = fuse_missing_buildings(
+        osm_path,
+        [("overture", [_polygon_feature(u_ring, {"sources": [{"dataset": "OpenStreetMap"}]})])],
+    )
+
+    assert record.written == 0, (
+        "an exact retrace of an existing CONCAVE building must be deduped "
+        "on the very first run, exactly as it already is for a convex one"
+    )
+    assert record.skipped_overlap == 1
+    assert record.kept_existing == 1
+
+
+def test_a_concave_candidate_is_not_duplicated_on_a_second_run(tmp_path):
+    """The review's own rerun repro: a concave candidate injected once,
+    then offered again unchanged. Before the fix, the injected U-shape's
+    own vertex-average centroid (now `kept_existing`) sits outside its
+    own ring, so the second run injects a second, overlapping copy of the
+    same real building instead of writing 0.
+    """
+    osm_path, _ = _write_three_building_osm(tmp_path)
+    u_ring = _u_shape(BASE_LON + 0.02, BASE_LAT + 0.02)
+    candidates = [("overture", [_polygon_feature(u_ring, {"height": 5.0})])]
+
+    first = fuse_missing_buildings(osm_path, candidates)
+    assert first.written == 1
+
+    second = fuse_missing_buildings(osm_path, candidates)
+    assert second.written == 0, "a concave candidate must be idempotent too, not just a square"
+    assert second.skipped_overlap == 1
+
+
+def test_fuse_then_refuse_cycle_is_byte_identical_with_a_concave_candidate_in_the_mix(tmp_path):
+    """The brief's own idempotency section, end to end, with the fixture
+    deliberately including at least one concave candidate alongside an
+    ordinary convex one: a second run over the SAME candidate set must
+    write 0 and leave the `.osm` byte for byte identical, the same
+    property `_fuse_boundaries_step` already guarantees for its own
+    sibling step.
+    """
+    osm_path, _ = _write_three_building_osm(tmp_path)
+    u_ring = _u_shape(BASE_LON + 0.02, BASE_LAT + 0.02)
+    square_ring = _square(BASE_LON + 0.03, BASE_LAT + 0.03)
+    candidates = [
+        ("overture", [_polygon_feature(u_ring), _polygon_feature(square_ring)]),
+    ]
+
+    first = fuse_missing_buildings(osm_path, candidates)
+    assert first.written == 2
+    first_bytes = osm_path.read_bytes()
+
+    second = fuse_missing_buildings(osm_path, candidates)
+    assert second.written == 0
+    second_bytes = osm_path.read_bytes()
+    assert second_bytes == first_bytes, "a second run must leave the file byte-identical"
+
+
+# --------------------------------------------------------------------------
+# Code review (task-6-review.md), Important I1: a building represented as a
+# multipolygon RELATION (tags on the relation, member ways carrying none of
+# their own, the ordinary real-OSM shape) is invisible to the dedup index,
+# which only ever reads `<way>` elements.
+# --------------------------------------------------------------------------
+
+
+def test_a_building_relations_member_way_protects_against_a_duplicate_candidate(tmp_path):
+    """A relation tagged `building=yes` with one `role="outer"` member way
+    (itself untagged, the real-OSM convention this module's own docstring
+    already names elsewhere): a candidate whose interior point falls
+    inside that member way's own ring must be recognised as a duplicate,
+    exactly as it would be for a plain tagged way.
+    """
+    ring = _square(BASE_LON, BASE_LAT)
+    nodes = [_node_el(700 + index, lon, lat) for index, (lon, lat) in enumerate(ring)]
+    member_way = _way_el(750, [700, 701, 702, 703, 700], [])
+    relation = _relation_el(
+        800, [("way", 750, "outer")], [("type", "multipolygon"), ("building", "yes")]
+    )
+    osm_path = tmp_path / "site.osm"
+    osm_path.write_text(_dump_osm([*nodes, member_way, relation]), encoding="utf-8")
+
+    record = fuse_missing_buildings(osm_path, [("overture", [_polygon_feature(ring)])])
+
+    assert record.written == 0, (
+        "a candidate duplicating a building RELATION's own outer member way "
+        "must be deduped, not injected as a phantom overlap"
+    )
+    assert record.skipped_overlap == 1
+    assert record.kept_existing == 1, "the relation itself counts as one existing building"
 
 
 # --------------------------------------------------------------------------

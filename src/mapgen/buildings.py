@@ -15,21 +15,34 @@ completeness backstop underneath them.
 
 A candidate footprint is injected only if BOTH hold:
 
-  (a) its centroid lies inside no ACCEPTED footprint (every existing OSM
-      `building=*` way, resolved through its own node refs, plus every
-      candidate already accepted earlier in this same run), and
-  (b) no accepted footprint's own centroid lies inside the candidate.
+  (a) its own representative interior point lies inside no ACCEPTED
+      footprint (every existing OSM `building=*` way, resolved through
+      its own node refs, plus every candidate already accepted earlier
+      in this same run), and
+  (b) no accepted footprint's own representative interior point lies
+      inside the candidate.
 
 Two directions, not one, because a small candidate sitting entirely inside
-a much larger existing footprint would pass (a) (its own centroid is
+a much larger existing footprint would pass (a) (its own interior point is
 inside the big one) but a huge candidate that entirely SWALLOWS a small
 existing footprint could otherwise slip through under (a) alone (the
-candidate's own centroid might sit outside the small existing shape
+candidate's own interior point might sit outside the small existing shape
 diagonally across the ring): (b) catches that direction by testing the
-existing footprint's centroid against the candidate's own ring instead.
-Centroid-in-polygon, not ring intersection: cheap, and enough to tell
-"this is materially the same building" from "these two happen to touch",
-which is the only distinction fusion needs to make.
+existing footprint's own interior point against the candidate's own ring
+instead. Point-in-polygon, not ring intersection: cheap, and enough to
+tell "this is materially the same building" from "these two happen to
+touch", which is the only distinction fusion needs to make.
+
+The "representative interior point" is `_representative_point`
+(a scanline label-point, guaranteed interior to any simple ring, convex
+or concave), NOT a plain vertex-average centroid: a vertex average is
+cheaper but is not guaranteed to lie inside its own ring once that ring
+is concave (a U-shaped building, a courtyard block, a dormitory wing),
+which let a genuine duplicate escape both rules entirely. See
+`_representative_point`'s own docstring for the fix and the code review
+finding (task-6-review.md, Critical C1) that caught it: a first version
+of this module used the vertex average here and was wrong on 1.74% of
+one real survey's own existing buildings.
 
 Existing OSM building ways are read, never written: their own tags are
 never touched, whatever a candidate at the same place might have called
@@ -41,11 +54,12 @@ never overwrites" rule.
 An Overture feature whose own `sources` list names only `OpenStreetMap`
 is, in practice, a re-trace of a way already in the `.osm`; nothing here
 looks at `sources` to catch that case specially, because the geometry
-test above already catches it: that Overture ring's centroid already
-sits inside the existing OSM way it duplicates, so rule (a) rejects it
-on its own, for the identical reason it rejects a genuinely new footprint
-that happens to overlap something real. The dataset a footprint CAME from
-never enters the dedup decision, only where it IS.
+test above already catches it: that Overture ring's own representative
+point already sits inside the existing OSM way it duplicates, so rule
+(a) rejects it on its own, for the identical reason it rejects a
+genuinely new footprint that happens to overlap something real. The
+dataset a footprint CAME from never enters the dedup decision, only
+where it IS.
 
 ## Idempotency, by the same mechanism, not a second one
 
@@ -162,9 +176,11 @@ class BuildingsFusionRecord:
     were never asked to make.
 
     `kept_existing` is a fact about the file BEFORE this run touched
-    anything: every `building=*` way already there, whatever happened to
-    it next (including, on a second run over the same candidates, every
-    way THIS module itself injected the first time, per the module
+    anything: every existing building already there, whatever happened to
+    it next, whether tagged directly on a `<way>` or on a `<relation>`
+    whose own member ways carry the geometry (code review task-6-review.md,
+    Important I1), including, on a second run over the same candidates,
+    every way THIS module itself injected the first time (per the module
     docstring's idempotency section).
     """
 
@@ -221,18 +237,86 @@ def _drop_closing_duplicate(
     return points
 
 
-def _ring_centroid(ring: Sequence[tuple[float, float]]) -> tuple[float, float]:
-    """The arithmetic mean of `ring`'s own distinct exterior vertices,
-    last-equals-first dropped first (the brief's own definition,
-    verbatim): idempotent to call on a ring `_drop_closing_duplicate` has
-    already been run over, since a ring with no repeated closing point
-    is returned unchanged by that function.
+def _horizontal_spans(
+    ring: Sequence[tuple[float, float]], y: float
+) -> list[tuple[float, float]]:
+    """Every interior span a horizontal line at height `y` cuts through
+    `ring`, as `(x_low, x_high)` pairs in ascending order, under the same
+    even-odd rule `_point_in_ring` itself uses.
+
+    Callers of this function only ever pass a `y` proven not to equal any
+    of `ring`'s own vertex y-values (`_representative_point`'s own
+    construction), so every edge either straddles `y` cleanly or misses
+    it entirely; no edge can lie exactly along it, which is what keeps
+    the crossing count even and the pairing below correct.
+    """
+    crossings: list[float] = []
+    count = len(ring)
+    for index in range(count):
+        x1, y1 = ring[index]
+        x2, y2 = ring[(index + 1) % count]
+        if (y1 > y) != (y2 > y):
+            crossings.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+    crossings.sort()
+    return [
+        (crossings[index], crossings[index + 1])
+        for index in range(0, len(crossings) - 1, 2)
+    ]
+
+
+def _representative_point(ring: Sequence[tuple[float, float]]) -> tuple[float, float]:
+    """A point GUARANTEED interior to `ring`, replacing a plain vertex-
+    average centroid, which is NOT guaranteed interior to a concave ring
+    (code review task-6-review.md, Critical C1: a U-shaped footprint's
+    own vertex average falls squarely in its own notch, outside the ring
+    entirely, which let rules (a)/(b) below miss a genuine duplicate on
+    the very first run and on every rerun).
+
+    The standard label-point scanline: a horizontal line is cast through
+    `ring` at a height strictly between two ADJACENT distinct vertex
+    y-values, chosen as close to the ring's own vertical middle as
+    possible (never through a bare bounding-box midpoint, which can land
+    exactly on a vertex and graze it, the degenerate case
+    `_horizontal_spans` is written to never be asked to handle); the
+    widest of the resulting interior spans is a real, unbroken run of
+    the ring's own interior, and ITS midpoint therefore sits strictly
+    between two points of the ring's own boundary, which is what makes
+    it interior by construction rather than by any property of the
+    ring's own vertex arrangement (convex or not, symmetric or not).
+
+    A ring whose vertices all share one y-value has no vertical extent
+    for a scanline to cut through at all (zero area, not a real
+    polygon); this is treated as the degenerate case it is, falling back
+    to the bounding box's own centre, rather than raising over a shape
+    that should never have passed the caller's own minimum-points check
+    in the first place.
     """
     points = _drop_closing_duplicate(ring)
-    count = len(points)
-    x_sum = sum(x for x, _ in points)
-    y_sum = sum(y for _, y in points)
-    return (x_sum / count, y_sum / count)
+    ys = sorted(set(y for _, y in points))
+    if len(ys) < 2:
+        xs = [x for x, _ in points]
+        return ((min(xs) + max(xs)) / 2.0, ys[0])
+
+    midpoint = (ys[0] + ys[-1]) / 2.0
+    lower, upper = ys[0], ys[-1]
+    for a, b in zip(ys, ys[1:]):
+        if a <= midpoint <= b:
+            lower, upper = a, b
+            break
+    test_y = (lower + upper) / 2.0
+
+    spans = _horizontal_spans(points, test_y)
+    if not spans:
+        # Never reached for a simple polygon (a scanline strictly between
+        # two of its own adjacent vertex y-values always cuts at least one
+        # interior span), but nothing here fabricates a point for
+        # anything self-intersecting or otherwise malformed enough to
+        # defeat that: the bounding box centre is the same honest
+        # fallback the degenerate branch above already uses.
+        xs = [x for x, _ in points]
+        return ((min(xs) + max(xs)) / 2.0, test_y)
+    widest = max(spans, key=lambda span: span[1] - span[0])
+    return ((widest[0] + widest[1]) / 2.0, test_y)
 
 
 def _ring_bbox(ring: Sequence[tuple[float, float]]) -> tuple[float, float, float, float]:
@@ -266,21 +350,24 @@ def _cells_for_bbox(
 
 @dataclass
 class _Footprint:
-    """One accepted footprint's own ring, bounding box and centroid,
-    precomputed once at acceptance time rather than on every later
-    query: an accepted footprint is tested against many later candidates
-    over the life of one `fuse_missing_buildings` call, its own geometry
-    never changes once accepted, so computing it twice would be pure
-    waste.
+    """One accepted footprint's own ring, bounding box and representative
+    interior point (`_representative_point`, GUARANTEED to lie inside
+    `ring` itself, not a plain vertex-average that a concave ring can
+    place outside its own boundary; see that function's own docstring
+    for the code-review finding this replaced), precomputed once at
+    acceptance time rather than on every later query: an accepted
+    footprint is tested against many later candidates over the life of
+    one `fuse_missing_buildings` call, its own geometry never changes
+    once accepted, so computing it twice would be pure waste.
     """
 
     ring: list[tuple[float, float]]
     bbox: tuple[float, float, float, float] = field(init=False)
-    centroid: tuple[float, float] = field(init=False)
+    interior_point: tuple[float, float] = field(init=False)
 
     def __post_init__(self) -> None:
         self.bbox = _ring_bbox(self.ring)
-        self.centroid = _ring_centroid(self.ring)
+        self.interior_point = _representative_point(self.ring)
 
 
 class _SpatialIndex:
@@ -292,34 +379,40 @@ class _SpatialIndex:
     footprints touched, not quadratic in how many exist.
 
     Two bucket maps, not one, because rule (a) and rule (b) ask opposite
-    questions: (a) is answered from the CANDIDATE's own centroid cell,
-    against every footprint whose BOUNDING BOX reaches that cell
+    questions: (a) is answered from the CANDIDATE's own interior-point
+    cell, against every footprint whose BOUNDING BOX reaches that cell
     (`_by_bbox_cell`); (b) is answered from every cell the CANDIDATE's own
-    bounding box spans, against every footprint whose CENTROID falls in
-    one of them (`_by_centroid_cell`). A footprint registered under
-    `_by_bbox_cell` for every cell its box spans is what lets (a) find a
-    footprint whose own centroid sits in a different cell from the one a
-    small candidate's centroid lands in but whose bulk still reaches it,
-    which is the exact "across cell borders" property this module's own
-    tests check for directly.
+    bounding box spans, against every footprint whose INTERIOR POINT falls
+    in one of them (`_by_interior_point_cell`). A footprint registered
+    under `_by_bbox_cell` for every cell its box spans is what lets (a)
+    find a footprint whose own interior point sits in a different cell
+    from the one a small candidate's interior point lands in but whose
+    bulk still reaches it, which is the exact "across cell borders"
+    property this module's own tests check for directly.
     """
 
     def __init__(self) -> None:
         self._by_bbox_cell: dict[tuple[int, int], list[_Footprint]] = defaultdict(list)
-        self._by_centroid_cell: dict[tuple[int, int], list[_Footprint]] = defaultdict(list)
+        self._by_interior_point_cell: dict[tuple[int, int], list[_Footprint]] = defaultdict(list)
 
     def add(self, footprint: _Footprint) -> None:
         for cell in _cells_for_bbox(footprint.bbox):
             self._by_bbox_cell[cell].append(footprint)
-        self._by_centroid_cell[_cell(*footprint.centroid)].append(footprint)
+        self._by_interior_point_cell[_cell(*footprint.interior_point)].append(footprint)
 
-    def candidate_centroid_is_covered(self, centroid: tuple[float, float]) -> bool:
+    def candidate_centroid_is_covered(self, point: tuple[float, float]) -> bool:
         """Rule (a): does any accepted footprint's own ring already
-        contain `centroid`?
+        contain the candidate's own representative point `point`?
+
+        Name kept from this module's first version (the brief's own
+        "centroid" wording) even though `point` is no longer a vertex
+        average: renaming every call site for a private, module-internal
+        method was judged less valuable than keeping this diff reviewable
+        against the finding it fixes.
         """
-        cell = _cell(*centroid)
+        cell = _cell(*point)
         return any(
-            _point_in_ring(centroid[0], centroid[1], footprint.ring)
+            _point_in_ring(point[0], point[1], footprint.ring)
             for footprint in self._by_bbox_cell.get(cell, ())
         )
 
@@ -327,11 +420,11 @@ class _SpatialIndex:
         self, ring: Sequence[tuple[float, float]], bbox: tuple[float, float, float, float]
     ) -> bool:
         """Rule (b): does `ring` already contain some accepted
-        footprint's own centroid?
+        footprint's own representative point?
         """
         for cell in _cells_for_bbox(bbox):
-            for footprint in self._by_centroid_cell.get(cell, ()):
-                if _point_in_ring(footprint.centroid[0], footprint.centroid[1], ring):
+            for footprint in self._by_interior_point_cell.get(cell, ()):
+                if _point_in_ring(footprint.interior_point[0], footprint.interior_point[1], ring):
                     return True
         return False
 
@@ -341,42 +434,116 @@ class _SpatialIndex:
 # --------------------------------------------------------------------------
 
 
+def _resolve_way_ring(
+    way: ET.Element, nodes: dict[str, tuple[float, float]]
+) -> list[tuple[float, float]] | None:
+    """`way`'s own `nd` refs resolved through `nodes` into a ring, its own
+    closing duplicate dropped, or None if any ref does not resolve or
+    fewer than 3 distinct vertices remain: the identical tolerance
+    `heights._footprint_ring` applies to a malformed way, shared here
+    between a plain tagged way and a building relation's own member way
+    (`_existing_building_footprints` below), rather than kept as two
+    copies of the same resolve-then-drop-then-floor logic.
+    """
+    refs = [nd.get("ref") for nd in way.findall("nd")]
+    ring: list[tuple[float, float]] = []
+    for ref in refs:
+        point = nodes.get(ref) if ref is not None else None
+        if point is None:
+            return None
+        ring.append(point)
+    ring = _drop_closing_duplicate(ring)
+    if len(ring) < _MIN_RING_POINTS:
+        return None
+    return ring
+
+
+def _relation_building_member_way_ids(relation: ET.Element) -> list[str]:
+    """Every `<member type="way">` ref a building relation names, for the
+    OUTER ring(s) only when any member's `role` distinguishes outer from
+    inner (an inner member is a hole and is dropped, matching this
+    module's own "holes dropped" rule for a MultiPolygon candidate's
+    interior rings); when no member's role distinguishes them at all
+    (every role empty or absent, real data this module has seen), every
+    member way is used instead, since there is then no signal here at
+    all to tell an outer ring from an inner one.
+    """
+    way_members = [
+        member
+        for member in relation.findall("member")
+        if member.get("type") == "way" and member.get("ref") is not None
+    ]
+    outer_refs = [member.get("ref") for member in way_members if member.get("role") == "outer"]
+    if outer_refs:
+        return outer_refs
+    return [member.get("ref") for member in way_members]
+
+
 def _existing_building_footprints(root: ET.Element) -> tuple[list[_Footprint], int]:
-    """Every `<way>` in `root` already tagged `building=*` (any value, not
-    only `yes`, matching `heights.py`'s own `_BUILDING_TAG_KEY` check),
-    resolved into a footprint through the file's own `<node>` elements.
+    """Every existing building already in `root`, as accepted footprints
+    for rules (a)/(b): every `<way>` tagged `building=*` directly (any
+    value, not only `yes`, matching `heights.py`'s own `_BUILDING_TAG_KEY`
+    check), PLUS every outer member way of a `<relation>` tagged
+    `building=*` (code review task-6-review.md, Important I1: a building
+    represented as a multipolygon relation, tags on the relation and its
+    member ways carrying none of their own, the ordinary real-OSM shape,
+    was previously invisible here, so a candidate exactly duplicating one
+    went undetected on real data).
 
     Returns `(footprints, total)`. `total` is `kept_existing`: literally
-    how many building ways were already in the file, whether or not this
-    function could resolve a usable ring for them. A way whose refs do
-    not all resolve, or whose ring has fewer than 3 distinct vertices once
-    its own closing duplicate is dropped, contributes to `total` but never
-    to `footprints`: it is still a building already in the file (counted),
-    but not a shape the dedup rules below can test against (excluded from
-    the index), the identical tolerance `heights._footprint_ring` applies
-    to a malformed way it folds into `no_data` rather than raising over.
+    how many buildings were already in the file, counting a tagged way
+    and a tagged relation the same way, whether or not this function
+    could resolve a usable ring for either. A way (plain or a relation's
+    own member) whose refs do not all resolve, or whose ring has fewer
+    than 3 distinct vertices once its own closing duplicate is dropped,
+    contributes to `total` but never to `footprints`: it is still a
+    building already in the file (counted), but not a shape the dedup
+    rules below can test against (excluded from the index), the identical
+    tolerance `heights._footprint_ring` applies to a malformed way it
+    folds into `no_data` rather than raising over.
 
-    A `<relation>` multipolygon building (tags on the relation, an outer
-    member way carrying none of its own) is not looked at here at all,
-    matching `heights.py`'s own `relations_skipped` scope limit: this
-    function only reads `<way>` elements.
+    Relation members are read only to grow the accepted set the dedup
+    rules test against; nothing here writes to them, and `heights.py`'s
+    own `relations_skipped` scope limit for the SEPARATE heights-fusion
+    pass is unaffected (a member way still carries no `height` tag of its
+    own to skip past, and this function is never called from there).
     """
     nodes: dict[str, tuple[float, float]] = {}
+    ways_by_id: dict[str, ET.Element] = {}
     for element in root:
-        if element.tag != "node":
-            continue
-        node_id = element.get("id")
-        lat = element.get("lat")
-        lon = element.get("lon")
-        if node_id is None or lat is None or lon is None:
-            continue
-        try:
-            nodes[node_id] = (float(lon), float(lat))
-        except ValueError:
-            continue
+        if element.tag == "node":
+            node_id = element.get("id")
+            lat = element.get("lat")
+            lon = element.get("lon")
+            if node_id is None or lat is None or lon is None:
+                continue
+            try:
+                nodes[node_id] = (float(lon), float(lat))
+            except ValueError:
+                continue
+        elif element.tag == "way":
+            way_id = element.get("id")
+            if way_id is not None:
+                ways_by_id[way_id] = element
 
     footprints: list[_Footprint] = []
     total = 0
+
+    for element in root:
+        if element.tag != "relation":
+            continue
+        tags = element.findall("tag")
+        if not any(tag.get("k") == _BUILDING_TAG_KEY for tag in tags):
+            continue
+        total += 1
+        for way_id in _relation_building_member_way_ids(element):
+            member_way = ways_by_id.get(way_id)
+            if member_way is None:
+                continue
+            ring = _resolve_way_ring(member_way, nodes)
+            if ring is not None:
+                footprints.append(_Footprint(ring=ring))
+
     for element in root:
         if element.tag != "way":
             continue
@@ -384,21 +551,10 @@ def _existing_building_footprints(root: ET.Element) -> tuple[list[_Footprint], i
         if not any(tag.get("k") == _BUILDING_TAG_KEY for tag in tags):
             continue
         total += 1
-        refs = [nd.get("ref") for nd in element.findall("nd")]
-        ring: list[tuple[float, float]] = []
-        resolved = True
-        for ref in refs:
-            point = nodes.get(ref) if ref is not None else None
-            if point is None:
-                resolved = False
-                break
-            ring.append(point)
-        if not resolved:
-            continue
-        ring = _drop_closing_duplicate(ring)
-        if len(ring) < _MIN_RING_POINTS:
-            continue
-        footprints.append(_Footprint(ring=ring))
+        ring = _resolve_way_ring(element, nodes)
+        if ring is not None:
+            footprints.append(_Footprint(ring=ring))
+
     return footprints, total
 
 
@@ -578,9 +734,9 @@ def fuse_missing_buildings(
             rings, invalid_count = _candidate_rings(feature)
             skipped_overlap += invalid_count
             for ring in rings:
-                centroid = _ring_centroid(ring)
+                interior_point = _representative_point(ring)
                 bbox = _ring_bbox(ring)
-                if index.candidate_centroid_is_covered(centroid):
+                if index.candidate_centroid_is_covered(interior_point):
                     skipped_overlap += 1
                     continue
                 if index.an_accepted_centroid_falls_inside(ring, bbox):
