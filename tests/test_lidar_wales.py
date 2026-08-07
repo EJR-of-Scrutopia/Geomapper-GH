@@ -397,6 +397,110 @@ def test_estimate_at_a_small_extent_still_prices_full_resolution(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# _pixels_per_raster(): the level-walk arithmetic detail() and estimate()
+# both stand on. `level` counts quarterings from full resolution (0), the
+# replacement for the old boolean `is_overview` (`is_overview = level > 0`).
+# --------------------------------------------------------------------------
+
+
+def test_pixels_per_raster_returns_level_0_for_a_small_area():
+    from mapgen.sources.lidar_wales import _pixels_per_raster
+
+    pixels, level = _pixels_per_raster(1_000_000.0)
+    # type(level) is int, not merely level == 0: a bool is also == 0 in
+    # Python (False == 0), which would let the old is_overview shape pass
+    # this assertion by accident and hide that the return type never
+    # actually changed.
+    assert type(level) is int
+    assert level == 0
+    assert pixels == 1_000_000.0
+
+
+def test_pixels_per_raster_returns_level_1_at_port_talbots_real_size():
+    # The owner's real Port Talbot survey (6.7 x 3.1 km unpadded): padded
+    # out on egrid.PAD_METRES this clears MAX_WINDOW_PIXELS once and comes
+    # back at overview level 1, the real download's own 2 m result.
+    from mapgen.sources.lidar_wales import _pixels_per_raster
+
+    pixels, level = _pixels_per_raster(20_500_000.0)
+    # Same reasoning as above: True == 1 in Python, so the type check is
+    # what actually distinguishes this from the old is_overview boolean.
+    assert type(level) is int
+    assert level == 1
+    assert pixels == pytest.approx(20_500_000.0 / 4.0)
+
+
+def test_pixels_per_raster_returns_level_2_at_four_times_max_plus_one():
+    from mapgen.cog import MAX_WINDOW_PIXELS
+    from mapgen.sources.lidar_wales import _pixels_per_raster
+
+    pixels, level = _pixels_per_raster(4.0 * MAX_WINDOW_PIXELS + 1)
+    assert level == 2
+    assert pixels <= MAX_WINDOW_PIXELS
+
+
+# --------------------------------------------------------------------------
+# detail(): the computed LiDAR resolution string, reusing covers() and the
+# same padded-area arithmetic estimate() already prices from. Never touches
+# the network, exactly like covers() and estimate() themselves.
+# --------------------------------------------------------------------------
+
+
+def test_detail_touches_no_network_with_no_cache(tmp_path):
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    detail = source.detail(NEAR_TP06_BBOX)
+    assert detail == "1 m at this extent"
+
+
+def test_detail_touches_no_network_with_a_cached_grid(tmp_path, ostn15_fixture_grid):
+    _seed_cache(tmp_path, ostn15_fixture_grid)
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    detail = source.detail(NEAR_TP06_BBOX)
+    assert detail == "1 m at this extent"
+
+
+def test_detail_over_a_small_in_mosaic_extent_is_full_resolution(tmp_path, ostn15_fixture_grid):
+    _seed_cache(tmp_path, ostn15_fixture_grid)
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    assert source.detail(NEAR_TP06_BBOX) == "1 m at this extent"
+
+
+def test_detail_over_a_port_talbot_sized_extent_falls_to_level_1(tmp_path):
+    """Reproduces the owner's real Port Talbot survey: 6.7 x 3.1 km,
+    padded on egrid.PAD_METRES to 7.1 x 3.5 km, which is 24.85 M sq m,
+    over MAX_WINDOW_PIXELS (16,777,216) once and under it after one
+    quartering, level 1, the real download's own 2 m result.
+    """
+    ref_lat = _TP06_LAT
+    width_m, height_m = 6_700.0, 3_100.0
+    delta_lon = math.degrees(width_m / (EARTH_RADIUS_M * math.cos(math.radians(ref_lat))))
+    delta_lat = math.degrees(height_m / EARTH_RADIUS_M)
+    bbox = BBox(
+        west=_TP06_LON - delta_lon / 2.0,
+        south=ref_lat - delta_lat / 2.0,
+        east=_TP06_LON + delta_lon / 2.0,
+        north=ref_lat + delta_lat / 2.0,
+    )
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+
+    detail = source.detail(bbox)
+
+    assert detail is not None
+    assert detail.startswith("2 m at this extent")
+    assert detail == "2 m at this extent (extents under about 4 x 4 km come back at 1 m)"
+
+
+def test_detail_over_paris_is_none(tmp_path):
+    # Same bbox test_resolver.py's own test_paris_lidar_wales_covers_none
+    # already pins to covers() == "none": a source with no coverage here
+    # has no detail to claim.
+    paris_bbox = BBox.parse("2.34,48.85,2.36,48.87")
+    source = LidarWalesSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    assert source.covers(paris_bbox) == "none"
+    assert source.detail(paris_bbox) is None
+
+
+# --------------------------------------------------------------------------
 # fetch(): happy path, skip-on-resume, refusals, cancel, failure kinds.
 # --------------------------------------------------------------------------
 

@@ -254,10 +254,12 @@ def _all_nodata(values) -> bool:
 
 def _pixels_per_raster(
     padded_area_m2: float, max_pixels: int = MAX_WINDOW_PIXELS
-) -> tuple[float, bool]:
+) -> tuple[float, int]:
     """The pixel count one of read_window's two rasters would actually
-    come back at for a padded_area_m2 extent, and whether that count came
-    from an overview level rather than full resolution.
+    come back at for a padded_area_m2 extent, and which level that count
+    came from: 0 is full resolution (1 m), and each increment is one more
+    quartering, i.e. one more doubling of the pixel size read_window would
+    actually deliver (level 1 is 2 m, level 2 is 4 m, and so on).
 
     Mirrors read_window's own finest-first level walk (cog.py) in pure
     arithmetic, with no mosaic open and no network touched: pixels at 1 m
@@ -273,15 +275,51 @@ def _pixels_per_raster(
     reusing MAX_WINDOW_PIXELS here cannot silently drift from the cap
     read_window itself enforces.
 
+    `level` replaces an earlier boolean `is_overview` (`is_overview =
+    level > 0` at every call site): estimate() only ever needed "is this
+    an overview or not" to choose between BYTES_PER_WINDOW_PIXEL and
+    BYTES_PER_OVERVIEW_PIXEL, but detail() needs the count of quarterings
+    itself, to name the pixel size (2**level) the real download would
+    come back at.
+
     Always terminates: each step divides by 4, so the count is eventually
     at or under any positive max_pixels, however large padded_area_m2 is.
     """
     pixels = padded_area_m2
-    is_overview = False
+    level = 0
     while pixels > max_pixels:
         pixels /= 4.0
-        is_overview = True
-    return pixels, is_overview
+        level += 1
+    return pixels, level
+
+
+def _padded_bng_area_m2(bbox: BBox, ostn15_cache_dir: Path | None) -> float:
+    """The padded extent's own area in square metres: BNG-projected when a
+    cached OSTN15 grid lets it be, an equirectangular approximation
+    (`extent_metres`) otherwise. Shared by `estimate()` and `detail()`, so
+    the two can never disagree about which level a given extent falls to:
+    `detail()` names the level `estimate()` itself would price.
+
+    This is deliberately NOT `best_effort_padded_bng_extent` (`bng.py`),
+    the helper `covers()` calls: that one falls back to
+    `approx_padded_bng_extent`'s pseudo-grid projection, built for
+    comparing against `MOSAIC_BOUNDS`'s own BNG coordinates, not for an
+    area figure. `estimate()` established this exact two-tier fallback
+    (a cached grid's real area, or `extent_metres`'s plain
+    width-times-height) before `covers()` existed; see `estimate()`'s own
+    docstring for why the equirectangular approximation is close enough
+    here.
+    """
+    grid = load_ostn15(cache_dir=ostn15_cache_dir)
+    if grid is not None:
+        try:
+            e_min, n_min, e_max, n_max = padded_bng_extent(bbox, grid, PAD_METRES)
+        except BngError:
+            pass
+        else:
+            return (e_max - e_min) * (n_max - n_min)
+    width_m, height_m = extent_metres(bbox)
+    return (width_m + 2.0 * PAD_METRES) * (height_m + 2.0 * PAD_METRES)
 
 
 class LidarWalesSource:
@@ -408,24 +446,43 @@ class LidarWalesSource:
         at all, so the owner's actual wait for a `lidar_wales` package is
         longer than whatever this method reports.
         """
-        grid = load_ostn15(cache_dir=self._ostn15_cache_dir)
-        padded_area_m2 = None
-        if grid is not None:
-            try:
-                e_min, n_min, e_max, n_max = padded_bng_extent(bbox, grid, PAD_METRES)
-            except BngError:
-                padded_area_m2 = None
-            else:
-                padded_area_m2 = (e_max - e_min) * (n_max - n_min)
-        if padded_area_m2 is None:
-            width_m, height_m = extent_metres(bbox)
-            padded_area_m2 = (width_m + 2.0 * PAD_METRES) * (height_m + 2.0 * PAD_METRES)
+        padded_area_m2 = _padded_bng_area_m2(bbox, self._ostn15_cache_dir)
 
-        pixels_per_raster, is_overview = _pixels_per_raster(padded_area_m2)
+        pixels_per_raster, level = _pixels_per_raster(padded_area_m2)
+        is_overview = level > 0
         bytes_per_pixel = BYTES_PER_OVERVIEW_PIXEL if is_overview else BYTES_PER_WINDOW_PIXEL
         bytes_estimate = int(pixels_per_raster * 2.0 * bytes_per_pixel)
         seconds_estimate = max(bytes_estimate / BYTES_PER_SECOND_ESTIMATE, SECONDS_FLOOR)
         return Estimate(bytes_estimate=bytes_estimate, seconds_estimate=seconds_estimate)
+
+    # -- detail --------------------------------------------------------------
+
+    def detail(self, bbox: BBox) -> str | None:
+        """The resolution the real download would deliver for bbox's own
+        padded extent, in the same words `_pixels_per_raster`'s level
+        already implies: "1 m at this extent" at level 0 (full
+        resolution), or "{2**level} m at this extent (extents under about
+        4 x 4 km come back at 1 m)" at any coarser level. None when
+        `covers(bbox)` is "none": a source with no coverage here has no
+        detail to claim.
+
+        Never touches the network: `covers()` and `_padded_bng_area_m2`
+        each read at most a cached OSTN15 grid (`best_effort_padded_bng_
+        extent`, `load_ostn15`), never a live request, the same guarantee
+        `estimate()` itself carries. Reuses `_padded_bng_area_m2`, the
+        exact area figure `estimate()` prices from, so this can never name
+        a level `estimate()`'s own bytes disagree with.
+        """
+        if self.covers(bbox) == "none":
+            return None
+        padded_area_m2 = _padded_bng_area_m2(bbox, self._ostn15_cache_dir)
+        _, level = _pixels_per_raster(padded_area_m2)
+        if level == 0:
+            return "1 m at this extent"
+        return (
+            f"{2 ** level} m at this extent (extents under about 4 x 4 km "
+            "come back at 1 m)"
+        )
 
     # -- fetch ---------------------------------------------------------------
 
