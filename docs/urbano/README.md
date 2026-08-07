@@ -229,6 +229,51 @@ added. `survey.json`'s own `buildings_fusion` block (`written`,
 `from_overture`, `from_os`, `kept_existing`, `skipped_overlap`) is that
 record.
 
+## The categorised boundaries file: filtering by category in Import Geojson File
+
+Phase 2b item A's `<stem>_boundaries_categorised.geojson` (`src/mapgen/package.py`,
+`_categorise_boundaries_step`) is packaged whenever `inspire` is selected,
+beside the plain `<stem>_boundaries.geojson` item 2 already writes. Read it
+the same way as every other GeoJSON in this README, straight into **Import
+Geojson File** (see "Import Geojson File: the Z ordinate is discarded, not
+merely unread" above), and the owner's own workflow from there is the same
+filtering pattern the OS Open section above already covers: set the
+component's property mapping to filter on key `category`, value `garden`
+(or `field`, `housing`, `retail`, `industrial`, `education`, `religious`,
+`allotments`, `water`, `greenspace`, `woodland`, `recreation`, or
+`unclassified`, whichever the extent actually produced; a category with
+nothing in this package simply never appears as a value to filter on) to
+pull that one category's own outlines into the canvas on its own.
+
+**Why filtering to one category still gets a complete, closed set of
+outlines.** Every INSPIRE parcel is classified on its own first, then each
+category's own group of parcels is run through the same curve-deduplication
+machinery `<stem>_boundaries.geojson` itself uses, separately, per category.
+A shared wall between two parcels of the SAME category collapses to one
+line exactly as it does in the plain file. A shared wall between two
+parcels of DIFFERENT categories (a garden backing onto a field, say) is
+kept once under EACH category rather than deduplicated away between them,
+deliberately: filtering the import down to `category = garden` alone still
+draws that shared wall, because the garden side of it is one of the curves
+`garden`'s own group produced, and the same wall reappears, separately,
+under `category = field` for the same reason. Filtering to a single
+category is never left with a gap where a different-category neighbour
+used to close the loop.
+
+**This is an overlay-derived approximation, not a land-use record.** Every
+feature's own `category` property comes from sampling the package's own
+overlay data (fused building footprints, Overture land use, water,
+OS Open Greenspace, OS OpenMapLocal woodland) at points inside each
+parcel, majority rule, never from any authoritative land-use register.
+Each feature's `note` property carries HM Land Registry's own boundary
+caveat verbatim, identical to `_boundaries.geojson`'s (a parcel's own
+extent is HM Land Registry's indicative geometry, category or not); the
+separate, additional honesty statement about the category itself, the
+fixed sentence `derived from map overlay, indicative`, is what
+`survey.json`'s own `boundaries_categories` block carries instead, because
+the category is mapgen's own sampled guess at what sits inside HM Land
+Registry's geometry, not a second fact HM Land Registry itself supplied.
+
 ## The elevation grid, which is how terrain reaches Grasshopper
 
 `<stem>.egrid` (task 39, `src/mapgen/egrid.py`) is the DEM in the only format

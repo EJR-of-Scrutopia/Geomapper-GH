@@ -276,8 +276,9 @@ disease, and the whole-branch review found a third. Assume there are more.
 6. **Scratch directories to delete by hand**, since the permission layer
    denies deletion from the assistant's shells: `C:\Users\Param\mgbench23`
    (around 315 MB), `mgbench`, `mgpar`, `mgstop`, `mgorphan`, `mggap`,
-   `mgstate`, `mgstate2`, `mgwelsh`, `mgtmp1`, and
-   `C:\Users\Param\AppData\Local\Temp\mgrev`. Nothing under
+   `mgstate`, `mgstate2`, `mgwelsh`, `mgtmp1`,
+   `C:\Users\Param\AppData\Local\Temp\mgrev`, and (new, from item A's own
+   Task 4) `C:\Users\Param\mgprobe_cat`. Nothing under
    `C:\Users\Param\Surveys` was touched by any of this.
 
 ## Still on the owner's list, not yet built
@@ -398,14 +399,60 @@ the owner hit drawing a 6.7 x 3.1 km extent over Port Talbot and getting a
 deselected, 285 Node. See the plan's own self-review notes for scope
 (lidar_cardiff's detail string belongs to item D, correctly absent here).
 
+**Phase 2b item A, categorised property boundaries, is built and proven
+end to end (2026-08-07).**
+`docs/superpowers/plans/2026-08-07-mapgen-phase2b-a-categorised-boundaries.md`'s
+four tasks are all complete: the INSPIRE merge additionally persists
+closed parcel rings (`<stem>_parcels.geojson`); `src/mapgen/classify.py`
+classifies each parcel by sampled-majority overlay against the package's
+own fused building footprints, Overture land use and water, and OS Open
+greenspace and woodland; a new package step (`_categorise_boundaries_step`,
+run immediately after buildings fusion) groups parcels by category and
+writes `<stem>_boundaries_categorised.geojson`, each category's own group
+deduplicated separately through the same curve machinery item 2 already
+uses, so a shared wall between two DIFFERENT categories' parcels survives
+once under EACH of them and filtering a Grasshopper import to one category
+alone still gets a complete, closed set of outlines. `survey.json` gains a
+`boundaries_categories` block (`parcels`, `counts`, `samples`, `capped`,
+`note`, `error`), documented in the README alongside a new one-line
+`<stem>_parcels.geojson` entry Task 1 had shipped without docs of its own;
+`docs/urbano/README.md` documents the owner's own filter-by-category
+workflow in Import Geojson File. Two review fix rounds landed before the
+live proof: an unbounded giant overlay ring (Overture's own "sea" feature)
+that never completed against the real Cowbridge package, fixed by an
+overflow list and then by clipping every overlay ring to the parcels' own
+extent, which cut the real Cowbridge step time from 283s to 7s; and a
+building reader that missed multipolygon-relation buildings, fixed by
+reusing the same helper buildings fusion itself already relies on.
+
+A live `run_survey` over the same Cowbridge extent the OS Open live test
+above uses (osm, overture, inspire and os_open together, both the OS Open
+shard cache and the INSPIRE zip cache warm) confirms the whole chain on
+disk at once: 2,133 real parcels classified, twelve categories in total:
+housing (1,626), garden (229), retail (103), field (56), seven smaller
+ones (greenspace, woodland, education, recreation, industrial, religious,
+water) and 58 unclassified. garden+field+housing is a clear majority
+(1,911 of 2,075) of the classified parcels, and the file itself holds
+6,769 curve features in 3.4 MB (`<stem>_boundaries_categorised.geojson`).
+Wall time varied 37.37s to 80.91s across two consecutive runs, real
+network round-trip variance on the warm-cache listing/handshake calls
+`os_open` and `inspire` still make even with nothing left to download;
+every count above was byte identical between the two runs. This is
+pending the whole-branch
+review that has closed every prior build item before it shipped; nothing
+here should be treated as final until that review runs.
+
 **Next up, per the addendum's own build order
 (`docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`):
-item A, categorised property boundaries.** INSPIRE parcels carry no
-land-use class today; item A classifies each parcel by overlay against
-data the package already holds (building presence, Overture land use,
-water, OS Open Greenspace, OS OpenMapLocal woodland) and writes a
-category-deduplicated `<stem>_boundaries_categorised.geojson` beside the
-existing fully-deduped file. No task briefs exist for it yet.
+item B, roof forms and canopy from the LiDAR, the flagship item.** Its own
+spec section ("Item B") now carries an owner-added resolution gate (roof
+fitting runs only when the package's own LiDAR is at the 1 m level, never
+a coarser overview) and a spike-validation requirement (outlier-robust
+plane fitting, a per-building fit-quality score recorded in the output,
+and a live check against buildings the owner can verify against reality),
+both added 2026-08-07 and both binding on whatever plan gets written for
+it; read the spec itself for what each actually requires rather than this
+summary. No task briefs exist for it yet.
 
 **Watch-items, carried forward and added to.** The int16 GDAL_METADATA
 scale/offset refusal deferred at Wales LiDAR's own Task 3 (`cog.py`) still
