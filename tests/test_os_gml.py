@@ -403,3 +403,230 @@ def test_iter_oml_features_yields_one_feature_without_reading_the_whole_stream()
     assert first.feature_type == "Building"
     position_after_one = fh.tell()
     assert position_after_one < len(data) // 2
+
+
+# --------------------------------------------------------------------------
+# Review findings, round 1.
+#
+# Critical: corrupt-but-well-formed-XML GML content (odd posList, empty/
+# self-closing posList or pos, non-numeric coordinate token, non-numeric
+# RoadLink length) must raise OsOpenError kind "parse" naming the feature
+# type and gml id, never a raw IndexError/AttributeError/ValueError. Each
+# hostile shape below is one of the review's own named cases, wrapped in
+# the smallest valid FeatureCollection that can carry it (never the
+# committed fixtures, which stay clean real-data samples).
+#
+# Important: a file whose root is not os:FeatureCollection must raise
+# OsOpenError kind "parse" rather than silently yielding nothing.
+# --------------------------------------------------------------------------
+
+_OML_WRAPPER_HEAD = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<os:FeatureCollection xmlns:os="http://namespaces.os.uk/product/1.0" '
+    'xmlns:oml="http://namespaces.os.uk/open/oml/1.0" '
+    'xmlns:gml="http://www.opengis.net/gml/3.2">'
+)
+_OML_WRAPPER_TAIL = "</os:FeatureCollection>"
+
+_ROADS_WRAPPER_HEAD = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<os:FeatureCollection xmlns:os="http://namespaces.os.uk/product/1.0" '
+    'xmlns:road="http://namespaces.os.uk/Open/Roads/1.0" '
+    'xmlns:net="urn:x-inspire:specification:gmlas:Network:3.2" '
+    'xmlns:gml="http://www.opengis.net/gml/3.2">'
+)
+_ROADS_WRAPPER_TAIL = "</os:FeatureCollection>"
+
+
+def _oml_features_from_body(body: str):
+    data = (_OML_WRAPPER_HEAD + body + _OML_WRAPPER_TAIL).encode("utf-8")
+    return list(os_gml.iter_oml_features(io.BytesIO(data)))
+
+
+def _road_features_from_body(body: str):
+    data = (_ROADS_WRAPPER_HEAD + body + _ROADS_WRAPPER_TAIL).encode("utf-8")
+    return list(os_gml.iter_road_features(io.BytesIO(data)))
+
+
+_BUILDING_WITH_ODD_POSLIST = (
+    '<os:featureMember><oml:Building gml:id="idBAD00001-0000-0000-0000-000000000000">'
+    "<oml:geometry><gml:Surface "
+    'gml:id="idBAD00001-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing>"
+    "<gml:posList>290000 165000 290010</gml:posList>"
+    "</gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></gml:Surface>"
+    "</oml:geometry><oml:featureCode>15014</oml:featureCode>"
+    "</oml:Building></os:featureMember>"
+)
+
+_BUILDING_WITH_EMPTY_POSLIST_IN_RING = (
+    '<os:featureMember><oml:Building gml:id="idBAD00002-0000-0000-0000-000000000000">'
+    "<oml:geometry><gml:Surface "
+    'gml:id="idBAD00002-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing>"
+    "<gml:posList/>"
+    "</gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></gml:Surface>"
+    "</oml:geometry><oml:featureCode>15014</oml:featureCode>"
+    "</oml:Building></os:featureMember>"
+)
+
+_RAILWAY_TRACK_WITH_EMPTY_POSLIST = (
+    '<os:featureMember><oml:RailwayTrack gml:id="idBAD00003-0000-0000-0000-000000000000">'
+    '<oml:classification codeSpace="x">Single Track</oml:classification>'
+    "<oml:geometry><gml:LineString "
+    'gml:id="idBAD00003-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:posList/>"
+    "</gml:LineString></oml:geometry>"
+    "</oml:RailwayTrack></os:featureMember>"
+)
+
+_NAMED_PLACE_WITH_EMPTY_POS = (
+    '<os:featureMember><oml:NamedPlace gml:id="idBAD00004-0000-0000-0000-000000000000">'
+    "<oml:distinctiveName>Bad Place</oml:distinctiveName>"
+    '<oml:classification codeSpace="x">Populated Place</oml:classification>'
+    "<oml:geometry><gml:Point "
+    'gml:id="idBAD00004-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:pos/>"
+    "</gml:Point></oml:geometry>"
+    "</oml:NamedPlace></os:featureMember>"
+)
+
+_NAMED_PLACE_WITH_ONE_COORDINATE_POS = (
+    '<os:featureMember><oml:NamedPlace gml:id="idBAD00005-0000-0000-0000-000000000000">'
+    "<oml:distinctiveName>Bad Place</oml:distinctiveName>"
+    '<oml:classification codeSpace="x">Populated Place</oml:classification>'
+    "<oml:geometry><gml:Point "
+    'gml:id="idBAD00005-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:pos>295661</gml:pos>"
+    "</gml:Point></oml:geometry>"
+    "</oml:NamedPlace></os:featureMember>"
+)
+
+_BUILDING_WITH_NON_NUMERIC_TOKEN = (
+    '<os:featureMember><oml:Building gml:id="idBAD00006-0000-0000-0000-000000000000">'
+    "<oml:geometry><gml:Surface "
+    'gml:id="idBAD00006-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing>"
+    "<gml:posList>290000 165000 abc 165005 290005 165005 290000 165000</gml:posList>"
+    "</gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></gml:Surface>"
+    "</oml:geometry><oml:featureCode>15014</oml:featureCode>"
+    "</oml:Building></os:featureMember>"
+)
+
+_ROADLINK_WITH_NON_NUMERIC_LENGTH = (
+    '<os:featureMember><road:RoadLink gml:id="idBAD00007-0000-0000-0000-000000000000">'
+    "<net:centrelineGeometry><gml:LineString "
+    'gml:id="idBAD00007-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:posList>300000 170000 300010 170010</gml:posList>"
+    "</gml:LineString></net:centrelineGeometry>"
+    '<road:length uom="m">notanumber</road:length>'
+    "</road:RoadLink></os:featureMember>"
+)
+
+
+def test_odd_count_poslist_raises_os_open_error_kind_parse_not_a_raw_index_error():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_BUILDING_WITH_ODD_POSLIST)
+    assert exc_info.value.kind == "parse"
+
+
+def test_empty_poslist_in_a_ring_raises_os_open_error_kind_parse_not_a_raw_attribute_error():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_BUILDING_WITH_EMPTY_POSLIST_IN_RING)
+    assert exc_info.value.kind == "parse"
+
+
+def test_empty_poslist_in_a_linestring_raises_os_open_error_kind_parse():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_RAILWAY_TRACK_WITH_EMPTY_POSLIST)
+    assert exc_info.value.kind == "parse"
+
+
+def test_empty_pos_raises_os_open_error_kind_parse_not_a_raw_attribute_error():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_NAMED_PLACE_WITH_EMPTY_POS)
+    assert exc_info.value.kind == "parse"
+
+
+def test_pos_with_one_coordinate_raises_os_open_error_kind_parse_not_a_raw_value_error():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_NAMED_PLACE_WITH_ONE_COORDINATE_POS)
+    assert exc_info.value.kind == "parse"
+
+
+def test_non_numeric_poslist_token_raises_os_open_error_kind_parse_not_a_raw_value_error():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_BUILDING_WITH_NON_NUMERIC_TOKEN)
+    assert exc_info.value.kind == "parse"
+
+
+def test_roadlink_non_numeric_length_raises_os_open_error_kind_parse_not_a_raw_value_error():
+    with pytest.raises(OsOpenError) as exc_info:
+        _road_features_from_body(_ROADLINK_WITH_NON_NUMERIC_LENGTH)
+    assert exc_info.value.kind == "parse"
+
+
+def test_malformed_feature_error_names_the_feature_type_and_gml_id_never_a_url():
+    with pytest.raises(OsOpenError) as exc_info:
+        _oml_features_from_body(_BUILDING_WITH_ODD_POSLIST)
+    message = str(exc_info.value)
+    assert "Building" in message
+    assert "idBAD00001-0000-0000-0000-000000000000" in message
+    assert "http://" not in message
+    assert "https://" not in message
+
+
+def test_a_malformed_feature_does_not_silently_drop_earlier_good_features():
+    # Fail-the-whole-stream (this task's deliberate choice; see the report)
+    # still must not withhold features already yielded before the failure.
+    body = _OML_SAMPLE_GOOD_BUILDING + _BUILDING_WITH_ODD_POSLIST
+    seen = []
+    with pytest.raises(OsOpenError):
+        for feature in os_gml.iter_oml_features(
+            io.BytesIO((_OML_WRAPPER_HEAD + body + _OML_WRAPPER_TAIL).encode("utf-8"))
+        ):
+            seen.append(feature)
+    assert len(seen) == 1
+    assert seen[0].feature_type == "Building"
+    assert seen[0].feature_id == "idGOOD0001-0000-0000-0000-000000000000"
+
+
+_OML_SAMPLE_GOOD_BUILDING = (
+    '<os:featureMember><oml:Building gml:id="idGOOD0001-0000-0000-0000-000000000000">'
+    "<oml:geometry><gml:Surface "
+    'gml:id="idGOOD0001-0" srsName="urn:ogc:def:crs:EPSG::27700" srsDimension="2">'
+    "<gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing>"
+    "<gml:posList>290000 165000 290010 165000 290010 165010 290000 165010 290000 165000"
+    "</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches>"
+    "</gml:Surface></oml:geometry>"
+    "<oml:featureCode>15014</oml:featureCode>"
+    "</oml:Building></os:featureMember>"
+)
+
+
+# --------------------------------------------------------------------------
+# Important finding: root element validation.
+# --------------------------------------------------------------------------
+
+
+def test_a_non_featurecollection_root_raises_os_open_error_kind_parse():
+    data = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<foo:Bar xmlns:foo="urn:foo"><foo:Baz/></foo:Bar>'
+    ).encode("utf-8")
+    with pytest.raises(OsOpenError) as exc_info:
+        list(os_gml.iter_oml_features(io.BytesIO(data)))
+    assert exc_info.value.kind == "parse"
+
+
+def test_wrong_root_error_names_the_product_never_a_url():
+    data = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<foo:Bar xmlns:foo="urn:foo"><foo:Baz/></foo:Bar>'
+    ).encode("utf-8")
+    with pytest.raises(OsOpenError) as exc_info:
+        list(os_gml.iter_oml_features(io.BytesIO(data)))
+    message = str(exc_info.value)
+    assert "OpenMapLocal" in message
+    assert "http://" not in message
+    assert "https://" not in message

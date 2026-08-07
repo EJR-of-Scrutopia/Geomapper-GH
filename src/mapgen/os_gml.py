@@ -116,6 +116,79 @@ but the failure that ends the stream is always `OsOpenError` kind
 `"parse"`, naming the OS Open product being read, never a URL (this
 module is never given one to begin with: see the module's own inputs,
 above) and never the raw stdlib exception.
+
+## Malformed feature content: OsOpenError, and the whole stream stops
+
+A GML stream can be perfectly well-formed XML while the GML CONTENT
+inside one feature is not usable: an odd number of posList tokens, an
+empty or self-closing `posList`/`pos`, a non-numeric coordinate token, or
+a RoadLink `length` that will not parse as a float. A review (task-2-
+review.md, Critical finding 1) found the first version of this module let
+every one of these escape as a raw `IndexError`/`AttributeError`/
+`ValueError` instead of `OsOpenError`, narrowing this task's own "never a
+raw exception" contract down to "never a raw `ET.ParseError`" only, and
+regressing the exact "wrap every escaping exception" rule commit 1e99afb
+had just established for `os_downloads.py` on this same task.
+
+The fix wraps only the per-feature `OsFeature(...)` construction (`_geometry`
+plus the property extractor) in `except OsOpenError: raise` followed by a
+deliberate `except Exception:` catch-all, the same shape `os_downloads.
+py`'s own `_get_json`/`download_entry` already use and for the same
+reason their own docstrings give: enumerating "the exception types we
+happened to think of" has already been proven, on this exact task, to
+miss one. The re-raised `OsOpenError` (kind `"parse"`) names the OS Open
+product, the feature's own local type, and its `gml:id`, never the raw
+exception or a URL.
+
+This is a DELIBERATE divergence from inspire.py's own `_MalformedParcel`,
+which counts a malformed HMLR parcel and moves on rather than failing the
+whole walk. inspire.py's own comments treat that as ordinary: real HMLR
+parcel data is known, from experience, to carry the occasional bad ring
+among tens of thousands of good ones. OS Open GML has no equivalent
+documented history, and task-2-review.md's own decisive real-data pass
+found none either: the entire real 361 MB OpenMapLocal SS.gml, 372,501
+`featureMember`s, parsed with zero malformed features of any kind. The
+plausible cause the review names for this failure mode, a download
+truncated or bit-flipped in a way that still leaves the XML itself
+syntactically closed, is evidence about the WHOLE transfer, not about one
+row: inspire.py's own `_extract_rings` already draws exactly this
+distinction for a wrong `srsName` ("a different projection is not one bad
+row, it is evidence that every coordinate already read out was never in
+the projection this function assumed", raising immediately rather than
+counting), and a single corrupted feature in an OS Open file is read here
+the same way, not as inspire.py's per-parcel case. Continuing to yield
+"successfully parsed" features from a stream already proven to contain at
+least one corrupted one would risk handing Task 3/4 silently-wrong
+geometry from features a bit-flip corrupted WITHOUT tripping any
+exception at all (a flipped digit that is still a valid float), which
+stopping on the first proven-bad feature at least bounds.
+
+## Root validation, and the one limitation this module accepts
+
+`_walk_features` checks the root element's own tag against
+`_FEATURE_COLLECTION_TAG` (`os:FeatureCollection` in the shared OS
+product namespace) immediately after obtaining it, before looking at a
+single `featureMember`, and raises `OsOpenError` kind `"parse"` naming
+what was found instead if it does not match (task-2-review.md, Important
+finding 2, first half: a file that is not OS Open GML at all used to
+yield an empty list silently).
+
+The second half of that finding, a VALID file from the WRONG OS Open
+product handed to the wrong reader (a real OpenRoads file passed to
+`iter_oml_features`), is NOT separately detected and is a deliberate,
+accepted limitation, not an oversight: all three products share the exact
+same root tag (see "the common wrapper" above), so the root check above
+cannot distinguish them, and the only per-product signal left, the
+feature elements' own namespace, is exactly what `wanted.get(local_name)`
+already filters on for its ordinary job of skipping feature types a
+reader does not want. Handing OpenRoads to `iter_oml_features` therefore
+still yields zero features, indistinguishable from a genuinely empty
+survey area, exactly like every other "recognised wrapper, nothing this
+reader wants inside it" case. A caller that needs to catch a wrong-
+reader-for-product wiring bug earlier than "an unexpectedly empty layer"
+must do so above this module, for example by checking which product
+produced the zip a `ZipReader` member name came from before ever handing
+its stream to one of these three functions.
 """
 
 from __future__ import annotations
@@ -132,6 +205,7 @@ _OML_NS = "http://namespaces.os.uk/open/oml/1.0"
 _ROAD_NS = "http://namespaces.os.uk/Open/Roads/1.0"
 _OGSP_NS = "http://namespaces.ordnancesurvey.co.uk/Open/Greenspace/1.0"
 
+_FEATURE_COLLECTION_TAG = f"{{{_OS_NS}}}FeatureCollection"
 _FEATURE_MEMBER_TAG = f"{{{_OS_NS}}}featureMember"
 
 _GML_ID = f"{{{_GML_NS}}}id"
@@ -357,6 +431,14 @@ def _walk_features(
     try:
         context = ET.iterparse(fh, events=("start", "end"))
         _, root = next(context)
+        if root.tag != _FEATURE_COLLECTION_TAG:
+            raise OsOpenError(
+                f"This does not look like an OS Open {product} GML file: its "
+                f"root element is {_local_name(root.tag)!r}, not "
+                f"{_local_name(_FEATURE_COLLECTION_TAG)!r} in the OS product "
+                f"namespace every OS Open GML file shares.",
+                kind="parse",
+            )
         for event, elem in context:
             if event != "end" or elem.tag != _FEATURE_MEMBER_TAG:
                 continue
@@ -368,12 +450,37 @@ def _walk_features(
                 extractor = wanted.get(local_name)
                 if extractor is None:
                     continue
-                feature = OsFeature(
-                    feature_id=feature_elem.get(_GML_ID, ""),
-                    feature_type=local_name,
-                    geometry=_geometry(feature_elem),
-                    properties=extractor(feature_elem),
-                )
+                try:
+                    feature = OsFeature(
+                        feature_id=feature_elem.get(_GML_ID, ""),
+                        feature_type=local_name,
+                        geometry=_geometry(feature_elem),
+                        properties=extractor(feature_elem),
+                    )
+                except OsOpenError:
+                    raise
+                except Exception:
+                    # A deliberate catch-all, not a named list of exception
+                    # types (IndexError from an odd posList, AttributeError
+                    # from an empty/self-closing posList or pos, ValueError
+                    # from a non-numeric token or a RoadLink length that
+                    # will not parse as a float): the same reasoning
+                    # os_downloads.py's own _get_json/download_entry give
+                    # for their own catch-alls, and the exact rule commit
+                    # 1e99afb established for this whole task the same
+                    # day, that this module's first version narrowed back
+                    # down to "every ET.ParseError" only. See the module
+                    # docstring's own "malformed feature content" section
+                    # for why this fails the WHOLE stream rather than
+                    # counting and skipping the one feature, the choice
+                    # inspire.py's own _MalformedParcel makes instead.
+                    raise OsOpenError(
+                        f"This {product} GML file's {local_name} "
+                        f"{feature_elem.get(_GML_ID, '')!r} carries GML "
+                        f"content this reader could not parse (a malformed "
+                        f"geometry or property value).",
+                        kind="parse",
+                    ) from None
             finally:
                 elem.clear()
                 root.clear()
