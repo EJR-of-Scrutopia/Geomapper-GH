@@ -2658,6 +2658,128 @@ function ok(condition, message) {
     }
   );
 
+  // =======================================================================
+  // Phase 2b item C, Task 3: the base entry's own "detail" field, when
+  // present, renders comma-joined after the base name and before
+  // everything else on the line. Only sources[0]'s detail is ever shown;
+  // a fill or reference entry's detail stays payload-only, since showing
+  // every entry's detail would triple the line for what the package
+  // actually gets, which is the base's quality.
+  // =======================================================================
+
+  await test(
+    "a base entry's detail renders comma-joined after its name and before any filled-by segment",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      sandbox.renderResolution([
+        {
+          category: "terrain",
+          sources: [
+            {
+              id: "lidar_wales",
+              display_name: "LiDAR terrain (Wales, 1 m)",
+              tier: 1,
+              coverage: "full",
+              role: "base",
+              detail: "2 m at this extent (extents under about 4 x 4 km come back at 1 m)",
+            },
+            {
+              id: "copernicus_glo30",
+              display_name: "Elevation (Copernicus GLO-30)",
+              tier: 2,
+              coverage: "full",
+              role: "fill",
+            },
+          ],
+        },
+      ]);
+      const html = sandbox.document.getElementById("tier-list").innerHTML;
+      const expected =
+        "<div>terrain: LiDAR terrain (Wales, 1 m), " +
+        "2 m at this extent (extents under about 4 x 4 km come back at 1 m), " +
+        "filled by Elevation (Copernicus GLO-30)</div>";
+      ok(html === expected, `unexpected tier list markup:\n  got:      ${html}\n  expected: ${expected}`);
+    }
+  );
+
+  await test(
+    "a base entry with no detail renders exactly as today, even when a FILL entry beside it has one",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      sandbox.renderResolution([
+        {
+          category: "buildings",
+          sources: [
+            { id: "osm", display_name: "OpenStreetMap", tier: 1, coverage: "full", role: "base" },
+            {
+              id: "os_open",
+              display_name: "OS Open",
+              tier: 2,
+              coverage: "partial",
+              role: "fill",
+              detail: "should never reach the rendered line",
+            },
+          ],
+        },
+      ]);
+      const html = sandbox.document.getElementById("tier-list").innerHTML;
+      const expected = "<div>buildings: OpenStreetMap, filled by OS Open (partial coverage here)</div>";
+      ok(html === expected, `unexpected tier list markup:\n  got:      ${html}\n  expected: ${expected}`);
+      ok(
+        !html.includes("should never reach"),
+        `a fill entry's own detail must not render, got: ${html}`
+      );
+    }
+  );
+
+  await test(
+    "a base entry with both partial coverage and detail orders as name, coverage caveat, then detail",
+    async () => {
+      const { sandbox } = await bootedSandbox();
+      sandbox.renderResolution([
+        {
+          category: "terrain",
+          sources: [
+            {
+              id: "lidar_wales",
+              display_name: "LiDAR terrain (Wales, 1 m)",
+              tier: 1,
+              coverage: "partial",
+              role: "base",
+              detail: "2 m at this extent",
+            },
+          ],
+        },
+      ]);
+      const html = sandbox.document.getElementById("tier-list").innerHTML;
+      const expected =
+        "<div>terrain: LiDAR terrain (Wales, 1 m) (partial coverage here), 2 m at this extent</div>";
+      ok(html === expected, `unexpected tier list markup:\n  got:      ${html}\n  expected: ${expected}`);
+    }
+  );
+
+  await test("a hostile detail string is HTML-escaped before being rendered", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.renderResolution([
+      {
+        category: "terrain",
+        sources: [
+          {
+            id: "lidar_wales",
+            display_name: "LiDAR terrain",
+            tier: 1,
+            coverage: "full",
+            role: "base",
+            detail: "<script>alert(1)</script> & Sons",
+          },
+        ],
+      },
+    ]);
+    const html = sandbox.document.getElementById("tier-list").innerHTML;
+    ok(!html.includes("<script>"), `expected the raw tag in detail to be escaped, got: ${html}`);
+    ok(html.includes("&lt;script&gt;"), `expected an escaped form present, got: ${html}`);
+  });
+
   function estimateResponse(resolution) {
     return {
       tiles: 1,

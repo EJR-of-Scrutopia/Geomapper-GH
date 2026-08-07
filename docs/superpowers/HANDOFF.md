@@ -377,6 +377,36 @@ stand. This is pending the whole-branch review that has closed every prior
 build item before it shipped; nothing here should be treated as final until
 that review runs.
 
+**Phase 2b item C, per-source detail preview in the UI, is built and
+shipped (2026-08-07).**
+`docs/superpowers/plans/2026-08-07-mapgen-phase2b-c-detail-preview.md`'s
+three tasks are all complete: `lidar_wales.detail()` computes, from the
+same quartering walk `estimate()` already mirrors, the raster level a
+real download would actually use for this extent and names it (`1 m at
+this extent`, or `2 m at this extent (extents under about 4 x 4 km come
+back at 1 m)`, and so on for the genuinely huge); the other six sources
+(`elevation`, `os_open`, `osm`, `overture`, `inspire`, `os_uprn`) carry a
+fixed, honest sentence each; `resolver.py`'s resolution entries gain the
+optional `detail` key wherever a source implements it, carried through to
+both the estimate payload and `survey.json`; and the tier list in the web
+UI appends the base entry's own detail (`sources[0]`, comma-joined after
+its name, before any `filled by`/`reference` segment; a fill or reference
+entry's own detail stays payload-only, since showing every entry's would
+triple the line for what the package actually gets). This closes the gap
+the owner hit drawing a 6.7 x 3.1 km extent over Port Talbot and getting a
+2 m raster with no warning why. Full suites green: 1760 Python passed / 16
+deselected, 285 Node. See the plan's own self-review notes for scope
+(lidar_cardiff's detail string belongs to item D, correctly absent here).
+
+**Next up, per the addendum's own build order
+(`docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`):
+item A, categorised property boundaries.** INSPIRE parcels carry no
+land-use class today; item A classifies each parcel by overlay against
+data the package already holds (building presence, Overture land use,
+water, OS Open Greenspace, OS OpenMapLocal woodland) and writes a
+category-deduplicated `<stem>_boundaries_categorised.geojson` beside the
+existing fully-deduped file. No task briefs exist for it yet.
+
 **Watch-items, carried forward and added to.** The int16 GDAL_METADATA
 scale/offset refusal deferred at Wales LiDAR's own Task 3 (`cog.py`) still
 needs to land before any 16-bit mosaic path is pointed at: right now a
@@ -408,17 +438,18 @@ Task 4's cold run: the first real owner run that ticks addresses is what
 will measure them, the same way Task 4's own cold Cowbridge run measured
 `os_open`'s.
 
-Next action, in the order the owner approved in the 2026-08-07 working
-session that produced this plan (their own spec documents do not exist yet
-and are themselves the next docs to write, not something already sitting in
-`docs/superpowers/specs/`): (a) a spec addendum for categorised property
-boundaries, roof forms read off the DSM, canopy positions, and a Grasshopper
-GeoTIFF reader script; (b) a benchmark design for an OS comparison, a
-dev-mode comparison against OS's own paid developer tooling, to calibrate
-the tier resolver's own tier tables against a second opinion; then (c) phase
-2 item 4, DataMapWales constraints and Cadw designations together with
-planning.data.gov.uk for England, which the existing
-`docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md` already covers.
+The addendum this section used to describe as not yet written now exists:
+`docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`
+covers items A through F, owner-approved, with its own build order. Item
+C (detail preview) is shipped, see above. **Next action: item A,
+categorised property boundaries.** Then item B (roofs and canopy from the
+LiDAR, the flagship), item D (Cardiff 25 cm LiDAR, needs its own live
+probe first), item F (the OS benchmark, after A-D so it measures the
+finished stack), and item E (full-resolution LiDAR rasters) only if the
+owner opens that gate. Phase 2 item 4, DataMapWales constraints and Cadw
+designations together with planning.data.gov.uk for England, follows the
+addendum unless the owner reorders; its own design already sits in
+`docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md`.
 
 ## Standing constraints
 

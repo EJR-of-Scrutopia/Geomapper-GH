@@ -2349,10 +2349,15 @@ function tierLineText(entry) {
   const sources = entry.sources || [];
   if (!sources.length) return "";
   const [first, ...rest] = sources;
-  let line =
-    first.role === "reference"
-      ? `${label}: reference: ${tierSourceName(first)}`
-      : `${label}: ${tierSourceName(first)}`;
+  // The base's own detail, when present, is the only one this line ever
+  // shows: it slots in right after the base name (and after the partial-
+  // coverage caveat, if that's also present), before "filled by" or
+  // "reference" segments for anything behind it. A fill or reference
+  // entry's own detail stays payload-only; rendering every entry's detail
+  // would triple the line for what the package actually gets, which is
+  // the base's quality.
+  const baseName = first.detail ? `${tierSourceName(first)}, ${first.detail}` : tierSourceName(first);
+  let line = first.role === "reference" ? `${label}: reference: ${baseName}` : `${label}: ${baseName}`;
   for (const source of rest) {
     line +=
       source.role === "reference"
