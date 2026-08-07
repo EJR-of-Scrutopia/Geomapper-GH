@@ -569,20 +569,75 @@ class ElevationSource:
 
     # -- detail (mapgen.resolver) ---------------------------------------------
 
-    def detail(self, bbox: BBox) -> str:
-        """The spec's own resolution copy, verbatim, for the default
-        COP30 model this class attribute set is built around.
+    def _model_description(self, model) -> str:
+        """The parenthesised half of detail()'s own string for a
+        non-Copernicus model: `model`'s own label, with the id it starts
+        with and the resolution figure it restates (both already said
+        elsewhere in detail()'s own output) stripped out, and any
+        "(default)" annotation (a GET /api/sources UI hint, not a fact
+        about the dataset) removed too.
 
-        Fixed regardless of bbox: resolve() only ever calls this on a
-        source whose covers(bbox) was not "none" for the same bbox
-        (mapgen.resolver's own candidate filter, see sources/base.py's
-        own docstring on this optional extension), and this source
-        covers every bbox at the one ground sample distance its
-        configured model reads at, so there is no bbox-dependent answer
-        to give and no covers() gate needed here either. Never touches
-        the network, trivially: nothing here reads anything at all.
+        Reuses the label's own words rather than inventing a second,
+        parallel description of the same seven-model table two different
+        ways: whoever wrote elevation_models.py already chose "bare
+        earth terrain", "surface model" and so on, and duplicating that
+        judgement here is exactly the kind of second copy this project's
+        "one vocabulary, read from one place" rule (elevation_models.py's
+        own module docstring) exists to prevent.
+
+        Falls back to demtype itself if stripping leaves nothing (an
+        unrecognised demtype's own synthetic label IS just its id; see
+        model_for's own docstring), so detail() never returns an empty
+        parenthesis.
         """
-        return "30 m (Copernicus GLO-30)"
+        label = model.label.replace(" (default)", "")
+        resolution_token = f"{self._resolution_m:g} m"
+        parts = [part.strip() for part in label.split(",")]
+        kept = [part for part in parts if part not in (self.demtype, resolution_token)]
+        return ", ".join(kept) or self.demtype
+
+    def detail(self, bbox: BBox) -> str:
+        """This INSTANCE's own configured model, named honestly: its own
+        ground sample distance and its own dataset name, never the
+        default's.
+
+        Built from self.demtype, self._resolution_m and
+        model_for(self.demtype).label, the same three facts __init__
+        already reads to set licence/attribution/_resolution_m for
+        whichever model configure() chose (see its own docstring): a
+        review finding caught an earlier version of this method
+        returning the fixed literal "30 m (Copernicus GLO-30)"
+        regardless of self.demtype, which stayed true for COP30 (the
+        default) but was a live, Settings-reachable lie for every other
+        model on the dropdown: COP90 (a real, distinct Copernicus
+        dataset, 90 m, not 30) and EU_DTM (a bare-earth terrain product
+        under CC BY 4.0, not a Copernicus surface model at all) both
+        claimed "Copernicus GLO-30", the name of neither dataset, right
+        beside a display_name/licence/attribution that already correctly
+        refused to make the same mistake.
+
+        COP30 and COP90 are named "Copernicus GLO-<n>", OpenTopography's
+        own published name for each (elevation_models.py's own module
+        docstring, "Where the metadata came from"), detected from
+        self.demtype's own "COP" prefix rather than a fact this
+        vocabulary states as a separate field, since the id already says
+        it and this vocabulary offers no third Copernicus product for
+        the pattern to ever mismatch against. Every other model's own
+        _model_description reuses its label's own words instead.
+
+        Fixed regardless of bbox, like every other source's own static
+        detail(): a downloaded model's own resolution is a property of
+        which model was configured, not of where a given survey happens
+        to draw its extent. Never touches the network: model_for() reads
+        a plain in-memory dict.
+        """
+        resolution_token = f"{self._resolution_m:g} m"
+        cop_suffix = self.demtype[len("COP"):] if self.demtype.startswith("COP") else ""
+        if cop_suffix.isdigit():
+            name = f"Copernicus GLO-{cop_suffix}"
+        else:
+            name = self._model_description(model_for(self.demtype))
+        return f"{resolution_token} ({name})"
 
     def estimate(self, bbox: BBox, tiles: Sequence[Tile]) -> Estimate:
         """One whole-area request, so nothing here counts tiles.

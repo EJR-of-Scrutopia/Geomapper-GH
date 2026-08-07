@@ -723,6 +723,44 @@ def test_an_unrecognised_model_constructs_without_raising_and_claims_nothing():
     assert "Not established by mapgen" in source.licence
 
 
+def test_detail_for_the_default_model_matches_the_spec_string_exactly():
+    # Task 2 of the detail-preview plan quoted "30 m (Copernicus GLO-30)"
+    # as elevation's own spec copy. That string is only honest for the
+    # DEFAULT model, COP30: the first implementation returned this
+    # literal regardless of which model configure() actually chose,
+    # which happened to stay true for a source nobody had reconfigured,
+    # and this test exists to keep that one case pinned once detail()
+    # stops being a bare hardcoded return.
+    assert ElevationSource(api_key="k").detail(BBOX) == "30 m (Copernicus GLO-30)"
+
+
+def test_detail_names_cop90_as_its_own_dataset_not_glo_30():
+    # Review finding (Important), live repro: configure("COP90") already
+    # corrects display_name/licence/attribution to COP90's own terms
+    # (test_configure_names_the_model_the_request_actually_asked_for,
+    # test_licence_and_attribution_follow_the_chosen_model above);
+    # detail() must follow the same rule rather than going on claiming
+    # the default's own 30 m Copernicus GLO-30 for a 90 m dataset.
+    # Asserted against ONE hardcoded literal, not against elevation_
+    # models.DEMTYPES' own resolution_m/label for COP90, so a typo in
+    # that table cannot make this test self-confirm.
+    configured = ElevationSource(api_key="k").configure("COP90")
+    assert configured.detail(BBOX) == "90 m (Copernicus GLO-90)"
+
+
+def test_detail_names_eu_dtm_as_bare_earth_never_as_glo_30():
+    # Review finding (Important), the other live repro: EU_DTM is a
+    # bare-earth terrain product under CC BY 4.0 (see
+    # test_licence_and_attribution_follow_the_chosen_model above), not a
+    # Copernicus surface model, and must never claim "GLO-30", which
+    # names a different dataset under a different licence entirely.
+    configured = ElevationSource(api_key="k").configure("EU_DTM")
+    detail = configured.detail(BBOX)
+    assert detail == "30 m (bare earth terrain, Europe)"
+    assert "GLO-30" not in detail
+    assert "Copernicus" not in detail
+
+
 def test_estimate_sizes_the_download_by_the_models_own_resolution():
     # A large extent, well clear of SMALLEST_OBSERVED_BYTES, so the floor
     # is not what this is measuring. COP90 is three times the ground
