@@ -29,6 +29,14 @@ Grasshopper use (Rhino 8, Python 3 component):
                       (the true offset is reported in `origin`). Default
                       False. Leave False when aligning with Urbano
                       layers.
+    crop       (str or 4 numbers) "x_min, y_min, x_max, y_max" in the
+                      output frame's own coordinates (the numbers you
+                      read in Rhino): only samples inside survive. THIS
+                      is how step 1 stays fast: full detail over the
+                      site, not the whole town.
+    offset     (str or 2 numbers) "dx, dy" metres added to every
+                      vertex, for nudging the mesh into a model whose
+                      other layers live in a different frame.
 
   and outputs: mesh, info, origin.
 
@@ -268,15 +276,42 @@ def _brackets(anchors, samples):
     return out
 
 
-def build_geometry(path, step=2, frame="urbano", mapgen_src=None):
+def _numbers(value, count, label):
+    """A list of `count` floats from a GH input that may arrive as a
+    list, a tuple, or a comma/space separated panel string."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = [p for p in value.replace(",", " ").split() if p]
+    else:
+        try:
+            parts = list(value)
+        except TypeError:
+            parts = [value]
+    if len(parts) != count:
+        raise MapgenTiffError(
+            f"{label} needs exactly {count} numbers, got {len(parts)}."
+        )
+    return [float(p) for p in parts]
+
+
+def build_geometry(path, step=2, frame="urbano", mapgen_src=None,
+                   crop=None, offset=None):
     """Everything Rhino-free: vertices, quad faces, stats.
 
     Returns (vertices, faces, info, origin): vertices is a list of
     (x, y, z), faces a list of (a, b, c, d) vertex indices.
+
+    crop: (x_min, y_min, x_max, y_max) in the OUTPUT frame's own
+    coordinates (the numbers you read in Rhino); only samples inside
+    survive. offset: (dx, dy) metres added to every vertex, for nudging
+    the mesh into a model whose layers live in a different frame.
     """
     if step is None or int(step) < 1:
         step = 1
     step = int(step)
+    crop = _numbers(crop, 4, "crop")
+    offset = _numbers(offset, 2, "offset") or [0.0, 0.0]
     frame = str(frame or "urbano").lower()
     # A Grasshopper File Path parameter turns the text "urbano" into a
     # full path ending in \urbano (it resolves relative to the document
@@ -306,17 +341,19 @@ def build_geometry(path, step=2, frame="urbano", mapgen_src=None):
             values, cols, rows, frame, pixel_size, pixel_height,
             e_origin, n_top,
             None if frame == "bng" else (anchor_cols, anchor_rows,
-                                         lattice_e, lattice_n))
+                                         lattice_e, lattice_n),
+            crop, offset)
     else:
         vertices, faces, kept, z_min, z_max = _geometry_pure(
             values, width, cols, rows, frame, pixel_size, pixel_height,
             e_origin, n_top,
             None if frame == "bng" else (anchor_cols, anchor_rows,
-                                         lattice_e, lattice_n))
+                                         lattice_e, lattice_n),
+            crop, offset)
     if kept == 0:
         raise MapgenTiffError(
-            f"{Path(path).name} has no data samples at step {step}; "
-            f"nothing to mesh."
+            f"{Path(path).name} has no data samples at step {step}"
+            f"{' inside the crop' if crop else ''}; nothing to mesh."
         )
     origin = (min(v[0] for v in vertices), min(v[1] for v in vertices))
     info = (
@@ -330,15 +367,12 @@ def build_geometry(path, step=2, frame="urbano", mapgen_src=None):
 
 
 def _geometry_numpy(grid, cols, rows, frame, pixel_size, pixel_height,
-                    e_origin, n_top, lattice):
+                    e_origin, n_top, lattice, crop=None, offset=(0.0, 0.0)):
     np = _np
     ci = np.asarray(cols)
     ri = np.asarray(rows)
     z = grid[np.ix_(ri, ci)].astype(np.float64)
     mask = np.isfinite(z)
-    kept = int(mask.sum())
-    if kept == 0:
-        return [], [], 0, 0.0, 0.0
 
     if frame == "bng":
         x_line = e_origin + (ci + 0.5) * pixel_size
@@ -368,10 +402,19 @@ def _geometry_numpy(grid, cols, rows, frame, pixel_size, pixel_height,
              + ln[np.ix_(r_low + 1, c_low)] * (1 - FC) * FR
              + ln[np.ix_(r_low + 1, c_low + 1)] * FC * FR)
 
+    if crop is not None:
+        x_min, y_min, x_max, y_max = crop
+        mask = mask & (x >= x_min) & (x <= x_max) & (y >= y_min) & (y <= y_max)
+    kept = int(mask.sum())
+    if kept == 0:
+        return [], [], 0, 0.0, 0.0
+
     index = np.full(z.shape, -1, dtype=np.int64)
     index[mask] = np.arange(kept)
     stacked = np.column_stack((
-        np.asarray(x)[mask], np.asarray(y)[mask], z[mask]))
+        np.asarray(x)[mask] + offset[0],
+        np.asarray(y)[mask] + offset[1],
+        z[mask]))
     corner = (mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, 1:] & mask[1:, :-1])
     a = index[:-1, :-1][corner]
     b = index[:-1, 1:][corner]
@@ -383,11 +426,13 @@ def _geometry_numpy(grid, cols, rows, frame, pixel_size, pixel_height,
     # onward breaks exactly and only inside Grasshopper.
     vertices = [tuple(v) for v in stacked.tolist()]
     faces = [tuple(f) for f in np.column_stack((a, b, c, d)).tolist()]
-    return vertices, faces, kept, float(np.nanmin(z)), float(np.nanmax(z))
+    z_kept = z[mask]
+    return vertices, faces, kept, float(z_kept.min()), float(z_kept.max())
 
 
 def _geometry_pure(values, width, cols, rows, frame, pixel_size,
-                   pixel_height, e_origin, n_top, lattice):
+                   pixel_height, e_origin, n_top, lattice,
+                   crop=None, offset=(0.0, 0.0)):
     if frame == "urbano":
         anchor_cols, anchor_rows, lattice_e, lattice_n = lattice
         col_bracket = _brackets(anchor_cols, cols)
@@ -414,8 +459,12 @@ def _geometry_pure(values, width, cols, rows, frame, pixel_size,
                     return top + (bot - top) * fr
                 x = blend(lattice_e)
                 y = blend(lattice_n)
+            if crop is not None and not (
+                crop[0] <= x <= crop[2] and crop[1] <= y <= crop[3]
+            ):
+                continue
             index[r_pos][c_pos] = len(vertices)
-            vertices.append((x, y, z))
+            vertices.append((x + offset[0], y + offset[1], z))
             if z < z_min:
                 z_min = z
             if z > z_max:
@@ -466,6 +515,8 @@ def _run_component():
         step=globals().get("step") or 2,
         frame=globals().get("frame") or "urbano",
         mapgen_src=globals().get("mapgen_src"),
+        crop=globals().get("crop"),
+        offset=globals().get("offset"),
     )
     shift = bool(globals().get("at_origin"))
     built = build_rhino_mesh(vertices, faces, shift, origin)
