@@ -118,7 +118,12 @@ def trimmed_plane(points) -> Plane | None:
 
     The untrimmed fit is never returned when a trim is possible: this is
     the owner's spike rule made structural. Fewer than 5 points cannot
-    spare one and take the single fit as-is.
+    spare one and take the single fit as-is. When a trim is possible but
+    the trimmed subset is plan-collinear (e.g. canopy strips confined to
+    one row), the refit will fail and this function returns None: a point
+    set whose trimmed core cannot support an honest plane rejects the fit
+    entirely, following absence-over-fabrication rather than shipping a
+    spike-corrupted untrimmed fit.
     """
     fit = _least_squares_plane(points)
     if fit is None or len(points) < 5:
@@ -126,7 +131,7 @@ def trimmed_plane(points) -> Plane | None:
     by_residual = sorted(points, key=lambda p: abs(fit.z_at(p[0], p[1]) - p[2]))
     keep = max(4, len(points) - max(1, int(len(points) * TRIM_FRACTION)))
     refit = _least_squares_plane(by_residual[:keep])
-    return refit if refit is not None else fit
+    return refit
 
 
 def extract_planes(points, rng: random.Random | None = None) -> list[FittedPlane]:
@@ -161,7 +166,7 @@ def extract_planes(points, rng: random.Random | None = None) -> list[FittedPlane
             break
         refined = trimmed_plane([points[i] for i in best_inliers])
         if refined is None:
-            refined = best_plane
+            break
         inliers = [
             i
             for i in remaining
