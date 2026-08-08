@@ -190,3 +190,134 @@ def ridge_azimuth_deg(p1: Plane, p2: Plane) -> float | None:
     if math.hypot(de, dn) < 1e-9:
         return None
     return math.degrees(math.atan2(de, dn)) % 180.0
+
+
+from mapgen.heights import _percentile
+
+MIN_ROOF_SAMPLES = 24
+MIN_QUALITY = 0.75
+FLAT_MAX_SLOPE_DEG = 5.0
+PITCH_MIN_SLOPE_DEG = 10.0
+PITCH_MAX_SLOPE_DEG = 65.0
+GABLE_ASPECT_TOLERANCE_DEG = 35.0
+GABLE_SLOPE_DIFFERENCE_MAX_DEG = 15.0
+ROOF_SHAPES = ("flat", "mono", "gable", "hip", "complex")
+
+
+@dataclass(frozen=True)
+class RoofForm:
+    shape: str
+    direction_deg: float | None
+    eaves_m: float
+    ridge_m: float
+    quality: float
+    planes: tuple[FittedPlane, ...]
+
+
+def _aspect_difference(a: float, b: float) -> float:
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+def _is_opposite_pair(p1: FittedPlane, p2: FittedPlane) -> bool:
+    aspects_opposite = (
+        _aspect_difference(
+            p1.plane.downslope_azimuth_deg(), p2.plane.downslope_azimuth_deg()
+        )
+        >= 180.0 - GABLE_ASPECT_TOLERANCE_DEG
+    )
+    slopes_alike = (
+        abs(p1.plane.slope_deg() - p2.plane.slope_deg())
+        <= GABLE_SLOPE_DIFFERENCE_MAX_DEG
+    )
+    return aspects_opposite and slopes_alike
+
+
+def classify_roof(points, planes) -> RoofForm | None:
+    """One building's roof form from its extracted planes, or None when
+    the evidence is below the honesty floor (too few samples, or the
+    planes explain less than MIN_QUALITY of them): None means NO tags,
+    the spec's absence-over-fabrication rule.
+    """
+    if len(points) < MIN_ROOF_SAMPLES or not planes:
+        return None
+    assigned: set[int] = set()
+    for fitted in planes:
+        assigned.update(fitted.inlier_indices)
+    quality = round(len(assigned) / len(points), 2)
+    if quality < MIN_QUALITY:
+        return None
+
+    floor = max(MIN_PLANE_SAMPLES, math.ceil(0.15 * len(assigned)))
+    significant = sorted(
+        (f for f in planes if len(f.inlier_indices) >= floor),
+        key=lambda f: len(f.inlier_indices),
+        reverse=True,
+    )
+    if not significant:
+        return None
+    pitched = [
+        f
+        for f in significant
+        if PITCH_MIN_SLOPE_DEG <= f.plane.slope_deg() <= PITCH_MAX_SLOPE_DEG
+    ]
+    flat = [f for f in significant if f.plane.slope_deg() < FLAT_MAX_SLOPE_DEG]
+
+    shape = "complex"
+    direction: float | None = None
+    if len(flat) == len(significant):
+        shape = "flat"
+    elif len(significant) == 1 and len(pitched) == 1:
+        shape = "mono"
+        direction = pitched[0].plane.downslope_azimuth_deg()
+    elif len(significant) == 2 and len(pitched) == 2:
+        if _is_opposite_pair(pitched[0], pitched[1]):
+            shape = "gable"
+            direction = ridge_azimuth_deg(pitched[0].plane, pitched[1].plane)
+            if direction is None:
+                shape, direction = "complex", None
+    elif 3 <= len(significant) <= 4 and len(pitched) == len(significant):
+        pair = None
+        for i in range(len(pitched)):
+            for j in range(i + 1, len(pitched)):
+                if _is_opposite_pair(pitched[i], pitched[j]):
+                    pair = (pitched[i], pitched[j])
+                    break
+            if pair:
+                break
+        if pair is not None:
+            pair_aspect = pair[0].plane.downslope_azimuth_deg()
+            others = [f for f in pitched if f is not pair[0] and f is not pair[1]]
+            end_face = any(
+                abs(
+                    _aspect_difference(
+                        f.plane.downslope_azimuth_deg(), pair_aspect
+                    )
+                    - 90.0
+                )
+                <= 45.0
+                for f in others
+            )
+            if end_face:
+                shape = "hip"
+                direction = ridge_azimuth_deg(pair[0].plane, pair[1].plane)
+                if direction is None:
+                    shape = "complex"
+
+    z_values = [points[i][2] for i in sorted(assigned)]
+    if shape == "flat":
+        level = round(_percentile(z_values, 0.5), 1)
+        eaves = ridge = level
+    else:
+        eaves = round(_percentile(z_values, 0.10), 1)
+        ridge = round(_percentile(z_values, 0.95), 1)
+    if direction is not None:
+        direction = round(direction, 0) % (360.0 if shape == "mono" else 180.0)
+    return RoofForm(
+        shape=shape,
+        direction_deg=direction,
+        eaves_m=eaves,
+        ridge_m=ridge,
+        quality=quality,
+        planes=tuple(significant),
+    )
