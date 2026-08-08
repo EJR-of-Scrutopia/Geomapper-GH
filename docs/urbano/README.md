@@ -311,7 +311,7 @@ building's polygon by the shared `building` id instead.
 **The vocabulary shipped is `gable`, `flat`, `mono` and `complex`.** A fifth
 class, `hip`, was tried against a real Welsh town's true 1 m LiDAR and
 dropped: at 1 m the DSM cannot tell a hip roof from a cross-gable, and a
-synthetic sweep across footprint aspect and azimuth answered hip correctly on
+synthetic sweep across footprint aspect, azimuth and noise answered hip correctly on
 only 33 of 135 combinations, the same roof reading as hip, gable, complex or
 flat depending only on which way it faced. Its cases fall through to
 `complex`: honest eaves and ridge heights, no form claimed.

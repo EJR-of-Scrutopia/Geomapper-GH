@@ -610,7 +610,8 @@ Each file:
   `gable`, `flat`, `mono` and `complex`: a fifth class, `hip`, was tried
   against a real Welsh town's 1 m LiDAR and dropped, because at 1 m the
   DSM cannot tell a hip roof from a cross-gable and the same roof read as
-  hip, gable, complex or flat depending only on which way it faced. A
+  hip, gable, complex or flat depending only on which way it faced and
+  which noise it drew. A
   building whose evidence is too thin, or whose fitted ridge sits under
   2.0 m of its own ground (the same floor a building's `height` tag is
   already refused under, elsewhere in this file: a slab is not a
