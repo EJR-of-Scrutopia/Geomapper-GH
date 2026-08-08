@@ -278,6 +278,109 @@ fixed sentence `derived from map overlay, indicative`, is what
 the category is mapgen's own sampled guess at what sits inside HM Land
 Registry's geometry, not a second fact HM Land Registry itself supplied.
 
+## Roof massing in Grasshopper
+
+`<stem>_roof_massing.geojson` (phase 2b item B, `src/mapgen/roofs.py`) is
+packaged whenever `lidar_wales` is selected, the extent's own rasters land at
+the 1 m LiDAR level (see the `roof_forms` row of the README's `survey.json`
+table), and at least one building classified. Read it the same way as every
+other GeoJSON in this README, straight into **Import Geojson File**.
+
+**The `[lon, lat, z]` positions arrive flattened, exactly as the "Import
+Geojson File" section above already establishes for any GeoJSON Z ordinate.**
+`LatLonToRhinoPoint` never reads it, so both the eaves polygon and the ridge
+line land at Z = 0 on import regardless of what mapgen wrote into their third
+coordinate. The heights are not lost, they are on the feature as ordinary
+properties instead: `eaves` and `ridge`, both metres above the building's own
+`ground_m`. Extrude the flattened footprint upward by its own `eaves` value to
+get the wall, and loft from that raised polygon to the ridge line, itself
+raised by its own `ridge` value, to get the roof; match a polygon to its ridge
+line by the shared `building` property, since a footprint can have more than
+one feature in the file. `direction` (gable ridge azimuth, 0 to 180; mono
+downslope azimuth, 0 to 360; absent on `flat` and `complex`) orients a pitched
+roof asset if you are placing one rather than lofting the fitted plane
+directly.
+
+`shape` and `quality` are filterable the same way `category` is on the
+categorised boundaries file above: set Import Geojson File's property mapping
+to filter on key `shape`, value `gable`, `flat`, `mono` or `complex`, to pull
+one roof form out on its own, or on `quality` to keep only the fits you trust.
+A ridge LineString carries no `shape` or `quality` of its own; find its
+building's polygon by the shared `building` id instead.
+
+**The vocabulary shipped is `gable`, `flat`, `mono` and `complex`.** A fifth
+class, `hip`, was tried against a real Welsh town's true 1 m LiDAR and
+dropped: at 1 m the DSM cannot tell a hip roof from a cross-gable, and a
+synthetic sweep across footprint aspect and azimuth answered hip correctly on
+only 33 of 135 combinations, the same roof reading as hip, gable, complex or
+flat depending only on which way it faced. Its cases fall through to
+`complex`: honest eaves and ridge heights, no form claimed.
+
+**Read `note` before treating this as a survey.** Every feature carries
+`derived from LiDAR plane fits, indicative`. A fitted plane reads sharper than
+the pixels it came from, but it will not resolve a conservatory, a dormer, or
+anything else the 1 m DSM itself cannot see, and on a concave footprint a
+ridge span can bridge a notch in the outline rather than stopping at it. A
+building below the fitter's own honesty floor (too little of the footprint
+explained, or a fitted ridge under 2.0 m of its own ground, the same floor a
+building's `height` tag is already refused under) carries no roof tags and no
+massing feature at all, rather than a guess.
+
+**A re-run over an already-tagged package classifies nothing new.**
+`fit_roof_forms` never re-touches a way that already carries `roof:shape`,
+from an earlier run or from OSM itself, so a second `mapgen survey` or
+`mapgen bridge` over the same package writes no new massing file: the first
+run's file is the one that persists on disk.
+
+## Canopy points
+
+`<stem>_canopy.geojson` (phase 2b item B, `src/mapgen/canopy.py`) is packaged
+whenever `lidar_wales` is selected and at least one cluster of above-ground
+return qualified. Unlike roof massing, it carries no 1 m floor of its own: a
+canopy cluster spans many pixels at any resolution this project produces, so
+it is packaged at whatever pixel size the extent's own rasters carry, and the
+`resolution` property on every feature says which.
+
+Each feature is a Point at a cluster's own centre, flattened to Z = 0 on
+import for the same reason the roof massing positions are (see above): place
+a circle of `crown_radius` metres at each point instead, and drive its
+extrusion, or a tree asset's height, from the feature's own `height` property
+(the p90 of the cluster, metres above the ground beneath it, never the
+maximum, so one stray high return does not set a whole canopy's height).
+
+**`note` is `vegetation and other above-ground features, derived from LiDAR,
+indicative`, deliberately not narrower.** A pylon or a crane clears the same
+3 m floor above the DTM a tree does, and a DSM-minus-DTM raster cannot tell
+one from the other; read this file as an above-ground survey, never a species
+one.
+
+## Bridge parity: canopy always, roof tags only at 1 m
+
+Every Welsh package already on disk, however old, already carries the three
+files both steps need: `<stem>.osm`, `<stem>_lidar_dtm.tif`,
+`<stem>_lidar_dsm.tif`. `mapgen bridge` re-runs `_fit_roofs_step` and
+`_canopy_step` over any of them exactly as a fresh `mapgen survey` would.
+This is the opposite of item A's categorised boundaries, which need a fresh
+merge and cannot be added to an old package this way: the asymmetry is real,
+not an inconsistency in the tool, because every input roofs and canopy need
+is already sitting in the folder.
+
+**Canopy lands on every one of them.** It has no resolution floor of its own
+and records `resolution_m` as whatever the package's rasters actually carry.
+
+**Roof tags land only when a package's own rasters happen to be at the 1 m
+LiDAR level**, and in practice that means an extent under about 4 x 4 km.
+Every real Welsh package on this machine today (Cowbridge, Llantwit Major,
+Port Talbot) was found, on validation, to be packaged at 2 m: a survey-sized
+extent misses the fetch's own pixel budget by about 1.3% and the packager
+falls back to the coarser overview silently. So a plain `mapgen bridge` over
+one of today's real packages will not, in practice, add roof tags; it will
+record exactly why, in `roof_forms.skipped_reason`, the same guidance the
+estimate panel's own detail preview already gives before download. A future
+extent under that guidance, or a future change to how the packager fetches,
+is what would change that outcome; this documents what ships today, not a
+promise about either.
+
 ## The elevation grid, which is how terrain reaches Grasshopper
 
 `<stem>.egrid` (task 39, `src/mapgen/egrid.py`) is the DEM in the only format

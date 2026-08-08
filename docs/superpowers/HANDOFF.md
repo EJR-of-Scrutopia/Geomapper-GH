@@ -442,17 +442,34 @@ pending the whole-branch
 review that has closed every prior build item before it shipped; nothing
 here should be treated as final until that review runs.
 
-**Next up, per the addendum's own build order
-(`docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`):
-item B, roof forms and canopy from the LiDAR, the flagship item.** Its own
-spec section ("Item B") now carries an owner-added resolution gate (roof
-fitting runs only when the package's own LiDAR is at the 1 m level, never
-a coarser overview) and a spike-validation requirement (outlier-robust
-plane fitting, a per-building fit-quality score recorded in the output,
-and a live check against buildings the owner can verify against reality),
-both added 2026-08-07 and both binding on whatever plan gets written for
-it; read the spec itself for what each actually requires rather than this
-summary. No task briefs exist for it yet.
+**Phase 2b item B, roof forms and canopy from the LiDAR, is built and shipped
+(2026-08-08).** All eight tasks of
+`docs/superpowers/plans/2026-08-08-mapgen-phase2b-b-roofs-canopy.md` are
+complete: `src/mapgen/roofs.py` fits roof planes onto every untagged building
+from its own DSM samples (sequential RANSAC, a trimmed refit against spikes,
+a per-building quality score) and writes `roof:shape`, `roof:direction`,
+`roof:height:eaves`, `roof:height:ridge` and `source:roof`, never overwriting
+a tag a mapper already carries; `src/mapgen/canopy.py` clusters DSM-minus-DTM
+return outside every footprint into `<stem>_canopy.geojson` points at any
+resolution; `_fit_roofs_step`/`_canopy_step` (`package.py`) wire both into
+`run_survey` and `bridge_package`, with a `ROOF_MAX_PIXEL_METRES = 1.5` gate
+on the roof step alone, and `survey.json` gains `roof_forms` and `canopy`
+blocks. Validation against the owner's real Cowbridge extent, fetched at true
+1 m rather than the 2 m every packaged Welsh survey on this machine turned
+out to hold, found the spec's own `hip` class unreliable (the 1 m DSM cannot
+separate it from a cross-gable; a synthetic sweep across footprint aspect,
+azimuth and noise answered hip correctly on only 33 of 135 combinations) and
+dropped it, shipping `gable`, `flat`, `mono` and `complex` instead: 1552
+buildings, 938 classified in about 11 s once the shipped ridge-height floor
+was applied (gable 472, complex 413, flat 45, mono 8), and 1410 massing
+features (938 eaves polygons, 472 gable ridge lines) written on the same run.
+The resolution gate this validation forced (roof fitting refuses anything
+coarser than the 1 m LiDAR level, in practice extents under about 4 x 4 km)
+and the full vocabulary and honesty-floor reasoning are in the spec's own
+"Item B" section and in
+`.superpowers/sdd/2026-08-08-mapgen-phase2b-b-roofs-canopy/roof-validation.md`;
+read either before touching `ROOF_SHAPES` or `MIN_RIDGE_METRES`. Full suites
+green: 1841 Python passed / 17 deselected, 285 Node.
 
 **Watch-items, carried forward and added to.** The int16 GDAL_METADATA
 scale/offset refusal deferred at Wales LiDAR's own Task 3 (`cog.py`) still

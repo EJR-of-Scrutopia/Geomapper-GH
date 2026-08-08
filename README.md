@@ -501,6 +501,13 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_contours_1m.geojson     one file per interval the
   Barry-Waterfront_2026-08-03_contours_0.5m.geojson   extent's own area qualifies
   Barry-Waterfront_2026-08-03_contours_0.25m.geojson  for
+  Barry-Waterfront_2026-08-03_roof_massing.geojson    eaves polygons and gable
+                                                      ridge lines, only if the
+                                                      package's own LiDAR was
+                                                      at the 1 m level
+  Barry-Waterfront_2026-08-03_canopy.geojson          canopy points, only if
+                                                      the LiDAR found above-
+                                                      ground clusters
   Barry-Waterfront_2026-08-03_boundaries.geojson      HM Land Registry property
                                                       boundary curves, only if
                                                       `inspire` was selected
@@ -575,6 +582,43 @@ Each file:
   `source`, `source_resolution_m` and `interpolated` (`true` below 1 m,
   since a 1 m raster cannot really resolve a quarter-metre rise, so those
   two files are honest about being smoothed rather than measured).
+- **`<stem>_roof_massing.geojson`**: one eaves Polygon per building
+  `roof_forms` (below) classified, `[lon, lat, z]` with `z` metres above
+  that building's own ground, plus one ridge LineString per classified
+  `gable` (the only shape with two significant planes to intersect;
+  `mono` has a direction but only one plane, `flat` and `complex` have
+  neither). Polygon properties: `building`, `shape`, `direction`,
+  `eaves`, `ridge`, `quality`, `ground_m`, `source`, `note`; ridge
+  properties: `building`, `feature` (`"ridge"`), `source`, `note`.
+  Packaged whenever `lidar_wales` is selected, the package's own rasters
+  are at the 1 m LiDAR level, and at least one building classified; any
+  of those failing writes no file at all.
+- **`<stem>_canopy.geojson`**: one Point per cluster of above-ground
+  LiDAR return outside every building footprint, `height` the p90 of the
+  cluster in metres, plus `crown_radius`, `resolution`, `source` and
+  `note`. Packaged whenever `lidar_wales` is selected and at least one
+  cluster qualified; unlike roof massing, it runs at whatever resolution
+  the package's rasters carry, not only at 1 m, so a package too coarse
+  for roof tags can still hold this file.
+
+  Roof fitting only runs on 1 m LiDAR: a plane fit needs enough samples
+  per face to tell one roof plane from noise, and a package whose own
+  rasters are coarser gets no roof tags at all, `roof_forms.skipped_reason`
+  (below) naming why. Where it does run, a fitted plane reads sharper than
+  the pixels it came from, but it will not resolve a conservatory or
+  anything else the DSM itself cannot see. The shipped tag vocabulary is
+  `gable`, `flat`, `mono` and `complex`: a fifth class, `hip`, was tried
+  against a real Welsh town's 1 m LiDAR and dropped, because at 1 m the
+  DSM cannot tell a hip roof from a cross-gable and the same roof read as
+  hip, gable, complex or flat depending only on which way it faced. A
+  building whose evidence is too thin, or whose fitted ridge sits under
+  2.0 m of its own ground (the same floor a building's `height` tag is
+  already refused under, elsewhere in this file: a slab is not a
+  building), gets no roof tags at all rather than a guess.
+  `<stem>_canopy.geojson` is exactly what its own `note` property says,
+  `vegetation and other above-ground features`: a pylon or a crane clears
+  the same 3 m floor a tree does and a raster cannot tell them apart, so
+  read it as an above-ground survey, never a species one.
 - **`<stem>_boundaries.geojson`**: HM Land Registry's INSPIRE Index
   Polygon parcels for whichever local authority (or authorities, at a
   border) the extent falls into, packaged whenever `inspire` is selected
@@ -666,7 +710,9 @@ Fields, as actually written:
 | `buildings_fusion` | `written`, `from_overture`, `from_os`, `kept_existing`, `skipped_overlap` and `error`: whether this package's `<stem>.osm` had missing building footprints injected from Overture's `<stem>_building.geojson` and OS OpenMap Local's `<stem>_os_buildings.geojson`, Overture checked first. `written` is how many new ways this run actually added; `from_overture`/`from_os` split that same total by which candidate file each one came from. `kept_existing` is every building already in the file before this run touched it, whether from the original download or an earlier fusion, left alone. `skipped_overlap` is every candidate footprint this run looked at and did not write, for either of two reasons folded into one count: it duplicated something already accepted, or it could not be trusted as a shape at all (an invalid or too-small ring); nothing here is invented for a footprint this project cannot vouch for. A package with neither candidate file, or with nothing left for either to add, is `written: 0` with a null `error`, the ordinary and expected outcome (the owner's own default today, with `os_open` unselected), not a reader-visible failure; only a non-null `error` means the step genuinely could not finish. Runs before `lidar_heights`, on every run and on `mapgen bridge`, so an injected footprint with no height of its own is already in the file by the time heights fusion runs immediately after it. |
 | `boundaries_categories` | `parcels`, `counts`, `samples`, `capped`, `note` and `error`: whether this package's INSPIRE parcels (`<stem>_parcels.geojson`) were classified by overlay against the package's own data and written to `<stem>_boundaries_categorised.geojson`. `parcels` is how many parcels this run classified. `counts` is `{category: count}` for every category with at least one parcel, drawn from the fixed vocabulary (`housing`, `garden`, `field`, `recreation`, `retail`, `industrial`, `education`, `religious`, `allotments`, `water`, `greenspace`, `woodland`, `unclassified`); a category with none in this package is simply absent from the map, never a zero entry. `samples` is the total interior sample points tested across every parcel, and `capped` is how many parcels hit the per-parcel sample ceiling, a signal that one parcel's own classification is a coarser approximation than usual, not a wrong one. `note` is always the fixed sentence `derived from map overlay, indicative`, the same caveat wherever a category appears in this package, because a parcel's category comes from sampling overlay data already in the package, never from an authoritative land-use register. `parcels: 0`, `counts: {}`, `samples: 0`, `capped: 0` and `error: null` together mean this package simply has no parcels to classify (`inspire` not selected, selected and holding none in this extent, or a package downloaded before `<stem>_parcels.geojson` existed and re-bridged: `mapgen bridge` never re-runs a source's merge, so an old package gains its parcels, and with them its categories, only from a fresh survey over the extent), the same "nothing to do" reading `buildings_fusion`'s own all-zero record gets; only a non-null `error` means the step genuinely could not finish, and the rest of the package, including any earlier run's own categorised file, is left untouched. Runs immediately after `buildings_fusion` and before `lidar_heights`, on every run and on `mapgen bridge`, because it reads building evidence out of the FUSED `.osm` that step has already written. |
 | `lidar_heights` | `written`, `buildings`, `kept_existing`, `no_data` and `error`: whether this package's `<stem>.osm` had DSM-minus-DTM building heights fused into it from the Welsh LiDAR layer. `written` is None on a package that never selected `lidar_wales`, which is different from `written: 0` (fused, and found nothing to add: every building already had a height, or none had enough LiDAR under it). `buildings` is every way tagged `building=*`; `kept_existing` is how many already carried a `height` tag and were left alone; `no_data` is how many could not be given one, for any reason (too little raster coverage, no OSTN15 shift, a malformed footprint): nothing here is invented for a building the rasters have no evidence for. Runs before the bridge, on every run and on `mapgen bridge`, so a package downloaded before this existed gets its buildings fixed in place with no re-download. |
-| `inspire_boundaries` | `written`, `curves`, `kept_existing` and `error`: whether this package's `<stem>.osm` had HM Land Registry property boundary curves fused into it from `<stem>_boundaries.geojson`. `written` is None on a package that never selected `inspire`, which is different from `written: 0`: an authority whose padded extent held zero kept parcels writes a real, empty boundaries file and genuinely fuses nothing, and a re-run of a package already fused writes nothing a second time either, both `written: 0` for different, honest reasons. `curves` is how many LineString curves the boundaries GeoJSON itself holds, read whether or not this run went on to inject any of them. `kept_existing` is how many of that file's own ways were already in `<stem>.osm` from an earlier fusion (the download itself, or an earlier `mapgen bridge`), recognised by their own `source=hm_land_registry` tag, which is what makes a repeat run `written: 0` rather than a duplicate set of ways. Runs immediately after `lidar_heights`, before the bridge, on every run and on `mapgen bridge`. |
+| `roof_forms` | `buildings`, `classified`, `kept_existing`, `below_quality`, `no_data`, `relations_skipped`, `shapes`, `skipped_reason` and `error`: whether this package's `<stem>.osm` had a roof form fitted onto every untagged building way, from the same Welsh LiDAR DSM and DTM `lidar_heights` reads above it. `buildings` is every way tagged `building=*` (None when this package never selected `lidar_wales`, or is missing its `.osm` or either raster, which is different from `buildings: 0`); `classified` is how many were tagged `roof:shape` and the rest by this run; `kept_existing` is how many already carried `roof:shape`, from an earlier fusion or from OSM itself, and were left untouched; `below_quality` is how many had DSM samples but the fit did not clear the honesty floor (too few significant planes, too little of the footprint explained, or a fitted ridge under 2.0 m of its own ground); `no_data` is how many had no usable samples at all (no raster coverage, no OSTN15 shift, an unresolvable footprint); `relations_skipped` is every multipolygon relation, never inspected for a roof. `buildings == classified + kept_existing + below_quality + no_data` always. `shapes` is `{shape: count}` for classified ways only, over `gable`, `flat`, `mono` and `complex` (a fifth class, `hip`, was tried and dropped; see the `<stem>_roof_massing.geojson` entry above). `skipped_reason` is set, and every count above is None, when this package's own rasters are coarser than the 1 m level roof fitting needs: the same guidance the estimate panel's own detail preview already gives before download (extents under about 4 x 4 km come back at 1 m). `error` is a plain sentence on the rare case the step could not finish at all (an unreadable raster, a network failure fetching OSTN15), distinct from a resolution skip. Runs immediately after `lidar_heights`, on every run and on `mapgen bridge`. |
+| `canopy` | `points`, `skipped_small`, `resolution_m` and `error`: whether this package's own LiDAR found clusters of above-ground return (DSM at least 3 m above the DTM) outside every building footprint and wrote them to `<stem>_canopy.geojson`. `points` is how many clusters cleared the minimum size (2 pixels, 8 m2) and became a Point feature; None when this package never selected `lidar_wales` or is missing its `.osm` or either raster, which is different from `points: 0` (ran, found nothing above the floor). `skipped_small` is how many candidate clusters were found and were too small to keep. `resolution_m` is the pixel size this run's own rasters actually carried, whatever that was: unlike `roof_forms`, this step has no 1 m floor of its own and runs at any resolution the package holds. `<stem>_canopy.geojson` itself is written only when `points` is at least 1. `error` is a plain sentence on the rare case the step could not finish (a mismatched DTM/DSM grid, an unreadable raster). Runs immediately after `roof_forms`, on every run and on `mapgen bridge`. |
+| `inspire_boundaries` | `written`, `curves`, `kept_existing` and `error`: whether this package's `<stem>.osm` had HM Land Registry property boundary curves fused into it from `<stem>_boundaries.geojson`. `written` is None on a package that never selected `inspire`, which is different from `written: 0`: an authority whose padded extent held zero kept parcels writes a real, empty boundaries file and genuinely fuses nothing, and a re-run of a package already fused writes nothing a second time either, both `written: 0` for different, honest reasons. `curves` is how many LineString curves the boundaries GeoJSON itself holds, read whether or not this run went on to inject any of them. `kept_existing` is how many of that file's own ways were already in `<stem>.osm` from an earlier fusion (the download itself, or an earlier `mapgen bridge`), recognised by their own `source=hm_land_registry` tag, which is what makes a repeat run `written: 0` rather than a duplicate set of ways. Runs immediately after `canopy`, before the bridge, on every run and on `mapgen bridge`. |
 | `started_at`, `finished_at` | UTC timestamps. |
 
 ## Using the output in Grasshopper, with Urbano 2
