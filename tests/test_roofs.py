@@ -257,6 +257,42 @@ class TestClassifyRoof:
         assert form.shape == "flat"
         assert form.eaves_m == form.ridge_m
 
+    def test_a_chimney_does_not_demote_a_flat_roof_to_complex(self):
+        # A flat deck carrying one SMALL elevated cluster: a chimney, an
+        # aerial mount, a plant box. It forms a plane of its own but never
+        # clears the significance floor, so it never decides the shape,
+        # and the flatness gate must not pool it into the spread either.
+        # The deck itself is flat and must read `flat`.
+        #
+        # Swept across the cluster sizes that stay under the floor, since
+        # the bug this pins was size-dependent: 12 is MIN_PLANE_SAMPLES
+        # (the smallest plane extract_planes will keep) and 28 is just
+        # under 15% of the assigned total here.
+        rng = random.Random(7)
+        for cluster_n in (12, 15, 20, 28):
+            points = [
+                (float(col), float(row), 5.0 + rng.gauss(0.0, 0.02))
+                for row in range(-6, 7)
+                for col in range(-6, 7)
+            ]
+            # A compact 2D patch, never a line: a plan-collinear cluster
+            # cannot support a plane at all (trimmed_plane refuses it), so
+            # extract_planes would never return the second plane this test
+            # is about and the fixture would pass for the wrong reason.
+            for i in range(cluster_n):
+                points.append((1.0 + 0.3 * (i % 5), 1.0 + 0.3 * (i // 5), 8.0))
+            form = _classified(points)
+            assert form.shape == "flat", (
+                f"a {cluster_n}-point chimney demoted a flat deck to "
+                f"{form.shape}"
+            )
+            # Still one level, so eaves and ridge stay equal: a flat roof
+            # reports the median of everything the planes explain, which a
+            # cluster this small cannot move. Only the flatness DECISION
+            # restricts itself to the significant planes.
+            assert form.eaves_m == form.ridge_m
+            assert abs(form.ridge_m - 5.0) < 0.2
+
     def test_spiked_gable_still_classifies_gable(self):
         # Three +8 m spikes (an aerial, a chimney, a bad return) on a
         # 30-degree gable: the owner's own failure case. The trimmed,

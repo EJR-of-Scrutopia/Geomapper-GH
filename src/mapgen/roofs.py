@@ -211,12 +211,19 @@ GABLE_SLOPE_DIFFERENCE_MAX_DEG = 15.0
 # extension beside a taller block, a plant deck: calling that "flat" and
 # then reporting one median level as both eaves and ridge asserts a
 # single roof plane the evidence does not show. Task 4's Cowbridge run
-# measured the spread (p95 minus p10) of the samples the accepted planes
-# explain: the median flat roof spans 0.38 m, but 39% of them spanned
-# more than half a metre and the worst spanned 4.20 m. Half a metre is
-# where a real flat roof's own noise and parapet stop and a second storey
-# begins, so anything wider is routed to `complex`, which reports the
-# true p10 and p95 instead of flattening the step away.
+# measured the spread (p95 minus p10) of the samples the SIGNIFICANT
+# planes explain (see classify_roof for why significance matters here):
+# the median flat roof spans 0.38 m, but 39% of them spanned more than
+# half a metre and the worst spanned 4.20 m. Half a metre is where a real
+# flat roof's own noise and parapet stop and a second storey begins, so
+# anything wider is routed to `complex`, which reports the true p10 and
+# p95 instead of flattening the step away.
+#
+# Half a metre is also exactly 2 x INLIER_TOLERANCE_METRES, which is the
+# widest band a single accepted plane's own inliers can occupy. That is
+# the reason to prefer 0.5 over a value fitted to the sample: one level
+# plane cannot breach it by construction, so the gate only ever fires on
+# a genuine second level, not on a noisy single deck.
 FLAT_MAX_SPREAD_METRES = 0.5
 
 # `hip` was dropped after Task 4's validation. See classify_roof.
@@ -286,6 +293,26 @@ def classify_roof(points, planes) -> RoofForm | None:
     z_low = _percentile(z_values, 0.10)
     z_high = _percentile(z_values, 0.95)
 
+    # The flatness gate below measures the SIGNIFICANT planes only, not
+    # every plane `extract_planes` returned. `extract_planes` keeps any
+    # plane with MIN_PLANE_SAMPLES (12) inliers, which is far under the
+    # significance floor for any building over about 80 samples, so a
+    # chimney, aerial mount or plant box with a dozen returns of its own
+    # forms a plane that never becomes significant and never decides the
+    # shape. Pooling it into the spread would demote a genuinely flat
+    # deck to `complex` over roof furniture, which is precisely what the
+    # significance floor exists to ignore. The stepped roof this gate is
+    # for has two SIGNIFICANT decks, and is still caught.
+    #
+    # `z_low`/`z_high` above stay over `assigned` for the eaves and ridge
+    # heights: those report the whole roof the planes explain, furniture
+    # included, and a chimney genuinely is part of the built height.
+    significant_z = sorted(
+        points[i][2]
+        for i in {i for f in significant for i in f.inlier_indices}
+    )
+    flat_spread = _percentile(significant_z, 0.95) - _percentile(significant_z, 0.10)
+
     shape = "complex"
     direction: float | None = None
     if len(flat) == len(significant):
@@ -293,7 +320,7 @@ def classify_roof(points, planes) -> RoofForm | None:
         # FLAT_MAX_SPREAD_METRES. A stepped roof falls through to
         # `complex`, which reports the real range rather than a median
         # that hides the step.
-        if z_high - z_low <= FLAT_MAX_SPREAD_METRES:
+        if flat_spread <= FLAT_MAX_SPREAD_METRES:
             shape = "flat"
     elif len(significant) == 1 and len(pitched) == 1:
         shape = "mono"
@@ -310,22 +337,27 @@ def classify_roof(points, planes) -> RoofForm | None:
     # the spec itself anticipated for a class the 1 m DSM cannot carry.
     #
     # The evidence, from synthetic hips swept across aspect ratio at 1 m
-    # sampling, five azimuths and three noise seeds each (15 runs per
-    # aspect, noise at the stated 0.08 m):
+    # sampling, five azimuths and three noise seeds each, so 15 runs per
+    # aspect and 9 aspects for 135 runs in total (noise at the stated
+    # 0.08 m). All nine rows, so the arithmetic is checkable:
     #
     #   aspect 1.00  hip  0/15   (8 refused, 4 complex, 3 flat)
-    #   aspect 1.25  hip 13/15   the only band that works
+    #   aspect 1.12  hip  6/15   (4 complex, 3 flat, 2 refused)
+    #   aspect 1.25  hip 13/15   (1 complex, 1 gable) the one band that works
     #   aspect 1.38  hip  6/15   (4 gable, 3 complex, 1 flat, 1 refused)
     #   aspect 1.50  hip  6/15   (9 gable)
     #   aspect 1.75  hip  2/15   (13 gable)
-    #   aspect 2.00+ hip  0/15   (all gable)
+    #   aspect 2.00  hip  0/15   (15 gable)
+    #   aspect 2.50  hip  0/15   (15 gable)
+    #   aspect 3.00  hip  0/15   (15 gable)
     #
-    # 33 of 135, and the same roof answers hip, gable, complex, flat or
-    # nothing depending only on which way it faces and which noise it
-    # drew. A tag nobody can rely on, whose absence means nothing either,
-    # is worse than no tag. The control sweep over gables in the same
-    # harness answered gable 15/15 at every aspect from 1.0 to 2.5, so
-    # this is hip's failure and not the fitter's.
+    # 0+6+13+6+6+2+0+0+0 = 33 of 135, and the same roof answers hip,
+    # gable, complex, flat or nothing depending only on which way it faces
+    # and which noise it drew. A tag nobody can rely on, whose absence
+    # means nothing either, is worse than no tag. The control sweep over
+    # gables in the same harness answered gable 15/15 at each of the five
+    # aspects it covered (1.00, 1.25, 1.50, 2.00, 2.50), so this is hip's
+    # failure and not the fitter's.
     #
     # Confirmed on real data twice over: only 53 of 1080 classified
     # Cowbridge buildings ever reached hip, and check 6's spike probe
