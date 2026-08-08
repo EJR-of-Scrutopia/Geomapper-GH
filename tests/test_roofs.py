@@ -144,7 +144,13 @@ class TestRidgeAzimuth:
         assert ridge_azimuth_deg(p, Plane(a=0.5, b=0.0, c=2.0)) is None
 
 
-from mapgen.roofs import MIN_QUALITY, MIN_ROOF_SAMPLES, RoofForm, classify_roof
+from mapgen.roofs import (
+    MIN_QUALITY,
+    MIN_ROOF_SAMPLES,
+    ROOF_SHAPES,
+    RoofForm,
+    classify_roof,
+)
 from mapgen.roofs import extract_planes as _extract
 
 
@@ -205,21 +211,51 @@ class TestClassifyRoof:
         assert form.shape == "mono"
         assert form.direction_deg is not None
 
-    def test_hip_roof(self):
-        # half_length=4.5 (not the original brief's 8.0): the synthetic
-        # hip's end-cap planes hold a fixed sample count regardless of
-        # length, so an elongated hip dilutes them under the significance
-        # floor (15% of assigned) and the shape always reads as gable,
-        # never reaching the hip/complex branches this test means to
-        # probe. A closer-to-square hip keeps both end caps above the
-        # floor and lands on hip or complex, per the allowance below.
+    def test_hip_roof_reads_complex_because_hip_was_dropped(self):
+        # `hip` was dropped by Task 4's validation: swept across aspect
+        # ratio, azimuth and noise seed at 1 m, a synthetic hip answered
+        # hip in only 33 of 135 runs and otherwise answered gable,
+        # complex, flat or nothing, while the gable control answered
+        # gable 15/15 at every aspect. See classify_roof for the table.
+        #
+        # A hip must now read `complex`: honest eaves and ridge, no form
+        # named, no direction asserted.
         form = _classified(
             _roof_points("hip", ridge_azimuth_deg=90.0, half_width=4.0,
                          half_length=4.5, noise=0.03)
         )
-        assert form.shape in ("hip", "complex")
-        if form.shape == "hip":
-            assert abs(form.direction_deg - 90.0) < 10.0
+        assert form.shape == "complex"
+        assert form.direction_deg is None
+        assert form.eaves_m < form.ridge_m
+
+    def test_hip_is_not_in_the_vocabulary(self):
+        assert "hip" not in ROOF_SHAPES
+        assert ROOF_SHAPES == ("flat", "mono", "gable", "complex")
+
+    def test_a_stepped_flat_roof_is_complex_not_flat(self):
+        # Two level decks 3 m apart, each big enough to be a significant
+        # plane. Every plane is flat, so the old rule called the whole
+        # building `flat` and reported ONE median level as both eaves and
+        # ridge, hiding the step. Task 4 measured this on real Cowbridge
+        # data: 39% of `flat` buildings spanned more than half a metre,
+        # the worst 4.20 m.
+        points = []
+        for row in range(-6, 7):
+            for col in range(-6, 7):
+                z = 4.0 if col < 0 else 7.0
+                points.append((float(col), float(row), z))
+        form = _classified(points)
+        assert form.shape == "complex"
+        # The step is reported, not averaged away.
+        assert form.eaves_m < form.ridge_m
+        assert form.ridge_m - form.eaves_m > 2.0
+
+    def test_a_genuinely_level_roof_is_still_flat(self):
+        # The other side of the same gate: real noise and a parapet's
+        # worth of spread stay under FLAT_MAX_SPREAD_METRES.
+        form = _classified(_roof_points("flat", noise=0.03))
+        assert form.shape == "flat"
+        assert form.eaves_m == form.ridge_m
 
     def test_spiked_gable_still_classifies_gable(self):
         # Three +8 m spikes (an aerial, a chimney, a bad return) on a
