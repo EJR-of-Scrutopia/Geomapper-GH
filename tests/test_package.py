@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from mapgen.bng import BngError
+from mapgen.bng import BngError, to_bng
 from mapgen.cog import BngWindow
 from mapgen.geo import BBox, build_tiles
 from mapgen.geotiff_write import write_bng_geotiff
@@ -56,6 +56,7 @@ from tests.test_heights import (
     _write_single_building_osm,
     _zero_shift_grid,
 )
+from tests.test_roofs import _gable_windows, _osm_with_building
 
 BBOX = BBox.parse("-3.29,51.38,-3.28,51.39")
 
@@ -3664,7 +3665,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # not there for the download. complete and stopped describe that
     # download and nothing else; so do tiles, sources and both timestamps.
     #
-    # Six blocks are the exception rather than one, and each was added by
+    # Eight blocks are the exception rather than one, and each was added by
     # the task that made this command produce something: `bridge`;
     # `project_setting` (task 35), which mapgen now writes whether or not the
     # bridge is working; `elevation_grid` (task 39), the DEM converted
@@ -3674,11 +3675,12 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     # done; `inspire_boundaries` (task 5 of the INSPIRE curves plan), the
     # same re-run shape for property boundary curves; `buildings_fusion`
     # (task 6 of the OS Open pack plan), the same re-run shape one step
-    # earlier in the pipeline; and `boundaries_categories` (task 3 of the
+    # earlier in the pipeline; `boundaries_categories` (task 3 of the
     # categorised boundaries plan), which this fixture's own package,
     # written long before that key existed, never carried at all until
-    # this very run adds it. Everything else is still read and never
-    # written.
+    # this very run adds it; and `roof_forms`/`canopy` (task 7 of the roofs
+    # and canopy plan), the identical re-run shape immediately after
+    # `lidar_heights`. Everything else is still read and never written.
     register_default_sources()
     root = _package_on_disk(tmp_path, complete=False, stopped=True)
     before = json.loads((root / "survey.json").read_text(encoding="utf-8"))
@@ -3691,6 +3693,7 @@ def test_a_bridge_run_changes_nothing_in_survey_json_but_its_urbano_blocks(tmp_p
     for changed in (
         "bridge", "project_setting", "elevation_grid", "lidar_heights",
         "inspire_boundaries", "buildings_fusion", "boundaries_categories",
+        "roof_forms", "canopy",
     ):
         before.pop(changed, None)
         after.pop(changed, None)
@@ -3715,22 +3718,27 @@ def test_bridge_package_emits_the_same_progress_events_a_survey_does(tmp_path):
     # boundaries plan): this package has no `<stem>_parcels.geojson`
     # either, which is that step's own ordinary, all-zero outcome
     # (started/finished, never a skip), then heights fusion (task 7), then
-    # boundaries fusion (task 5 of the INSPIRE curves plan): this package
-    # has no packaged LiDAR rasters and no boundaries GeoJSON, so both of
-    # those are skipped rather than attempted.
+    # roof fitting and canopy (task 7 of the roofs and canopy plan): this
+    # package has no packaged LiDAR rasters either, so both are skipped the
+    # same way heights fusion just was, then boundaries fusion (task 5 of
+    # the INSPIRE curves plan): this package has no packaged LiDAR rasters
+    # and no boundaries GeoJSON, so both of those are skipped rather than
+    # attempted.
     assert [e["event"] for e in log.events] == [
         "buildings_fusion_started",
         "buildings_fusion_finished",
         "boundaries_categories_started",
         "boundaries_categories_finished",
         "heights_fusion_skipped",
+        "roof_forms_skipped",
+        "canopy_skipped",
         "boundaries_fusion_skipped",
         "bridge_started",
         "bridge_failed",
         "project_setting_started",
         "project_setting_written",
     ]
-    assert "exit code 1" in log.events[7]["error"]
+    assert "exit code 1" in log.events[9]["error"]
 
 
 def test_a_stop_that_landed_at_the_very_end_can_have_its_urbano_files_afterwards(tmp_path):
@@ -6280,6 +6288,267 @@ def test_bridge_package_re_runs_fusion_idempotently(tmp_path, monkeypatch):
     # The file itself agrees: still exactly one height tag, not two.
     osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
     assert osm_text.count('k="height" v="6.0"') == 1
+
+
+# --------------------------------------------------------------------------
+# Task 7 of the roofs and canopy plan: fitting a roof form onto <stem>.osm's
+# building ways (roofs.py) and deriving canopy points from the same
+# package's own LiDAR (canopy.py), both wired immediately after heights
+# fusion above.
+#
+# The 1 m gable fixture is `tests/test_roofs.py`'s own
+# `_gable_windows`/`_osm_with_building`, carried through
+# `write_bng_geotiff` exactly the way `LidarHeightsStubSource` above
+# carries `_constant_window` through it, so a run through `run_survey`
+# exercises the real `fit_roof_forms` rather than a stand-in for it. The
+# fixture building already carries `height`, so heights fusion above
+# leaves it as `kept_existing` and never rewrites the file: the only step
+# left that could touch `.osm` bytes on this fixture is the roof step
+# itself, which is what the resolution-gate test below needs to isolate.
+#
+# mapgen.package.load_ostn15 is monkeypatched to the same zero-shift grid
+# these fixtures are built against, for the identical reason the
+# heights-fusion tests above do it: no real OSTN15 cache and no network
+# touched.
+# --------------------------------------------------------------------------
+
+_GABLE_E0, _GABLE_N0 = 318000.0, 176000.0
+_GABLE_RING_BNG = [
+    (_GABLE_E0 + 4.0, _GABLE_N0 + 4.0), (_GABLE_E0 + 16.0, _GABLE_N0 + 4.0),
+    (_GABLE_E0 + 16.0, _GABLE_N0 + 16.0), (_GABLE_E0 + 4.0, _GABLE_N0 + 16.0),
+]
+
+
+def _window_at_pixel(pixel, size=20, value=100.0, e0=_GABLE_E0, n0=_GABLE_N0):
+    values = array("f", [value]) * (size * size)
+    return BngWindow(
+        e_origin=e0, n_top=n0 + size * pixel, pixel_size=pixel,
+        width=size, height=size, values=values,
+    )
+
+
+class RoofsStubSource(StubSource):
+    """Writes a real `.osm` (one gable-roofed building, already tagged
+    `height` so heights fusion leaves it untouched) and real packaged
+    LiDAR rasters beside it, at whatever pixel size the test asks for: the
+    exact three files `_fit_roofs_step` looks for, built from the
+    identical gable fixture `tests/test_roofs.py` proves `fit_roof_forms`
+    against.
+    """
+
+    def __init__(self, source_id="stub", pixel=1.0, **kwargs):
+        super().__init__(source_id=source_id, **kwargs)
+        self._pixel = pixel
+
+    def merge(self, parts, out_dir, stem):
+        grid = _zero_shift_grid()
+        osm_path = out_dir / f"{stem}.osm"
+        _osm_with_building(
+            osm_path, _GABLE_RING_BNG, grid, extra_tags=(("height", "6.0"),)
+        )
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dsm_path = out_dir / f"{stem}_lidar_dsm.tif"
+        if self._pixel == 1.0:
+            dtm, dsm = _gable_windows(_GABLE_E0, _GABLE_N0)
+        else:
+            dtm = _window_at_pixel(self._pixel, value=100.0)
+            dsm = _window_at_pixel(self._pixel, value=106.0)
+        write_bng_geotiff(dtm_path, dtm)
+        write_bng_geotiff(dsm_path, dsm)
+        return [osm_path, dtm_path, dsm_path]
+
+
+def test_the_roofs_step_tags_a_gable_and_writes_massing_at_1m(tmp_path, monkeypatch):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(RoofsStubSource(pixel=1.0))
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.survey["roof_forms"]["classified"] == 1
+    osm_text = (result.paths.root / f"{result.paths.stem}.osm").read_text(encoding="utf-8")
+    assert 'k="roof:shape"' in osm_text
+    massing_path = result.paths.root / f"{result.paths.stem}_roof_massing.geojson"
+    assert massing_path.is_file()
+    names = [e["event"] for e in log.snapshot()]
+    assert names.index("roof_forms_started") < names.index("roof_forms_written")
+
+
+def test_the_roofs_step_is_skipped_by_the_resolution_gate_at_2m(tmp_path, monkeypatch):
+    """Every real package the owner has today carries 2 m rasters (a
+    survey-sized extent misses `cog.py`'s `MAX_WINDOW_PIXELS` by a small
+    margin and falls back a level), so this is the shape the gate exists
+    to catch honestly, not a contrived one. `2.0000004`, not a plain
+    `2.0`, matches the real `ModelPixelScale` (about 1.9999895) a packaged
+    overview level actually carries; both format to `2` under `:g`.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(RoofsStubSource(pixel=2.0000004))
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    record = result.survey["roof_forms"]
+    assert record["classified"] is None
+    assert record["skipped_reason"] is not None
+    assert "needs the 1 m LiDAR level" in record["skipped_reason"]
+    assert "4 x 4 km" in record["skipped_reason"]
+
+    expected_osm = tmp_path / "expected.osm"
+    _osm_with_building(
+        expected_osm, _GABLE_RING_BNG, _zero_shift_grid(),
+        extra_tags=(("height", "6.0"),),
+    )
+    osm_path = result.paths.root / f"{result.paths.stem}.osm"
+    assert osm_path.read_bytes() == expected_osm.read_bytes(), (
+        "the resolution gate must return before touching the .osm at all"
+    )
+    massing_path = result.paths.root / f"{result.paths.stem}_roof_massing.geojson"
+    assert not massing_path.is_file()
+
+    events = log.snapshot()
+    names = [e["event"] for e in events]
+    assert "roof_forms_skipped" in names
+    skipped = next(e for e in events if e["event"] == "roof_forms_skipped")
+    assert "reason" in skipped
+
+
+def test_the_roofs_step_is_skipped_when_lidar_rasters_are_missing(tmp_path):
+    """All three files are required, the identical floor
+    `_fuse_heights_step` already sets; two of three present is the same as
+    none, and this must never raise.
+    """
+    register(UrbanoReadableStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.survey["roof_forms"] == {
+        "buildings": None, "classified": None, "kept_existing": None,
+        "below_quality": None, "no_data": None, "relations_skipped": None,
+        "shapes": None, "skipped_reason": None, "error": None,
+    }
+    events = log.snapshot()
+    names = [e["event"] for e in events]
+    assert "roof_forms_skipped" in names
+    skipped = next(e for e in events if e["event"] == "roof_forms_skipped")
+    assert "reason" not in skipped
+
+
+_CANOPY_SIZE = 12
+_CANOPY_E0, _CANOPY_N0 = 318000.0, 176000.0
+# A footprint over the block at rows 4-6, cols 4-6, the identical geometry
+# `tests/test_canopy.py`'s own masking test proves `build_canopy` against.
+_CANOPY_RING_BNG = [
+    (_CANOPY_E0 + 3.5, _CANOPY_N0 + 12.0 - 7.5),
+    (_CANOPY_E0 + 7.5, _CANOPY_N0 + 12.0 - 7.5),
+    (_CANOPY_E0 + 7.5, _CANOPY_N0 + 12.0 - 3.5),
+    (_CANOPY_E0 + 3.5, _CANOPY_N0 + 12.0 - 3.5),
+]
+
+
+class CanopyStubSource(StubSource):
+    """Writes a real `.osm` (one building, positioned exactly over the
+    IN-footprint canopy block below) and real packaged LiDAR rasters: a
+    flat 100 m DTM and a DSM carrying two 3x3, 8 m canopy blocks, one
+    inside the building footprint (must be masked away) and one well
+    outside it, at the far corner of the same window (must survive).
+    """
+
+    def merge(self, parts, out_dir, stem):
+        grid = _zero_shift_grid()
+        ground = [100.0] * (_CANOPY_SIZE * _CANOPY_SIZE)
+        dsm = list(ground)
+        for row in range(4, 7):
+            for col in range(4, 7):
+                dsm[row * _CANOPY_SIZE + col] = 108.0
+        for row in range(8, 11):
+            for col in range(8, 11):
+                dsm[row * _CANOPY_SIZE + col] = 108.0
+        osm_path = out_dir / f"{stem}.osm"
+        _osm_with_building(osm_path, _CANOPY_RING_BNG, grid)
+        dtm_path = out_dir / f"{stem}_lidar_dtm.tif"
+        dsm_path = out_dir / f"{stem}_lidar_dsm.tif"
+        n_top = _CANOPY_N0 + _CANOPY_SIZE
+        write_bng_geotiff(
+            dtm_path,
+            BngWindow(
+                e_origin=_CANOPY_E0, n_top=n_top, pixel_size=1.0,
+                width=_CANOPY_SIZE, height=_CANOPY_SIZE, values=array("f", ground),
+            ),
+        )
+        write_bng_geotiff(
+            dsm_path,
+            BngWindow(
+                e_origin=_CANOPY_E0, n_top=n_top, pixel_size=1.0,
+                width=_CANOPY_SIZE, height=_CANOPY_SIZE, values=array("f", dsm),
+            ),
+        )
+        return [osm_path, dtm_path, dsm_path]
+
+
+def test_the_canopy_step_masks_the_in_footprint_block_and_keeps_the_outside_one(
+    tmp_path, monkeypatch
+):
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(CanopyStubSource())
+    log = EventLog()
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
+
+    assert result.survey["canopy"]["points"] == 1
+    canopy_path = result.paths.root / f"{result.paths.stem}_canopy.geojson"
+    collection = json.loads(canopy_path.read_text(encoding="utf-8"))
+    assert len(collection["features"]) == 1
+    lon, lat = collection["features"][0]["geometry"]["coordinates"]
+    easting, northing = to_bng(lat, lon, _zero_shift_grid())
+    # The surviving point sits near the OUTSIDE block's own centre
+    # (cols/rows 8-10); the masked block's centre (cols/rows 4-6) must be
+    # nowhere near it.
+    assert abs(easting - (_CANOPY_E0 + 9.5)) < 1.0
+    assert abs(northing - (_CANOPY_N0 + 2.5)) < 1.0
+    events = log.snapshot()
+    names = [e["event"] for e in events]
+    assert names.index("canopy_started") < names.index("canopy_written")
+
+
+def test_bridge_package_re_runs_roof_forms_and_canopy_idempotently(tmp_path, monkeypatch):
+    """The reason this matters, the identical shape
+    `test_bridge_package_re_runs_fusion_idempotently` above already proves
+    for heights: every package the owner already has can now have its
+    roofs fitted and its canopy derived by a plain re-bridge, and a
+    package the DOWNLOAD already fitted must not be re-fitted into
+    duplicate tags, the idempotence half `fit_roof_forms`'s own
+    `kept_existing` branch already guarantees.
+    """
+    import mapgen.package as package_module
+
+    monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
+    register(RoofsStubSource(pixel=1.0))
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+    downloaded = result.survey["roof_forms"]
+    assert downloaded["classified"] == 1
+    assert downloaded["kept_existing"] == 0
+
+    payload = bridge_package(
+        result.paths.root, bridge_runner=FakeBridgeRunner(returncode=0)
+    )
+
+    rebridged = payload["roof_forms"]
+    assert rebridged["classified"] == 0
+    assert rebridged["kept_existing"] == 1
+
+    canopy = payload["canopy"]
+    assert canopy["error"] is None
+    assert canopy["points"] is not None
+    assert canopy["resolution_m"] == 1.0
 
 
 # --------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from mapgen import __version__
-from mapgen.bng import BngError, ensure_ostn15, load_ostn15
+from mapgen.bng import BngError, ensure_ostn15, load_ostn15, to_bng
 from mapgen.boundary_curves import boundary_curves_with_counts
 from mapgen.bridge import BridgeError, BridgeRequest, run_bridge
 from mapgen.buildings import (
@@ -28,6 +28,7 @@ from mapgen.buildings import (
     _resolve_way_ring,
     fuse_missing_buildings,
 )
+from mapgen.canopy import CanopyError, build_canopy
 from mapgen.categories import ALL_CATEGORY_IDS, overture_types_for_categories, validate_categories
 from mapgen.classify import (
     OverlaySets,
@@ -72,6 +73,7 @@ from mapgen.naming import (
     tiling_fingerprint,
 )
 from mapgen.resolver import resolve
+from mapgen.roofs import RoofsError, fit_roof_forms
 from mapgen.sources.base import (
     FAILURE_NO_OUTPUT,
     FAILURE_UNKNOWN,
@@ -1014,6 +1016,20 @@ def run_survey(
         # source in the same run never got its turn.
         lidar_heights = _fuse_heights_step(root=paths.root, stem=paths.stem, sink=sink)
 
+        # Task 7 of the roofs and canopy plan. Immediately after heights
+        # fusion, unconditionally, for the identical reason that step is
+        # not gated on `stopped` or `unrecoverable` either: the height tags
+        # it just wrote need to already be in the file before a roof fit
+        # rewrites the same ways, and running this pair even after a stop
+        # or a raise-in-waiting leaves nothing worse than the flat roofs
+        # and missing canopy the package would otherwise have kept. BEFORE
+        # the INSPIRE boundary injection below because neither step here
+        # touches a boundary curve, nor does that one touch a building way
+        # or the LiDAR rasters, so their relative order carries no meaning
+        # either way.
+        roof_forms = _fit_roofs_step(root=paths.root, stem=paths.stem, sink=sink)
+        canopy = _canopy_step(root=paths.root, stem=paths.stem, sink=sink)
+
         # Task 5 of the INSPIRE curves plan. Immediately after the heights
         # fusion above and, like it, unconditionally BEFORE the bridge
         # step below: gated only on the two files _fuse_boundaries_step
@@ -1132,6 +1148,8 @@ def run_survey(
         inspire_boundaries,
         buildings_fusion,
         boundaries_categories,
+        roof_forms,
+        canopy,
     )
     atomic_write_text(paths.survey_json, json.dumps(survey, indent=2))
     # reported_stopped here too, not the control-flow flag: the browser
@@ -1852,6 +1870,219 @@ def _fuse_heights_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, o
         buildings=record.buildings,
         kept_existing=record.kept_existing,
         no_data=record.no_data,
+    )
+
+
+# --------------------------------------------------------------------------
+# Task 7 of the roofs and canopy plan: fitting a roof form onto every
+# untagged building in <stem>.osm (roofs.py) and deriving canopy points
+# from the same package's own LiDAR (canopy.py), both following
+# _fuse_heights_step's own one-shape-whatever-happened pattern immediately
+# above. Wired right after heights fusion in both run_survey and
+# bridge_package (see both call sites): the height tags that step just
+# wrote are already in the file by the time either of these runs, and
+# nothing after this pair (the INSPIRE boundary injection) touches
+# building or roof geometry, so the two orderings never have to agree
+# about anything.
+# --------------------------------------------------------------------------
+
+# Roof fitting needs 1 m samples: `roofs.py`'s sequential RANSAC counts on
+# enough points per face to tell one plane from noise, and a coarser pixel
+# gives it too few to do that honestly. Every real Welsh package the owner
+# has today carries 2 m rasters (a survey-sized extent misses
+# cog.py's MAX_WINDOW_PIXELS by a small margin and falls back a level), so
+# 1.5 is chosen to sit cleanly between the two: a genuine 1 m raster's own
+# ModelPixelScale reads under it, and the 2 m fallback reads well over it.
+ROOF_MAX_PIXEL_METRES = 1.5
+
+
+def _roofs_record(**overrides) -> dict[str, object]:
+    """survey.json's `roof_forms` block, in ONE shape whatever happened,
+    the identical None-except-what-happened discipline `_heights_record`
+    above already keeps: every key reads None on a package this step never
+    ran on at all, so a reader can index any of them the same way whether
+    or not this run had LiDAR to fit against.
+    """
+    record: dict[str, object] = {
+        "buildings": None, "classified": None, "kept_existing": None,
+        "below_quality": None, "no_data": None, "relations_skipped": None,
+        "shapes": None, "skipped_reason": None, "error": None,
+    }
+    record.update(overrides)
+    return record
+
+
+def _fit_roofs_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, object]:
+    """Fit and tag a roof form onto every untagged building way in
+    `<stem>.osm`, reported as a record, in `_fuse_heights_step`'s own
+    style.
+
+    Gated first on the identical three files that step needs already
+    being in the package: `<stem>.osm`, `<stem>_lidar_dtm.tif` and
+    `<stem>_lidar_dsm.tif`. Missing any of the three is the ordinary case
+    of a survey that never selected `lidar_wales`, not a failure, and
+    records the all-None shape with `roof_forms_skipped`.
+
+    Past that sits a second gate this step alone needs: the two rasters'
+    own pixel size has to be at or under `ROOF_MAX_PIXEL_METRES`, because a
+    plane fit over samples coarser than that is not one this module can
+    stand behind. `roof_forms_skipped` fires again here, this time with a
+    `reason` field the UI's own event log prints verbatim, so the owner
+    sees exactly why a package with real LiDAR still got no roof tags
+    without needing a second code path to surface it.
+
+    `massing_path` is always handed to `fit_roof_forms`, which writes the
+    Grasshopper-ready GeoJSON itself, only when at least one building
+    actually classified.
+
+    Everything past the second gate is caught and recorded rather than
+    raised: an unreadable raster, a network failure fetching OSTN15, or a
+    malformed `.osm` all leave the building flat, exactly the package the
+    owner already had, rather than taking the rest of the survey down with
+    them.
+    """
+    osm_path = Path(root) / f"{stem}.osm"
+    dtm_path = Path(root) / f"{stem}_lidar_dtm.tif"
+    dsm_path = Path(root) / f"{stem}_lidar_dsm.tif"
+    if not (osm_path.is_file() and dtm_path.is_file() and dsm_path.is_file()):
+        sink.emit("roof_forms_skipped")
+        return _roofs_record()
+    try:
+        grid = load_ostn15()
+        if grid is None:
+            grid = ensure_ostn15()
+        dtm_window = read_full_window(CogReader.open(FileByteSource(dtm_path)))
+        dsm_window = read_full_window(CogReader.open(FileByteSource(dsm_path)))
+        coarsest = max(
+            dtm_window.pixel_size, dtm_window.pixel_height,
+            dsm_window.pixel_size, dsm_window.pixel_height,
+        )
+        if coarsest > ROOF_MAX_PIXEL_METRES:
+            reason = (
+                f"roof fitting needs the 1 m LiDAR level and this package's "
+                f"rasters are {coarsest:g} m; extents under about 4 x 4 km "
+                f"come back at 1 m"
+            )
+            sink.emit("roof_forms_skipped", reason=reason)
+            return _roofs_record(skipped_reason=reason)
+        sink.emit("roof_forms_started")
+        record = fit_roof_forms(
+            osm_path, dtm_window, dsm_window, grid,
+            massing_path=Path(root) / f"{stem}_roof_massing.geojson",
+        )
+    except (RoofsError, CogError, BngError, OSError) as exc:
+        error = str(exc)
+        sink.emit("roof_forms_failed", error=error)
+        return _roofs_record(error=error)
+    sink.emit(
+        "roof_forms_written",
+        classified=record.classified,
+        buildings=record.buildings,
+        below_quality=record.below_quality,
+        no_data=record.no_data,
+    )
+    return _roofs_record(
+        buildings=record.buildings,
+        classified=record.classified,
+        kept_existing=record.kept_existing,
+        below_quality=record.below_quality,
+        no_data=record.no_data,
+        relations_skipped=record.relations_skipped,
+        shapes=dict(record.shapes),
+    )
+
+
+def _canopy_record(**overrides) -> dict[str, object]:
+    """survey.json's `canopy` block, in ONE shape whatever happened, the
+    same None-except-what-happened discipline `_roofs_record` above keeps.
+    """
+    record: dict[str, object] = {
+        "points": None, "skipped_small": None, "resolution_m": None, "error": None,
+    }
+    record.update(overrides)
+    return record
+
+
+def _canopy_step(root: Path, stem: str, sink: ProgressSink) -> dict[str, object]:
+    """Derive canopy points (DSM minus DTM outside every building
+    footprint) from this package's own LiDAR and write
+    `<stem>_canopy.geojson`, reported as a record, in `_fit_roofs_step`'s
+    own style immediately above it.
+
+    Gated on the identical three files `_fit_roofs_step` needs, for the
+    identical reason: missing any of them is the ordinary case of a survey
+    with no Welsh LiDAR, not a failure. Unlike that step, there is no
+    second, resolution gate here: a canopy cluster spans many pixels at
+    any resolution this project produces, where a roof plane specifically
+    needs 1 m to tell two faces a metre or two apart from noise, so this
+    step runs at whatever pixel size the package's own rasters carry.
+
+    Building footprints to mask come from the FUSED `.osm`, read with
+    `buildings._existing_building_footprints` so a footprint tagged
+    directly on a way or carried by a multipolygon relation's outer member
+    is masked the same way either time, the identical reading
+    `_categorise_boundaries_step` already relies on for its own building
+    rings. Each ring is projected to BNG with the loaded OSTN15 grid; a
+    ring with no coverage there (`BngError`) is simply dropped from the
+    mask rather than failing the whole step, since one footprint this
+    project cannot place is not a reason to stop looking for canopy
+    everywhere else in the package.
+
+    `<stem>_canopy.geojson` is written atomically, and only when
+    `build_canopy` actually found a point: a package with nothing above
+    the 3 m floor gets no file at all, the identical absence-over-an-
+    empty-shell rule `roofs.py`'s own massing file already follows.
+
+    Every failure (an unreadable raster, a network failure fetching
+    OSTN15, a malformed `.osm`) is caught here and recorded rather than
+    raised, for the same reason `_fit_roofs_step` catches its own: a
+    package with no canopy layer is exactly the package the owner already
+    had.
+    """
+    osm_path = Path(root) / f"{stem}.osm"
+    dtm_path = Path(root) / f"{stem}_lidar_dtm.tif"
+    dsm_path = Path(root) / f"{stem}_lidar_dsm.tif"
+    if not (osm_path.is_file() and dtm_path.is_file() and dsm_path.is_file()):
+        sink.emit("canopy_skipped")
+        return _canopy_record()
+
+    sink.emit("canopy_started")
+    try:
+        grid = load_ostn15()
+        if grid is None:
+            grid = ensure_ostn15()
+        dtm_window = read_full_window(CogReader.open(FileByteSource(dtm_path)))
+        dsm_window = read_full_window(CogReader.open(FileByteSource(dsm_path)))
+        osm_root = ET.fromstring(osm_path.read_text(encoding="utf-8"))
+        footprints, _ = _existing_building_footprints(osm_root)
+        footprints_bng: list[list[tuple[float, float]]] = []
+        for footprint in footprints:
+            try:
+                footprints_bng.append(
+                    [to_bng(lat, lon, grid) for lon, lat in footprint.ring]
+                )
+            except BngError:
+                # No OSTN15 coverage for this footprint: it simply does not
+                # mask, the same practical fact `_fit_roofs_step`'s own
+                # no_data outcome records for a footprint it cannot place.
+                continue
+        features, record = build_canopy(dtm_window, dsm_window, footprints_bng, grid)
+    except (CanopyError, CogError, BngError, HeightsError, OSError, ET.ParseError) as exc:
+        error = str(exc)
+        sink.emit("canopy_failed", error=error)
+        return _canopy_record(error=error)
+
+    if features:
+        collection = {"type": "FeatureCollection", "features": features}
+        atomic_write_bytes(
+            Path(root) / f"{stem}_canopy.geojson",
+            json.dumps(collection, indent=2).encode("utf-8"),
+        )
+    sink.emit("canopy_written", points=record.points, skipped_small=record.skipped_small)
+    return _canopy_record(
+        points=record.points,
+        skipped_small=record.skipped_small,
+        resolution_m=record.resolution_m,
     )
 
 
@@ -3315,6 +3546,19 @@ def bridge_package(
     # `written` count, never re-adding a tag that is already there.
     payload["lidar_heights"] = _fuse_heights_step(root=root, stem=stem, sink=sink)
 
+    # Task 7 of the roofs and canopy plan. Same ordering as run_survey's
+    # own call site and for the same reason: the height tags heights
+    # fusion just wrote need to already be in the file before a roof fit
+    # rewrites the same ways, and this is also what proves the roof step's
+    # own idempotence on a package a prior bridge already fitted, the
+    # identical `kept_existing`-goes-up shape the heights step above
+    # proves for itself. Neither step here reads or writes a boundary
+    # curve, and the INSPIRE injection immediately below never touches a
+    # building way or the LiDAR rasters, so their relative order carries
+    # no meaning either way.
+    payload["roof_forms"] = _fit_roofs_step(root=root, stem=stem, sink=sink)
+    payload["canopy"] = _canopy_step(root=root, stem=stem, sink=sink)
+
     # Task 5 of the INSPIRE curves plan. Same ordering as run_survey's own
     # call site: immediately after heights fusion, unconditionally before
     # the bridge attempt below. The provenance enrichment runs regardless
@@ -4481,6 +4725,8 @@ def _build_survey_json(
     inspire_boundaries=None,
     buildings_fusion=None,
     boundaries_categories=None,
+    roof_forms=None,
+    canopy=None,
 ) -> dict:
     width_m, height_m = extent_metres(request.bbox)
     outputs_by_source = outputs_by_source or {}
@@ -4500,6 +4746,8 @@ def _build_survey_json(
     }
     buildings_fusion = buildings_fusion or _buildings_record()
     boundaries_categories = boundaries_categories or _categories_record()
+    roof_forms = roof_forms or _roofs_record()
+    canopy = canopy or _canopy_record()
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
@@ -4723,6 +4971,22 @@ def _build_survey_json(
         # sentence when the step ran and could not finish; every OTHER
         # layer's own data is untouched either way, per Task 20's ruling.
         "lidar_heights": lidar_heights,
+        # Task 7 of the roofs and canopy plan. Same None-except-what-
+        # happened discipline as `lidar_heights` immediately above:
+        # every key here is None on a package this step never ran on at
+        # all (no `.osm`, or no Welsh LiDAR selected). `skipped_reason`
+        # is the one key that is non-None while every count is still
+        # None: this package DID have LiDAR, just not at the 1 m level
+        # roof fitting needs, and the sentence explains that rather than
+        # leaving a reader to guess why nothing was tagged.
+        "roof_forms": roof_forms,
+        # Same plan, same file gate as `roof_forms` immediately above, but
+        # no second resolution gate of its own (see `_canopy_step`'s own
+        # docstring for why): `points` and `skipped_small` read zero, not
+        # None, whenever the step actually ran and simply found nothing
+        # above the 3 m floor, the identical zero-means-ran discipline
+        # `build_canopy` itself already keeps.
+        "canopy": canopy,
         # Task 5 of the INSPIRE curves plan. Same None-vs-0 discipline as
         # `lidar_heights` immediately above: `written` is None, not 0,
         # on a package this step never ran on at all (no `.osm`, or no
