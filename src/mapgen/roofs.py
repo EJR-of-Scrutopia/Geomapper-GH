@@ -336,6 +336,7 @@ from pathlib import Path
 from mapgen.bng import BngError, Ostn15Grid, to_bng
 from mapgen.cog import BngWindow
 from mapgen.heights import (
+    HeightsError,
     _declaration_line,
     _footprint_ring,
     _grid_points,
@@ -410,6 +411,18 @@ def _roof_samples(ring_bng, dtm: BngWindow, dsm: BngWindow):
 
 
 def _write_roof_tags(way: ET.Element, form: RoofForm) -> None:
+    """Write the fitted tags onto `way`, skipping any key it already
+    carries.
+
+    `roof:shape` alone gates `kept_existing` in `fit_roof_forms` (per the
+    brief), so a way can still reach here carrying a stale, independently
+    upstream-sourced fragment of one of the other four keys (real OSM
+    data does carry partial roof tagging). Collecting the existing keys
+    once and skipping them matches heights.py's own never-overwrite-
+    mapper-data rule for `height`/`source:height`: the mapper's own value
+    wins, this only fills the gaps.
+    """
+    existing_keys = {t.get("k") for t in way.findall("tag")}
     for key, value in (
         (ROOF_SHAPE_TAG_KEY, form.shape),
         (
@@ -420,7 +433,7 @@ def _write_roof_tags(way: ET.Element, form: RoofForm) -> None:
         (ROOF_RIDGE_TAG_KEY, f"{form.ridge_m:.1f}"),
         (SOURCE_ROOF_TAG_KEY, SOURCE_ROOF_ATTRIBUTION),
     ):
-        if value is None:
+        if value is None or key in existing_keys:
             continue
         tag = ET.SubElement(way, "tag")
         tag.set("k", key)
@@ -462,7 +475,7 @@ def fit_roof_forms(
         raise RoofsError(f"{path.name} could not be read: {exc}") from None
     try:
         declaration = _declaration_line(text)
-    except Exception as exc:
+    except HeightsError as exc:
         raise RoofsError(str(exc)) from None
     try:
         root = ET.fromstring(text)

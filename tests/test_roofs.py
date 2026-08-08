@@ -5,9 +5,7 @@ import xml.etree.ElementTree as ET
 from array import array
 from pathlib import Path
 
-import pytest
-
-from mapgen.bng import from_bng, load_ostn15
+from mapgen.bng import _NODE_COUNT, Ostn15Grid, from_bng
 from mapgen.cog import BngWindow
 from mapgen.roofs import (
     INLIER_TOLERANCE_METRES,
@@ -253,15 +251,14 @@ class TestClassifyRoof:
 # --------------------------------------------------------------------------
 # Task 3: the .osm loop, roof tags, and the record.
 #
-# Fixture pattern deliberately different from test_heights.py's: those
-# fixtures build a hand-rolled zero-shift Ostn15Grid so from_bng/to_bng
-# degenerate to a bare, network-free projection, and they never call
-# load_ostn15() at all. This suite's fixture instead needs a real
-# from_bng round trip to place lat/lon nodes for fit_roof_forms's own
-# to_bng to project back, so it loads the real cached grid via
-# load_ostn15() and, if this machine has never fetched one, skips rather
-# than fabricate a substitute grid that would quietly change what these
-# tests prove (see _live_ostn15_grid below).
+# Fixture pattern reused verbatim from test_heights.py: a hand-rolled
+# Ostn15Grid every node of which carries a (0, 0) shift, so from_bng and
+# to_bng degenerate to tm_inverse/tm_forward, exact inverses of each
+# other. That is what lets _osm_with_building below choose BNG
+# coordinates directly, project them to lat/lon with from_bng, and get
+# them back out of fit_roof_forms's own to_bng call almost unchanged,
+# with no real OSTN15 cache and no network touched. A fresh clone or a
+# CI runner has no `~/.mapgen` cache; this fixture never asks for one.
 # --------------------------------------------------------------------------
 
 from mapgen.roofs import (  # noqa: E402
@@ -272,11 +269,9 @@ from mapgen.roofs import (  # noqa: E402
 )
 
 
-def _live_ostn15_grid():
-    grid = load_ostn15()
-    if grid is None:
-        pytest.skip("OSTN15 grid not cached on this machine")
-    return grid
+def _zero_shift_grid() -> Ostn15Grid:
+    shifts = array("f", [0.0]) * (_NODE_COUNT * 2)
+    return Ostn15Grid(shifts)
 
 
 def _window(e0, n0, size, values, pixel=1.0):
@@ -323,7 +318,7 @@ def _osm_with_building(path, ring_bng, grid, extra_tags=()):
 
 class TestFitRoofForms:
     def test_gable_building_gains_roof_tags(self, tmp_path):
-        grid = _live_ostn15_grid()
+        grid = _zero_shift_grid()
         e0, n0 = 318000.0, 176000.0
         dtm, dsm = _gable_windows(e0, n0)
         osm = tmp_path / "site.osm"
@@ -345,7 +340,7 @@ class TestFitRoofForms:
         assert min(direction, 180.0 - direction) < 10.0
 
     def test_second_run_is_byte_identical(self, tmp_path):
-        grid = _live_ostn15_grid()
+        grid = _zero_shift_grid()
         e0, n0 = 318000.0, 176000.0
         dtm, dsm = _gable_windows(e0, n0)
         osm = tmp_path / "site.osm"
@@ -360,7 +355,7 @@ class TestFitRoofForms:
         assert osm.read_bytes() == first
 
     def test_no_raster_data_writes_nothing(self, tmp_path):
-        grid = _live_ostn15_grid()
+        grid = _zero_shift_grid()
         e0, n0 = 318000.0, 176000.0
         nan = float("nan")
         dtm = _window(e0, n0, 20, [nan] * 400)
@@ -376,7 +371,7 @@ class TestFitRoofForms:
 
     def test_counts_always_reconcile(self, tmp_path):
         # buildings == classified + kept_existing + below_quality + no_data
-        grid = _live_ostn15_grid()
+        grid = _zero_shift_grid()
         e0, n0 = 318000.0, 176000.0
         dtm, dsm = _gable_windows(e0, n0)
         osm = tmp_path / "site.osm"
@@ -389,3 +384,29 @@ class TestFitRoofForms:
             + record.below_quality + record.no_data
         )
         assert record.kept_existing == 1
+
+    def test_a_stale_partial_roof_tag_is_kept_not_duplicated(self, tmp_path):
+        # A way with roof:direction but no roof:shape is real-world OSM
+        # shape (roof:* tags are contributed independently upstream): it
+        # must still pass the roof:shape gate as untagged, get fitted,
+        # and come out with exactly one roof:direction tag, the mapper's
+        # own stale value, untouched, alongside the freshly fitted keys.
+        grid = _zero_shift_grid()
+        e0, n0 = 318000.0, 176000.0
+        dtm, dsm = _gable_windows(e0, n0)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid, extra_tags=(("roof:direction", "123"),))
+        record = fit_roof_forms(osm, dtm, dsm, grid)
+        assert record.classified == 1
+        assert record.kept_existing == 0
+        way = ET.fromstring(osm.read_text(encoding="utf-8")).find("way")
+        direction_tags = [t for t in way.findall("tag") if t.get("k") == "roof:direction"]
+        assert len(direction_tags) == 1
+        assert direction_tags[0].get("v") == "123"
+        tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
+        assert tags["roof:shape"] == "gable"
+        assert tags["roof:height:eaves"]
+        assert tags["roof:height:ridge"]
+        assert tags["source:roof"] == SOURCE_ROOF_ATTRIBUTION
