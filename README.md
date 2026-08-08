@@ -978,16 +978,20 @@ filtered by key and value in Urbano's own GeoJSON import. **Boundary-Line**
 nothing in the owner's workflow consumes it yet, and it joins later through
 the same OS Data Hub client in a short task if wanted.
 
-Still to come, in build order: categorised property boundaries, roof forms
-read off the DSM, canopy positions, and a Grasshopper GeoTIFF reader script,
-items the owner named directly in the 2026-08-07 working session that
-produced this build's own plan, with their own spec addendum still to be
-written; an OS benchmark, a dev-mode comparison against OS's paid developer
-tooling to calibrate the tier resolver's own tier tables against a second
-opinion, whose design is likewise still to be written; then, per the phase 2
-design record, DataMapWales constraints and Cadw designations together with
-planning.data.gov.uk for England, Sentinel-2 context imagery via Earth
-Search, England LiDAR as its own task (the discovery API is open but bulk
-raster download there has no documented route yet), PlanIt planning history,
-and BGS boreholes. See `docs/superpowers/specs/` for the design record
-covering that last group.
+The items the owner named in the 2026-08-07 working session now have their
+own spec addendum (`docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`)
+and most have shipped: the per-source detail preview (item C), categorised
+property boundaries (item A, see the `boundaries_categories` row of the
+`survey.json` schema above), roof forms and canopy positions read off the
+DSM (item B, see "Roof forms and canopy" above), and the Grasshopper
+GeoTIFF reader script (`docs/grasshopper/lidar_to_mesh.py`, a documentation
+artifact rather than pipeline code). Still to come, in build order: the
+Cardiff 25 cm LiDAR source (item D, 2011 flight, needs its own live probe
+first); an OS benchmark (item F), a dev-mode comparison against OS's paid
+developer tooling to calibrate the tier resolver's own tier tables against
+a second opinion; then, per the phase 2 design record, DataMapWales
+constraints and Cadw designations together with planning.data.gov.uk for
+England, Sentinel-2 context imagery via Earth Search, England LiDAR as its
+own task (the discovery API is open but bulk raster download there has no
+documented route yet), PlanIt planning history, and BGS boreholes. See
+`docs/superpowers/specs/` for the design record covering that last group.

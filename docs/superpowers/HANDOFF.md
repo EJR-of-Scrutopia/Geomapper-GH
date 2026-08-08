@@ -505,12 +505,15 @@ will measure them, the same way Task 4's own cold Cowbridge run measured
 The addendum this section used to describe as not yet written now exists:
 `docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`
 covers items A through F, owner-approved, with its own build order. Item
-C (detail preview) is shipped, see above. **Next action: item A,
-categorised property boundaries.** Then item B (roofs and canopy from the
-LiDAR, the flagship), item D (Cardiff 25 cm LiDAR, needs its own live
-probe first), item F (the OS benchmark, after A-D so it measures the
-finished stack), and item E (full-resolution LiDAR rasters) only if the
-owner opens that gate. Phase 2 item 4, DataMapWales constraints and Cadw
+C (detail preview), item A (categorised property boundaries) and item B
+(roofs and canopy from the LiDAR, the flagship) are all shipped, see
+above. **Next action: item D, the Cardiff 25 cm LiDAR source, which needs
+its own live probe of DataMapWales before any task is briefed.** Then
+item F (the OS benchmark, after A-D so it measures the finished stack),
+and item E (full-resolution LiDAR rasters) only if the owner opens that
+gate; item B's validation gives that gate a measured basis, since the
+owner's survey-sized extents currently come back at 2 m and miss the 1 m
+budget by about 1.3%. Phase 2 item 4, DataMapWales constraints and Cadw
 designations together with planning.data.gov.uk for England, follows the
 addendum unless the owner reorders; its own design already sits in
 `docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md`.
