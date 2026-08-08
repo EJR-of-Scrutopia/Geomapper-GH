@@ -1,4 +1,5 @@
 """tests/test_roofs.py"""
+import json
 import math
 import random
 import xml.etree.ElementTree as ET
@@ -146,6 +147,7 @@ class TestRidgeAzimuth:
 
 from mapgen.roofs import (
     MIN_QUALITY,
+    MIN_RIDGE_METRES,
     MIN_ROOF_SAMPLES,
     ROOF_SHAPES,
     RoofForm,
@@ -319,6 +321,26 @@ class TestClassifyRoof:
     def test_too_few_samples_refused(self):
         assert _classified(_roof_points("flat")[: MIN_ROOF_SAMPLES - 1]) is None
 
+    def test_a_low_flat_plane_is_refused_not_a_roof(self):
+        # Controller ruling from Task 4's validation: 89 real Cowbridge
+        # buildings classified with ridge under 0.5 m, 64 of them `flat`
+        # at quality 1.00, which is bare ground or a slab fitting one
+        # plane perfectly, not a roof. MIN_RIDGE_METRES is
+        # MIN_HEIGHT_METRES itself (see roofs.py), so 0.4 m sits well
+        # under the floor whatever that floor is set to.
+        assert 0.4 < MIN_RIDGE_METRES
+        form = _classified(_roof_points("flat", eaves=0.4, noise=0.0))
+        assert form is None
+
+    def test_the_same_plane_higher_up_still_classifies_flat(self):
+        # The other side of the same gate: a genuinely low but real roof
+        # clears the floor and classifies normally.
+        assert 3.0 >= MIN_RIDGE_METRES
+        form = _classified(_roof_points("flat", eaves=3.0, noise=0.0))
+        assert form is not None
+        assert form.shape == "flat"
+        assert form.eaves_m == form.ridge_m == 3.0
+
 
 # --------------------------------------------------------------------------
 # Task 3: the .osm loop, roof tags, and the record.
@@ -482,3 +504,76 @@ class TestFitRoofForms:
         assert tags["roof:height:eaves"]
         assert tags["roof:height:ridge"]
         assert tags["source:roof"] == SOURCE_ROOF_ATTRIBUTION
+
+
+# --------------------------------------------------------------------------
+# Task 5: the massing GeoJSON.
+#
+# Uses the same hermetic zero-shift grid fixture as TestFitRoofForms
+# above (Task 3's fix round), not load_ostn15: no real OSTN15 cache and
+# no network touched.
+# --------------------------------------------------------------------------
+
+
+class TestMassing:
+    def test_classified_building_emits_polygon_and_ridge(self, tmp_path):
+        grid = _zero_shift_grid()
+        e0, n0 = 318000.0, 176000.0
+        dtm, dsm = _gable_windows(e0, n0)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid)
+        massing = tmp_path / "site_roof_massing.geojson"
+        fit_roof_forms(osm, dtm, dsm, grid, massing_path=massing)
+        collection = json.loads(massing.read_text(encoding="utf-8"))
+        kinds = [f["geometry"]["type"] for f in collection["features"]]
+        assert kinds.count("Polygon") == 1
+        assert kinds.count("LineString") == 1
+        polygon = next(f for f in collection["features"]
+                       if f["geometry"]["type"] == "Polygon")
+        ridge = next(f for f in collection["features"]
+                     if f["geometry"]["type"] == "LineString")
+        eaves_z = polygon["geometry"]["coordinates"][0][0][2]
+        ridge_z = ridge["geometry"]["coordinates"][0][2]
+        assert eaves_z < ridge_z
+        assert polygon["properties"]["quality"] >= 0.75
+        assert polygon["properties"]["ground_m"] == 100.0
+        assert "indicative" in polygon["properties"]["note"]
+        # The ridge line's z must be the SAME number the tag carries, not
+        # a second, independently computed height: the file and the tags
+        # can never disagree.
+        assert ridge["geometry"]["coordinates"][0][2] == polygon["properties"]["ridge"]
+        assert ridge["geometry"]["coordinates"][1][2] == polygon["properties"]["ridge"]
+        assert ridge["properties"]["feature"] == "ridge"
+        assert ridge["properties"]["building"] == polygon["properties"]["building"]
+        assert ridge["properties"]["source"] == polygon["properties"]["source"]
+        assert "indicative" in ridge["properties"]["note"]
+
+    def test_no_classification_writes_no_file(self, tmp_path):
+        grid = _zero_shift_grid()
+        e0, n0 = 318000.0, 176000.0
+        nan = float("nan")
+        dtm = _window(e0, n0, 20, [nan] * 400)
+        dsm = _window(e0, n0, 20, [nan] * 400)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid)
+        massing = tmp_path / "site_roof_massing.geojson"
+        fit_roof_forms(osm, dtm, dsm, grid, massing_path=massing)
+        assert not massing.exists()
+
+    def test_no_massing_path_means_no_file_and_no_error(self, tmp_path):
+        # massing_path is optional: a caller that never passes it (the
+        # existing Task 3 call sites) gets exactly the old behaviour.
+        grid = _zero_shift_grid()
+        e0, n0 = 318000.0, 176000.0
+        dtm, dsm = _gable_windows(e0, n0)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid)
+        record = fit_roof_forms(osm, dtm, dsm, grid)
+        assert record.classified == 1
+        assert not (tmp_path / "site_roof_massing.geojson").exists()

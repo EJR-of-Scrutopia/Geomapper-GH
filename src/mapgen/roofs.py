@@ -9,6 +9,7 @@ fit). Task 2 adds classification, Task 3 the .osm loop, Task 5 massing.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -196,7 +197,7 @@ def ridge_azimuth_deg(p1: Plane, p2: Plane) -> float | None:
     return math.degrees(math.atan2(de, dn)) % 180.0
 
 
-from mapgen.heights import _percentile
+from mapgen.heights import MIN_HEIGHT_METRES, _percentile
 
 MIN_ROOF_SAMPLES = 24
 MIN_QUALITY = 0.75
@@ -225,6 +226,22 @@ GABLE_SLOPE_DIFFERENCE_MAX_DEG = 15.0
 # plane cannot breach it by construction, so the gate only ever fires on
 # a genuine second level, not on a noisy single deck.
 FLAT_MAX_SPREAD_METRES = 0.5
+
+# A classified ridge under this is not a roof at all. Task 4's validation
+# against real Cowbridge data found 89 classified buildings with ridge
+# under 0.5 m, 64 of them tagged `flat` at quality 1.00: a perfectly flat
+# patch of BARE GROUND is perfectly explained by one plane, so it scores
+# 1.00 on a question quality was never measuring. This is the identical
+# physical question heights.py already ruled on for `height` itself:
+# "Heights under 2.0 m are refused, not rounded up, and recorded as
+# `no_data` exactly like a tile with no coverage: a slab, a low wall or a
+# misregistered footprint reads as a few tens of centimetres of
+# DSM-minus-DTM, and writing that as a building height would put
+# fabricated data into a package." A ridge under that floor is the same
+# slab, the same low wall, the same misregistered footprint, read off the
+# DSM's own peak instead of its median, so this is MIN_HEIGHT_METRES
+# itself, not a new number picked for roofs.
+MIN_RIDGE_METRES = MIN_HEIGHT_METRES
 
 # `hip` was dropped after Task 4's validation. See classify_roof.
 ROOF_SHAPES = ("flat", "mono", "gable", "complex")
@@ -261,9 +278,10 @@ def _is_opposite_pair(p1: FittedPlane, p2: FittedPlane) -> bool:
 
 def classify_roof(points, planes) -> RoofForm | None:
     """One building's roof form from its extracted planes, or None when
-    the evidence is below the honesty floor (too few samples, or the
-    planes explain less than MIN_QUALITY of them): None means NO tags,
-    the spec's absence-over-fabrication rule.
+    the evidence is below the honesty floor (too few samples, the planes
+    explain less than MIN_QUALITY of them, or the fitted ridge sits under
+    MIN_RIDGE_METRES): None means NO tags, the spec's absence-over-
+    fabrication rule.
     """
     if len(points) < MIN_ROOF_SAMPLES or not planes:
         return None
@@ -375,6 +393,14 @@ def classify_roof(points, planes) -> RoofForm | None:
     else:
         eaves = round(z_low, 1)
         ridge = round(z_high, 1)
+    if ridge < MIN_RIDGE_METRES:
+        # See MIN_RIDGE_METRES: below the floor, this is bare ground or a
+        # slab fitting one plane perfectly, not a roof. None means NO
+        # tags, the same absence-over-fabrication rule this function
+        # already applies above for thin evidence; the caller counts this
+        # `below_quality`, exactly where a fit the evidence cannot support
+        # belongs.
+        return None
     if direction is not None:
         direction = round(direction, 0) % (360.0 if shape == "mono" else 180.0)
     return RoofForm(
@@ -397,8 +423,9 @@ def classify_roof(points, planes) -> RoofForm | None:
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from mapgen.bng import BngError, Ostn15Grid, to_bng
+from mapgen.bng import BngError, Ostn15Grid, from_bng, to_bng
 from mapgen.cog import BngWindow
+from mapgen.fsutil import atomic_write_bytes
 from mapgen.heights import (
     HeightsError,
     _declaration_line,
@@ -414,6 +441,13 @@ ROOF_EAVES_TAG_KEY = "roof:height:eaves"
 ROOF_RIDGE_TAG_KEY = "roof:height:ridge"
 SOURCE_ROOF_TAG_KEY = "source:roof"
 SOURCE_ROOF_ATTRIBUTION = "Welsh Government LiDAR 2020 to 2023 (DSM plane fit)"
+
+# Task 5's massing GeoJSON: the same attribution, and one note carried on
+# every feature (polygon and ridge alike) because both are a plane fit's
+# read of a roof, not a survey of it. "indicative" is load-bearing: a
+# concave footprint can make the ridge span (see _ridge_segment) bridge a
+# notch in the outline, and this is what covers that case honestly.
+MASSING_NOTE = "derived from LiDAR plane fits, indicative"
 
 _BUILDING_TAG_KEY = "building"
 
@@ -504,6 +538,73 @@ def _write_roof_tags(way: ET.Element, form: RoofForm) -> None:
         tag.set("v", value)
 
 
+def _ridge_segment(pair, ring_bng):
+    """Two (e, n, z) endpoints of a gable pair's intersection line,
+    clipped to the footprint, in the CENTRED frame the planes live in
+    (the caller adds the centre back before projecting to lon/lat), or
+    None when there is no honest span to report.
+
+    Parametrises the intersection line by solving one coordinate from
+    `(a1-a2)e + (b1-b2)n = c2-c1` at the footprint centre (whichever of
+    e or n has the larger coefficient, to avoid dividing by a near-zero
+    one), with direction taken from the planes' gradient difference
+    rotated 90 degrees (the same vector `ridge_azimuth_deg` reads).  It
+    then intersects that infinite line with every ring edge in 2D and
+    takes the span between the smallest and largest intersection
+    parameters found. Fewer than two intersections, or a near-parallel
+    pair (no line at all), returns None; the polygon still ships either
+    way. On a concave footprint the span can bridge a notch outside the
+    building; the massing note's "indicative" covers exactly this.
+    """
+    p1, p2 = pair[0].plane, pair[1].plane
+    de = -(p1.b - p2.b)
+    dn = p1.a - p2.a
+    length = math.hypot(de, dn)
+    if length < 1e-9:
+        return None
+    de, dn = de / length, dn / length
+    rhs = p2.c - p1.c
+    da, db = p1.a - p2.a, p1.b - p2.b
+    if abs(da) >= abs(db):
+        n0 = 0.0
+        e0 = (rhs - db * n0) / da
+    else:
+        e0 = 0.0
+        n0 = (rhs - da * e0) / db
+    ts = []
+    prev = ring_bng[-1]
+    for vertex in ring_bng:
+        (x1, y1), (x2, y2) = prev, vertex
+        prev = vertex
+        # Solve (e0 + t*de, n0 + t*dn) crossing segment (x1,y1)-(x2,y2).
+        sx, sy = x2 - x1, y2 - y1
+        denom = de * sy - dn * sx
+        if abs(denom) < 1e-12:
+            continue
+        # Cramer's rule on [de -sx; dn -sy] u = [x1-e0; y1-n0] gives
+        # u = (dn*(x1-e0) - de*(y1-n0)) / denom (determinant -denom over
+        # a numerator that itself carries the matching sign; the two
+        # negations cancel). Dividing by -denom, as an earlier version of
+        # this function did, flips every crossing's u outside [0, 1] and
+        # silently drops every real intersection: confirmed both
+        # algebraically and by running this exact fixture, where it
+        # produced zero crossings on any edge of a footprint the ridge
+        # plainly cuts through.
+        u = ((x1 - e0) * dn - (y1 - n0) * de) / denom
+        if not (0.0 <= u <= 1.0):
+            continue
+        crossing_e, crossing_n = x1 + u * sx, y1 + u * sy
+        ts.append((crossing_e - e0) * de + (crossing_n - n0) * dn)
+    if len(ts) < 2:
+        return None
+    t_min, t_max = min(ts), max(ts)
+    z = p1.z_at(e0 + t_min * de, n0 + t_min * dn)
+    return (
+        (e0 + t_min * de, n0 + t_min * dn, z),
+        (e0 + t_max * de, n0 + t_max * dn, z),
+    )
+
+
 def fit_roof_forms(
     osm_path: Path,
     dtm: BngWindow,
@@ -521,8 +622,18 @@ def fit_roof_forms(
     makes a second run over the same package idempotent by construction
     and byte-identical.
 
-    `massing_path` is Task 5's seam for writing the massing GeoJSON;
-    until Task 5, it is accepted here and ignored.
+    `massing_path`, when given, gets a GeoJSON `FeatureCollection` for
+    direct Grasshopper import: one Polygon per classified building (the
+    footprint ring at eaves height, metres above that building's own
+    ground) plus one LineString ridge per classified `gable` (the only
+    shape with both a direction and two planes to intersect; `mono` has
+    a direction but no second plane, `flat` and `complex` have neither).
+    Built in this same loop, from the same fit that wrote the tags, so
+    the file and the tags can never disagree. Unclassified buildings
+    contribute nothing, and the file itself is written atomically and
+    only when at least one building classified: an empty classification
+    writes no file at all, matching the module's absence-over-
+    fabrication rule for the tags themselves.
 
     Raises `RoofsError` for an `.osm` that cannot be read as the shape
     `mapgen.merge.merge_osm_xml` produces at all; a footprint this module
@@ -562,6 +673,7 @@ def fit_roof_forms(
     relations_skipped = 0
     shapes: dict[str, int] = {}
     changed = False
+    features: list[dict] = []
 
     for element in root:
         if element.tag == "relation":
@@ -597,12 +709,72 @@ def fit_roof_forms(
             below_quality += 1
             continue
         _write_roof_tags(element, form)
+        if massing_path is not None:
+            way_id = element.get("id")
+            try:
+                building_id: object = int(way_id)
+            except (TypeError, ValueError):
+                building_id = way_id
+            ring_positions = []
+            for e, n in projected:
+                lat, lon = from_bng(e, n, grid)
+                ring_positions.append([lon, lat, form.eaves_m])
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Polygon", "coordinates": [ring_positions]},
+                    "properties": {
+                        "building": building_id,
+                        "shape": form.shape,
+                        "direction": form.direction_deg,
+                        "eaves": form.eaves_m,
+                        "ridge": form.ridge_m,
+                        "quality": form.quality,
+                        "ground_m": round(ground, 2),
+                        "source": SOURCE_ROOF_ATTRIBUTION,
+                        "note": MASSING_NOTE,
+                    },
+                }
+            )
+            # Gable only (see the docstring above): the only classified
+            # shape with exactly two significant planes to intersect.
+            if form.shape == "gable" and form.direction_deg is not None:
+                ring_centred = [(e - centre[0], n - centre[1]) for e, n in projected]
+                segment = _ridge_segment(form.planes[:2], ring_centred)
+                if segment is not None:
+                    (e1, n1, _), (e2, n2, _) = segment
+                    lat1, lon1 = from_bng(e1 + centre[0], n1 + centre[1], grid)
+                    lat2, lon2 = from_bng(e2 + centre[0], n2 + centre[1], grid)
+                    features.append(
+                        {
+                            "type": "Feature",
+                            "geometry": {
+                                "type": "LineString",
+                                "coordinates": [
+                                    [lon1, lat1, form.ridge_m],
+                                    [lon2, lat2, form.ridge_m],
+                                ],
+                            },
+                            "properties": {
+                                "building": building_id,
+                                "feature": "ridge",
+                                "source": SOURCE_ROOF_ATTRIBUTION,
+                                "note": MASSING_NOTE,
+                            },
+                        }
+                    )
         shapes[form.shape] = shapes.get(form.shape, 0) + 1
         classified += 1
         changed = True
 
     if changed:
         _rewrite_osm(path, declaration, root)
+
+    if massing_path is not None and features:
+        collection = {"type": "FeatureCollection", "features": features}
+        atomic_write_bytes(
+            Path(massing_path), json.dumps(collection, indent=2).encode("utf-8")
+        )
 
     return RoofsRecord(
         buildings=buildings,
