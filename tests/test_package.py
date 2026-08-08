@@ -6387,7 +6387,8 @@ def test_the_roofs_step_is_skipped_by_the_resolution_gate_at_2m(tmp_path, monkey
     import mapgen.package as package_module
 
     monkeypatch.setattr(package_module, "load_ostn15", lambda: _zero_shift_grid())
-    register(RoofsStubSource(pixel=2.0000004))
+    gate_pixel = 2.0000004
+    register(RoofsStubSource(pixel=gate_pixel))
     log = EventLog()
 
     result = run_survey(_request(tmp_path, run_bridge_step=False), progress=log)
@@ -6397,6 +6398,14 @@ def test_the_roofs_step_is_skipped_by_the_resolution_gate_at_2m(tmp_path, monkey
     assert record["skipped_reason"] is not None
     assert "needs the 1 m LiDAR level" in record["skipped_reason"]
     assert "4 x 4 km" in record["skipped_reason"]
+    # The numeric substitution itself, not just the prose either side of
+    # it: computed with the identical `:g` format spec the production
+    # f-string uses, from the fixture's own pixel value, so a drift in
+    # either the format spec (e.g. to `:.7f`, which would leak
+    # `2.0000004` straight into the owner-visible message) or the
+    # substituted value fails this assertion rather than sliding past it.
+    expected_pixel_text = f"rasters are {gate_pixel:g} m"
+    assert expected_pixel_text in record["skipped_reason"]
 
     expected_osm = tmp_path / "expected.osm"
     _osm_with_building(
@@ -6415,6 +6424,7 @@ def test_the_roofs_step_is_skipped_by_the_resolution_gate_at_2m(tmp_path, monkey
     assert "roof_forms_skipped" in names
     skipped = next(e for e in events if e["event"] == "roof_forms_skipped")
     assert "reason" in skipped
+    assert expected_pixel_text in skipped["reason"]
 
 
 def test_the_roofs_step_is_skipped_when_lidar_rasters_are_missing(tmp_path):
