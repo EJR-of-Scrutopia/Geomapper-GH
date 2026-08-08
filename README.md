@@ -616,7 +616,8 @@ Each file:
   already refused under, elsewhere in this file: a slab is not a
   building), gets no roof tags at all rather than a guess.
   `<stem>_canopy.geojson` is exactly what its own `note` property says,
-  `vegetation and other above-ground features`: a pylon or a crane clears
+  `vegetation and other above-ground features, derived from LiDAR,
+  indicative`: a pylon or a crane clears
   the same 3 m floor a tree does and a raster cannot tell them apart, so
   read it as an above-ground survey, never a species one.
 - **`<stem>_boundaries.geojson`**: HM Land Registry's INSPIRE Index
@@ -983,7 +984,8 @@ own spec addendum (`docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-de
 and most have shipped: the per-source detail preview (item C), categorised
 property boundaries (item A, see the `boundaries_categories` row of the
 `survey.json` schema above), roof forms and canopy positions read off the
-DSM (item B, see "Roof forms and canopy" above), and the Grasshopper
+DSM (item B, see the `<stem>_roof_massing.geojson` and `<stem>_canopy.geojson`
+entries and the `roof_forms` and `canopy` schema rows above), and the Grasshopper
 GeoTIFF reader script (`docs/grasshopper/lidar_to_mesh.py`, a documentation
 artifact rather than pipeline code). Still to come, in build order: the
 Cardiff 25 cm LiDAR source (item D, 2011 flight, needs its own live probe
