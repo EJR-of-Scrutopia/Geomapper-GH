@@ -321,3 +321,218 @@ def classify_roof(points, planes) -> RoofForm | None:
         quality=quality,
         planes=tuple(significant),
     )
+
+
+# --------------------------------------------------------------------------
+# Task 3: the .osm loop, roof tags, and the record. Transposed from
+# heights.fuse_building_heights: same parse, same node table, same
+# building-ways-only/relations-skipped/atomic-rewrite shape, with a plane
+# fit standing where the fusion put a plain DSM-minus-DTM subtraction.
+# --------------------------------------------------------------------------
+
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+from mapgen.bng import BngError, Ostn15Grid, to_bng
+from mapgen.cog import BngWindow
+from mapgen.heights import (
+    _declaration_line,
+    _footprint_ring,
+    _grid_points,
+    _point_in_polygon,
+    _rewrite_osm,
+)
+
+ROOF_SHAPE_TAG_KEY = "roof:shape"
+ROOF_DIRECTION_TAG_KEY = "roof:direction"
+ROOF_EAVES_TAG_KEY = "roof:height:eaves"
+ROOF_RIDGE_TAG_KEY = "roof:height:ridge"
+SOURCE_ROOF_TAG_KEY = "source:roof"
+SOURCE_ROOF_ATTRIBUTION = "Welsh Government LiDAR 2020 to 2023 (DSM plane fit)"
+
+_BUILDING_TAG_KEY = "building"
+
+
+class RoofsError(RuntimeError):
+    """Raised when a package's own `.osm` cannot be read or rewritten,
+    matching `HeightsError`'s scope exactly: caught and recorded by the
+    package step, never allowed to take a survey down.
+    """
+
+
+@dataclass(frozen=True)
+class RoofsRecord:
+    """What one pass over an `.osm` did, mirroring `HeightsRecord`'s shape
+    with the two extra outcomes a roof fit can land on: `below_quality`
+    (evidence gathered, `classify_roof` refused it) alongside `no_data`
+    (no usable evidence at all). `buildings == classified + kept_existing
+    + below_quality + no_data` always. `shapes` counts classified ways by
+    `RoofForm.shape`.
+    """
+
+    buildings: int
+    classified: int
+    kept_existing: int
+    below_quality: int
+    no_data: int
+    relations_skipped: int
+    shapes: dict[str, int]
+
+
+def _roof_samples(ring_bng, dtm: BngWindow, dsm: BngWindow):
+    """(points, ground, centre) for one footprint, or None when the
+    evidence is below the floor.
+
+    `points` are (e, n, z above ground), centred on the footprint's own
+    sample mean for conditioning (plane fitting is better behaved near
+    the origin); `ground` is the DTM median (the heights.py convention);
+    `centre` is the (mean easting, mean northing) the centring subtracted,
+    kept so Task 5's massing can place geometry back in real BNG.
+    """
+    eastings = [e for e, _ in ring_bng]
+    northings = [n for _, n in ring_bng]
+    raw = []
+    for e, n in _grid_points(min(eastings), min(northings), max(eastings), max(northings)):
+        if not _point_in_polygon(e, n, ring_bng):
+            continue
+        dtm_v = dtm.sample_bng(e, n)
+        dsm_v = dsm.sample_bng(e, n)
+        if dtm_v is None or dsm_v is None:
+            continue
+        raw.append((e, n, dtm_v, dsm_v))
+    if len(raw) < MIN_ROOF_SAMPLES:
+        return None
+    ground = _percentile([r[2] for r in raw], 0.5)
+    e_mean = sum(r[0] for r in raw) / len(raw)
+    n_mean = sum(r[1] for r in raw) / len(raw)
+    points = [(e - e_mean, n - n_mean, dsm_v - ground) for e, n, _, dsm_v in raw]
+    return points, ground, (e_mean, n_mean)
+
+
+def _write_roof_tags(way: ET.Element, form: RoofForm) -> None:
+    for key, value in (
+        (ROOF_SHAPE_TAG_KEY, form.shape),
+        (
+            ROOF_DIRECTION_TAG_KEY,
+            None if form.direction_deg is None else f"{form.direction_deg:.0f}",
+        ),
+        (ROOF_EAVES_TAG_KEY, f"{form.eaves_m:.1f}"),
+        (ROOF_RIDGE_TAG_KEY, f"{form.ridge_m:.1f}"),
+        (SOURCE_ROOF_TAG_KEY, SOURCE_ROOF_ATTRIBUTION),
+    ):
+        if value is None:
+            continue
+        tag = ET.SubElement(way, "tag")
+        tag.set("k", key)
+        tag.set("v", value)
+
+
+def fit_roof_forms(
+    osm_path: Path,
+    dtm: BngWindow,
+    dsm: BngWindow,
+    grid: Ostn15Grid,
+    massing_path: Path | None = None,
+) -> RoofsRecord:
+    """Fit and tag a roof form onto every untagged building way in
+    `osm_path`, atomically, idempotently, absence over fabrication
+    throughout.
+
+    Ways tagged `building=*` only; a multipolygon relation is counted in
+    `relations_skipped` and never looked at. A way that already carries
+    `roof:shape` is `kept_existing` and never re-touched, which is what
+    makes a second run over the same package idempotent by construction
+    and byte-identical.
+
+    `massing_path` is Task 5's seam for writing the massing GeoJSON;
+    until Task 5, it is accepted here and ignored.
+
+    Raises `RoofsError` for an `.osm` that cannot be read as the shape
+    `mapgen.merge.merge_osm_xml` produces at all; a footprint this module
+    cannot make sense of on its own (unresolvable node, no OSTN15
+    coverage, too little raster data) is never an exception, only
+    `no_data`, and a footprint `classify_roof` cannot honestly call a
+    shape is `below_quality`, per the module's absence-over-fabrication
+    rule.
+    """
+    path = Path(osm_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RoofsError(f"{path.name} could not be read: {exc}") from None
+    try:
+        declaration = _declaration_line(text)
+    except Exception as exc:
+        raise RoofsError(str(exc)) from None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise RoofsError(f"{path.name} is not valid XML: {exc}") from None
+
+    nodes: dict[str, tuple[float, float]] = {}
+    for element in root:
+        if element.tag != "node":
+            continue
+        node_id, lat, lon = element.get("id"), element.get("lat"), element.get("lon")
+        if node_id is None or lat is None or lon is None:
+            continue
+        try:
+            nodes[node_id] = (float(lat), float(lon))
+        except ValueError:
+            continue
+
+    buildings = classified = kept_existing = below_quality = no_data = 0
+    relations_skipped = 0
+    shapes: dict[str, int] = {}
+    changed = False
+
+    for element in root:
+        if element.tag == "relation":
+            relations_skipped += 1
+            continue
+        if element.tag != "way":
+            continue
+        tags = element.findall("tag")
+        if not any(t.get("k") == _BUILDING_TAG_KEY for t in tags):
+            continue
+        buildings += 1
+        if any(t.get("k") == ROOF_SHAPE_TAG_KEY for t in tags):
+            kept_existing += 1
+            continue
+        ring = _footprint_ring(element, nodes)
+        if ring is None:
+            no_data += 1
+            continue
+        try:
+            projected = [to_bng(lat, lon, grid) for lat, lon in ring]
+        except BngError:
+            # No OSTN15 coverage for this footprint: the same practical
+            # fact as a raster with nothing under it (see heights.py).
+            no_data += 1
+            continue
+        sampled = _roof_samples(projected, dtm, dsm)
+        if sampled is None:
+            no_data += 1
+            continue
+        points, ground, centre = sampled
+        form = classify_roof(points, extract_planes(points, rng=random.Random(0)))
+        if form is None:
+            below_quality += 1
+            continue
+        _write_roof_tags(element, form)
+        shapes[form.shape] = shapes.get(form.shape, 0) + 1
+        classified += 1
+        changed = True
+
+    if changed:
+        _rewrite_osm(path, declaration, root)
+
+    return RoofsRecord(
+        buildings=buildings,
+        classified=classified,
+        kept_existing=kept_existing,
+        below_quality=below_quality,
+        no_data=no_data,
+        relations_skipped=relations_skipped,
+        shapes=shapes,
+    )

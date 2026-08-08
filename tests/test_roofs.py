@@ -1,7 +1,14 @@
 """tests/test_roofs.py"""
 import math
 import random
+import xml.etree.ElementTree as ET
+from array import array
+from pathlib import Path
 
+import pytest
+
+from mapgen.bng import from_bng, load_ostn15
+from mapgen.cog import BngWindow
 from mapgen.roofs import (
     INLIER_TOLERANCE_METRES,
     MIN_PLANE_SAMPLES,
@@ -241,3 +248,144 @@ class TestClassifyRoof:
 
     def test_too_few_samples_refused(self):
         assert _classified(_roof_points("flat")[: MIN_ROOF_SAMPLES - 1]) is None
+
+
+# --------------------------------------------------------------------------
+# Task 3: the .osm loop, roof tags, and the record.
+#
+# Fixture pattern deliberately different from test_heights.py's: those
+# fixtures build a hand-rolled zero-shift Ostn15Grid so from_bng/to_bng
+# degenerate to a bare, network-free projection, and they never call
+# load_ostn15() at all. This suite's fixture instead needs a real
+# from_bng round trip to place lat/lon nodes for fit_roof_forms's own
+# to_bng to project back, so it loads the real cached grid via
+# load_ostn15() and, if this machine has never fetched one, skips rather
+# than fabricate a substitute grid that would quietly change what these
+# tests prove (see _live_ostn15_grid below).
+# --------------------------------------------------------------------------
+
+from mapgen.roofs import (  # noqa: E402
+    ROOF_SHAPE_TAG_KEY,
+    SOURCE_ROOF_ATTRIBUTION,
+    RoofsRecord,
+    fit_roof_forms,
+)
+
+
+def _live_ostn15_grid():
+    grid = load_ostn15()
+    if grid is None:
+        pytest.skip("OSTN15 grid not cached on this machine")
+    return grid
+
+
+def _window(e0, n0, size, values, pixel=1.0):
+    return BngWindow(
+        e_origin=e0, n_top=n0 + size * pixel, pixel_size=pixel,
+        width=size, height=size, values=array("f", values),
+    )
+
+
+def _gable_windows(e0, n0, size=20, eaves=5.0, ridge=8.0):
+    """DTM flat at 100.0; DSM carries a west-east gable over the middle
+    of the window (ridge running north-south at the window's centre
+    column), background at ground."""
+    ground = [100.0] * (size * size)
+    dsm = []
+    centre = size / 2.0
+    for row in range(size):
+        for col in range(size):
+            offset = abs((col + 0.5) - centre)
+            if 4 <= row < size - 4 and offset <= 6.0:
+                dsm.append(100.0 + max(eaves, ridge - (ridge - eaves) * offset / 6.0))
+            else:
+                dsm.append(100.0)
+    return _window(e0, n0, size, ground), _window(e0, n0, size, dsm)
+
+
+def _osm_with_building(path, ring_bng, grid, extra_tags=()):
+    """Write a minimal mapgen-shaped .osm holding one closed building way
+    whose nodes are `ring_bng` projected to lat/lon via from_bng."""
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<osm version="0.6" generator="test">']
+    refs = []
+    for i, (e, n) in enumerate(ring_bng, start=1):
+        lat, lon = from_bng(e, n, grid)
+        lines.append(f'  <node id="{i}" lat="{lat:.7f}" lon="{lon:.7f}" />')
+        refs.append(i)
+    nds = "".join(f'<nd ref="{r}" />' for r in refs + [refs[0]])
+    tags = '<tag k="building" v="yes" />' + "".join(
+        f'<tag k="{k}" v="{v}" />' for k, v in extra_tags
+    )
+    lines.append(f'  <way id="100">{nds}{tags}</way>')
+    lines.append("</osm>")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class TestFitRoofForms:
+    def test_gable_building_gains_roof_tags(self, tmp_path):
+        grid = _live_ostn15_grid()
+        e0, n0 = 318000.0, 176000.0
+        dtm, dsm = _gable_windows(e0, n0)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid)
+        record = fit_roof_forms(osm, dtm, dsm, grid)
+        assert record.buildings == 1
+        assert record.classified == 1
+        assert record.shapes.get("gable") == 1
+        root = ET.fromstring(osm.read_text(encoding="utf-8"))
+        way = root.find("way")
+        tags = {t.get("k"): t.get("v") for t in way.findall("tag")}
+        assert tags["roof:shape"] == "gable"
+        assert float(tags["roof:height:eaves"]) < float(tags["roof:height:ridge"])
+        assert tags["source:roof"] == SOURCE_ROOF_ATTRIBUTION
+        # Ridge runs north-south in the fixture: direction near 0 or 180.
+        direction = float(tags["roof:direction"])
+        assert min(direction, 180.0 - direction) < 10.0
+
+    def test_second_run_is_byte_identical(self, tmp_path):
+        grid = _live_ostn15_grid()
+        e0, n0 = 318000.0, 176000.0
+        dtm, dsm = _gable_windows(e0, n0)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid)
+        fit_roof_forms(osm, dtm, dsm, grid)
+        first = osm.read_bytes()
+        record = fit_roof_forms(osm, dtm, dsm, grid)
+        assert record.kept_existing == 1
+        assert record.classified == 0
+        assert osm.read_bytes() == first
+
+    def test_no_raster_data_writes_nothing(self, tmp_path):
+        grid = _live_ostn15_grid()
+        e0, n0 = 318000.0, 176000.0
+        nan = float("nan")
+        dtm = _window(e0, n0, 20, [nan] * 400)
+        dsm = _window(e0, n0, 20, [nan] * 400)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid)
+        before = osm.read_bytes()
+        record = fit_roof_forms(osm, dtm, dsm, grid)
+        assert record.no_data == 1
+        assert osm.read_bytes() == before
+
+    def test_counts_always_reconcile(self, tmp_path):
+        # buildings == classified + kept_existing + below_quality + no_data
+        grid = _live_ostn15_grid()
+        e0, n0 = 318000.0, 176000.0
+        dtm, dsm = _gable_windows(e0, n0)
+        osm = tmp_path / "site.osm"
+        ring = [(e0 + 4.0, n0 + 4.0), (e0 + 16.0, n0 + 4.0),
+                (e0 + 16.0, n0 + 16.0), (e0 + 4.0, n0 + 16.0)]
+        _osm_with_building(osm, ring, grid, extra_tags=(("roof:shape", "gable"),))
+        record = fit_roof_forms(osm, dtm, dsm, grid)
+        assert record.buildings == (
+            record.classified + record.kept_existing
+            + record.below_quality + record.no_data
+        )
+        assert record.kept_existing == 1
