@@ -5,9 +5,9 @@ LayerSource. `covers`, `tier`, `detail`, `estimate`, `routing_note` and
 pure arithmetic and, at most, a cache-only OSTN15 read or a directory
 listing. `fetch()` is the network half: it ensures the two archive zips
 sit in `cache_dir()`, downloaded and verified once each, and hands their
-paths back for a later task's `merge()` to unpack the ESRI ASCII grid
-members inside them (see probe-report.md's own "Zip members are ESRI
-ASCII grids" section).
+paths back for `merge()` (below) to unpack the ESRI ASCII grid members
+inside them (see probe-report.md's own "Zip members are ESRI ASCII
+grids" section).
 
 ## Location honesty ruling
 
@@ -78,8 +78,49 @@ beside its own cache path, verifies the transfer's length against
 `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES`, and only then opens it with
 `zipfile.ZipFile` to confirm `namelist()` is non-empty, so a truncated or
 otherwise corrupt download is caught here, at fetch time, rather than
-surfacing later inside a future `merge()` that expected a readable
-archive and got a lie the byte count alone could not tell.
+surfacing later inside `merge()`, which expects a readable archive and
+would otherwise be handed a lie the byte count alone could not tell.
+
+## merge(): no bbox in its own signature, so fetch() remembers it
+
+`LayerSource.merge(parts, out_dir, stem)` (`sources/base.py`) carries no
+bbox parameter; every other method on this class that needs one takes it
+directly. `fetch()` stashes its own `bbox` argument on `self._bbox` for
+exactly this reason, the same way `self._ostn15_cache_dir` is
+constructor state `merge()` already reads for `_window_pixels`'s own
+`best_effort_padded_bng_extent` call: package.py's `run_survey` always
+calls `fetch()` and then `merge()` on the identical registered source
+instance for one survey (never a fresh one in between), so instance
+state is the one route available for a fact `merge()` needs but its own
+protocol signature has no room for.
+
+## The window, and why the budget gate reads _window_pixels rather than
+## the window it is about to build
+
+`merge()`'s own window is the padded extent's intersection with
+`_ENVELOPE`, snapped OUTWARD to the 0.25 m lattice so every edge lands on
+an exact pixel boundary (every member's own `xllcorner`/`yllcorner` is an
+integer metre, hence already on that lattice). The budget gate runs
+BEFORE that window is built at all, and it gates on `_window_pixels`'s
+own, unsnapped figure, the exact number `detail()` already previewed:
+snapping outward can only grow a window by under one pixel per edge, and
+gating on the snapped count instead would let the refusal and the
+preview disagree by that same sliver, for no benefit, since the number
+the owner already read in `detail()`'s own sentence is `_window_pixels`'s.
+
+## One failed member fails the whole merge
+
+A member whose header will not parse, or whose full value grid will not
+(`asc_grid.AscGridError` either way), takes the WHOLE merge down with it,
+kind `"parse"`, regardless of whether that member's own bounds would
+otherwise have placed it inside or outside the window: a header this
+module cannot trust is not one it can use to decide "safe to skip" from,
+and skipping a member on the strength of a header call that itself just
+failed would be a silent hole dressed up as an honest gap. Neither
+archive raster is written until BOTH have been fully assembled without
+incident, so a corrupt member in either one leaves the package holding
+neither `<stem>_lidar25_dsm.tif` nor `<stem>_lidar25_dtm.tif`, never one
+without the other.
 """
 
 from __future__ import annotations
@@ -87,17 +128,20 @@ from __future__ import annotations
 import math
 import uuid
 import zipfile
+from array import array
 from pathlib import Path
 from typing import Sequence
 
 import requests
 
+from mapgen.asc_grid import AscGridError, parse_asc, parse_asc_header
 from mapgen.bng import best_effort_padded_bng_extent
-from mapgen.cog import MAX_WINDOW_PIXELS, USER_AGENT
+from mapgen.cog import MAX_WINDOW_PIXELS, USER_AGENT, BngWindow
 from mapgen.config import CONFIG_PATH
 from mapgen.egrid import PAD_METRES
 from mapgen.fsutil import ensure_dir
 from mapgen.geo import BBox, Tile
+from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken
 from mapgen.sources.base import (
     FAILURE_UNKNOWN,
@@ -206,21 +250,34 @@ _ROUTING_NOTE = (
 
 class LidarCardiffError(RuntimeError):
     """Raised when `fetch()` cannot obtain or verify one of the two
-    archive zips.
+    archive zips, or when `merge()` cannot turn them into the 25 cm
+    rasters.
 
     `kind` is `"download"` (a transport failure, or a downloaded body
     whose length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly)
     or `"parse"` (a right-length body that did not open as a non-empty
-    zip), the same two-way slice of `os_downloads.OsOpenError`'s own
-    kind vocabulary applied here without importing that class: this
-    source's own failures are never a listing or a ranged read, so it
-    never needs the other two kinds that vocabulary carries.
+    zip, OR, from `merge()`, a zip member whose header or values
+    `asc_grid.AscGridError` refused), the same two-way slice of
+    `os_downloads.OsOpenError`'s own kind vocabulary applied here without
+    importing that class: this source's own download failures are never
+    a listing or a ranged read, so `fetch()` never needs the other two
+    kinds that vocabulary carries. `merge()` also raises a third kind,
+    `"budget"`: the padded extent's own intersection with the coverage
+    envelope needs more pixels at 25 cm than `cog.MAX_WINDOW_PIXELS`
+    allows, the same number `detail()` already previewed. `"budget"` is
+    never retryable (the extent does not get smaller by asking again),
+    the same practical fact `sources/base.py`'s own `FAILURE_NODE_CAP`
+    documents for OsmSource's unrelated failure; it is left to fall
+    through `_classify_lidar_cardiff_error`'s existing default rather
+    than added as a third branch there, since that classifier is read
+    only from `fetch()`'s own except blocks and a merge()-raised error
+    never reaches it.
 
     Every message names the zip's own file name (`DSM_ZIP_NAME` /
-    `DTM_ZIP_NAME`), never `DSM_ZIP_URL` / `DTM_ZIP_URL` and never
-    `str()` on a caught `requests` exception, matching `os_downloads.py`'s
-    own "no-URL rule": a `requests` exception's own message embeds the
-    URL it was called with.
+    `DTM_ZIP_NAME`) or the pixel arithmetic itself, never `DSM_ZIP_URL` /
+    `DTM_ZIP_URL` and never `str()` on a caught `requests` exception,
+    matching `os_downloads.py`'s own "no-URL rule": a `requests`
+    exception's own message embeds the URL it was called with.
     """
 
     def __init__(self, message: str, *, kind: str) -> None:
@@ -390,6 +447,16 @@ class LidarCardiffSource:
         # same deferred IncompleteSurveyError shape lidar_wales.py and
         # os_uprn.py already get from populating this exact attribute.
         self.tile_failures: list[TileFailure] = []
+        # Set at the top of every fetch(); merge() reads it back. See the
+        # module docstring's "merge(): no bbox in its own signature"
+        # section: LayerSource.merge's own protocol carries no bbox
+        # parameter, and this is the constructor-state route merge()
+        # takes instead, the same kind of extra state lidar_wales.py's
+        # own merge() already reads off self._ostn15_cache_dir for its
+        # contour step. None only before the first fetch() call; a
+        # merge() invoked without one first (a test doing so directly)
+        # sets this itself before calling merge().
+        self._bbox: BBox | None = None
 
     # category -> tier, this source's own row of mapgen.resolver's shared
     # table: terrain only (see the module docstring's "Terrain only"
@@ -623,23 +690,27 @@ class LidarCardiffSource:
         """Ensures both archive zips sit in `cache_dir()`, downloading and
         verifying whichever one is missing or the wrong size, and returns
         their cached paths: `[DSM path, DTM path]`, in that order,
-        documented here because a later task's `merge()` reads them.
+        documented here because `merge()` reads them.
 
-        `bbox` and `work_dir` are accepted only to satisfy the
-        LayerSource protocol signature and are not otherwise used: this
-        archive is static 2011 data (the module docstring's own "500 m
-        lattice" section), fetched and cached whole regardless of which
-        part of the block a given survey's own extent touches, the same
-        reason `estimate()` above needs neither `bbox` nor `tiles` to
-        answer honestly. The two zips are read back from `cache_dir()`
-        itself, never copied into `work_dir`: they are shared across
-        every future survey that ever selects this source, the same
-        national-cache shape `os_uprn.py`'s own `fetch()` gives its own
-        one download for the identical reason. `tiles` IS used, though
-        only to know which tiles to blame a failure on
-        (`_record_tile_failures`): see `__init__`'s own comment for why
-        that accounting exists at all for a source with no tile-shaped
-        work.
+        `work_dir` is accepted only to satisfy the LayerSource protocol
+        signature and is not otherwise used: this archive is static 2011
+        data (the module docstring's own "500 m lattice" section),
+        fetched and cached whole regardless of which part of the block a
+        given survey's own extent touches, the same reason `estimate()`
+        above needs neither `bbox` nor `tiles` to answer honestly. The
+        two zips are read back from `cache_dir()` itself, never copied
+        into `work_dir`: they are shared across every future survey that
+        ever selects this source, the same national-cache shape
+        `os_uprn.py`'s own `fetch()` gives its own one download for the
+        identical reason. `bbox` IS used, but only remembered
+        (`self._bbox`) rather than acted on here: `merge()` is where the
+        actual window this extent needs gets built, and its own protocol
+        signature has no bbox parameter of its own (see the module
+        docstring's "merge(): no bbox in its own signature" section).
+        `tiles` is used too, though only to know which tiles to blame a
+        failure on (`_record_tile_failures`): see `__init__`'s own
+        comment for why that accounting exists at all for a source with
+        no tile-shaped work.
 
         `cancel` is checked before each of the two zips, never mid
         download: a unit already in flight always finishes, matching
@@ -653,6 +724,7 @@ class LidarCardiffSource:
         `fetch()` uses for its own `OsOpenError`.
         """
         self.tile_failures = []
+        self._bbox = bbox
         if cancel is not None:
             cancel.raise_if_cancelled()
 
@@ -676,3 +748,240 @@ class LidarCardiffSource:
             raise
 
         return [dsm_path, dtm_path]
+
+    # -- merge -------------------------------------------------------------
+
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        """Assembles the two archive zips' own ASCII grid members into
+        `<stem>_lidar25_dsm.tif` and `<stem>_lidar25_dtm.tif` (spec-pinned
+        names), refusing the extent up front, with kind `"budget"`, when
+        its own intersection with the coverage envelope needs more
+        pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows: the same
+        figure `detail()` already previewed (`_window_pixels`), so the
+        preview and the refusal can never disagree.
+
+        `parts` holds `fetch()`'s own two zip paths, selected here BY
+        NAME (`DSM_ZIP_NAME`/`DTM_ZIP_NAME`), never by position: the
+        `ElevationSource.merge` lesson every other source's own merge()
+        in this package already follows (`lidar_wales.py`, `os_uprn.py`).
+
+        `self._bbox`, set at the top of the most recent `fetch()` call on
+        this same instance, is where the extent comes from: see the
+        module docstring's "merge(): no bbox in its own signature"
+        section for why this method's own protocol signature has nowhere
+        else to carry it.
+
+        Neither raster is written until both have been fully assembled:
+        a member that fails to parse, in either zip, raises before
+        `write_bng_geotiff` is ever called for either one (see the module
+        docstring's "One failed member fails the whole merge" section),
+        so a failed merge leaves neither `_lidar25_dsm.tif` nor
+        `_lidar25_dtm.tif` behind, never one without the other.
+        """
+        out_dir = Path(out_dir)
+        dsm_zip_path = next((part for part in parts if part.name == DSM_ZIP_NAME), None)
+        dtm_zip_path = next((part for part in parts if part.name == DTM_ZIP_NAME), None)
+        if dsm_zip_path is None or dtm_zip_path is None:
+            raise LidarCardiffError(
+                "Both archive zips are needed to build the 25 cm rasters, "
+                "and this merge was not handed both.",
+                kind="parse",
+            )
+
+        pixels = _window_pixels(self._bbox, self._ostn15_cache_dir)
+        if pixels > MAX_WINDOW_PIXELS:
+            # Verbatim, with only the pixel count substituted (the plan's
+            # own pinned reason string): the thousands separator is part
+            # of the pinned text, not an incidental formatting choice.
+            raise LidarCardiffError(
+                f"this extent needs {pixels:,} pixels at 25 cm and the "
+                f"raster budget is 16,777,216; extents under about 1 x 1 "
+                f"km inside the covered block come back at 25 cm",
+                kind="budget",
+            )
+
+        window_e_min, window_n_max, window_width, window_height = (
+            _snapped_merge_window(self._bbox, self._ostn15_cache_dir)
+        )
+
+        dsm_window = _assemble_window(
+            dsm_zip_path, window_e_min, window_n_max, window_width, window_height
+        )
+        dtm_window = _assemble_window(
+            dtm_zip_path, window_e_min, window_n_max, window_width, window_height
+        )
+
+        dsm_output = out_dir / f"{stem}_lidar25_dsm.tif"
+        dtm_output = out_dir / f"{stem}_lidar25_dtm.tif"
+        write_bng_geotiff(dsm_output, dsm_window)
+        write_bng_geotiff(dtm_output, dtm_window)
+        return [dsm_output, dtm_output]
+
+
+def _snapped_merge_window(
+    bbox: BBox, ostn15_cache_dir: Path | None
+) -> tuple[float, float, int, int]:
+    """The window `merge()` builds: the padded extent's own intersection
+    with `_ENVELOPE`, snapped OUTWARD to the 0.25 m lattice anchored at
+    integer metres, as `(e_min, n_max, width_px, height_px)`.
+
+    Every member's own `xllcorner`/`yllcorner` is an integer metre (the
+    module docstring's own probed fact), so that lattice's pixel edges
+    sit at exact multiples of `PIXEL_METRES`; snapping the window OUTWARD
+    onto the same lattice, rather than leaving it at the padded extent's
+    own arbitrary real-valued edges, is what makes every paste in
+    `_paste_member` below an exact integer-offset copy rather than a
+    resample. Outward, specifically, so the window never loses so much
+    as a sliver of what was actually asked for: floor on the near edges,
+    ceil on the far ones.
+
+    Not used for the budget gate itself (`_window_pixels`, called
+    separately in `merge()`, prices the unsnapped intersection): see the
+    module docstring's own note on why gating on this function's
+    slightly larger, snapped figure would let the refusal disagree with
+    `detail()`'s own preview by the sliver snapping can add.
+    """
+    e_min, n_min, e_max, n_max = best_effort_padded_bng_extent(
+        bbox, PAD_METRES, cache_dir=ostn15_cache_dir
+    )
+    env_e_min, env_n_min, env_e_max, env_n_max = _ENVELOPE
+    win_e_min = max(e_min, env_e_min)
+    win_n_min = max(n_min, env_n_min)
+    win_e_max = min(e_max, env_e_max)
+    win_n_max = min(n_max, env_n_max)
+
+    window_e_min = math.floor(win_e_min / PIXEL_METRES) * PIXEL_METRES
+    window_e_max = math.ceil(win_e_max / PIXEL_METRES) * PIXEL_METRES
+    window_n_min = math.floor(win_n_min / PIXEL_METRES) * PIXEL_METRES
+    window_n_max = math.ceil(win_n_max / PIXEL_METRES) * PIXEL_METRES
+    window_width = max(0, round((window_e_max - window_e_min) / PIXEL_METRES))
+    window_height = max(0, round((window_n_max - window_n_min) / PIXEL_METRES))
+    return window_e_min, window_n_max, window_width, window_height
+
+
+def _assemble_window(
+    zip_path: Path,
+    window_e_min: float,
+    window_n_max: float,
+    window_width: int,
+    window_height: int,
+) -> BngWindow:
+    """The window's own rectangle, built from `zip_path`'s members: NaN
+    everywhere at first (`array("f")`, so `write_bng_geotiff` sees a
+    genuinely absent value rather than a fabricated zero), then every
+    member whose own header-declared bounds overlap the window is fully
+    parsed (`value_scale=0.001`: the archive's own millimetres) and
+    pasted in. A pixel the window asks for that no member's own envelope
+    reaches stays NaN and reads back as nodata: partial coverage is an
+    honest raster with the uncovered area absent, never guessed at,
+    matching how the Welsh mosaic already answers nodata over England
+    (`cog.py`'s own module docstring).
+
+    `parse_asc_header` runs on EVERY member first, whether or not it
+    turns out to overlap the window, and any `AscGridError` it raises
+    (or that the later `parse_asc` full parse raises, for a member that
+    does overlap) fails this whole call: see the module docstring's "One
+    failed member fails the whole merge" section for why a header this
+    function cannot trust is not one it can use to decide "safe to skip"
+    from.
+    """
+    window_e_max = window_e_min + window_width * PIXEL_METRES
+    window_n_min = window_n_max - window_height * PIXEL_METRES
+    values = array("f", [math.nan]) * (window_width * window_height)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        for name in archive.namelist():
+            # latin-1 rather than ascii or utf-8: it never raises on any
+            # byte value, so a genuinely corrupt member fails through
+            # AscGridError's own, tested checks below rather than a
+            # UnicodeDecodeError this function would otherwise have to
+            # catch and translate separately for no benefit (the real
+            # archive's own members are plain ASCII text throughout, so
+            # this never changes what a well-formed member reads as).
+            text = archive.read(name).decode("latin-1")
+            try:
+                header = parse_asc_header(text)
+            except AscGridError as exc:
+                raise LidarCardiffError(str(exc), kind="parse") from exc
+
+            member_e_min = header["xllcorner"]
+            member_n_min = header["yllcorner"]
+            member_e_max = member_e_min + header["ncols"] * header["cellsize"]
+            member_n_max = member_n_min + header["nrows"] * header["cellsize"]
+            if (
+                member_e_max <= window_e_min or member_e_min >= window_e_max
+                or member_n_max <= window_n_min or member_n_min >= window_n_max
+            ):
+                continue  # This member's own bounds miss the window entirely.
+
+            try:
+                member = parse_asc(text, value_scale=0.001)
+            except AscGridError as exc:
+                raise LidarCardiffError(str(exc), kind="parse") from exc
+
+            _paste_member(values, window_e_min, window_n_max, window_width, member)
+
+    return BngWindow(
+        e_origin=window_e_min,
+        n_top=window_n_max,
+        pixel_size=PIXEL_METRES,
+        width=window_width,
+        height=window_height,
+        values=values,
+    )
+
+
+def _paste_member(
+    values: array,
+    window_e_min: float,
+    window_n_max: float,
+    window_width: int,
+    member: BngWindow,
+) -> None:
+    """Copies `member`'s own overlap with the window straight into
+    `values`, with no resampling and no interpolation: both rectangles
+    sit on the identical 0.25 m lattice (every member's own xllcorner/
+    yllcorner is an integer metre, and the window was snapped outward
+    onto that same lattice by `_snapped_merge_window`), so every offset
+    below lands on an exact pixel boundary rather than needing to be
+    split across two source pixels.
+    """
+    window_height = len(values) // window_width
+    window_e_max = window_e_min + window_width * PIXEL_METRES
+    window_n_min = window_n_max - window_height * PIXEL_METRES
+    member_e_min, member_n_min, member_e_max, member_n_max = member.bounds()
+
+    overlap_e_min = max(member_e_min, window_e_min)
+    overlap_e_max = min(member_e_max, window_e_max)
+    overlap_n_min = max(member_n_min, window_n_min)
+    overlap_n_max = min(member_n_max, window_n_max)
+    if overlap_e_max <= overlap_e_min or overlap_n_max <= overlap_n_min:
+        return  # Touches the window's own bounding rectangle, but not this slice.
+
+    def _snap(raw: float) -> int:
+        # Exact by construction (both rectangles share the one 0.25 m
+        # lattice anchored at integer metres): this assert is what turns
+        # a lattice mismatch, were one ever introduced upstream, into a
+        # loud failure here rather than a silently resampled, wrong
+        # pixel a plain round() would produce without comment.
+        rounded = round(raw)
+        assert abs(raw - rounded) < 1e-6, (
+            "lidar_cardiff merge: member and window pixel lattices do not "
+            "align; every member's own xllcorner/yllcorner must be an "
+            "integer metre on the 0.25 m lattice the window is built on."
+        )
+        return rounded
+
+    member_col0 = _snap((overlap_e_min - member_e_min) / PIXEL_METRES)
+    member_row0 = _snap((member_n_max - overlap_n_max) / PIXEL_METRES)
+    window_col0 = _snap((overlap_e_min - window_e_min) / PIXEL_METRES)
+    window_row0 = _snap((window_n_max - overlap_n_max) / PIXEL_METRES)
+    overlap_width = _snap((overlap_e_max - overlap_e_min) / PIXEL_METRES)
+    overlap_height = _snap((overlap_n_max - overlap_n_min) / PIXEL_METRES)
+
+    for row in range(overlap_height):
+        src_start = (member_row0 + row) * member.width + member_col0
+        dst_start = (window_row0 + row) * window_width + window_col0
+        values[dst_start:dst_start + overlap_width] = (
+            member.values[src_start:src_start + overlap_width]
+        )

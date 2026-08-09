@@ -38,7 +38,7 @@ import pytest
 import requests
 
 from mapgen.bng import tm_inverse
-from mapgen.cog import MAX_WINDOW_PIXELS
+from mapgen.cog import MAX_WINDOW_PIXELS, CogReader, FileByteSource, read_full_window
 from mapgen.egrid import PAD_METRES
 from mapgen.geo import BBox, Tile
 from mapgen.package import IncompleteSurveyError, SurveyRequest, run_survey
@@ -829,6 +829,363 @@ def test_a_fetch_failure_is_deferred_not_fatal_through_a_real_run_survey(tmp_pat
         assert "http" not in str(excinfo.value).lower()
     finally:
         clear_registry()
+
+
+# --------------------------------------------------------------------------
+# merge(): archive members assembled into 25 cm rasters, budget refused
+# honestly. Every test below builds its own small, real, zipfile-openable
+# zip with synthetic ESRI ASCII grid members on the 0.25 m lattice (real
+# xllcorner/yllcorner integer metres, matching the archive's own
+# convention), never a 2000x2000 real-size member: the paste arithmetic
+# is exercised for real regardless of a member's own size, only its
+# corners and its overlap with the window matter.
+#
+# `source._bbox` is set directly rather than through a real fetch() call:
+# merge()'s own protocol (sources/base.py's LayerSource) carries no bbox
+# parameter, and lidar_cardiff.py's own module docstring ("merge(): no
+# bbox in its own signature") documents fetch() as the one place that
+# normally sets this same attribute. test_fetch_stores_bbox_on_self_for_
+# merge_to_read_later above proves that wiring on its own, so setting it
+# directly here tests merge() in isolation from fetch()'s own network and
+# cache mechanics without testing anything fetch() has not already been
+# proven to do.
+# --------------------------------------------------------------------------
+
+
+def _format_asc_member(
+    xllcorner: float,
+    yllcorner: float,
+    ncols: int,
+    nrows: int,
+    cellsize: float,
+    value_mm: float,
+    nodata: float = -9999.0,
+) -> str:
+    """A real ESRI ASCII grid member's text: CRLF terminated like the
+    archive's own members, `ncols * nrows` cells, every one of them
+    `value_mm` millimetres uniformly (the archive's own units;
+    `parse_asc(text, value_scale=0.001)` is what turns this back into
+    metres). `xllcorner`/`yllcorner` are always whole numbers of metres
+    in every fixture built with this helper, matching the real archive's
+    own convention and the 0.25 m lattice `merge()` assumes throughout.
+    """
+    header = (
+        f"ncols {ncols}\r\n"
+        f"nrows {nrows}\r\n"
+        f"xllcorner {xllcorner}\r\n"
+        f"yllcorner {yllcorner}\r\n"
+        f"cellsize {cellsize}\r\n"
+        f"NODATA_value {nodata}\r\n"
+    )
+    row = " ".join([str(value_mm)] * ncols)
+    rows = "\r\n".join([row] * nrows)
+    return header + rows + "\r\n"
+
+
+def _format_corrupt_asc_member(
+    xllcorner: float, yllcorner: float, ncols: int, nrows: int, cellsize: float
+) -> str:
+    """A syntactically header-valid member whose own value rows hold a
+    non-numeric token in every cell: `parse_asc_header` (which never
+    looks past the header) reads it without complaint, but the full
+    `parse_asc` parse must fail the moment it tries to convert the first
+    token to a float.
+    """
+    header = (
+        f"ncols {ncols}\r\n"
+        f"nrows {nrows}\r\n"
+        f"xllcorner {xllcorner}\r\n"
+        f"yllcorner {yllcorner}\r\n"
+        f"cellsize {cellsize}\r\n"
+        f"NODATA_value -9999\r\n"
+    )
+    row = " ".join(["not-a-number"] * ncols)
+    rows = "\r\n".join([row] * nrows)
+    return header + rows + "\r\n"
+
+
+def _build_member_zip(path: Path, members: dict[str, str]) -> None:
+    """A real, `zipfile`-openable zip at `path`, one stored member per
+    `members` (name -> already-formatted `.asc` text): the exact shape
+    `merge()` itself opens with `zipfile.ZipFile` and walks via
+    `namelist()`.
+    """
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        for name, text in members.items():
+            archive.writestr(name, text)
+
+
+def test_fetch_stores_bbox_on_self_for_merge_to_read_later(tmp_path, monkeypatch):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    _write_right_size_stub(tmp_path / DSM_ZIP_NAME, DSM_ZIP_BYTES)
+    _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
+
+    source.fetch(bbox, [], tmp_path / "work", NullProgress())
+
+    assert source._bbox is bbox
+
+
+def _patch_padded_extent(monkeypatch, rect: tuple[float, float, float, float]) -> None:
+    """Forces `merge()`'s own `best_effort_padded_bng_extent(bbox,
+    PAD_METRES, ...)` call to answer `rect` regardless of `bbox`.
+
+    `_bbox_for_padded_bng_rect` (top of this file) reproduces a target
+    rectangle by SUBTRACTING `PAD_METRES` from every edge and relying on
+    the real padding arithmetic to add it back; that only holds up for a
+    rectangle comfortably larger than `2 * PAD_METRES` (400 m) in both
+    dimensions; PAD_METRES itself is 200 m). Every merge() fixture below
+    is a handful of metres across, deliberately small so its own NaN
+    array and paste loop stay cheap, so this patches the one function
+    that turns a bbox into a BNG rectangle directly instead, which is
+    exact regardless of how small the target window is and needs no
+    real bbox at all: `source._bbox` can be set to anything once this is
+    in place, since nothing downstream of it looks at the bbox's own
+    coordinates any more.
+    """
+    monkeypatch.setattr(
+        lidar_cardiff,
+        "best_effort_padded_bng_extent",
+        lambda bbox, pad, cache_dir=None: rect,
+    )
+
+
+# A window spanning two members, meeting exactly at e=311500 (inside
+# ST1177SW, 311000-311500 x 177000-177500, whose own east neighbour
+# ST1177SE, 311500-312000 x 177000-177500, is also a real COVERAGE_TILES
+# entry): 4 x 2 m at 0.25 m is 16 x 8 pixels, columns 0-7 from the west
+# member and 8-15 from the east one.
+_SEAM_WINDOW_RECT = (311498.0, 177010.0, 311502.0, 177012.0)
+
+
+def _seam_test_zips(tmp_path: Path) -> tuple[Path, Path]:
+    west = _format_asc_member(311498.0, 177010.0, 8, 8, 0.25, 1000)  # -> 1.0 m
+    east = _format_asc_member(311500.0, 177010.0, 8, 8, 0.25, 2000)  # -> 2.0 m
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    _build_member_zip(dsm_zip, {"dsm_west.asc": west, "dsm_east.asc": east})
+    _build_member_zip(dtm_zip, {"dtm_west.asc": west, "dtm_east.asc": east})
+    return dsm_zip, dtm_zip
+
+
+def test_merge_pastes_two_members_with_an_exact_seam(tmp_path, monkeypatch):
+    _patch_padded_extent(monkeypatch, _SEAM_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+    dsm_zip, dtm_zip = _seam_test_zips(tmp_path)
+
+    package_dir = tmp_path / "package"
+    outputs = source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+
+    dsm_output = package_dir / "TestSite_lidar25_dsm.tif"
+    dtm_output = package_dir / "TestSite_lidar25_dtm.tif"
+    assert outputs == [dsm_output, dtm_output]
+
+    reader = CogReader.open(FileByteSource(dsm_output))
+    window = read_full_window(reader)
+    assert window.width == 16
+    assert window.height == 8
+
+    # Well inside each member, away from the seam, where every
+    # surrounding pixel belongs to the same one.
+    assert window.sample_bng(311498.5, 177011.0) == pytest.approx(1.0, abs=1e-4)
+    assert window.sample_bng(311501.5, 177011.0) == pytest.approx(2.0, abs=1e-4)
+
+    # Exactly on the seam (e=311500, the members' own shared boundary):
+    # bilinear interpolation splits evenly between the west member's own
+    # last column (1.0) and the east member's own first column (2.0).
+    # This is the proof the seam itself is exact: a duplicated or a
+    # missing column here would land on 1.0, on 2.0, or on a different
+    # split, never precisely 1.5.
+    assert window.sample_bng(311500.0, 177011.0) == pytest.approx(1.5, abs=1e-4)
+
+
+# 4 x 4 m inside ST1177SW, comfortably clear of every tile edge, sized to
+# match the fixture member exactly (16 x 16 px) so the window holds no
+# NaN at all and the sampled point below is not near any boundary.
+_MM_SCALE_WINDOW_RECT = (311100.0, 177100.0, 311104.0, 177104.0)
+
+
+def test_merge_converts_millimetres_to_metres(tmp_path, monkeypatch):
+    _patch_padded_extent(monkeypatch, _MM_SCALE_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+    member = _format_asc_member(311100.0, 177100.0, 16, 16, 0.25, 85321)
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    _build_member_zip(dsm_zip, {"dsm.asc": member})
+    _build_member_zip(dtm_zip, {"dtm.asc": member})
+
+    package_dir = tmp_path / "package"
+    source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+
+    reader = CogReader.open(FileByteSource(package_dir / "TestSite_lidar25_dsm.tif"))
+    window = read_full_window(reader)
+    assert window.sample_bng(311102.0, 177102.0) == pytest.approx(85.321, rel=1e-5)
+
+
+# 4 x 4 m inside ST1177SW, well away from _SKIP_TEST fixtures above.
+_SKIP_TEST_WINDOW_RECT = (311050.0, 177050.0, 311054.0, 177054.0)
+
+
+def test_merge_never_fully_parses_a_member_wholly_outside_the_window(tmp_path, monkeypatch):
+    _patch_padded_extent(monkeypatch, _SKIP_TEST_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    inside = _format_asc_member(311050.0, 177050.0, 16, 16, 0.25, 1000)
+    # Inside ST1076NE (310500-311000 x 176500-177000), nowhere near the
+    # window above: parse_asc_header must still be allowed to read this
+    # member's own header (that is what tells merge() to skip it), but
+    # the full, float-converting parse_asc must never run on it.
+    outside = _format_asc_member(310600.0, 176600.0, 8, 8, 0.25, 2000)
+
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    _build_member_zip(dsm_zip, {"dsm_inside.asc": inside, "dsm_outside.asc": outside})
+    _build_member_zip(dtm_zip, {"dtm_inside.asc": inside, "dtm_outside.asc": outside})
+
+    real_parse_asc = lidar_cardiff.parse_asc
+    calls: list[str] = []
+
+    def _counting_parse_asc(text, value_scale=1.0):
+        calls.append(text)
+        return real_parse_asc(text, value_scale=value_scale)
+
+    monkeypatch.setattr(lidar_cardiff, "parse_asc", _counting_parse_asc)
+
+    source.merge([dsm_zip, dtm_zip], tmp_path / "package", "TestSite")
+
+    # One call per zip (the "inside" member only); the "outside" member
+    # is skipped on its header alone in both.
+    assert len(calls) == 2
+    assert all("1000" in text and "2000" not in text for text in calls)
+
+
+def test_merge_refuses_over_budget_with_the_pixel_count_substituted(tmp_path):
+    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    pixels = _window_pixels(bbox, tmp_path)
+    # Sanity: this fixture really is the ~48 million pixel, over-budget
+    # extent test_window_pixels_over_the_whole_block_is_48_million_and_
+    # over_budget already pins; the exact int can drift by a handful of
+    # pixels from the tm_inverse/tm_forward round trip, which is why the
+    # message assertion below re-derives it rather than hard-coding
+    # "48,000,000".
+    assert pixels == pytest.approx(48_000_000, rel=1e-3)
+    assert pixels > MAX_WINDOW_PIXELS
+
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = bbox
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge([dsm_zip, dtm_zip], tmp_path / "package", "TestSite")
+
+    assert excinfo.value.kind == "budget"
+    # The item B lesson: pin the SUBSTITUTION, not just the surrounding
+    # prose. The thousands separator is part of the pinned reason string
+    # itself, not incidental formatting.
+    assert "," in f"{pixels:,}"
+    assert str(excinfo.value) == (
+        f"this extent needs {pixels:,} pixels at 25 cm and the raster "
+        f"budget is 16,777,216; extents under about 1 x 1 km inside the "
+        f"covered block come back at 25 cm"
+    )
+
+
+def test_merge_refuses_over_budget_before_opening_either_zip_and_writes_no_file(
+    tmp_path, monkeypatch
+):
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        lidar_cardiff, "parse_asc", lambda text, value_scale=1.0: calls.append(text)
+    )
+
+    # Never created: proof the budget gate never even tries to open
+    # either zip, let alone parse a member out of it.
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    assert not dsm_zip.exists()
+    assert not dtm_zip.exists()
+
+    package_dir = tmp_path / "package"
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+
+    assert excinfo.value.kind == "budget"
+    assert calls == []
+    assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
+    assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
+
+
+# Straddles ST1277SW's own south edge (n=177000, 312000-312500 x
+# 177000-177500 is real coverage) into the 500 m cell south of it
+# (312000-312500 x 176500-177000), which the module docstring names as
+# one of the two gaps beside ST1277SW that COVERAGE_TILES does not
+# include: no archive member is ever published for it.
+_PARTIAL_COVERAGE_WINDOW_RECT = (312100.0, 176996.0, 312104.0, 177004.0)
+
+
+def test_merge_leaves_nan_exactly_where_no_member_covers_the_window(tmp_path, monkeypatch):
+    _patch_padded_extent(monkeypatch, _PARTIAL_COVERAGE_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    # Covers only the window's own northern half (n=177000-177004, inside
+    # ST1277SW); the southern half (176996-177000) has no member at all.
+    member = _format_asc_member(312100.0, 177000.0, 16, 16, 0.25, 100_000)  # 100.0 m
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    _build_member_zip(dsm_zip, {"dsm.asc": member})
+    _build_member_zip(dtm_zip, {"dtm.asc": member})
+
+    package_dir = tmp_path / "package"
+    source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+
+    reader = CogReader.open(FileByteSource(package_dir / "TestSite_lidar25_dsm.tif"))
+    window = read_full_window(reader)
+
+    # Well inside the covered northern half.
+    assert window.sample_bng(312102.0, 177002.0) == pytest.approx(100.0, abs=1e-3)
+
+    # Well inside the uncovered gap: every one of its four surrounding
+    # pixels is NaN, so sample_bng answers None rather than a fabricated
+    # height.
+    assert window.sample_bng(312102.0, 176998.0) is None
+
+
+# 4 x 4 m inside ST1177SW, well clear of every other fixture above.
+_CORRUPT_MEMBER_WINDOW_RECT = (311200.0, 177200.0, 311204.0, 177204.0)
+
+
+def test_merge_fails_the_whole_merge_on_a_corrupt_member(tmp_path, monkeypatch):
+    _patch_padded_extent(monkeypatch, _CORRUPT_MEMBER_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    good_member = _format_asc_member(311200.0, 177200.0, 16, 16, 0.25, 1000)
+    corrupt_member = _format_corrupt_asc_member(311200.0, 177200.0, 16, 16, 0.25)
+
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    # The DSM zip's own member is corrupt; the DTM zip's is fine. Both
+    # outputs must still end up missing: neither is written until both
+    # have been fully, successfully assembled.
+    _build_member_zip(dsm_zip, {"dsm.asc": corrupt_member})
+    _build_member_zip(dtm_zip, {"dtm.asc": good_member})
+
+    package_dir = tmp_path / "package"
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+
+    assert excinfo.value.kind == "parse"
+    assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
+    assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
 
 
 @pytest.mark.live
