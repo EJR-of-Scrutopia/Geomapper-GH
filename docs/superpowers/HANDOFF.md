@@ -555,7 +555,18 @@ scope blindly. And `os_uprn`'s own `SECONDS_FLOOR`/byte constants are still
 the pre-measurement placeholders `os_open.py`'s own siblings were before
 Task 4's cold run: the first real owner run that ticks addresses is what
 will measure them, the same way Task 4's own cold Cowbridge run measured
-`os_open`'s.
+`os_open`'s. New at item D's final review, with an executed repro on
+record (that item's final-review.md): a merge-time exception in ANY
+source escapes `run_survey` with NO survey.json written at all, because
+the download loop's deferred-failure net wraps fetch but nothing wraps
+the merge phase, while `web/server.py`'s own comments promise a
+truthful survey.json on every outcome. lidar_cardiff now refuses its
+own known merge-phase failures at fetch time instead (budget,
+none-coverage, stale cache pointers), but the pipeline-level gap
+belongs to every source and needs its own small task: either a
+merge-phase catch that records the failure and still writes
+survey.json, or a correction to the server comment's promise, decided
+on purpose.
 
 The addendum this section used to describe as not yet written now exists:
 `docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`
