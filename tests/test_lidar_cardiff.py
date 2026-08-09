@@ -29,6 +29,7 @@ a "full" one.
 
 from __future__ import annotations
 
+import json
 import socket
 import zipfile
 from datetime import date
@@ -352,6 +353,22 @@ def _any_bbox() -> BBox:
     return BBox.parse("-3.272,51.393,-3.268,51.397")
 
 
+def _covered_bbox() -> BBox:
+    """A small, comfortably "full"-covered, safely under-budget bbox
+    (`_FULL_UNDER_BUDGET`, inside ST1177SW), for a fetch()-focused test
+    that needs to get PAST the none-coverage gate to exercise the
+    download mechanics beneath it. `_any_bbox()` (Barry) is `covers() ==
+    "none"`, on purpose, for the tests that want exactly that; a test
+    that wants fetch() to reach `_ensure_zip` at all now needs this one
+    instead, since fetch()'s none-coverage gate (review Critical 1's fix)
+    runs before either zip is touched. Requires an isolated
+    `ostn15_cache_dir` (see `_bbox_for_padded_bng_rect`'s own module
+    docstring caveat); every call site below already constructs its
+    `LidarCardiffSource` with one.
+    """
+    return _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
+
+
 def test_estimate_is_cold_when_the_cache_dir_is_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
@@ -408,7 +425,7 @@ def test_estimate_is_warm_when_both_zips_are_present(tmp_path, monkeypatch):
     # loosened back to a >0 check, say), this half would fail even though
     # the assertions above still pass.
     warm_source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
-    result = warm_source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+    result = warm_source.fetch(_covered_bbox(), [], tmp_path / "work", NullProgress())
     assert result == [dsm_path, dtm_path]
 
 
@@ -648,7 +665,7 @@ def test_fetch_does_not_download_when_both_zips_are_already_the_right_size(
     _write_right_size_stub(dtm_path, DTM_ZIP_BYTES)
 
     source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
-    result = source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+    result = source.fetch(_covered_bbox(), [], tmp_path / "work", NullProgress())
 
     assert result == [dsm_path, dtm_path]
 
@@ -664,7 +681,7 @@ def test_fetch_redownloads_a_wrong_size_cached_zip(tmp_path, monkeypatch):
     session = _ScriptedSession({DSM_ZIP_URL: fresh_dsm_bytes})
 
     source = LidarCardiffSource(session=session, ostn15_cache_dir=tmp_path)
-    result = source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+    result = source.fetch(_covered_bbox(), [], tmp_path / "work", NullProgress())
 
     assert result == [dsm_path, dtm_path]
     # DTM was already the right size: never requested.
@@ -684,7 +701,7 @@ def test_fetch_raises_download_kind_with_no_url_on_a_size_mismatch(tmp_path, mon
 
     source = LidarCardiffSource(session=session, ostn15_cache_dir=tmp_path)
     with pytest.raises(LidarCardiffError) as excinfo:
-        source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+        source.fetch(_covered_bbox(), [], tmp_path / "work", NullProgress())
 
     assert excinfo.value.kind == "download"
     assert "http" not in str(excinfo.value).lower()
@@ -705,7 +722,7 @@ def test_fetch_fails_validation_with_the_sources_own_error_for_a_non_zip_payload
 
     source = LidarCardiffSource(session=session, ostn15_cache_dir=tmp_path)
     with pytest.raises(LidarCardiffError) as excinfo:
-        source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+        source.fetch(_covered_bbox(), [], tmp_path / "work", NullProgress())
 
     # The source's own exception type, not a raw zipfile.BadZipFile
     # escaping unwrapped.
@@ -770,6 +787,121 @@ def test_fetch_refuses_over_budget_before_downloading_anything(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------
+# fetch()'s own none-coverage gate (final whole-branch review, Critical 1):
+# an extent with covers() == "none" used to sail past the budget gate at 0
+# pixels (0 is comfortably under MAX_WINDOW_PIXELS) and crash run_survey
+# uncaught inside merge(), from a degenerate width-by-zero-height window
+# handed to write_bng_geotiff. This section proves the fetch()-side fix;
+# the merge()-level second-line-of-defence guard is proven separately,
+# further down, beside the rest of the merge() tests.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_refuses_none_coverage_extents_before_downloading_anything(
+    tmp_path, monkeypatch
+):
+    # Warm-cache scenario, deliberately: the owner's own real cache can
+    # already be warm (a completed live run leaves both zips cached
+    # permanently), so this test does not rely on a cold cache to prove
+    # the gate never reaches _ensure_zip. Right-size stubs (never opened
+    # as real zips; see _write_right_size_stub's own docstring) stand in
+    # for an already-warm cache, and the assertions below confirm no zip
+    # OPEN, and not even a pointer write, is needed for the refusal.
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    _write_right_size_stub(tmp_path / DSM_ZIP_NAME, DSM_ZIP_BYTES)
+    _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)
+
+    # Barry: eastings overlap _ENVELOPE, northings miss it entirely, the
+    # exact axis-degenerate shape the final review's Critical 1 executed
+    # against a real extent (raw 310800-311600 x 165500-166300). covers()
+    # is "none" here, and _window_pixels prices it at 0 (one axis clamped
+    # to zero by its own max(0.0, ...)), which is exactly why the budget
+    # gate alone cannot catch this and a separate gate is needed.
+    bbox = _any_bbox()
+    assert LidarCardiffSource(ostn15_cache_dir=tmp_path).covers(bbox) == "none"
+    assert _window_pixels(bbox, tmp_path) == 0
+
+    tiles = [
+        Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox),
+        Tile(tile_id="r00_c01", row=0, col=1, core_bbox=bbox, query_bbox=bbox),
+    ]
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    work_dir = tmp_path / "work"
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.fetch(bbox, tiles, work_dir, NullProgress())
+
+    assert excinfo.value.kind == "no_coverage"
+    assert str(excinfo.value) == (
+        "this extent is outside the ten covered tiles at Creigiau and "
+        "Pentyrch, north-west Cardiff; the 25 cm archive holds nothing here"
+    )
+
+    assert source.tile_failures
+    assert {failure.tile_id for failure in source.tile_failures} == {"r00_c00", "r00_c01"}
+    for failure in source.tile_failures:
+        assert failure.source == "lidar_cardiff"
+        # Never retryable: asking again does not move the extent.
+        assert failure.kind == FAILURE_NODE_CAP
+        assert failure.reason == str(excinfo.value)
+        assert "http" not in failure.reason.lower()
+
+    # No pointer written either: the gate runs before fetch() reaches the
+    # point where it would trust even an already-warm cache.
+    assert not (work_dir / lidar_cardiff._DSM_CACHE_POINTER_NAME).exists()
+    assert not (work_dir / lidar_cardiff._DTM_CACHE_POINTER_NAME).exists()
+
+
+def test_a_none_coverage_extent_is_deferred_not_fatal_and_writes_survey_json(
+    tmp_path, monkeypatch
+):
+    """The final-review Critical 1 finding, reproduced and proven fixed: a
+    covers() == "none" extent with lidar_cardiff selected used to crash
+    run_survey UNCAUGHT (merge() built a degenerate window and
+    write_bng_geotiff refused it, with no try/except anywhere above it),
+    so no survey.json was ever written, contradicting server.py's own
+    documented guarantee. The fetch()-side none-coverage gate is what
+    actually reaches this pipeline: it fires from fetch(), which package.py
+    already wraps in the same deferred-failure/retry machinery
+    test_a_fetch_failure_is_deferred_not_fatal_through_a_real_run_survey
+    proves for a transport failure, above.
+    """
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "lidar_cardiff_cache")
+    clear_registry()
+    try:
+        register(LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path))
+        second_source = _SecondSourceRecordingFetch()
+        register(second_source)
+
+        bbox = _any_bbox()  # Barry: covers() == "none".
+        request = SurveyRequest(
+            bbox=bbox,
+            region="Test Region",
+            site="Test Site",
+            output_root=tmp_path / "packages",
+            tile_size_m=2000.0,
+            overlap_m=50.0,
+            source_ids=("lidar_cardiff", "stub_second_source"),
+            survey_date=date(2026, 8, 1),
+            run_bridge_step=False,
+        )
+
+        with pytest.raises(IncompleteSurveyError) as excinfo:
+            run_survey(request)
+
+        assert second_source.fetch_called
+        assert "http" not in str(excinfo.value).lower()
+
+        # The bug this closes, made concrete: survey.json exists at all.
+        survey_json_paths = list((tmp_path / "packages").rglob("survey.json"))
+        assert len(survey_json_paths) == 1
+        payload = json.loads(survey_json_paths[0].read_text(encoding="utf-8"))
+        assert payload["complete"] is False
+    finally:
+        clear_registry()
+
+
+# --------------------------------------------------------------------------
 # tile_failures: the pipeline-safety account. Review finding (Critical):
 # LidarCardiffSource never set this, unlike every other production
 # LayerSource (lidar_wales, os_uprn, os_open, elevation, osm, overture,
@@ -800,7 +932,7 @@ def test_fetch_records_a_classified_tile_failure_with_no_url_on_a_transport_fail
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)  # already warm
 
-    bbox = _any_bbox()
+    bbox = _covered_bbox()
     tiles = [
         Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox),
         Tile(tile_id="r00_c01", row=0, col=1, core_bbox=bbox, query_bbox=bbox),
@@ -867,7 +999,7 @@ def test_a_fetch_failure_is_deferred_not_fatal_through_a_real_run_survey(tmp_pat
         register(second_source)
 
         request = SurveyRequest(
-            bbox=_any_bbox(),
+            bbox=_covered_bbox(),
             region="Test Region",
             site="Test Site",
             output_root=tmp_path / "packages",
@@ -1473,17 +1605,80 @@ def test_merge_leaves_no_files_when_the_second_write_fails(tmp_path, monkeypatch
     assert leftover == []
 
 
+# Eastings overlap _ENVELOPE (310500-312500); northings (100000-100100)
+# are nowhere near it (_ENVELOPE's own northings are 176500-178000): the
+# same axis-degenerate shape the final review's Critical 1 executed
+# against a real Barry extent, reproduced here as a precise, deterministic
+# rectangle via _patch_padded_extent rather than relying on a real bbox's
+# own OSTN15 projection.
+_DEGENERATE_WINDOW_RECT = (311000.0, 100000.0, 311100.0, 100100.0)
+
+
+def test_merge_refuses_a_degenerate_window_as_the_second_line_of_defence(
+    tmp_path, monkeypatch
+):
+    """final-review Critical 1's fix, merge()-side half: a window whose
+    snapped intersection with _ENVELOPE comes back zero pixels in one
+    axis (width 400, height 0 here) used to reach write_bng_geotiff and
+    crash with GeoTiffWriteError. This is deliberately reached directly,
+    bypassing fetch()'s own primary gate, to prove merge()'s copy holds
+    even when nothing upstream of it has already refused.
+    """
+    _patch_padded_extent(monkeypatch, _DEGENERATE_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    # Passes the budget gate at 0 pixels (one axis clamped to zero width
+    # by _window_pixels' own max(0.0, ...)), which is exactly what makes
+    # the degenerate-window guard a genuinely necessary second check
+    # rather than something the budget gate would already have caught.
+    assert _window_pixels(source._bbox, tmp_path) == 0
+
+    package_dir = tmp_path / "package"
+    with pytest.raises(LidarCardiffError) as excinfo:
+        # Nonexistent zip paths: the guard must fire before either is
+        # ever opened.
+        source.merge(
+            [tmp_path / DSM_ZIP_NAME, tmp_path / DTM_ZIP_NAME], package_dir, "TestSite"
+        )
+
+    assert excinfo.value.kind == "no_coverage"
+    assert str(excinfo.value) == (
+        "this extent is outside the ten covered tiles at Creigiau and "
+        "Pentyrch, north-west Cardiff; the 25 cm archive holds nothing here"
+    )
+    assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
+    assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
+
+
 @pytest.mark.live
-def test_live_fetch_downloads_both_real_zips_into_the_real_cache():
+def test_live_fetch_downloads_both_real_zips_into_the_real_cache(tmp_path):
     # No cache_dir monkeypatch here, deliberately: this is the one test in
     # this file that touches the owner's real ~/.mapgen/lidar_cardiff, on
     # purpose (the brief's own "into the REAL cache directory" wording),
     # so a later run of the full suite (this test still deselected by
     # "not live") finds both zips already cached.
+    #
+    # work_dir IS a tmp_path, not cache_dir() itself (final-review
+    # Important 1): passing the real national cache directory as work_dir
+    # used to make fetch() write its own two .cache_pointer bridge files
+    # straight into it, littering the owner's real cache with per-run test
+    # artefacts on every live run rather than a survey's own scratch dir.
     directory = lidar_cardiff.cache_dir()
     source = LidarCardiffSource()
 
-    result = source.fetch(_any_bbox(), [], directory, NullProgress())
+    # A covered extent, not _any_bbox() (Barry): fetch()'s own
+    # none-coverage gate (final-review Critical 1) now refuses a
+    # none-covered extent before either zip is even downloaded, and this
+    # test's whole point is the real download. _covered_bbox()'s own
+    # docstring caveat about needing an isolated ostn15_cache_dir does not
+    # bind here: this source uses the real, possibly-warm ~/.mapgen OSTN15
+    # grid, but _FULL_UNDER_BUDGET's own 40 m margin from every real tile
+    # edge comfortably absorbs the few-metre difference between that real
+    # grid and the gridless approximation this bbox was reconstructed
+    # against.
+    bbox = _covered_bbox()
+    result = source.fetch(bbox, [], tmp_path / "work", NullProgress())
 
     assert result == [directory / DSM_ZIP_NAME, directory / DTM_ZIP_NAME]
     assert result[0].stat().st_size == DSM_ZIP_BYTES
@@ -1495,6 +1690,8 @@ def test_live_fetch_downloads_both_real_zips_into_the_real_cache():
 
     # Subsequent runs find them cached: re-fetching with a network-
     # refusing session must succeed without downloading anything again.
+    # A second, distinct work_dir: a real survey never reuses another
+    # survey's own scratch directory either.
     cached_source = LidarCardiffSource(session=_RefusesToConnect())
-    result_again = cached_source.fetch(_any_bbox(), [], directory, NullProgress())
+    result_again = cached_source.fetch(bbox, [], tmp_path / "work2", NullProgress())
     assert result_again == result

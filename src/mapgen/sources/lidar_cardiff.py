@@ -152,6 +152,53 @@ grow a window by under one pixel per edge, and gating on the snapped
 count instead would let the refusal and the preview disagree by that
 same sliver, for no benefit.
 
+## The none-coverage gate: 0 pixels is not the same fact as "nothing to refuse"
+
+A final whole-branch review (Critical 1) found the budget gate alone is
+not enough: an extent with `covers(bbox) == "none"` can still pass it,
+because 0 pixels is comfortably under `MAX_WINDOW_PIXELS`. Two shapes of
+"none" reach this gap. The first, and the one the review executed
+against a real extent: the padded extent overlaps `_ENVELOPE`'s own
+bounding rectangle in ONE axis but not the other (eastings inside,
+northings nowhere near), so `_window_pixels` prices the intersection at
+0 (one axis clamped to zero width by its own `max(0.0, ...)`) and the
+budget gate waves it through; `merge()` then builds a window that is
+wide but zero pixels TALL (or the reverse), and `write_bng_geotiff`
+refuses that shape outright (`GeoTiffWriteError`), uncaught, since
+`merge()`'s own exceptions are not wrapped by `run_survey`. The second,
+milder shape: an extent that lands entirely inside one of the two 500 m
+cells `COVERAGE_TILES` does NOT include (the gaps beside ST1277SW, see
+the module docstring's "500 m lattice" section) sits wholly inside
+`_ENVELOPE` with a perfectly ordinary, non-degenerate pixel count, so it
+sails through both the coverage question and the budget question and
+would otherwise package an all-NaN 25 cm pair for ground the resolver
+itself already told the owner this source has nothing for.
+
+Both shapes are the same underlying fact (`covers(bbox) == "none"`), and
+`fetch()`'s own gate answers both of them at once, correctly, because it
+asks `covers()` itself, the exact lattice test that already tells the two
+shapes apart from a genuine "full" or "partial" extent: it runs AFTER the
+budget gate (reachable only once an extent has already cleared that one),
+with the same two-gate shape and the same pinned-string discipline
+(`_NO_COVERAGE_REASON`) the budget refusal established.
+
+`merge()`'s own second-line-of-defence copy is narrower, and deliberately
+so: it cannot repeat the `covers()` lattice test cheaply at that point (it
+no longer has a convenient bbox-shaped question to ask; it already has a
+window), so it guards only on the one fact the FIRST shape above is
+proven to leave behind, `_snapped_merge_window`'s own `width` or `height`
+coming back zero, which is also the only shape that would otherwise reach
+`write_bng_geotiff` and crash it. The second, milder shape (a gap-cell
+extent, wholly inside `_ENVELOPE` with an ordinary, non-degenerate pixel
+count) does NOT trip this guard: nothing in `merge()` alone can tell that
+window apart from a genuinely thin sliver of real partial coverage
+without re-running the lattice test, so guarding against it here would
+need `merge()` to duplicate `covers()`'s own logic for a case `fetch()`'s
+gate has already refused before `merge()` is ever reached in the ordinary
+path. The guard's job is narrower: never let a `merge()` invoked some
+other way (a resumed run, a future direct caller) reach the one shape
+that would otherwise crash the writer.
+
 ## One failed member fails the whole merge
 
 A member whose header will not parse, or whose full value grid will not
@@ -361,24 +408,31 @@ class LidarCardiffError(RuntimeError):
     a zip member whose header or values `asc_grid.AscGridError` refused;
     a pointer file whose own recorded text is not a usable path at all;
     or `merge()` missing an input it needs, either the two zip paths or
-    `self._bbox`), or `"budget"` (the padded extent's own intersection
-    with the coverage envelope needs more pixels at 25 cm than
+    `self._bbox`), `"budget"` (the padded extent's own intersection with
+    the coverage envelope needs more pixels at 25 cm than
     `cog.MAX_WINDOW_PIXELS` allows, the same number `detail()` already
-    previewed). `"download"` is the only retryable kind
-    (`_classify_lidar_cardiff_error`); `"budget"` maps to
-    `FAILURE_NODE_CAP` there, the same "the answer is a smaller extent,
-    not another identical request" vocabulary entry `sources/base.py`
-    documents for OsmSource's own, unrelated failure, since asking again
-    never shrinks an extent; `"parse"` falls through to `FAILURE_UNKNOWN`.
+    previewed), or `"no_coverage"` (the extent has no overlap with any of
+    the ten `COVERAGE_TILES` at all: `covers(bbox) == "none"`, or, the
+    narrower case `merge()`'s own guard catches, a window whose snapped
+    intersection with `_ENVELOPE` is zero pixels wide or tall in at least
+    one axis, which implies the identical fact). `"download"` is the only
+    retryable kind (`_classify_lidar_cardiff_error`); `"budget"` and
+    `"no_coverage"` both map to `FAILURE_NODE_CAP` there, the same "the
+    answer is a different extent, not another identical request"
+    vocabulary entry `sources/base.py` documents for OsmSource's own,
+    unrelated failure, since asking again never changes either fact;
+    `"parse"` falls through to `FAILURE_UNKNOWN`.
 
-    `"budget"` is raised from two places: `fetch()`, BEFORE either zip is
-    downloaded (the primary gate: this is what actually reaches
-    package.py's ordinary source-failure/tile_failures path, since
-    `merge()`'s own exceptions are not currently caught by `run_survey`),
-    and `merge()` itself, kept as a second line of defence for a call
-    reached by some other route. Both build their message from the same
-    `_budget_refusal_reason` so the two can never disagree with each
-    other or with `detail()`'s own preview.
+    `"budget"` and `"no_coverage"` are each raised from two places:
+    `fetch()`, BEFORE either zip is downloaded (the primary gate: this is
+    what actually reaches package.py's ordinary source-failure/
+    tile_failures path, since `merge()`'s own exceptions are not
+    currently caught by `run_survey`), and `merge()` itself, kept as a
+    second line of defence for a call reached by some other route. Every
+    gate builds its message from one shared function
+    (`_budget_refusal_reason`, `_NO_COVERAGE_REASON`) so no two call
+    sites, and no gate and `detail()`'s or `covers()`'s own preview, can
+    ever disagree about the same extent.
 
     Every message names the zip's own file name (`DSM_ZIP_NAME` /
     `DTM_ZIP_NAME`) or the pixel arithmetic itself, never `DSM_ZIP_URL` /
@@ -400,20 +454,20 @@ def _classify_lidar_cardiff_error(exc: LidarCardiffError) -> str:
     `FAILURE_UNREACHABLE`, retryable: the same bucket `os_uprn.py`'s own
     `_classify_os_open_error` gives `OsOpenError`'s `"download"`/
     `"listing"` kinds, which this mirrors for the identical reason.
-    `"budget"` is `FAILURE_NODE_CAP`: the extent needs more pixels than
-    the raster budget allows, and retrying the identical request asks
-    the identical question of the identical extent, so nothing about a
-    second attempt could ever answer differently, the same reasoning
-    `osm.py`'s own `NodeCapExceededError` mapping already documents for
-    an unrelated too-dense-to-serve failure. `"parse"` (a right-length
-    body that will not open as a zip, a member `asc_grid.AscGridError`
-    refused, or `merge()` missing a required input) falls through to
+    `"budget"` and `"no_coverage"` are both `FAILURE_NODE_CAP`: neither
+    extent gets more pixels, or moves inside the covered block, by
+    retrying the identical request, so nothing about a second attempt
+    could ever answer differently, the same reasoning `osm.py`'s own
+    `NodeCapExceededError` mapping already documents for an unrelated
+    too-dense-to-serve failure. `"parse"` (a right-length body that will
+    not open as a zip, a member `asc_grid.AscGridError` refused, or
+    `merge()` missing a required input) falls through to
     `FAILURE_UNKNOWN`, the same catch-all `os_uprn.py`'s own classifier
     gives every kind it does not special-case.
     """
     if exc.kind == "download":
         return FAILURE_UNREACHABLE
-    if exc.kind == "budget":
+    if exc.kind in ("budget", "no_coverage"):
         return FAILURE_NODE_CAP
     return FAILURE_UNKNOWN
 
@@ -547,6 +601,17 @@ def _budget_refusal_reason(pixels: int) -> str:
         f"budget is 16,777,216; extents under about 600 x 600 m inside "
         f"the covered block come back at 25 cm"
     )
+
+
+# Pinned verbatim (final whole-branch review, Critical 1's fix). Shared by
+# both gates below for the identical reason `_budget_refusal_reason` is
+# shared: `fetch()`'s own gate is what actually reaches the owner, and
+# `merge()`'s copy is the second line of defence, and the two must never
+# say two different things about the same fact.
+_NO_COVERAGE_REASON = (
+    "this extent is outside the ten covered tiles at Creigiau and Pentyrch, "
+    "north-west Cardiff; the 25 cm archive holds nothing here"
+)
 
 
 def _resolve_cache_pointer(parts: Sequence[Path], pointer_name: str) -> Path | None:
@@ -973,13 +1038,25 @@ class LidarCardiffSource:
         fetch(), first, and again in merge()" section for why this is
         the gate that actually has to reach the owner.
 
+        The none-coverage gate runs SECOND, once an extent has already
+        cleared the budget gate: `covers(bbox) == "none"` means this
+        extent has no overlap with any of the ten `COVERAGE_TILES` at
+        all (a final whole-branch review's own Critical finding: 0
+        pixels, the budget gate's own price for exactly this extent, is
+        comfortably under budget, so that gate alone waves it through).
+        Refused here the same way, kind `"no_coverage"`, before either
+        zip is downloaded: see the module docstring's "The none-coverage
+        gate" section for the two shapes of "none" this closes and why
+        `fetch()`, not `merge()`, is where this has to live to actually
+        reach the owner.
+
         `cancel` is checked before each of the two zips, never mid
         download: a unit already in flight always finishes, matching
         every other source's own reading of this optional parameter (see
         `sources/base.py`'s `LayerSource` docstring).
 
-        A `LidarCardiffError` from either zip, or from the budget gate,
-        is recorded against every tile in `tiles`
+        A `LidarCardiffError` from either zip, or from either gate, is
+        recorded against every tile in `tiles`
         (`_classify_lidar_cardiff_error` maps its own `kind` to the
         shared failure vocabulary) and then re-raised unchanged, the
         same "record, then raise" shape `os_uprn.py`'s own `fetch()` uses
@@ -993,6 +1070,13 @@ class LidarCardiffSource:
         pixels = _window_pixels(bbox, self._ostn15_cache_dir)
         if pixels > MAX_WINDOW_PIXELS:
             error = LidarCardiffError(_budget_refusal_reason(pixels), kind="budget")
+            self._record_tile_failures(
+                tiles, _classify_lidar_cardiff_error(error), str(error)
+            )
+            raise error
+
+        if self.covers(bbox) == "none":
+            error = LidarCardiffError(_NO_COVERAGE_REASON, kind="no_coverage")
             self._record_tile_failures(
                 tiles, _classify_lidar_cardiff_error(error), str(error)
             )
@@ -1079,6 +1163,15 @@ class LidarCardiffSource:
         `AttributeError` from deep inside the BNG projection code that
         would otherwise follow from a bare `None`.
 
+        A window whose snapped intersection with the coverage envelope
+        comes back zero pixels wide or tall in either axis (kind
+        `"no_coverage"`) is refused before either zip is even opened,
+        rather than handed to `write_bng_geotiff`, which refuses that
+        shape outright: see the module docstring's "The none-coverage
+        gate" section for why this is a narrower, second-line-of-defence
+        copy of `fetch()`'s own gate rather than a full replacement for
+        it.
+
         Neither raster is written until both have been fully assembled:
         a member that fails to parse, in either zip, raises before either
         temp file below is ever written (see the module docstring's "One
@@ -1118,6 +1211,14 @@ class LidarCardiffSource:
         window_e_min, window_n_max, window_width, window_height = (
             _snapped_merge_window(self._bbox, self._ostn15_cache_dir)
         )
+        if window_width == 0 or window_height == 0:
+            # Second line of defence, never the only one: see the module
+            # docstring's "The none-coverage gate" section for why this
+            # narrower guard exists beside fetch()'s own covers()-based
+            # gate rather than instead of it. Raised before either zip is
+            # opened, the same "refuse before doing any real work" shape
+            # every other gate in this file already follows.
+            raise LidarCardiffError(_NO_COVERAGE_REASON, kind="no_coverage")
 
         dsm_window = _assemble_window(
             dsm_zip_path, window_e_min, window_n_max, window_width, window_height
