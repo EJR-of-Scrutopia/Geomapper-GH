@@ -9,7 +9,9 @@ by the grid itself, one row per line. The real members are 2000x2000 cells,
 CRLF terminated, and hold heights in MILLIMETRES (the filename says so), so
 Task 4 calls `parse_asc` with `value_scale=0.001`. `parse_asc_header` exists
 so a caller can check a member's bounds and cell size cheaply, without
-converting four million tokens to float first.
+converting four million tokens to float first, and it gives up within a
+fixed, small number of lines, rather than scanning to the end of the
+member, if the header never reaches a value row at all.
 
 A real header, whitespace separated and in the order NRW happens to write
 it, but read here in any order and any case:
@@ -39,6 +41,13 @@ _REQUIRED_INT_KEYS = ("ncols", "nrows")
 _REQUIRED_FLOAT_KEYS = ("xllcorner", "yllcorner", "cellsize")
 _DEFAULT_NODATA = -9999.0
 
+# A real header is the six keys above plus, at most, a stray unrecognised
+# one or two (an ESRI writer's own extension) and never a blank line. This
+# is generous slack over that, not an estimate of a legitimate header's
+# length: it exists so a malformed member (no value row ever appears)
+# is refused after a fixed, small read rather than scanned to its end.
+_MAX_HEADER_LINES = 32
+
 
 class AscGridError(RuntimeError):
     """Raised when an ESRI ASCII grid's header or values cannot be read.
@@ -53,9 +62,12 @@ def parse_asc_header(text: str) -> dict:
     """The six header keys, read without looking at a single value row.
 
     Stops at the first line whose first token parses as a number, which is
-    the ESRI convention for where the header ends: it never scans further
-    into `text`, so a caller can bounds-check a member many megabytes long
-    for the cost of reading half a dozen short lines.
+    the ESRI convention for where the header ends. When no such line turns
+    up within `_MAX_HEADER_LINES`, this raises rather than reading on: a
+    real header is six keys and a little slack, never hundreds of
+    thousands of lines, so a caller can bounds-check a member many
+    megabytes long for the cost of reading a fixed, small number of short
+    lines, on a well-formed member and on a malformed one alike.
     """
     header, _ = _read_header(text)
     return header
@@ -82,12 +94,12 @@ def parse_asc(text: str, value_scale: float = 1.0) -> BngWindow:
                 f"ASCII grid ends after {row_number - 1} of {nrows} rows."
             ) from None
         tokens = line.split()
-        if len(tokens) < ncols:
+        if len(tokens) != ncols:
             raise AscGridError(
                 f"ASCII grid row {row_number} holds {len(tokens)} values, "
-                f"short of the {ncols} the header declares."
+                f"not the {ncols} the header declares."
             )
-        for token in tokens[:ncols]:
+        for token in tokens:
             try:
                 value = float(token)
             except ValueError:
@@ -95,6 +107,11 @@ def parse_asc(text: str, value_scale: float = 1.0) -> BngWindow:
                     f"ASCII grid row {row_number} holds {token!r}, which is "
                     f"not a number."
                 ) from None
+            if not math.isfinite(value):
+                raise AscGridError(
+                    f"ASCII grid row {row_number} holds {token!r}, which is "
+                    f"not a number."
+                )
             values.append(math.nan if value == nodata else value * value_scale)
 
     return BngWindow(
@@ -113,12 +130,25 @@ def _read_header(text: str) -> tuple[dict, int]:
     `pos` walks `text` one line at a time; the loop breaks the moment a
     line's first token parses as a number, leaving `pos` at the start of
     that line so `parse_asc` can resume reading rows from exactly there
-    without re-scanning anything this function already looked at.
+    without re-scanning anything this function already looked at. Bounded
+    at `_MAX_HEADER_LINES`: without this, a member whose value block never
+    starts with a numeric token (a truncated download, a wrong file
+    entirely) makes this loop read every remaining line to the end of
+    `text`, exactly the "full parse" cost `parse_asc_header` exists to
+    avoid.
     """
     raw: dict[str, str] = {}
     pos = 0
     length = len(text)
+    lines_read = 0
     while True:
+        lines_read += 1
+        if lines_read > _MAX_HEADER_LINES:
+            raise AscGridError(
+                f"ASCII grid has no value row within its first "
+                f"{_MAX_HEADER_LINES} lines, so it is not a well-formed "
+                f"ESRI ASCII grid."
+            )
         newline = text.find("\n", pos)
         end = length if newline == -1 else newline
         line = text[pos:end]
@@ -136,7 +166,10 @@ def _read_header(text: str) -> tuple[dict, int]:
             raise AscGridError(
                 f"ASCII grid header line {tokens[0]!r} has no value."
             )
-        raw[tokens[0].lower()] = tokens[1]
+        key = tokens[0].lower()
+        if key in raw:
+            raise AscGridError(f"ASCII grid header repeats key '{key}'.")
+        raw[key] = tokens[1]
         if newline == -1:
             pos = length
             break
@@ -167,12 +200,23 @@ def _coerce_header(raw: dict[str, str]) -> dict:
         if text_value is None:
             raise AscGridError(f"ASCII grid header is missing '{key}'.")
         try:
-            header[key] = float(text_value)
+            value = float(text_value)
         except ValueError:
             raise AscGridError(
                 f"ASCII grid header's '{key}' ({text_value!r}) is not a "
                 f"number."
             ) from None
+        if not math.isfinite(value):
+            raise AscGridError(
+                f"ASCII grid header's '{key}' ({text_value!r}) is not a "
+                f"finite number."
+            )
+        if key == "cellsize" and value <= 0.0:
+            raise AscGridError(
+                f"ASCII grid header's 'cellsize' ({value:g}) must be "
+                f"positive."
+            )
+        header[key] = value
     nodata_text = raw.get("nodata_value")
     if nodata_text is None:
         header["nodata_value"] = _DEFAULT_NODATA

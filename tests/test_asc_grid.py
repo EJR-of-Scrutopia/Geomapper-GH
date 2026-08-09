@@ -9,6 +9,7 @@ rule rather than a fixture the size of a real download.
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
 
@@ -154,3 +155,106 @@ def test_asc_grid_error_never_carries_a_url() -> None:
         assert "http" not in str(exc).lower()
     else:
         pytest.fail("expected AscGridError")
+
+
+def test_cellsize_zero_raises_naming_it() -> None:
+    text = (
+        "ncols 3\n"
+        "nrows 2\n"
+        "xllcorner 310500\n"
+        "yllcorner 176500\n"
+        "cellsize 0\n"
+        "1.0 2.0 3.0\n"
+        "4.0 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="cellsize"):
+        parse_asc(text)
+
+
+def test_cellsize_negative_raises_naming_it() -> None:
+    text = (
+        "ncols 3\n"
+        "nrows 2\n"
+        "xllcorner 310500\n"
+        "yllcorner 176500\n"
+        "cellsize -0.25\n"
+        "1.0 2.0 3.0\n"
+        "4.0 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="cellsize"):
+        parse_asc(text)
+
+
+def test_non_finite_corner_raises_naming_it() -> None:
+    text = (
+        "ncols 3\n"
+        "nrows 2\n"
+        "xllcorner nan\n"
+        "yllcorner 176500\n"
+        "cellsize 0.25\n"
+        "1.0 2.0 3.0\n"
+        "4.0 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="xllcorner"):
+        parse_asc(text)
+
+
+def test_nan_value_token_raises_with_row_number() -> None:
+    text = _HEADER + (
+        "nan 2.0 3.0\n"
+        "4.0 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="row 1"):
+        parse_asc(text)
+
+
+def test_inf_value_token_raises_with_row_number() -> None:
+    text = _HEADER + (
+        "1.0 2.0 3.0\n"
+        "inf 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="row 2"):
+        parse_asc(text)
+
+
+def test_over_long_row_raises_like_a_short_row() -> None:
+    text = _HEADER + (
+        "1.0 2.0 3.0 4.0\n"
+        "4.0 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="row 1"):
+        parse_asc(text)
+
+
+def test_duplicate_header_key_raises() -> None:
+    text = (
+        "ncols 3\n"
+        "nrows 2\n"
+        "xllcorner 310500\n"
+        "yllcorner 176500\n"
+        "cellsize 0.25\n"
+        "ncols 999\n"
+        "1.0 2.0 3.0\n"
+        "4.0 5.0 6.0\n"
+    )
+    with pytest.raises(AscGridError, match="ncols"):
+        parse_asc(text)
+
+
+def test_garbage_value_block_raises_quickly_instead_of_scanning() -> None:
+    """A value block that never starts with a numeric token must not turn
+    the header-only read into a full-file scan.
+
+    Each garbage line carries a distinct, non-numeric first token so the
+    duplicate-key check does not short-circuit this before the line-count
+    bound does: this is specifically exercising that bound. Enough lines
+    that an unbounded scan would show up as a fraction of a second, not
+    merely as an exception.
+    """
+    garbage = "".join(f"junk{i} value\n" for i in range(200_000))
+    text = _HEADER + garbage
+    started = time.perf_counter()
+    with pytest.raises(AscGridError, match="no value row"):
+        parse_asc_header(text)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.05
