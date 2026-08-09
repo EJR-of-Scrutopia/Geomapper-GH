@@ -508,6 +508,11 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_canopy.geojson          canopy points, only if
                                                       the LiDAR found above-
                                                       ground clusters
+  Barry-Waterfront_2026-08-03_lidar25_dsm.tif         Creigiau/Pentyrch 25 cm,
+  Barry-Waterfront_2026-08-03_lidar25_dtm.tif         only if `lidar_cardiff`
+                                                      was selected and the
+                                                      extent falls inside the
+                                                      ten-tile block
   Barry-Waterfront_2026-08-03_boundaries.geojson      HM Land Registry property
                                                       boundary curves, only if
                                                       `inspire` was selected
@@ -621,6 +626,23 @@ Each file:
   indicative`: a pylon or a crane clears
   the same 3 m floor a tree does and a raster cannot tell them apart, so
   read it as an above-ground survey, never a species one.
+- **`<stem>_lidar25_dsm.tif`, `<stem>_lidar25_dtm.tif`**: 25 cm terrain
+  (surface and bare-earth) from Natural Resources Wales' 2011 historic
+  archive, packaged whenever the `lidar_cardiff` source is selected and
+  the extent falls inside the ten quarter-tiles it covers: Creigiau and
+  Pentyrch, north-west Cardiff, about 2.5 km2, the only 25 cm the archive
+  holds anywhere near Cardiff. **Not central Cardiff, and not current
+  ground**: flown 23 March 2011, fifteen years of change since, so
+  buildings and ground both may differ from what stands there today.
+  Extents under about 1 x 1 km inside the block come back at 25 cm; a
+  larger covered extent is refused outright, with the pixel count and
+  the reason recorded rather than silently downsampled. Terrain only:
+  fused building heights, roof forms, canopy points, `<stem>.egrid` and
+  every contour file above stay on the 2020-2023 1 m data
+  (`lidar_wales`) regardless of whether `lidar_cardiff` is also
+  selected, so a package never understates the vintage of half of what
+  it holds by dressing a 2011 archive's own terrain up with a newer
+  flight's derived products.
 - **`<stem>_boundaries.geojson`**: HM Land Registry's INSPIRE Index
   Polygon parcels for whichever local authority (or authorities, at a
   border) the extent falls into, packaged whenever `inspire` is selected
@@ -783,6 +805,7 @@ including drawing sheets.
 | Overture Maps | Mixed by theme: Open Database License (ODbL) and CDLA-Permissive-2.0 | (c) Overture Maps Foundation |
 | Copernicus DEM, via OpenTopography | Free for any use, with attribution | (c) DLR e.V. 2010-2014, (c) Airbus Defence and Space GmbH |
 | Welsh LiDAR (`lidar_wales`) | Open Government Licence v3.0 | Contains Welsh Government and Natural Resources Wales information licensed under the Open Government Licence v3.0 |
+| Cardiff 25 cm historic LiDAR (`lidar_cardiff`) | Open Government Licence for Public Sector Information (OGL) | Contains Natural Resources Wales information © Natural Resources Wales and Database Right. All rights Reserved. |
 | HM Land Registry INSPIRE Index Polygons (`inspire`) | Open Government Licence v3.0 | This information is subject to Crown copyright and database rights [year] and is reproduced with the permission of HM Land Registry. The polygons (including the associated geometry, namely x, y co-ordinates) are subject to Crown copyright and database rights [year] Ordnance Survey AC0000851063. |
 | OS Open map data (`os_open`): OpenMap Local, Open Roads, Open Greenspace | Open Government Licence v3.0 | Contains OS data © Crown copyright and database right [year] |
 | Addresses (`os_uprn`): OS Open UPRN | Open Government Licence v3.0 | Contains OS data © Crown copyright and database right [year] |
@@ -802,7 +825,10 @@ Open Roads reads only the squares it needs, at roughly 50 MB per area, out of
 the OS Data Hub's single 608 MB national zip through a ranged read rather
 than downloading the whole file. `os_uprn`'s address layer is a single 619 MB
 national CSV, downloaded once, ever, and cached for every later survey
-regardless of where in Great Britain it runs. Every later survey over ground
+regardless of where in Great Britain it runs. `lidar_cardiff`'s two archive
+zips (about 84 MB combined) are cached the same way, once, under
+`~/.mapgen/lidar_cardiff`, regardless of which part of the ten-tile block a
+given survey's own extent touches. Every later survey over ground
 already cached this way costs nothing further to download, and `mapgen
 estimate` says so through each source's own `routing_note`.
 
@@ -940,11 +966,15 @@ Government's whole-Wales mosaics (Open Government Licence v3.0), generates
 contours at the interval each extent's own area qualifies for, fuses
 DSM-minus-DTM building heights into the `.osm`, and feeds the `.egrid` from
 that same 1 m DTM with the 30 m OpenTopography DEM as fallback beyond its
-edge. The resolution promise is 1 m, not finer: the 25 cm data in NRW's own
-archive catalogue turned out, on checking, to be ten 2011 quarter-tiles,
+edge. The resolution promise here is 1 m, not finer: the 25 cm data in NRW's
+own archive catalogue turned out, on checking, to be ten 2011 quarter-tiles,
 about 2.5 km2, in the Creigiau and Pentyrch corner of north-west Cardiff,
-nowhere near most Welsh sites, so no copy anywhere in this project claims
-25 cm.
+nowhere near most Welsh sites, which is why `lidar_wales` itself never
+claims 25 cm. That corner is served separately, honestly, by its own
+source; see item D below. (This paragraph used to say no copy anywhere in
+this project claims 25 cm at all. That was true before item D existed; the
+25 cm claim now exists in exactly one place, `lidar_cardiff`'s own
+surfaces, where it is true.)
 
 **Build item 2, INSPIRE property boundaries, has shipped.** The `inspire`
 source downloads HM Land Registry's INSPIRE Index Polygons for whichever
@@ -988,13 +1018,32 @@ property boundaries (item A, see the `boundaries_categories` row of the
 DSM (item B, see the `<stem>_roof_massing.geojson` and `<stem>_canopy.geojson`
 entries and the `roof_forms` and `canopy` schema rows above), and the Grasshopper
 GeoTIFF reader script (`docs/grasshopper/lidar_to_mesh.py`, a documentation
-artifact rather than pipeline code). Still to come, in build order: the
-Cardiff 25 cm LiDAR source (item D, 2011 flight, needs its own live probe
-first); an OS benchmark (item F), a dev-mode comparison against OS's paid
-developer tooling to calibrate the tier resolver's own tier tables against
-a second opinion; then, per the phase 2 design record, DataMapWales
-constraints and Cadw designations together with planning.data.gov.uk for
-England, Sentinel-2 context imagery via Earth Search, England LiDAR as its
-own task (the discovery API is open but bulk raster download there has no
-documented route yet), PlanIt planning history, and BGS boreholes. See
+artifact rather than pipeline code).
+
+**Build item D, the Cardiff 25 cm LiDAR source, has shipped.**
+`lidar_cardiff` packages Natural Resources Wales' 2011 historic 25 cm
+archive as `<stem>_lidar25_dsm.tif` and `<stem>_lidar25_dtm.tif` over the
+ten quarter-tiles it actually covers, Creigiau and Pentyrch in north-west
+Cardiff, about 2.5 km2; see "What a survey folder contains" above for the
+full detail (location honesty, the flown-2011 vintage, the budget rule,
+and why heights, roofs, canopy, the `.egrid` and every contour file still
+read from the 2020-2023 1 m data regardless). Proven live over a real,
+sub-budget extent inside the block: both rasters at 0.25 m exactly, real
+Creigiau/Pentyrch heights sampled off them, a real cache-warm survey
+running in about 22 seconds end to end (the merge itself accounting for
+nearly all of that), and the Grasshopper reader
+(`docs/grasshopper/lidar_to_mesh.py`) confirmed against the live DSM. The
+owner's own 2026-08-08 decision, recorded so it is not re-opened: ship the
+spec as written, the ten tiles, not the general Wales-wide archive access
+the plan-time probe also surfaced as an option; that broader route was
+offered and explicitly declined.
+
+Still to come, in build order: an OS benchmark (item F), a dev-mode
+comparison against OS's paid developer tooling to calibrate the tier
+resolver's own tier tables against a second opinion; then, per the phase 2
+design record, DataMapWales constraints and Cadw designations together
+with planning.data.gov.uk for England, Sentinel-2 context imagery via
+Earth Search, England LiDAR as its own task (the discovery API is open but
+bulk raster download there has no documented route yet), PlanIt planning
+history, and BGS boreholes. See
 `docs/superpowers/specs/` for the design record covering that last group.

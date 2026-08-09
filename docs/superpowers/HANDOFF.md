@@ -471,6 +471,61 @@ and the full vocabulary and honesty-floor reasoning are in the spec's own
 read either before touching `ROOF_SHAPES` or `MIN_RIDGE_METRES`. Full suites
 green: 1841 Python passed / 17 deselected, 285 Node.
 
+**Phase 2b item D, the Cardiff 25 cm LiDAR source, is built and shipped
+(2026-08-09).** All six tasks of
+`docs/superpowers/plans/2026-08-09-mapgen-phase2b-d-cardiff-lidar.md` are
+complete: `src/mapgen/asc_grid.py` parses the archive's own ESRI ASCII
+grid members; `src/mapgen/sources/lidar_cardiff.py` (`LidarCardiffSource`)
+covers, tiers and prices the ten quarter-tiles a plan-time live probe
+against the real NRW WFS catalogue found this archive actually holds
+(`probe-report.md`, 2026-08-08); `fetch()` downloads and verifies the two
+archive zips (about 84 MB combined) into a national `~/.mapgen/lidar_cardiff`
+cache, budget-gated before either download starts; `merge()` assembles
+their ASCII grid members into `<stem>_lidar25_dsm.tif` and
+`<stem>_lidar25_dtm.tif` at the archive's own 0.25 m, refusing (never
+downsampling) an extent whose padded window needs more pixels than the
+raster budget allows; and `package.py` registers it opt-in, alongside
+`lidar_wales`, with its own provenance entry (`vintage_note`) carrying
+the flown-2011 caveat onto every package that selects it.
+
+The plan-time probe (`probe-report.md`) corrected the spec's own premise
+twice before any task was briefed: these ten tiles are Creigiau and
+Pentyrch in north-west Cardiff, about 2.5 km2, not "central Cardiff" as
+the spec's own wording had drifted to say, and they are not the only
+25 cm LiDAR in Wales (1,470 records nationally), just the only one this
+source serves. **The owner's own 2026-08-08 decision, recorded here so it
+is not re-opened from the probe report alone:** ship the spec as written,
+the ten tiles, at the corrected location; the general, Wales-wide archive
+access the probe's own "Design consequence" section raised as an
+alternative (the same machinery generalised to serve central Cardiff at
+whatever resolution its own nearest flight actually offers) was put to
+the owner and explicitly declined.
+
+Task 6 proved the shipped source live over a real, sub-budget extent
+inside the block (BNG roughly 311150-311750 by 177050-177650, chosen over
+the plan's own illustrative example once that example's padded window
+was checked and found to clear the raster budget by 61%, a plan-time
+arithmetic slip rather than a code defect): both rasters landed at
+0.25 m exactly, `covers()` full, real Creigiau/Pentyrch heights sampled
+off both (roughly 10-68 m OD across the whole ten-tile footprint, well
+under the pre-run guess of 90-130 m OD, again the ground correcting the
+assumption rather than a bug, independently confirmed straight off the
+raw archive members before any of this project's own code touched them),
+and the Grasshopper reader (`docs/grasshopper/lidar_to_mesh.py`)'s own
+command-line self-test read the live DSM straight off disk (4001 x 4001
+px at 0.25 m, z 9.88 to 68.26 m) in under 3 seconds. The whole survey
+(cache-warm, `osm` + `lidar_cardiff`) ran in about 22 s end to end, with
+the `lidar_cardiff` merge step itself accounting for nearly all of it
+(about 21 s of it: two ~40 MB zips opened, ~16 million ESRI ASCII grid
+cells parsed and pasted, two GeoTIFFs written). `BYTES_PER_SECOND_ESTIMATE`
+was corrected from its never-measured 2,000,000 placeholder to
+15,000,000 against Task 3's own live cold-run measurement (roughly
+20.5 MB/s, both zips, one machine, one day); `SECONDS_FLOOR` was
+corrected from an equally unmeasured 3.0 to 0.1 against five isolated
+warm-cache `fetch()` trials on this machine (4.4 to 5.0 ms each, a warm
+fetch() here being nothing but two `Path.stat()` calls). Full suites
+green: 1929 Python passed / 18 deselected, 285 Node.
+
 **Watch-items, carried forward and added to.** The int16 GDAL_METADATA
 scale/offset refusal deferred at Wales LiDAR's own Task 3 (`cog.py`) still
 needs to land before any 16-bit mosaic path is pointed at: right now a
@@ -505,17 +560,19 @@ will measure them, the same way Task 4's own cold Cowbridge run measured
 The addendum this section used to describe as not yet written now exists:
 `docs/superpowers/specs/2026-08-07-mapgen-phase2b-addendum-design.md`
 covers items A through F, owner-approved, with its own build order. Item
-C (detail preview), item A (categorised property boundaries) and item B
-(roofs and canopy from the LiDAR, the flagship) are all shipped, see
-above. **Next action: item D, the Cardiff 25 cm LiDAR source, which needs
-its own live probe of DataMapWales before any task is briefed.** Then
-item F (the OS benchmark, after A-D so it measures the finished stack),
-and item E (full-resolution LiDAR rasters) only if the owner opens that
-gate; item B's validation gives that gate a measured basis, since the
-owner's survey-sized extents currently come back at 2 m and miss the 1 m
-budget by about 1.3%. Phase 2 item 4, DataMapWales constraints and Cadw
-designations together with planning.data.gov.uk for England, follows the
-addendum unless the owner reorders; its own design already sits in
+C (detail preview), item A (categorised property boundaries), item B
+(roofs and canopy from the LiDAR, the flagship) and item D (the Cardiff
+25 cm LiDAR source) are all shipped, see above. **Next action: item F,
+the OS benchmark, a dev-mode comparison against OS's paid developer
+tooling to calibrate the tier resolver's own tier tables against a second
+opinion, now that A through D give it a finished stack to measure.**
+Item E (full-resolution LiDAR rasters) stays owner-gated and is not
+briefed unless the owner opens it; item B's validation gives that gate a
+measured basis, since the owner's survey-sized extents currently come
+back at 2 m and miss the 1 m budget by about 1.3%. Phase 2 item 4,
+DataMapWales constraints and Cadw designations together with
+planning.data.gov.uk for England, follows the addendum unless the owner
+reorders; its own design already sits in
 `docs/superpowers/specs/2026-08-05-mapgen-phase2-design.md`.
 
 ## Standing constraints

@@ -354,6 +354,37 @@ indicative`, deliberately not narrower.** A pylon or a crane clears the same
 one from the other; read this file as an above-ground survey, never a species
 one.
 
+## The Cardiff 25 cm block: a separate, historic terrain source
+
+`lidar_cardiff` is a different source from everything above, not another
+resolution of `lidar_wales`: tick it in the layer checklist and draw your
+extent inside the ten quarter-tiles it actually covers, Creigiau and
+Pentyrch in north-west Cardiff, about 2.5 km2 (the estimate panel's own
+detail preview says "25 cm at this extent, flown 2011" once you are
+inside the block; outside it, this source has nothing to give you). Keep
+the extent under about 1 x 1 km: the archive is 25 cm per pixel, four
+times the samples per side of the 1 m data at the same ground area, and
+the same raster-size budget every source in this project shares refuses
+anything larger, with the pixel count and the reason recorded rather than
+a silent fallback to something coarser.
+
+What arrives is `<stem>_lidar25_dsm.tif` and `<stem>_lidar25_dtm.tif`,
+read into Rhino the same way as `lidar_wales`'s own pair: the Grasshopper
+mesh route, `docs/grasshopper/lidar_to_mesh.py`, reads either file
+straight off disk at its own native 0.25 m and builds the terrain mesh
+component-side, with no separate export step. Nothing else in this README
+reads these two files: no roof massing, no canopy points, no `.egrid` and
+no contour file is ever generated from them (see the main README's own
+package-contents entry for why), so the mesh route above is the one way
+this source's terrain reaches a Grasshopper document.
+
+**Flown 23 March 2011 is a historic surface, not a current one.** Fifteen
+years of change since means real ground: buildings this raster shows may
+since have been extended, demolished or never existed yet when the survey
+flew, and the reverse just as often. Treat it as a base to check against
+site photographs and today's OSM footprints, not as a substitute for
+either.
+
 ## Bridge parity: canopy always, roof tags only at 1 m
 
 Every Welsh package already on disk, however old, already carries the three
