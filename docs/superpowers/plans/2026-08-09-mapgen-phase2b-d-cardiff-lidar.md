@@ -166,7 +166,10 @@ new. No network anywhere in this task's code paths.
   - `detail(bbox) -> str | None`, computed, never guessed:
     - covered ("full") and within budget: `25 cm at this extent, flown 2011`
     - covered ("full") but over budget: `25 cm needs an extent under
-      about 1 x 1 km here (flown 2011)`
+      about 600 x 600 m here (flown 2011)` (post-Task-6-review correction:
+      the original wording here, "1 x 1 km," was the PADDED window's own
+      threshold, not a raw drawable extent; see Task 6's review and
+      fix-round report for the arithmetic)
     - "partial": `25 cm over part of this extent, flown 2011` (with the
       over-budget sentence appended when the INTERSECTION is over
       budget)
@@ -266,8 +269,10 @@ Mechanics, pinned:
   error with this exact reason (it reaches the UI through the ordinary
   source-failure event, and detail() already warned):
   `this extent needs {pixels:,} pixels at 25 cm and the raster budget
-  is 16,777,216; extents under about 1 x 1 km inside the covered block
-  come back at 25 cm`
+  is 16,777,216; extents under about 600 x 600 m inside the covered block
+  come back at 25 cm` (post-Task-6-review correction: "1 x 1 km" was the
+  padded window's own threshold, not a raw drawable extent; see Task 6's
+  review and fix-round report)
 - Window: the padded extent's intersection with the coverage envelope,
   snapped OUTWARD to the 0.25 m pixel lattice anchored at integer
   metres (xllcorner values are integers, so pixel edges sit at
@@ -377,7 +382,10 @@ Mechanics:
     paragraph carrying location honesty (Creigiau and Pentyrch, ~2.5
     km2, the only 25 cm the archive holds over Cardiff), vintage
     honesty (flown 23 March 2011, fifteen years of change since), the
-    budget rule (extents under about 1 x 1 km), and the exclusions
+    budget rule (extents under about 600 x 600 m, corrected post-Task-6-
+    review from this brief's own original "1 x 1 km," which was the
+    padded window's own threshold, not a raw drawable extent), and the
+    exclusions
     (heights, roofs, canopy, terrain grid and contours all stay on the
     2020-2023 1 m data). UPDATE the roadmap's old "no copy anywhere in
     this project claims 25 cm" sentence honestly: the claim was written

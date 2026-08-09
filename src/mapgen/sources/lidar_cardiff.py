@@ -518,9 +518,22 @@ def _window_pixels(bbox: BBox, ostn15_cache_dir: Path | None) -> int:
 
 
 def _budget_refusal_reason(pixels: int) -> str:
-    """The plan's own pinned reason string, verbatim, with only the pixel
-    count substituted (thousands separated: part of the pinned text, not
-    incidental formatting).
+    """The refusal reason string, with only the pixel count substituted
+    (thousands separated: part of the pinned text, not incidental
+    formatting).
+
+    The plan's own original wording said "under about 1 x 1 km," which is
+    the PADDED window's own threshold (`MAX_WINDOW_PIXELS` at
+    `PIXEL_METRES`: 4096 x 4096 px * 0.25 m = 1024 m of padded window),
+    not a raw, drawable extent size. `_window_pixels` pads every extent by
+    `PAD_METRES` (200 m) on every side before pricing it, so a raw extent
+    has only `1024 - 2 * 200 = 624 m` per side of headroom before this
+    gate fires, not 1024 m. A Task 6 review caught the drift (that task's
+    own live run had already measured it: a 900 m raw extent comes back
+    27,039,999 pixels, 61% over budget, despite reading as safely "under
+    1 km"); "under about 600 x 600 m," rounded DOWN from the true 624 m
+    edge rather than up to it, is what every user-facing sentence in this
+    module says now.
 
     Shared by two gates: `fetch()`'s own, which runs first and refuses
     before either zip is downloaded, and `merge()`'s own, kept as the
@@ -531,8 +544,8 @@ def _budget_refusal_reason(pixels: int) -> str:
     """
     return (
         f"this extent needs {pixels:,} pixels at 25 cm and the raster "
-        f"budget is 16,777,216; extents under about 1 x 1 km inside the "
-        f"covered block come back at 25 cm"
+        f"budget is 16,777,216; extents under about 600 x 600 m inside "
+        f"the covered block come back at 25 cm"
     )
 
 
@@ -738,18 +751,26 @@ class LidarCardiffSource:
         - "full" and within `MAX_WINDOW_PIXELS`:
           "25 cm at this extent, flown 2011"
         - "full" but over budget:
-          "25 cm needs an extent under about 1 x 1 km here (flown 2011)"
+          "25 cm needs an extent under about 600 x 600 m here (flown 2011)"
         - "partial":
           "25 cm over part of this extent, flown 2011", with
-          "; 25 cm needs an extent under about 1 x 1 km here" appended
+          "; 25 cm needs an extent under about 600 x 600 m here" appended
           when the padded extent's own intersection with the coverage
           envelope is itself over budget
         - "none": `None`
 
-        "About 1 x 1 km" is `MAX_WINDOW_PIXELS` at `PIXEL_METRES`, spelled
-        out rather than computed inline so the sentence stays a fixed
-        string: `sqrt(16_777_216) * 0.25` is 1024 m, which is "about 1 km"
-        at the precision an owner reads a coverage sentence at.
+        "About 600 x 600 m" is a RAW, drawable extent size, not the padded
+        window `MAX_WINDOW_PIXELS` itself gates on: the budget is 4096 x
+        4096 pixels at `PIXEL_METRES` (0.25 m), 1024 m of PADDED window,
+        but `_window_pixels` pads every extent by `PAD_METRES` (200 m) on
+        every side before pricing it, so a raw extent only has
+        `1024 - 2 * 200 = 624 m` per side of headroom before the gate
+        fires. "600 x 600 m," rounded DOWN from that 624 m edge (never up
+        to it, and never the padded 1024 m figure a Task 6 review found
+        this sentence wrongly quoting), is what every user-facing string
+        in this module says: honest-conservative, so an owner who draws
+        exactly what this sentence says never lands on the wrong side of
+        the gate.
 
         Never touches the network: `covers()` and `_window_pixels` are
         both cache-only, the same guarantee `estimate()` itself carries.
@@ -761,11 +782,11 @@ class LidarCardiffSource:
         over_budget = pixels > MAX_WINDOW_PIXELS
         if coverage == "full":
             if over_budget:
-                return "25 cm needs an extent under about 1 x 1 km here (flown 2011)"
+                return "25 cm needs an extent under about 600 x 600 m here (flown 2011)"
             return "25 cm at this extent, flown 2011"
         sentence = "25 cm over part of this extent, flown 2011"
         if over_budget:
-            sentence += "; 25 cm needs an extent under about 1 x 1 km here"
+            sentence += "; 25 cm needs an extent under about 600 x 600 m here"
         return sentence
 
     # -- estimate / routing_note ----------------------------------------------

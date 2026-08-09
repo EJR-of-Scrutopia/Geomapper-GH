@@ -362,11 +362,16 @@ extent inside the ten quarter-tiles it actually covers, Creigiau and
 Pentyrch in north-west Cardiff, about 2.5 km2 (the estimate panel's own
 detail preview says "25 cm at this extent, flown 2011" once you are
 inside the block; outside it, this source has nothing to give you). Keep
-the extent under about 1 x 1 km: the archive is 25 cm per pixel, four
+the extent under about 600 x 600 m: the archive is 25 cm per pixel, four
 times the samples per side of the 1 m data at the same ground area, and
 the same raster-size budget every source in this project shares refuses
-anything larger, with the pixel count and the reason recorded rather than
-a silent fallback to something coarser.
+anything larger. That budget is a 1024 m padded window (4096 x 4096
+pixels at 0.25 m), but every extent is padded 200 m on each side before
+it is checked, which leaves about 624 m of raw, drawable extent, not
+1024; 600 rounds that down rather than up, so drawing exactly what this
+sentence says never lands on the wrong side of the gate. A larger
+extent is refused with the pixel count and the reason recorded, rather
+than a silent fallback to something coarser.
 
 What arrives is `<stem>_lidar25_dsm.tif` and `<stem>_lidar25_dtm.tif`,
 read into Rhino the same way as `lidar_wales`'s own pair: the Grasshopper

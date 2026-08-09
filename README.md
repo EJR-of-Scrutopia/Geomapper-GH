@@ -634,9 +634,12 @@ Each file:
   holds anywhere near Cardiff. **Not central Cardiff, and not current
   ground**: flown 23 March 2011, fifteen years of change since, so
   buildings and ground both may differ from what stands there today.
-  Extents under about 1 x 1 km inside the block come back at 25 cm; a
-  larger covered extent is refused outright, with the pixel count and
-  the reason recorded rather than silently downsampled. Terrain only:
+  Extents under about 600 x 600 m inside the block come back at 25 cm
+  (the raster budget itself is a 1024 m padded window, but a 200 m pad
+  on every side eats into it, leaving about 624 m of raw, drawable
+  extent; 600 rounds that down, never up); a larger covered extent is
+  refused outright, with the pixel count and the reason recorded rather
+  than silently downsampled. Terrain only:
   fused building heights, roof forms, canopy points, `<stem>.egrid` and
   every contour file above stay on the 2020-2023 1 m data
   (`lidar_wales`) regardless of whether `lidar_cardiff` is also

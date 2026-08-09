@@ -278,7 +278,7 @@ def test_detail_full_but_over_budget(tmp_path):
     bbox = _bbox_for_padded_bng_rect(*_FULL_OVER_BUDGET)
     assert source.covers(bbox) == "full"
     assert source.detail(bbox) == (
-        "25 cm needs an extent under about 1 x 1 km here (flown 2011)"
+        "25 cm needs an extent under about 600 x 600 m here (flown 2011)"
     )
 
 
@@ -295,7 +295,7 @@ def test_detail_partial_and_over_budget_appends_the_extra_sentence(tmp_path):
     assert source.covers(bbox) == "partial"
     assert source.detail(bbox) == (
         "25 cm over part of this extent, flown 2011; "
-        "25 cm needs an extent under about 1 x 1 km here"
+        "25 cm needs an extent under about 600 x 600 m here"
     )
 
 
@@ -750,8 +750,8 @@ def test_fetch_refuses_over_budget_before_downloading_anything(tmp_path, monkeyp
     # round-trip noise.
     assert str(excinfo.value) == (
         f"this extent needs {pixels:,} pixels at 25 cm and the raster "
-        f"budget is 16,777,216; extents under about 1 x 1 km inside the "
-        f"covered block come back at 25 cm"
+        f"budget is 16,777,216; extents under about 600 x 600 m inside "
+        f"the covered block come back at 25 cm"
     )
 
     assert source.tile_failures
@@ -1304,8 +1304,8 @@ def test_merge_refuses_over_budget_with_the_pixel_count_substituted(tmp_path):
     assert "," in f"{pixels:,}"
     assert str(excinfo.value) == (
         f"this extent needs {pixels:,} pixels at 25 cm and the raster "
-        f"budget is 16,777,216; extents under about 1 x 1 km inside the "
-        f"covered block come back at 25 cm"
+        f"budget is 16,777,216; extents under about 600 x 600 m inside "
+        f"the covered block come back at 25 cm"
     )
 
 
