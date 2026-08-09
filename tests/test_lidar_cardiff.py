@@ -516,7 +516,7 @@ def test_urls_and_byte_counts_are_pinned():
     assert DSM_ZIP_BYTES == 45_011_591
     assert DTM_ZIP_BYTES == 38_784_302
     assert PIXEL_METRES == 0.25
-    assert lidar_cardiff.BYTES_PER_SECOND_ESTIMATE == 2_000_000
+    assert lidar_cardiff.BYTES_PER_SECOND_ESTIMATE == 15_000_000
 
 
 def test_coverage_tiles_is_exactly_the_ten_probed_envelopes():

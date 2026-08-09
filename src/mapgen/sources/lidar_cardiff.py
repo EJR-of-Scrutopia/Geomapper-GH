@@ -302,19 +302,38 @@ _DTM_CACHE_POINTER_NAME = f"{DTM_ZIP_NAME}.cache_pointer"
 # one the same catalogue lists at half that cell size).
 PIXEL_METRES = 0.25
 
-# No live measurement yet: a placeholder in the same sense os_uprn.py's
-# own BYTES_PER_SECOND_ESTIMATE is a placeholder before that source's
-# first real cold run, to be corrected against measurement once a later
-# task's live run actually times the two downloads (fetch()'s own live
-# test times a real cold run, but does not yet feed that measurement
-# back into this constant).
-BYTES_PER_SECOND_ESTIMATE = 2_000_000
+# Task 3's own live cold-run measurement (task-3-report.md): both zips,
+# 83,795,893 bytes combined, in about 4.09 s (pytest-reported test
+# duration for test_live_fetch_downloads_both_real_zips_into_the_real_cache),
+# roughly 20.5 MB/s effective on this machine's link that day. The
+# 2,000,000 placeholder this replaces was never checked against that run
+# and sat ten times below it, the wrong side of honest for a term that
+# prices a real transfer's time: an estimate this far under a measured
+# rate makes a cold-cache survey's own countdown look far worse than the
+# download will actually be. Following os_open.py's own
+# BYTES_PER_SECOND_ESTIMATE rule (a rate genuinely AT OR BELOW the
+# slowest clean measurement on record, not the measured figure itself and
+# not an average): 15,000,000 sits a genuine ~27% below the 20.5 MB/s
+# figure, a wider margin than os_open.py's own ~6.5% because this is a
+# single run on a single day (one machine, one link, one day, no repeat
+# run), thinner evidence than the three-product corroboration that
+# measurement had.
+BYTES_PER_SECOND_ESTIMATE = 15_000_000
 
-# No warm path has ever been measured either (nothing has downloaded
-# either zip on this machine yet): kept only so a warm estimate never
-# claims exactly zero seconds. Refit alongside BYTES_PER_SECOND_ESTIMATE
-# above from the same later live run.
-SECONDS_FLOOR = 3.0
+# Task 6's own live measurement (task-6-report.md): five isolated warm-
+# cache fetch() calls against the real ~/.mapgen/lidar_cardiff cache (both
+# zips already present, right-sized), a fresh LidarCardiffSource built for
+# each trial: 4.4, 4.5, 4.7, 4.9 and 5.0 ms. A warm fetch() here is
+# nothing but two Path.stat() calls (see _cache_is_warm's and
+# _ensure_zip's own warm branch), never a listing round trip or a shard
+# read, so there is no equivalent of os_open.py's own network-overhead
+# floor to allow for; the honest floor is a small multiple of the
+# slowest observed trial, not a number that was never measured against
+# anything. 0.1 s is twenty times the slowest of the five trials, margin
+# for a slower stat() call on a different machine or a busier disk on a
+# different day, while no longer overstating a near-instant warm check by
+# two orders of magnitude the way the previous, unmeasured 3.0 did.
+SECONDS_FLOOR = 0.1
 
 # The os_uprn.py-style routing_note: a plain statement of the one-time
 # download a cold cache implies, read by package.py's own
