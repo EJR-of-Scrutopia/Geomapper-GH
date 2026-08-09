@@ -94,19 +94,29 @@ instance for one survey (never a fresh one in between), so instance
 state is the one route available for a fact `merge()` needs but its own
 protocol signature has no room for.
 
-## The window, and why the budget gate reads _window_pixels rather than
-## the window it is about to build
+## The budget gate lives in fetch(), first, and again in merge()
 
-`merge()`'s own window is the padded extent's intersection with
-`_ENVELOPE`, snapped OUTWARD to the 0.25 m lattice so every edge lands on
-an exact pixel boundary (every member's own `xllcorner`/`yllcorner` is an
-integer metre, hence already on that lattice). The budget gate runs
-BEFORE that window is built at all, and it gates on `_window_pixels`'s
-own, unsnapped figure, the exact number `detail()` already previewed:
-snapping outward can only grow a window by under one pixel per edge, and
-gating on the snapped count instead would let the refusal and the
-preview disagree by that same sliver, for no benefit, since the number
-the owner already read in `detail()`'s own sentence is `_window_pixels`'s.
+The over-budget refusal (`_budget_refusal_reason`) fires in TWO places.
+`fetch()` checks it first, before either zip is downloaded: this is the
+gate that actually reaches the owner, because package.py's `run_survey`
+wraps `fetch()` in the deferred-failure/retry machinery
+(`tile_failures`, the same account `_record_tile_failures` already
+populates for a download failure) but does not currently wrap `merge()`
+in anything at all, so an exception raised only from `merge()` would
+propagate out of `run_survey` uncaught rather than reaching the owner
+through the ordinary source-failure event. `merge()` keeps its own copy
+of the same gate regardless, as a second line of defence for a call
+reached by some other route (a resumed run, a future caller); it must
+never be the ONLY gate, but removing it would leave a `merge()` invoked
+without a preceding `fetch()`'s own refusal building the full window's
+worth of NaN for nothing.
+
+Both gates use `_window_pixels`'s own, unsnapped figure, the exact
+number `detail()` already previewed, rather than the pixel count
+`merge()`'s own snapped window ends up with: snapping outward can only
+grow a window by under one pixel per edge, and gating on the snapped
+count instead would let the refusal and the preview disagree by that
+same sliver, for no benefit.
 
 ## One failed member fails the whole merge
 
@@ -121,6 +131,17 @@ archive raster is written until BOTH have been fully assembled without
 incident, so a corrupt member in either one leaves the package holding
 neither `<stem>_lidar25_dsm.tif` nor `<stem>_lidar25_dtm.tif`, never one
 without the other.
+
+The same "never one without the other" claim also has to survive a
+write failure between the two `write_bng_geotiff` calls, not only a
+parse failure before them (a review finding: disk-full or an antivirus
+lock partway through the second write used to leave the first file
+sitting on disk, complete, with no sibling). Both rasters are therefore
+written to temporary names in `out_dir` first and renamed into their
+real, spec-pinned names only once BOTH writes have succeeded; a failure
+on the second write deletes the first write's own temp file before
+re-raising, the same temp-then-rename shape `fetch()`'s own `_ensure_zip`
+already uses for the identical reason.
 """
 
 from __future__ import annotations
@@ -144,6 +165,7 @@ from mapgen.geo import BBox, Tile
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken
 from mapgen.sources.base import (
+    FAILURE_NODE_CAP,
     FAILURE_UNKNOWN,
     FAILURE_UNREACHABLE,
     Estimate,
@@ -250,28 +272,33 @@ _ROUTING_NOTE = (
 
 class LidarCardiffError(RuntimeError):
     """Raised when `fetch()` cannot obtain or verify one of the two
-    archive zips, or when `merge()` cannot turn them into the 25 cm
-    rasters.
+    archive zips, refuses an over-budget extent, or is asked to `merge()`
+    without one; or when `merge()` itself cannot turn the two zips into
+    the 25 cm rasters.
 
     `kind` is `"download"` (a transport failure, or a downloaded body
-    whose length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly)
-    or `"parse"` (a right-length body that did not open as a non-empty
-    zip, OR, from `merge()`, a zip member whose header or values
-    `asc_grid.AscGridError` refused), the same two-way slice of
-    `os_downloads.OsOpenError`'s own kind vocabulary applied here without
-    importing that class: this source's own download failures are never
-    a listing or a ranged read, so `fetch()` never needs the other two
-    kinds that vocabulary carries. `merge()` also raises a third kind,
-    `"budget"`: the padded extent's own intersection with the coverage
-    envelope needs more pixels at 25 cm than `cog.MAX_WINDOW_PIXELS`
-    allows, the same number `detail()` already previewed. `"budget"` is
-    never retryable (the extent does not get smaller by asking again),
-    the same practical fact `sources/base.py`'s own `FAILURE_NODE_CAP`
-    documents for OsmSource's unrelated failure; it is left to fall
-    through `_classify_lidar_cardiff_error`'s existing default rather
-    than added as a third branch there, since that classifier is read
-    only from `fetch()`'s own except blocks and a merge()-raised error
-    never reaches it.
+    whose length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly),
+    `"parse"` (a right-length body that did not open as a non-empty zip;
+    a zip member whose header or values `asc_grid.AscGridError` refused;
+    or `merge()` missing an input it needs, either the two zip paths or
+    `self._bbox`), or `"budget"` (the padded extent's own intersection
+    with the coverage envelope needs more pixels at 25 cm than
+    `cog.MAX_WINDOW_PIXELS` allows, the same number `detail()` already
+    previewed). `"download"` is the only retryable kind
+    (`_classify_lidar_cardiff_error`); `"budget"` maps to
+    `FAILURE_NODE_CAP` there, the same "the answer is a smaller extent,
+    not another identical request" vocabulary entry `sources/base.py`
+    documents for OsmSource's own, unrelated failure, since asking again
+    never shrinks an extent; `"parse"` falls through to `FAILURE_UNKNOWN`.
+
+    `"budget"` is raised from two places: `fetch()`, BEFORE either zip is
+    downloaded (the primary gate: this is what actually reaches
+    package.py's ordinary source-failure/tile_failures path, since
+    `merge()`'s own exceptions are not currently caught by `run_survey`),
+    and `merge()` itself, kept as a second line of defence for a call
+    reached by some other route. Both build their message from the same
+    `_budget_refusal_reason` so the two can never disagree with each
+    other or with `detail()`'s own preview.
 
     Every message names the zip's own file name (`DSM_ZIP_NAME` /
     `DTM_ZIP_NAME`) or the pixel arithmetic itself, never `DSM_ZIP_URL` /
@@ -289,20 +316,25 @@ def _classify_lidar_cardiff_error(exc: LidarCardiffError) -> str:
     """The shared failure vocabulary's term (`sources/base.py`) for this
     source's own `LidarCardiffError`.
 
-    Mirrors `os_uprn.py`'s own `_classify_os_open_error` for the identical
-    two-kind split: `LidarCardiffError.kind` is a two-way slice of
-    `os_downloads.OsOpenError`'s own vocabulary (see that class's own
-    docstring), and `os_uprn.py`'s classifier already answers exactly this
-    question for both of the kinds this source can raise. `"download"` (a
-    transport failure, or a length mismatch) is `FAILURE_UNREACHABLE`,
-    retryable: the same bucket `os_uprn.py`'s own classifier gives
-    `OsOpenError`'s `"download"`/`"listing"` kinds. `"parse"` (a
-    right-length body that will not open as a zip) falls through to
+    `"download"` (a transport failure, or a length mismatch) is
+    `FAILURE_UNREACHABLE`, retryable: the same bucket `os_uprn.py`'s own
+    `_classify_os_open_error` gives `OsOpenError`'s `"download"`/
+    `"listing"` kinds, which this mirrors for the identical reason.
+    `"budget"` is `FAILURE_NODE_CAP`: the extent needs more pixels than
+    the raster budget allows, and retrying the identical request asks
+    the identical question of the identical extent, so nothing about a
+    second attempt could ever answer differently, the same reasoning
+    `osm.py`'s own `NodeCapExceededError` mapping already documents for
+    an unrelated too-dense-to-serve failure. `"parse"` (a right-length
+    body that will not open as a zip, a member `asc_grid.AscGridError`
+    refused, or `merge()` missing a required input) falls through to
     `FAILURE_UNKNOWN`, the same catch-all `os_uprn.py`'s own classifier
     gives every kind it does not special-case.
     """
     if exc.kind == "download":
         return FAILURE_UNREACHABLE
+    if exc.kind == "budget":
+        return FAILURE_NODE_CAP
     return FAILURE_UNKNOWN
 
 
@@ -403,6 +435,25 @@ def _window_pixels(bbox: BBox, ostn15_cache_dir: Path | None) -> int:
     width = max(0.0, min(e_max, env_e_max) - max(e_min, env_e_min))
     height = max(0.0, min(n_max, env_n_max) - max(n_min, env_n_min))
     return int((width / PIXEL_METRES) * (height / PIXEL_METRES))
+
+
+def _budget_refusal_reason(pixels: int) -> str:
+    """The plan's own pinned reason string, verbatim, with only the pixel
+    count substituted (thousands separated: part of the pinned text, not
+    incidental formatting).
+
+    Shared by two gates: `fetch()`'s own, which runs first and refuses
+    before either zip is downloaded, and `merge()`'s own, kept as the
+    second line of defence for a `merge()` reached by some other route
+    (a resumed run, a future caller that skips straight to it). One
+    function is what keeps the two gates, and `detail()`'s own preview,
+    from ever drifting apart in wording.
+    """
+    return (
+        f"this extent needs {pixels:,} pixels at 25 cm and the raster "
+        f"budget is 16,777,216; extents under about 1 x 1 km inside the "
+        f"covered block come back at 25 cm"
+    )
 
 
 class LidarCardiffSource:
@@ -702,31 +753,50 @@ class LidarCardiffSource:
         into `work_dir`: they are shared across every future survey that
         ever selects this source, the same national-cache shape
         `os_uprn.py`'s own `fetch()` gives its own one download for the
-        identical reason. `bbox` IS used, but only remembered
-        (`self._bbox`) rather than acted on here: `merge()` is where the
-        actual window this extent needs gets built, and its own protocol
-        signature has no bbox parameter of its own (see the module
-        docstring's "merge(): no bbox in its own signature" section).
-        `tiles` is used too, though only to know which tiles to blame a
-        failure on (`_record_tile_failures`): see `__init__`'s own
-        comment for why that accounting exists at all for a source with
-        no tile-shaped work.
+        identical reason. `bbox` IS used for two things: the budget gate
+        immediately below, and remembered on `self._bbox` for `merge()`
+        to read later, since that method's own protocol signature has no
+        bbox parameter of its own (see the module docstring's "merge():
+        no bbox in its own signature" section). `tiles` is used too,
+        though only to know which tiles to blame a failure on
+        (`_record_tile_failures`): see `__init__`'s own comment for why
+        that accounting exists at all for a source with no tile-shaped
+        work.
+
+        The budget gate runs FIRST, before either zip is downloaded: an
+        extent whose own intersection with the coverage envelope needs
+        more pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows is
+        refused here, with a recorded `tile_failures` entry
+        (`FAILURE_NODE_CAP`, never retryable) and a raised
+        `LidarCardiffError` (kind `"budget"`), rather than only inside
+        `merge()`: see the module docstring's "The budget gate lives in
+        fetch(), first, and again in merge()" section for why this is
+        the gate that actually has to reach the owner.
 
         `cancel` is checked before each of the two zips, never mid
         download: a unit already in flight always finishes, matching
         every other source's own reading of this optional parameter (see
         `sources/base.py`'s `LayerSource` docstring).
 
-        A `LidarCardiffError` from either zip is recorded against every
-        tile in `tiles` (`_classify_lidar_cardiff_error` maps its own
-        `kind` to the shared failure vocabulary) and then re-raised
-        unchanged, the same "record, then raise" shape `os_uprn.py`'s own
-        `fetch()` uses for its own `OsOpenError`.
+        A `LidarCardiffError` from either zip, or from the budget gate,
+        is recorded against every tile in `tiles`
+        (`_classify_lidar_cardiff_error` maps its own `kind` to the
+        shared failure vocabulary) and then re-raised unchanged, the
+        same "record, then raise" shape `os_uprn.py`'s own `fetch()` uses
+        for its own `OsOpenError`.
         """
         self.tile_failures = []
         self._bbox = bbox
         if cancel is not None:
             cancel.raise_if_cancelled()
+
+        pixels = _window_pixels(bbox, self._ostn15_cache_dir)
+        if pixels > MAX_WINDOW_PIXELS:
+            error = LidarCardiffError(_budget_refusal_reason(pixels), kind="budget")
+            self._record_tile_failures(
+                tiles, _classify_lidar_cardiff_error(error), str(error)
+            )
+            raise error
 
         directory = cache_dir()
         dsm_path = directory / DSM_ZIP_NAME
@@ -758,7 +828,13 @@ class LidarCardiffSource:
         its own intersection with the coverage envelope needs more
         pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows: the same
         figure `detail()` already previewed (`_window_pixels`), so the
-        preview and the refusal can never disagree.
+        preview and the refusal can never disagree. `fetch()` checks the
+        identical gate first, before either zip is even downloaded (see
+        the module docstring's "The budget gate lives in fetch(), first,
+        and again in merge()" section for why that copy, not this one, is
+        the one that actually reaches the owner today); this copy stays
+        as a second line of defence for a `merge()` reached by some other
+        route.
 
         `parts` holds `fetch()`'s own two zip paths, selected here BY
         NAME (`DSM_ZIP_NAME`/`DTM_ZIP_NAME`), never by position: the
@@ -769,15 +845,30 @@ class LidarCardiffSource:
         this same instance, is where the extent comes from: see the
         module docstring's "merge(): no bbox in its own signature"
         section for why this method's own protocol signature has nowhere
-        else to carry it.
+        else to carry it. A `merge()` called before any `fetch()` on this
+        instance has no extent to read and raises a named
+        `LidarCardiffError` (kind `"parse"`) rather than an unlabelled
+        `AttributeError` from deep inside the BNG projection code that
+        would otherwise follow from a bare `None`.
 
         Neither raster is written until both have been fully assembled:
-        a member that fails to parse, in either zip, raises before
-        `write_bng_geotiff` is ever called for either one (see the module
-        docstring's "One failed member fails the whole merge" section),
-        so a failed merge leaves neither `_lidar25_dsm.tif` nor
-        `_lidar25_dtm.tif` behind, never one without the other.
+        a member that fails to parse, in either zip, raises before either
+        temp file below is ever written (see the module docstring's "One
+        failed member fails the whole merge" section), so a failed
+        assembly leaves neither `_lidar25_dsm.tif` nor `_lidar25_dtm.tif`
+        behind. The same guarantee also covers a failure between the two
+        WRITES themselves (disk full, an antivirus lock): both rasters
+        are written to temporary names first and renamed into their real
+        names only once both writes succeeded, so a failure on the second
+        write cannot leave the first sitting on disk without its sibling.
         """
+        if self._bbox is None:
+            raise LidarCardiffError(
+                "merge() needs the extent fetch() was called with, and no "
+                "fetch() has set one on this source instance yet.",
+                kind="parse",
+            )
+
         out_dir = Path(out_dir)
         dsm_zip_path = next((part for part in parts if part.name == DSM_ZIP_NAME), None)
         dtm_zip_path = next((part for part in parts if part.name == DTM_ZIP_NAME), None)
@@ -790,15 +881,7 @@ class LidarCardiffSource:
 
         pixels = _window_pixels(self._bbox, self._ostn15_cache_dir)
         if pixels > MAX_WINDOW_PIXELS:
-            # Verbatim, with only the pixel count substituted (the plan's
-            # own pinned reason string): the thousands separator is part
-            # of the pinned text, not an incidental formatting choice.
-            raise LidarCardiffError(
-                f"this extent needs {pixels:,} pixels at 25 cm and the "
-                f"raster budget is 16,777,216; extents under about 1 x 1 "
-                f"km inside the covered block come back at 25 cm",
-                kind="budget",
-            )
+            raise LidarCardiffError(_budget_refusal_reason(pixels), kind="budget")
 
         window_e_min, window_n_max, window_width, window_height = (
             _snapped_merge_window(self._bbox, self._ostn15_cache_dir)
@@ -813,8 +896,23 @@ class LidarCardiffSource:
 
         dsm_output = out_dir / f"{stem}_lidar25_dsm.tif"
         dtm_output = out_dir / f"{stem}_lidar25_dtm.tif"
-        write_bng_geotiff(dsm_output, dsm_window)
-        write_bng_geotiff(dtm_output, dtm_window)
+        # Temp-then-rename, both files, and only after both writes have
+        # succeeded: see the module docstring's own note on why a plain
+        # pair of sequential writes to the real names would let a second-
+        # write failure leave the first file behind without its sibling.
+        # Mirrors _ensure_zip's own temp-file naming exactly.
+        dsm_temp = dsm_output.with_name(f"{dsm_output.name}.{uuid.uuid4().hex[:8]}.part")
+        dtm_temp = dtm_output.with_name(f"{dtm_output.name}.{uuid.uuid4().hex[:8]}.part")
+
+        write_bng_geotiff(dsm_temp, dsm_window)
+        try:
+            write_bng_geotiff(dtm_temp, dtm_window)
+        except BaseException:
+            dsm_temp.unlink(missing_ok=True)
+            raise
+
+        dsm_temp.replace(dsm_output)
+        dtm_temp.replace(dtm_output)
         return [dsm_output, dtm_output]
 
 

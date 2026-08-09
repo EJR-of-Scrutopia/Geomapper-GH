@@ -44,6 +44,7 @@ from mapgen.geo import BBox, Tile
 from mapgen.package import IncompleteSurveyError, SurveyRequest, run_survey
 from mapgen.sources import lidar_cardiff
 from mapgen.sources.base import (
+    FAILURE_NODE_CAP,
     FAILURE_UNREACHABLE,
     Estimate,
     NullProgress,
@@ -714,6 +715,61 @@ def test_fetch_fails_validation_with_the_sources_own_error_for_a_non_zip_payload
 
 
 # --------------------------------------------------------------------------
+# fetch()'s own budget gate (review Important #2): the primary refusal now
+# lives here, before either zip is downloaded, because package.py's
+# run_survey wraps fetch() in the deferred-failure/retry machinery but does
+# not currently wrap merge() in anything, so a merge()-only refusal would
+# never reach the owner through the ordinary source-failure event. merge()
+# keeps its own copy of the same gate as a second line of defence (tested
+# separately, further down); this section proves the fetch()-side one.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_refuses_over_budget_before_downloading_anything(tmp_path, monkeypatch):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    pixels = _window_pixels(bbox, tmp_path)
+    assert pixels > MAX_WINDOW_PIXELS
+
+    tiles = [
+        Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox),
+        Tile(tile_id="r00_c01", row=0, col=1, core_bbox=bbox, query_bbox=bbox),
+    ]
+    # A socket-refusing session: if the gate ran after either zip started
+    # downloading rather than before both, this fixture is what turns
+    # that regression into a test failure rather than a slow real request.
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.fetch(bbox, tiles, tmp_path / "work", NullProgress())
+
+    assert excinfo.value.kind == "budget"
+    # Pin the substitution, not just the prose (the item B lesson, same
+    # as the merge()-side test): re-derive the exact pixel count rather
+    # than hard-coding a number that can drift with tm_inverse/tm_forward
+    # round-trip noise.
+    assert str(excinfo.value) == (
+        f"this extent needs {pixels:,} pixels at 25 cm and the raster "
+        f"budget is 16,777,216; extents under about 1 x 1 km inside the "
+        f"covered block come back at 25 cm"
+    )
+
+    assert source.tile_failures
+    assert {failure.tile_id for failure in source.tile_failures} == {"r00_c00", "r00_c01"}
+    for failure in source.tile_failures:
+        assert failure.source == "lidar_cardiff"
+        # Never retryable: asking again cannot shrink the extent.
+        assert failure.kind == FAILURE_NODE_CAP
+        assert failure.reason == str(excinfo.value)
+        assert "http" not in failure.reason.lower()
+
+    # Neither zip exists: the gate ran before _ensure_zip touched either.
+    assert not (tmp_path / DSM_ZIP_NAME).exists()
+    assert not (tmp_path / DTM_ZIP_NAME).exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+# --------------------------------------------------------------------------
 # tile_failures: the pipeline-safety account. Review finding (Critical):
 # LidarCardiffSource never set this, unlike every other production
 # LayerSource (lidar_wales, os_uprn, os_open, elevation, osm, overture,
@@ -1186,6 +1242,77 @@ def test_merge_fails_the_whole_merge_on_a_corrupt_member(tmp_path, monkeypatch):
     assert excinfo.value.kind == "parse"
     assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
     assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
+
+
+def test_merge_without_a_prior_fetch_raises_a_named_error_not_a_bare_crash(tmp_path):
+    # Review Important #3: a fresh source, never fetch()ed, used to crash
+    # merge() with a bare AttributeError from deep inside the BNG
+    # projection code (self._bbox is None, and best_effort_padded_bng_
+    # extent has no bbox to read a corner off). Every other failure mode
+    # in this module raises a named LidarCardiffError; this one must too.
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    assert source._bbox is None
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge(
+            [tmp_path / DSM_ZIP_NAME, tmp_path / DTM_ZIP_NAME],
+            tmp_path / "package",
+            "TestSite",
+        )
+
+    assert excinfo.value.kind == "parse"
+    assert "fetch" in str(excinfo.value).lower()
+    assert "http" not in str(excinfo.value).lower()
+
+
+# 4 x 4 m inside ST1177SW, matching the mm-scale fixture's own member
+# exactly: reused here only because its geometry is already proven
+# gap-free, not because this test cares about the mm scaling itself.
+_WRITE_FAILURE_WINDOW_RECT = _MM_SCALE_WINDOW_RECT
+
+
+def test_merge_leaves_no_files_when_the_second_write_fails(tmp_path, monkeypatch):
+    # Review Important #1: write_bng_geotiff's own atomic-write contract
+    # covers ONE file; a failure between the DSM write and the DTM write
+    # used to leave a lone, complete DSM tif on disk with no DTM sibling,
+    # contradicting this module's own "never one without the other"
+    # claim. Simulates the failure the owner's own machine has hit
+    # before (disk full, an antivirus lock) by monkeypatching
+    # write_bng_geotiff to fail on its second call only, with both
+    # member parses genuinely successful beforehand.
+    _patch_padded_extent(monkeypatch, _WRITE_FAILURE_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+    member = _format_asc_member(311100.0, 177100.0, 16, 16, 0.25, 85321)
+    dsm_zip = tmp_path / DSM_ZIP_NAME
+    dtm_zip = tmp_path / DTM_ZIP_NAME
+    _build_member_zip(dsm_zip, {"dsm.asc": member})
+    _build_member_zip(dtm_zip, {"dtm.asc": member})
+
+    real_write_bng_geotiff = lidar_cardiff.write_bng_geotiff
+    calls: list[Path] = []
+
+    def _fail_on_second_write(path, window):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("simulated disk-full on the second write")
+        real_write_bng_geotiff(path, window)
+
+    monkeypatch.setattr(lidar_cardiff, "write_bng_geotiff", _fail_on_second_write)
+
+    package_dir = tmp_path / "package"
+    with pytest.raises(OSError):
+        source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+
+    assert len(calls) == 2  # both writes were attempted; the second failed.
+    assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
+    assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
+    # No temp litter either: the first write's own temp file is cleaned
+    # up when the second one fails, and a failed write_bng_geotiff never
+    # leaves its own destination behind (fsutil.atomic_write_bytes' own
+    # contract), so package_dir holds nothing at all.
+    leftover = list(package_dir.iterdir()) if package_dir.exists() else []
+    assert leftover == []
 
 
 @pytest.mark.live
