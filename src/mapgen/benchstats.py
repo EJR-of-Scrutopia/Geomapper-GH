@@ -52,9 +52,6 @@ from typing import Sequence
 from mapgen.buildings import point_in_ring
 from mapgen.heights import _percentile
 
-Ring = list[tuple[float, float]]
-Polyline = list[tuple[float, float]]
-
 Cell = tuple[int, int]
 Bbox = tuple[float, float, float, float]
 
@@ -65,7 +62,7 @@ Bbox = tuple[float, float, float, float]
 # not an import: both of those operate in WGS84 degrees at their own fixed
 # `CELL_SIZE_DEGREES`, while everything in this module is already in real
 # BNG metres, so the cell size itself differs by call site
-# (`_MATCH_CELL_SIZE_M` for footprints, `_OFFSET_CELL_SIZE_M` for polyline
+# (`MATCH_CELL_SIZE_M` for footprints, `OFFSET_CELL_SIZE_M` for polyline
 # segments) rather than being one shared constant.
 # --------------------------------------------------------------------------
 
@@ -325,11 +322,14 @@ def match_footprints(
 # polyline_offsets
 # --------------------------------------------------------------------------
 
-# The nearest-segment cell index's own cell size: larger than
-# `search_radius`'s own default (15 m) so that checking a sample's own cell
-# plus its 8 neighbours (`_nearest_theirs_segment_point`) always reaches
-# every segment that could possibly fall within the radius, whatever corner
-# of its own cell the sample happens to sit in.
+# The nearest-segment cell index's own cell size. The default `search_radius`
+# (15 m) fits inside one cell, so the common case only ever needs a sample's
+# own cell plus its 8 immediate neighbours; `_nearest_theirs_point` derives
+# however many cells actually need checking from the ACTUAL `search_radius`
+# it is called with, never assuming it is fixed at this module's own
+# default (task-2-review.md's own Important finding: a search span fixed at
+# 3x3 regardless of the argument silently drops a real match once
+# `search_radius` exceeds this constant).
 OFFSET_CELL_SIZE_M = 25.0
 
 
@@ -452,23 +452,29 @@ def _nearest_theirs_point(
 ) -> tuple[float, float] | None:
     """The nearest point to `sample` among every segment in `segments`
     that `index` (a `OFFSET_CELL_SIZE_M` cell index over those same
-    segments' own bounding boxes) places in `sample`'s own cell or one of
-    its 8 neighbours, if that nearest point is within `search_radius`;
+    segments' own bounding boxes) places within `sample`'s own cell or one
+    of its neighbours, if that nearest point is within `search_radius`;
     None otherwise.
 
-    Checking a 3x3 block of `OFFSET_CELL_SIZE_M` cells finds every segment
-    that could possibly be within `search_radius`, because
-    `OFFSET_CELL_SIZE_M` (25 m) is itself larger than the default
-    `search_radius` (15 m): a point anywhere inside its own cell is never
-    more than one cell width away from any point up to `search_radius`
-    away from it, so that point's segment (registered under every cell its
-    OWN bbox touches) is always found in the home cell or an immediate
-    neighbour, never two cells out.
+    The neighbourhood span is derived from `search_radius` itself
+    (`ceil(search_radius / OFFSET_CELL_SIZE_M)` cells in every direction
+    from the sample's own cell, floored at 1), not a fixed 3x3 block: a
+    fixed block is only correct while `search_radius <= OFFSET_CELL_SIZE_M`
+    (task-2-review.md's own Important finding, an executed construction
+    that this module's own test suite now reproduces: a sample at
+    `(24, 0)`, cell column 0, with a real segment 26 m away registered in
+    cell column 2, was silently dropped to `unmatched` under a fixed 3x3
+    search once `search_radius=30.0` was passed, even though 26 m sits
+    well inside that radius). Deriving the span from the actual argument
+    makes the search correct for any `search_radius`, not only the
+    default: at the default 15 m, `ceil(15 / 25) == 1`, so the common case
+    still checks exactly the same 3x3 block as before.
     """
+    span = max(1, math.ceil(search_radius / OFFSET_CELL_SIZE_M))
     col, row = _cell(sample[0], sample[1], OFFSET_CELL_SIZE_M)
     candidates: set[int] = set()
-    for d_col in (-1, 0, 1):
-        for d_row in (-1, 0, 1):
+    for d_col in range(-span, span + 1):
+        for d_row in range(-span, span + 1):
             candidates.update(index.get((col + d_col, row + d_row), ()))
 
     best_point: tuple[float, float] | None = None

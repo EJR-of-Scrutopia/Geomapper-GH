@@ -212,6 +212,33 @@ def test_sample_beyond_search_radius_lands_in_unmatched_samples():
     assert stats.count + stats.unmatched_samples == 21
 
 
+def test_search_radius_wider_than_cell_size_still_finds_a_real_match():
+    # task-2-review.md's own Important finding: a fixed 3x3 cell-block
+    # search (span=1) only reaches one OFFSET_CELL_SIZE_M (25m) cell in
+    # every direction, so it silently misses a real match once
+    # search_radius is widened past that cell size. Sample at (24, 0) sits
+    # in cell column 0 (floor(24/25)); a real segment at e=50 sits in cell
+    # column 2 (floor(50/25)), two columns over, at a true distance of 26m.
+    ours = [[(24.0, 0.0), (24.0, 0.0)]]
+    theirs = [[(50.0, -5.0), (50.0, 5.0)]]
+
+    # Control: at the default-sized 15m radius, 26m is correctly out of
+    # range regardless of the cell search span, so this must be unchanged
+    # by the fix.
+    control = polyline_offsets(ours, theirs, search_radius=15.0)
+    assert control.count == 0
+    assert control.unmatched_samples == 2
+
+    # At search_radius=30.0, 26m is well inside it: the neighbourhood span
+    # must now be derived from the actual radius (ceil(30 / 25) == 2) to
+    # reach cell column 2, two columns over from the sample's own column 0.
+    widened = polyline_offsets(ours, theirs, search_radius=30.0)
+    assert widened.count == 2
+    assert widened.unmatched_samples == 0
+    assert widened.mean_de == pytest.approx(26.0, abs=0.001)
+    assert widened.mean_dn == pytest.approx(0.0, abs=0.001)
+
+
 # --------------------------------------------------------------------------
 # distribution
 # --------------------------------------------------------------------------
