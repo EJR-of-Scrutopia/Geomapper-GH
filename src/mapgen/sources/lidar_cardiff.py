@@ -1,12 +1,13 @@
 """LidarCardiffSource: NRW's 2011 historic 25 cm LiDAR archive over ten
 quarter-tiles in Creigiau and Pentyrch, north-west Cardiff, as an opt-in
-LayerSource. This module is the source's disk-and-arithmetic half only:
-`covers`, `tier`, `detail`, `estimate`, `routing_note` and `cache_dir`,
-every one of them pure arithmetic and, at most, a cache-only OSTN15 read
-or a directory listing. Fetching the two zips and unpacking the ESRI
-ASCII grid members inside them (see probe-report.md's own "Zip members
-are ESRI ASCII grids" section) is a later task's job, once this half's
-own numbers are pinned down and tested.
+LayerSource. `covers`, `tier`, `detail`, `estimate`, `routing_note` and
+`cache_dir` are the source's disk-and-arithmetic half, every one of them
+pure arithmetic and, at most, a cache-only OSTN15 read or a directory
+listing. `fetch()` is the network half: it ensures the two archive zips
+sit in `cache_dir()`, downloaded and verified once each, and hands their
+paths back for a later task's `merge()` to unpack the ESRI ASCII grid
+members inside them (see probe-report.md's own "Zip members are ESRI
+ASCII grids" section).
 
 ## Location honesty ruling
 
@@ -53,7 +54,7 @@ purpose: it prices the one HTTP-shaped question ("how big a window would
 the merge actually build"), not the coverage question, and the tile
 layout's own concave corners have no effect on how large that window is.
 
-## No network in this module yet
+## No network except fetch()
 
 `covers`, `tier`, `detail`, `estimate`, `routing_note` and `cache_dir`
 never import `requests`, never call `mapgen.bng.ensure_ostn15`, and never
@@ -61,21 +62,44 @@ open a socket: `mapgen.bng.best_effort_padded_bng_extent` and
 `mapgen.bng.load_ostn15` are both cache-only, the same guarantee
 `lidar_wales.py`'s and `os_uprn.py`'s own `covers()`/`estimate()` carry,
 so a settings panel can call `/api/estimate` with this source selected
-before a single byte of either zip has ever been fetched.
+before a single byte of either zip has ever been fetched. `fetch()` is
+the one exception, and the whole reason `__init__` now takes a `session`:
+mirrors `lidar_wales.py`'s own constructor exactly, a deliberate seam the
+Task 2 review confirmed was left open for this task rather than an
+oversight.
+
+## Why zipfile, not the ranged ZipReader
+
+`os_downloads.ZipReader` refuses these 2011-era zips (central directory
+signature mismatch, probed 2026-08-08); stdlib zipfile reads them, and at
+45 MB whole-download is the right shape anyway. `fetch()` therefore never
+imports `os_downloads` at all: it streams each zip whole to a temp file
+beside its own cache path, verifies the transfer's length against
+`DSM_ZIP_BYTES`/`DTM_ZIP_BYTES`, and only then opens it with
+`zipfile.ZipFile` to confirm `namelist()` is non-empty, so a truncated or
+otherwise corrupt download is caught here, at fetch time, rather than
+surfacing later inside a future `merge()` that expected a readable
+archive and got a lie the byte count alone could not tell.
 """
 
 from __future__ import annotations
 
 import math
+import uuid
+import zipfile
 from pathlib import Path
 from typing import Sequence
 
+import requests
+
 from mapgen.bng import best_effort_padded_bng_extent
-from mapgen.cog import MAX_WINDOW_PIXELS
+from mapgen.cog import MAX_WINDOW_PIXELS, USER_AGENT
 from mapgen.config import CONFIG_PATH
 from mapgen.egrid import PAD_METRES
+from mapgen.fsutil import ensure_dir
 from mapgen.geo import BBox, Tile
-from mapgen.sources.base import Estimate
+from mapgen.jobs import CancelToken
+from mapgen.sources.base import Estimate, ProgressSink
 
 # The archive's own flight date (probe-report.md, live 2026-08-08),
 # probed rather than assumed: appears verbatim in every user-facing
@@ -150,11 +174,12 @@ DTM_ZIP_NAME = DTM_ZIP_URL.rsplit("/", 1)[-1]
 # one the same catalogue lists at half that cell size).
 PIXEL_METRES = 0.25
 
-# No live measurement yet for this module (fetch() is a later task): a
-# placeholder in the same sense os_uprn.py's own BYTES_PER_SECOND_ESTIMATE
-# is a placeholder before that source's first real cold run, to be
-# corrected against measurement once a later task's live run actually
-# times the two downloads.
+# No live measurement yet: a placeholder in the same sense os_uprn.py's
+# own BYTES_PER_SECOND_ESTIMATE is a placeholder before that source's
+# first real cold run, to be corrected against measurement once a later
+# task's live run actually times the two downloads (fetch()'s own live
+# test times a real cold run, but does not yet feed that measurement
+# back into this constant).
 BYTES_PER_SECOND_ESTIMATE = 2_000_000
 
 # No warm path has ever been measured either (nothing has downloaded
@@ -173,16 +198,41 @@ _ROUTING_NOTE = (
 )
 
 
+class LidarCardiffError(RuntimeError):
+    """Raised when `fetch()` cannot obtain or verify one of the two
+    archive zips.
+
+    `kind` is `"download"` (a transport failure, or a downloaded body
+    whose length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly)
+    or `"parse"` (a right-length body that did not open as a non-empty
+    zip), the same two-way slice of `os_downloads.OsOpenError`'s own
+    kind vocabulary applied here without importing that class: this
+    source's own failures are never a listing or a ranged read, so it
+    never needs the other two kinds that vocabulary carries.
+
+    Every message names the zip's own file name (`DSM_ZIP_NAME` /
+    `DTM_ZIP_NAME`), never `DSM_ZIP_URL` / `DTM_ZIP_URL` and never
+    `str()` on a caught `requests` exception, matching `os_downloads.py`'s
+    own "no-URL rule": a `requests` exception's own message embeds the
+    URL it was called with.
+    """
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def cache_dir() -> Path:
     """`~/.mapgen/lidar_cardiff`.
 
     Resolved from `CONFIG_PATH` (`mapgen.config`), the same directory
     `bng.py`'s own `_cache_path` and `os_downloads.py`'s own `cache_root`
     already treat as this tool's cache root, rather than a second,
-    independently chosen home. Never creates the directory: this module
-    only ever reads it (`_cache_is_warm`, below); a later task's fetch()
-    creates it before it writes anything, the same division `bng.py`'s
-    own `_cache_path`/`ensure_ostn15` pair keeps.
+    independently chosen home. Never creates the directory itself:
+    `_cache_is_warm` and `estimate()`/`routing_note()` only ever read it,
+    and `LidarCardiffSource.fetch()`'s own `_ensure_zip` is what creates
+    it before it writes anything, the same division `bng.py`'s own
+    `_cache_path`/`ensure_ostn15` pair keeps.
     """
     return CONFIG_PATH.parent / "lidar_cardiff"
 
@@ -279,7 +329,19 @@ class LidarCardiffSource:
     )
     requires_api_key = False
 
-    def __init__(self, ostn15_cache_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        session: object | None = None,
+        timeout_seconds: float = 60.0,
+        ostn15_cache_dir: Path | None = None,
+    ) -> None:
+        # Mirrors LidarWalesSource.__init__ exactly (parameter names,
+        # order and defaults): the Task 2 review confirmed this
+        # constructor's earlier, session-less shape was a deliberate seam
+        # left for this task, not an oversight. session is used only by
+        # fetch(); every other method on this class never touches it.
+        self.session = session if session is not None else requests.Session()
+        self.timeout_seconds = timeout_seconds
         # None means "the default, ~/.mapgen" (bng.py's own _cache_path);
         # a test or a caller that wants an isolated cache passes a
         # tmp_path, matching every other BNG-aware source in this
@@ -407,3 +469,130 @@ class LidarCardiffSource:
         if _cache_is_warm(cache_dir()):
             return None
         return _ROUTING_NOTE
+
+    # -- fetch -----------------------------------------------------------------
+
+    def _ensure_zip(
+        self, url: str, expected_bytes: int, dest: Path, progress: ProgressSink, tile_id: str
+    ) -> None:
+        """Ensures `dest` holds a right-size, zip-openable copy of the
+        archive at `url`, downloading it first when `dest` is missing or
+        the wrong size (a resumed run's own stale partial counts as the
+        wrong size, and is re-downloaded whole rather than resumed: see
+        the module docstring's "Whole-download is the sane route" note).
+
+        Streams to a randomly-suffixed `.part` file beside `dest` (never
+        `dest` itself, so a reader of `dest` never sees a partial body),
+        the same atomic write-then-rename shape `inspire.py`'s own
+        `fetch_authority_zip` and `os_downloads.download_entry` both use
+        for their own whole-file downloads. The temp file is removed on
+        every failure path this function can take: a `requests`
+        transport failure, a length mismatch, or a right-length body that
+        does not open as a non-empty zip. A file only ever lands at
+        `dest`'s own real name once every one of those checks has
+        already passed, so a later call's own `dest.stat().st_size ==
+        expected_bytes` warm check can trust whatever it finds there
+        without re-opening it.
+
+        Raises `LidarCardiffError` kind `"download"` for a transport
+        failure or a length mismatch, kind `"parse"` for a right-length
+        body that fails the zip check. Never puts `url` in a message (see
+        `LidarCardiffError`'s own docstring).
+        """
+        if dest.exists() and dest.stat().st_size == expected_bytes:
+            progress.emit("tile_skipped", source=self.id, tile_id=tile_id)
+            return
+
+        ensure_dir(dest.parent)
+        temp_path = dest.with_name(f"{dest.name}.{uuid.uuid4().hex[:8]}.part")
+        written = 0
+        try:
+            with self.session.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                stream=True,
+                timeout=self.timeout_seconds,
+            ) as response:
+                response.raise_for_status()
+                with temp_path.open("wb") as handle:
+                    for chunk in response.iter_content(1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+                            written += len(chunk)
+        except requests.RequestException as exc:
+            temp_path.unlink(missing_ok=True)
+            raise LidarCardiffError(
+                f"Could not download {dest.name}.", kind="download"
+            ) from exc
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+        if written != expected_bytes:
+            temp_path.unlink(missing_ok=True)
+            raise LidarCardiffError(
+                f"{dest.name} downloaded {written} bytes, expected {expected_bytes}.",
+                kind="download",
+            )
+
+        try:
+            with zipfile.ZipFile(temp_path) as archive:
+                has_members = bool(archive.namelist())
+        except zipfile.BadZipFile:
+            has_members = False
+        if not has_members:
+            temp_path.unlink(missing_ok=True)
+            raise LidarCardiffError(
+                f"{dest.name} did not open as a valid, non-empty zip file "
+                f"once downloaded.",
+                kind="parse",
+            )
+
+        temp_path.replace(dest)
+        progress.emit("tile_done", source=self.id, tile_id=tile_id)
+
+    def fetch(
+        self,
+        bbox: BBox,
+        tiles: Sequence[Tile],
+        work_dir: Path,
+        progress: ProgressSink,
+        cancel: CancelToken | None = None,
+    ) -> list[Path]:
+        """Ensures both archive zips sit in `cache_dir()`, downloading and
+        verifying whichever one is missing or the wrong size, and returns
+        their cached paths: `[DSM path, DTM path]`, in that order,
+        documented here because a later task's `merge()` reads them.
+
+        `bbox`, `tiles` and `work_dir` are accepted only to satisfy the
+        LayerSource protocol signature and are not otherwise used: this
+        archive is static 2011 data (the module docstring's own "500 m
+        lattice" section), fetched and cached whole regardless of which
+        part of the block a given survey's own extent touches, the same
+        reason `estimate()` above needs neither `bbox` nor `tiles` to
+        answer honestly. The two zips are read back from `cache_dir()`
+        itself, never copied into `work_dir`: they are shared across
+        every future survey that ever selects this source, the same
+        national-cache shape `os_uprn.py`'s own `fetch()` gives its own
+        one download for the identical reason.
+
+        `cancel` is checked before each of the two zips, never mid
+        download: a unit already in flight always finishes, matching
+        every other source's own reading of this optional parameter (see
+        `sources/base.py`'s `LayerSource` docstring).
+        """
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+
+        directory = cache_dir()
+        dsm_path = directory / DSM_ZIP_NAME
+        dtm_path = directory / DTM_ZIP_NAME
+
+        self._ensure_zip(DSM_ZIP_URL, DSM_ZIP_BYTES, dsm_path, progress, "dsm")
+
+        if cancel is not None:
+            cancel.raise_if_cancelled()
+
+        self._ensure_zip(DTM_ZIP_URL, DTM_ZIP_BYTES, dtm_path, progress, "dtm")
+
+        return [dsm_path, dtm_path]

@@ -30,6 +30,8 @@ a "full" one.
 from __future__ import annotations
 
 import socket
+import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +40,7 @@ from mapgen.cog import MAX_WINDOW_PIXELS
 from mapgen.egrid import PAD_METRES
 from mapgen.geo import BBox
 from mapgen.sources import lidar_cardiff
+from mapgen.sources.base import NullProgress
 from mapgen.sources.lidar_cardiff import (
     COVERAGE_TILES,
     DSM_ZIP_BYTES,
@@ -48,6 +51,7 @@ from mapgen.sources.lidar_cardiff import (
     DTM_ZIP_URL,
     FLOWN,
     PIXEL_METRES,
+    LidarCardiffError,
     LidarCardiffSource,
     _touched_lattice_cells,
     _window_pixels,
@@ -505,3 +509,197 @@ def test_no_url_ever_appears_in_a_user_facing_string():
     ]
     for text in strings:
         assert "http" not in text.lower()
+
+
+# --------------------------------------------------------------------------
+# fetch(): the two zips, cached once, verified. Every offline test below
+# patches lidar_cardiff.cache_dir to an isolated tmp_path (never the real
+# ~/.mapgen/lidar_cardiff) and never lets a stub session serve fewer or
+# more bytes than a real Content-Length answer would, since fetch() checks
+# length exactly. "Already warm" fixtures below are plain padding bytes,
+# never real zip content: _ensure_zip's own warm branch (dest already the
+# right size) returns before it ever opens the file with zipfile, the same
+# way _cache_is_warm above only ever checks size, so a warm fixture's own
+# content is never read at all and does not need to be a real zip.
+# --------------------------------------------------------------------------
+
+
+def _build_padded_zip(path: Path, member_name: str, total_size: int) -> bytes:
+    """A real, `zipfile`-openable zip at `path`, one stored member, padded
+    so the whole file is exactly `total_size` bytes. Two passes: the
+    first writes an empty member to measure this zip's own fixed
+    overhead (local header + central directory + end-of-central-
+    directory, all independent of a STORED member's own payload), the
+    second writes the exact padding needed to reach the target. Returns
+    the finished file's own bytes, for a stub session to serve back.
+    """
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr(member_name, b"")
+    overhead = path.stat().st_size
+    payload_size = total_size - overhead
+    assert payload_size >= 0, "target size too small for this member name"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr(member_name, b"\x00" * payload_size)
+    data = path.read_bytes()
+    assert len(data) == total_size
+    return data
+
+
+class _FakeStreamResponse:
+    """A minimal stand-in for `requests.Response` under `stream=True`:
+    only the members `LidarCardiffSource._ensure_zip` actually calls.
+    """
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int):
+        body = self._body
+        for start in range(0, len(body), chunk_size):
+            yield body[start : start + chunk_size]
+
+
+class _ScriptedSession:
+    """Answers `.get(url, ...)` with whatever `bodies[url]` holds, and
+    records every URL asked for. Raises `AssertionError` for a URL not in
+    `bodies`, so a test cannot pass by accident on the wrong archive.
+    """
+
+    def __init__(self, bodies: dict[str, bytes]) -> None:
+        self._bodies = bodies
+        self.requested_urls: list[str] = []
+
+    def get(self, url, headers=None, stream=None, timeout=None):
+        self.requested_urls.append(url)
+        if url not in self._bodies:
+            raise AssertionError(f"unexpected request for {url!r}")
+        return _FakeStreamResponse(self._bodies[url])
+
+
+class _RefusesToConnect:
+    """A session whose `.get()` always fails the test: proves fetch()
+    never opens a network connection when both zips are already cached at
+    the right size, the fetch()-era successor to this suite's own
+    socket-refusing fixture above (this class is what a session-shaped
+    seam gives fetch() that covers/tier/detail/estimate/routing_note
+    never had, per the module docstring's own "No network except fetch()"
+    section).
+    """
+
+    def get(self, *args, **kwargs):
+        raise AssertionError(
+            "lidar_cardiff's fetch() must not touch the network when both "
+            "zips are already cached at the right size"
+        )
+
+
+def test_fetch_does_not_download_when_both_zips_are_already_the_right_size(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    dsm_path = tmp_path / DSM_ZIP_NAME
+    dtm_path = tmp_path / DTM_ZIP_NAME
+    dsm_path.write_bytes(b"\x00" * DSM_ZIP_BYTES)
+    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)
+
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    result = source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+
+    assert result == [dsm_path, dtm_path]
+
+
+def test_fetch_redownloads_a_wrong_size_cached_zip(tmp_path, monkeypatch):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    dsm_path = tmp_path / DSM_ZIP_NAME
+    dtm_path = tmp_path / DTM_ZIP_NAME
+    dsm_path.write_bytes(b"stale-partial-download")  # wrong size on purpose
+    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)  # already warm, right size
+
+    fresh_dsm_bytes = _build_padded_zip(tmp_path / "fresh_dsm_source.zip", "dsm.asc", DSM_ZIP_BYTES)
+    session = _ScriptedSession({DSM_ZIP_URL: fresh_dsm_bytes})
+
+    source = LidarCardiffSource(session=session, ostn15_cache_dir=tmp_path)
+    result = source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+
+    assert result == [dsm_path, dtm_path]
+    # DTM was already the right size: never requested.
+    assert session.requested_urls == [DSM_ZIP_URL]
+    assert dsm_path.stat().st_size == DSM_ZIP_BYTES
+    assert dsm_path.read_bytes() == fresh_dsm_bytes
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_fetch_raises_download_kind_with_no_url_on_a_size_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    dtm_path = tmp_path / DTM_ZIP_NAME
+    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)  # already warm, right size
+
+    short_body = b"x" * (DSM_ZIP_BYTES - 1)  # one byte short of the constant
+    session = _ScriptedSession({DSM_ZIP_URL: short_body})
+
+    source = LidarCardiffSource(session=session, ostn15_cache_dir=tmp_path)
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+
+    assert excinfo.value.kind == "download"
+    assert "http" not in str(excinfo.value).lower()
+    assert DSM_ZIP_URL not in str(excinfo.value)
+    assert not (tmp_path / DSM_ZIP_NAME).exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_fetch_fails_validation_with_the_sources_own_error_for_a_non_zip_payload(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    dtm_path = tmp_path / DTM_ZIP_NAME
+    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)  # already warm, right size
+
+    garbage = b"x" * DSM_ZIP_BYTES  # right length, not a zip at all
+    session = _ScriptedSession({DSM_ZIP_URL: garbage})
+
+    source = LidarCardiffSource(session=session, ostn15_cache_dir=tmp_path)
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+
+    # The source's own exception type, not a raw zipfile.BadZipFile
+    # escaping unwrapped.
+    assert excinfo.value.kind == "parse"
+    assert not (tmp_path / DSM_ZIP_NAME).exists()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+@pytest.mark.live
+def test_live_fetch_downloads_both_real_zips_into_the_real_cache():
+    # No cache_dir monkeypatch here, deliberately: this is the one test in
+    # this file that touches the owner's real ~/.mapgen/lidar_cardiff, on
+    # purpose (the brief's own "into the REAL cache directory" wording),
+    # so a later run of the full suite (this test still deselected by
+    # "not live") finds both zips already cached.
+    directory = lidar_cardiff.cache_dir()
+    source = LidarCardiffSource()
+
+    result = source.fetch(_any_bbox(), [], directory, NullProgress())
+
+    assert result == [directory / DSM_ZIP_NAME, directory / DTM_ZIP_NAME]
+    assert result[0].stat().st_size == DSM_ZIP_BYTES
+    assert result[1].stat().st_size == DTM_ZIP_BYTES
+    with zipfile.ZipFile(result[0]) as archive:
+        assert len(archive.namelist()) == 10
+    with zipfile.ZipFile(result[1]) as archive:
+        assert len(archive.namelist()) == 10
+
+    # Subsequent runs find them cached: re-fetching with a network-
+    # refusing session must succeed without downloading anything again.
+    cached_source = LidarCardiffSource(session=_RefusesToConnect())
+    result_again = cached_source.fetch(_any_bbox(), [], directory, NullProgress())
+    assert result_again == result
