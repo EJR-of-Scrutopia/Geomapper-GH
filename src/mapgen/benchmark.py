@@ -28,11 +28,22 @@ anywhere, logs it, or lets it reach an exception message. The CLI's own
 ## Reading the package
 
 `survey.json` gives the stem (`urbano_stem`) and the bbox. Buildings are
-every `building=*` way in `<stem>.osm`, the FUSED file: OSM's own trace
-carries no `source` tag at all, while Overture and OS OpenMap Local
-injections (`mapgen.buildings.fuse_missing_buildings`) each carry one, so
-splitting building counts by that tag (missing counted as `"osm"`) is
-exactly a split by which pipeline stage put a given footprint there.
+every `building=*` way in `<stem>.osm`, the FUSED file: Overture and OS
+OpenMap Local injections (`mapgen.buildings.fuse_missing_buildings`) each
+carry a `source` tag of one of two EXACT, known values
+(`package.BUILDINGS_SOURCE_OVERTURE`/`BUILDINGS_SOURCE_OS_OPEN`); every
+other building way, tagged or not, is counted `"osm"`. This is NOT the
+same as "carries no `source` tag at all" (task-3-review.md's own
+Important finding 1, an executed demonstration): ordinary upstream OSM
+data commonly carries its own unrelated `source=*` provenance tag
+(`source=Bing`, `source=survey`, bulk-import tags), which
+`merge_osm_xml` preserves verbatim with no stripping step anywhere in the
+OSM source pipeline, so bucketing on presence/absence alone would
+misreport a perfectly ordinary OSM-native building as an Overture or
+OS-OpenMap-Local injection that never happened. Bucketing on the two
+known values instead is correct regardless of what else a real OSM
+extract's own `source` tag ever says.
+
 Roads are every `highway=*` way in the same file (OSM-derived, so subject
 to the epoch question) PLUS, when `<stem>_os_roads.geojson` exists (OS
 OpenMap Local's own road layer, `mapgen.sources.os_open`), its LineStrings
@@ -77,16 +88,23 @@ from mapgen.bng import BngError, Ostn15Grid, ensure_ostn15, load_ostn15, padded_
 from mapgen.fsutil import atomic_write_bytes, atomic_write_text
 from mapgen.geo import BBox
 from mapgen.ngd import BUILDING_COLLECTION, ROAD_COLLECTION, NgdClient
+from mapgen.package import BUILDINGS_SOURCE_OS_OPEN, BUILDINGS_SOURCE_OVERTURE
 
 _BUILDING_TAG_KEY = "building"
 _HIGHWAY_TAG_KEY = "highway"
 _SOURCE_TAG_KEY = "source"
 
-# The bucket a building way with no `source` tag at all falls into:
-# `mapgen.sources.osm`'s own merge never writes one, only
-# `buildings.fuse_missing_buildings`'s Overture/OS-OpenMap-Local
-# injections do (see the module docstring).
+# The bucket every building way falls into UNLESS its own `source` tag is
+# one of the two EXACT values `buildings.fuse_missing_buildings` actually
+# writes (`_KNOWN_INJECTION_SOURCES` below), imported from `package.py`
+# rather than re-typed here so the two can never drift apart
+# (task-3-review.md's own Important finding 1: presence/absence of ANY
+# `source` tag is not the same test, since real upstream OSM data can and
+# does carry its own unrelated `source=*` provenance tag; see the module
+# docstring).
 OSM_SOURCE_LABEL = "osm"
+
+_KNOWN_INJECTION_SOURCES = {BUILDINGS_SOURCE_OVERTURE, BUILDINGS_SOURCE_OS_OPEN}
 
 _NGD_DESCRIPTION_PROPERTY = "description"
 
@@ -246,8 +264,12 @@ def _read_buildings(
 
     Returns `(rings, counts_by_source, tag_value_counts)`: `rings` is the
     population `match_footprints` runs against; `counts_by_source` is how
-    many buildings carry each `source` tag value (`OSM_SOURCE_LABEL` for
-    none at all); `tag_value_counts` is how many carry each `building=
+    many buildings carry each of the two KNOWN injection `source` values
+    (`_KNOWN_INJECTION_SOURCES`), with everything else, tagged or not,
+    counted `OSM_SOURCE_LABEL` (task-3-review.md's own Important finding
+    1: an unrelated upstream `source=*` tag, `source=Bing` for instance,
+    must never be counted as an Overture/OS-OpenMap-Local injection that
+    never happened); `tag_value_counts` is how many carry each `building=
     <value>` tag value, the report's own comparison against NGD's
     `description` frequency table. The latter two are counted for every
     building=* way regardless of whether its own footprint could be
@@ -265,7 +287,8 @@ def _read_buildings(
         if _BUILDING_TAG_KEY not in tags:
             continue
 
-        source = tags.get(_SOURCE_TAG_KEY, OSM_SOURCE_LABEL)
+        source_tag = tags.get(_SOURCE_TAG_KEY)
+        source = source_tag if source_tag in _KNOWN_INJECTION_SOURCES else OSM_SOURCE_LABEL
         counts_by_source[source] = counts_by_source.get(source, 0) + 1
         tag_value = tags[_BUILDING_TAG_KEY]
         tag_value_counts[tag_value] = tag_value_counts.get(tag_value, 0) + 1
@@ -359,10 +382,45 @@ def _read_os_open_roads(geojson_path: Path, grid: Ostn15Grid) -> list[list[tuple
 # --------------------------------------------------------------------------
 
 
+def _exterior_rings(geometry: dict) -> list[list]:
+    """Every constituent polygon's own OUTER ring in `geometry`'s own raw
+    coordinate arrays: one for a `Polygon`, one PER constituent polygon
+    for a `MultiPolygon` (task-3-review.md's own Minor finding 2: reading
+    only `coordinates[0]`'s own first polygon silently dropped every
+    other part of a genuine multi-part NGD building, with no count or
+    signal that anything was left out). Interior (hole) rings are never
+    read here, matching `match_footprints`'s own exterior-only ring
+    convention throughout this module.
+
+    `[]`, not a guess, for any shape this cannot make sense of: an
+    unrecognised geometry type, or a `coordinates` array that is not
+    shaped the way GeoJSON's own spec says `Polygon`/`MultiPolygon`
+    should be.
+    """
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list) or not coordinates:
+        return []
+    if geometry_type == "Polygon":
+        return [coordinates[0]]
+    if geometry_type == "MultiPolygon":
+        return [
+            polygon[0]
+            for polygon in coordinates
+            if isinstance(polygon, list) and polygon
+        ]
+    return []
+
+
 def _ngd_building_rings(features: Sequence[dict]) -> list[list[tuple[float, float]]]:
-    """Every buildingpart feature's own exterior ring, already BNG (the
+    """Every buildingpart feature's own exterior ring(s), already BNG (the
     `crs`/`bbox-crs` the client requested; see `ngd.py`'s own docstring):
     no projection here, unlike every one of our own populations above.
+
+    A `MultiPolygon` feature contributes one ring per constituent
+    polygon, not only its first (`_exterior_rings`): every part of a
+    genuine multi-part building enters `match_footprints`, none silently
+    dropped.
     """
     rings: list[list[tuple[float, float]]] = []
     for feature in features:
@@ -371,22 +429,14 @@ def _ngd_building_rings(features: Sequence[dict]) -> list[list[tuple[float, floa
         geometry = feature.get("geometry")
         if not isinstance(geometry, dict):
             continue
-        geometry_type = geometry.get("type")
-        coordinates = geometry.get("coordinates")
-        exterior = None
-        if geometry_type == "Polygon" and isinstance(coordinates, list) and coordinates:
-            exterior = coordinates[0]
-        elif geometry_type == "MultiPolygon" and isinstance(coordinates, list) and coordinates:
-            first_polygon = coordinates[0]
-            if isinstance(first_polygon, list) and first_polygon:
-                exterior = first_polygon[0]
-        if not isinstance(exterior, list) or len(exterior) < 3:
-            continue
-        try:
-            ring = [(float(pair[0]), float(pair[1])) for pair in exterior]
-        except (TypeError, ValueError, IndexError):
-            continue
-        rings.append(ring)
+        for exterior in _exterior_rings(geometry):
+            if not isinstance(exterior, list) or len(exterior) < 3:
+                continue
+            try:
+                ring = [(float(pair[0]), float(pair[1])) for pair in exterior]
+            except (TypeError, ValueError, IndexError):
+                continue
+            rings.append(ring)
     return rings
 
 

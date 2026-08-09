@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import json
 import socket
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
 from mapgen import benchmark as benchmark_module
 from mapgen import cli as cli_module
-from mapgen.benchmark import BenchmarkError, run_benchmark
+from mapgen.benchmark import BenchmarkError, _ngd_building_rings, _read_buildings, run_benchmark
 from mapgen.bng import tm_inverse
 from mapgen.cli import main
 from mapgen.geo import BBox
@@ -441,6 +442,156 @@ def test_a_building_relation_tag_is_never_counted(tmp_path):
     )
     report = json.loads(json_path.read_text(encoding="utf-8"))
     assert sum(report["counts"]["buildings"]["ours"].values()) == 2
+
+
+# --------------------------------------------------------------------------
+# task-3-review.md Important finding 1: an upstream OSM source=* tag (an
+# ordinary provenance convention, `source=Bing` included) is not the same
+# thing as an Overture/OS-OpenMap-Local injection, and must never be
+# counted as one.
+# --------------------------------------------------------------------------
+
+
+def test_read_buildings_counts_an_upstream_source_bing_tag_as_osm():
+    # The review's own executed demonstration, reproduced directly against
+    # _read_buildings: an ordinary OSM-native building=house way carrying
+    # its own unrelated source=Bing tag (a standard OSM provenance
+    # convention this project's own OSM merge never strips) must bucket
+    # as "osm", not "Bing".
+    nodes_elems, way = _closed_way(
+        9201,
+        _shift([(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)]),
+        51,
+        [("building", "house"), ("source", "Bing")],
+    )
+    root = ET.fromstring(_dump_osm([*nodes_elems, way]))
+    nodes = {
+        element.get("id"): (float(element.get("lat")), float(element.get("lon")))
+        for element in root
+        if element.tag == "node"
+    }
+
+    rings, counts_by_source, tag_value_counts = _read_buildings(root, nodes, _zero_shift_grid())
+
+    assert counts_by_source == {"osm": 1}
+    assert tag_value_counts == {"house": 1}
+    assert len(rings) == 1
+
+
+def test_report_counts_an_upstream_source_bing_building_as_osm(tmp_path):
+    root = tmp_path / "package"
+    root.mkdir()
+    stem = "Bing-Site_2026-08-10"
+    (root / "survey.json").write_text(
+        json.dumps({"urbano_stem": stem, "bbox": _BBOX.to_dict()}), encoding="utf-8"
+    )
+    nodes_elems, way = _closed_way(
+        9202,
+        _shift([(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)]),
+        61,
+        [("building", "house"), ("source", "Bing")],
+    )
+    (root / f"{stem}.osm").write_text(_dump_osm([*nodes_elems, way]), encoding="utf-8")
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    _, json_path = run_benchmark(
+        root, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert report["counts"]["buildings"]["ours"] == {"osm": 1}
+
+
+def test_read_buildings_still_buckets_the_two_known_injection_labels():
+    # The generic-presence bug this fix removes must not take the real
+    # values down with it: overture and os_openmap_local (package.py's
+    # own BUILDINGS_SOURCE_OVERTURE/BUILDINGS_SOURCE_OS_OPEN) still bucket
+    # by name, exactly as before.
+    overture_nodes, overture_way = _closed_way(
+        9203, _shift([(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)]), 71,
+        [("building", "yes"), ("source", "overture")],
+    )
+    os_open_nodes, os_open_way = _closed_way(
+        9204, _shift([(50.0, 50.0), (55.0, 50.0), (55.0, 55.0), (50.0, 55.0)]), 81,
+        [("building", "yes"), ("source", "os_openmap_local")],
+    )
+    root = ET.fromstring(
+        _dump_osm([*overture_nodes, overture_way, *os_open_nodes, os_open_way])
+    )
+    nodes = {
+        element.get("id"): (float(element.get("lat")), float(element.get("lon")))
+        for element in root
+        if element.tag == "node"
+    }
+
+    _, counts_by_source, _ = _read_buildings(root, nodes, _zero_shift_grid())
+
+    assert counts_by_source == {"overture": 1, "os_openmap_local": 1}
+
+
+# --------------------------------------------------------------------------
+# task-3-review.md Minor finding 2: a MultiPolygon NGD building must
+# contribute every constituent polygon, not only its first.
+# --------------------------------------------------------------------------
+
+
+def test_ngd_multipolygon_building_contributes_every_part():
+    feature = {
+        "type": "Feature",
+        "id": "two-part-multipolygon",
+        "properties": {"description": "Terrace"},
+        "geometry": {
+            "type": "MultiPolygon",
+            "coordinates": [
+                [[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+                [[[100.0, 100.0], [110.0, 100.0], [110.0, 110.0], [100.0, 110.0], [100.0, 100.0]]],
+            ],
+        },
+    }
+
+    rings = _ngd_building_rings([feature])
+
+    assert len(rings) == 2
+    assert rings[0][0] == (0.0, 0.0)
+    assert rings[1][0] == (100.0, 100.0)
+
+
+def test_report_counts_every_part_of_an_ngd_multipolygon_building(tmp_path):
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    e0, n0 = _BASE_E, _BASE_N
+    multipolygon_feature = {
+        "type": "Feature",
+        "id": "two-part-multipolygon",
+        "properties": {"description": "Terrace"},
+        "geometry": {
+            "type": "MultiPolygon",
+            "coordinates": [
+                # Part 1 matches building A almost exactly: a real match.
+                [[[e0, n0], [e0 + 10.0, n0], [e0 + 10.0, n0 + 10.0], [e0, n0 + 10.0], [e0, n0]]],
+                # Part 2 sits far from anything of ours: unmatched, but
+                # still counted.
+                [
+                    [
+                        [e0 + 9_000.0, n0 + 9_000.0],
+                        [e0 + 9_010.0, n0 + 9_000.0],
+                        [e0 + 9_010.0, n0 + 9_010.0],
+                        [e0 + 9_000.0, n0 + 9_010.0],
+                        [e0 + 9_000.0, n0 + 9_000.0],
+                    ]
+                ],
+            ],
+        },
+    }
+    client = _StubNgdClient(buildings=[multipolygon_feature], roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert report["counts"]["buildings"]["ngd"] == 2
+    assert report["buildings"]["matched"] == 1
+    assert report["buildings"]["unmatched_theirs"] == 1
 
 
 def test_missing_os_roads_file_is_an_empty_control_population_not_an_error(tmp_path):

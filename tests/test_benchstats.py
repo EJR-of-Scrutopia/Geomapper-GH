@@ -6,6 +6,7 @@ import pytest
 
 from mapgen import benchstats
 from mapgen.benchstats import (
+    LSQ_MIN_SAMPLES,
     MATCH_IOU_FLOOR,
     MatchResult,
     OffsetStats,
@@ -352,6 +353,165 @@ def test_lsq_fields_are_none_when_there_are_no_matches_at_all():
     assert stats.lsq_de is None
     assert stats.lsq_dn is None
     assert stats.lsq_magnitude is None
+
+
+# --------------------------------------------------------------------------
+# polyline_offsets: task-3-review.md's own Important finding 2, fixed here.
+# A CLAMPED sample's offset is not purely along its matched segment's own
+# normal (only an interior sample's is), so the naive `N`/`V` shortcut is
+# only exact once clamped samples are excluded from it. These tests are
+# the review's own executed demonstrations (a same-extent two-orientation
+# grid, and a short 20 m version of it) turned into pinned assertions:
+# before this fix both overshot the true shift (0.943 and a magnitude of
+# 1.527 respectively, the second past the epoch report's own CONSISTENT
+# upper band); after it, both answer honestly.
+# --------------------------------------------------------------------------
+
+
+def test_lsq_recovers_true_shift_on_a_same_extent_two_orientation_grid():
+    # task-3-review.md's own Important finding 2, executed construction:
+    # unlike this file's own two-orientation LSQ test above, `theirs` is
+    # NOT extended past `ours` here. This is the realistic case (a real
+    # OSM way and its matching NGD roadlink describe the same physical
+    # road, split at the same junctions, so their extents are naturally
+    # similar, never one artificially longer), and it is exactly the case
+    # that used to overshoot: before the interior-only fix this construction
+    # answered lsq=(0.943, 0.943) against a true (0.9, 0.9).
+    shift_e, shift_n = 0.9, 0.9
+    horizontal_ours = [(0.0, 0.0), (100.0, 0.0)]
+    horizontal_theirs = [(shift_e, shift_n), (100.0 + shift_e, shift_n)]
+    vertical_ours = [(500.0, 0.0), (500.0, 100.0)]
+    vertical_theirs = [(500.0 + shift_e, shift_n), (500.0 + shift_e, 100.0 + shift_n)]
+
+    stats = polyline_offsets(
+        [horizontal_ours, vertical_ours], [horizontal_theirs, vertical_theirs]
+    )
+
+    assert stats.unmatched_samples == 0
+    # The naive mean still understates it, as always (unaffected by this
+    # fix, since the naive statistics never excluded clamped samples).
+    assert stats.mean_de == pytest.approx(0.4714, abs=0.001)
+    # The least-squares estimate now recovers the true shift cleanly,
+    # rather than the 0.943 overshoot the review measured against the
+    # pre-fix accumulation.
+    assert stats.lsq_de == pytest.approx(shift_e, abs=0.02)
+    assert stats.lsq_dn == pytest.approx(shift_n, abs=0.02)
+    assert stats.lsq_magnitude == pytest.approx(math.hypot(shift_e, shift_n), abs=0.02)
+
+
+def test_lsq_on_a_short_same_extent_grid_answers_honestly_never_an_overshoot():
+    # task-3-review.md's own second executed construction: the same
+    # same-extent shape as above, shortened to 20 m each way (short
+    # residential spurs/cul-de-sacs are common in real UK street
+    # networks). Before the interior-only fix this answered
+    # lsq_magnitude=1.527, PAST the epoch report's own CONSISTENT upper
+    # bound (1.5 m) for a road population whose true shift is exactly the
+    # 0.9 m hypothesis: a plausible-looking, band-crossing, wrong number.
+    #
+    # With `sample_every=5.0` (the module's own default) over a 20 m line,
+    # densify gives 5 samples per line (0, 5, 10, 15, 20); the one sample
+    # at each line's own near end (e=0, shifted 0.9 m away from theirs'
+    # own start) projects with a clamped or exactly-boundary parameter
+    # and is excluded, leaving exactly 4 interior samples per line, 8
+    # total: precisely `LSQ_MIN_SAMPLES`. This implementation therefore
+    # answers a real, correct recovery here, not `None` and not an
+    # overshoot: documented as the actual behaviour at this exact
+    # boundary, per the review's own instruction to assert whichever this
+    # implementation yields.
+    shift_e, shift_n = 0.9, 0.9
+    horizontal_ours = [(0.0, 0.0), (20.0, 0.0)]
+    horizontal_theirs = [(shift_e, shift_n), (20.0 + shift_e, shift_n)]
+    vertical_ours = [(500.0, 0.0), (500.0, 20.0)]
+    vertical_theirs = [(500.0 + shift_e, shift_n), (500.0 + shift_e, 20.0 + shift_n)]
+
+    stats = polyline_offsets(
+        [horizontal_ours, vertical_ours], [horizontal_theirs, vertical_theirs]
+    )
+
+    assert stats.count == 10
+    assert stats.lsq_de is not None
+    assert stats.lsq_de == pytest.approx(shift_e, abs=0.02)
+    assert stats.lsq_dn == pytest.approx(shift_n, abs=0.02)
+    # Never the pre-fix overshoot, and never past the epoch report's own
+    # CONSISTENT upper bound for a true 0.9 m shift.
+    assert stats.lsq_magnitude == pytest.approx(math.hypot(shift_e, shift_n), abs=0.02)
+    assert stats.lsq_magnitude < 1.5
+
+
+def test_lsq_min_samples_floor_trips_even_on_a_well_conditioned_orientation_mix():
+    # A genuinely two-orientation (perfectly orthogonal, well-separated,
+    # no cross-contamination) population, but a THIN one: 2 samples per
+    # line, 4 total, well under LSQ_MIN_SAMPLES. The determinant of N
+    # would in fact be perfectly healthy here (an orthogonal pair is the
+    # best-conditioned case there is); this test is what pins that a
+    # well-conditioned but thin sample is still refused, not answered,
+    # since 4 points is too few to trust regardless of geometry.
+    shift_e, shift_n = 0.9, 0.9
+    horizontal_ours = [(0.0, 0.0), (10.0, 0.0)]
+    horizontal_theirs = [(-200.0 + shift_e, shift_n), (300.0 + shift_e, shift_n)]
+    vertical_ours = [(500.0, 0.0), (500.0, 10.0)]
+    vertical_theirs = [(500.0 + shift_e, -200.0 + shift_n), (500.0 + shift_e, 300.0 + shift_n)]
+
+    stats = polyline_offsets(
+        [horizontal_ours, vertical_ours],
+        [horizontal_theirs, vertical_theirs],
+        sample_every=10.0,
+    )
+
+    assert 0 < stats.count < LSQ_MIN_SAMPLES
+    assert stats.lsq_de is None
+    assert stats.lsq_dn is None
+    assert stats.lsq_magnitude is None
+
+
+def test_lsq_relative_determinant_floor_traps_the_window_a_fixed_floor_missed():
+    # task-3-review.md's own Minor finding 1, executed construction: two
+    # well-separated (non-contaminating), well-populated orientations a
+    # tiny fraction of a degree apart. Under the OLD absolute
+    # `_LSQ_DET_FLOOR = 1e-9`, the review measured a real window (roughly
+    # 1e-4 to 3e-5 degrees of separation) where the system had not yet
+    # been floored to None but was already numerically unstable enough to
+    # answer more than double the true shift. The RELATIVE floor closes
+    # that window: even 0.01 degrees of separation, with dozens of
+    # samples on each line (comfortably more than the old floor's own
+    # blind spot needed to misbehave), now reports None rather than a
+    # wrong number.
+    shift_e, shift_n = 0.9, 0.9
+
+    def _line(angle_degrees: float, length: float, origin: tuple[float, float]):
+        radius = math.radians(angle_degrees)
+        ox, oy = origin
+        return [(ox, oy), (ox + math.cos(radius) * length, oy + math.sin(radius) * length)]
+
+    def _extended_theirs(ours_line, extend: float = 300.0):
+        (x0, y0), (x1, y1) = ours_line
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        ux, uy = dx / length, dy / length
+        return [
+            (x0 - ux * extend + shift_e, y0 - uy * extend + shift_n),
+            (x1 + ux * extend + shift_e, y1 + uy * extend + shift_n),
+        ]
+
+    a_ours = _line(0.0, 100.0, (0.0, 0.0))
+    b_ours = _line(0.01, 100.0, (2_000.0, 2_000.0))  # far apart: no cross-contamination
+    stats = polyline_offsets(
+        [a_ours, b_ours], [_extended_theirs(a_ours), _extended_theirs(b_ours)]
+    )
+    assert stats.count >= LSQ_MIN_SAMPLES
+    assert stats.lsq_de is None
+    assert stats.lsq_dn is None
+    assert stats.lsq_magnitude is None
+
+    # The brief's own pinned 2-degree case, well clear of that window,
+    # still answers cleanly: the relative floor does not overcorrect.
+    c_ours = _line(0.0, 100.0, (0.0, 0.0))
+    d_ours = _line(2.0, 100.0, (2_000.0, 2_000.0))
+    clean = polyline_offsets(
+        [c_ours, d_ours], [_extended_theirs(c_ours), _extended_theirs(d_ours)]
+    )
+    assert clean.lsq_de == pytest.approx(shift_e, abs=0.001)
+    assert clean.lsq_dn == pytest.approx(shift_n, abs=0.001)
 
 
 # --------------------------------------------------------------------------

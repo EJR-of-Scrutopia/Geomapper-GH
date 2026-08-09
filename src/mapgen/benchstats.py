@@ -335,15 +335,53 @@ OFFSET_CELL_SIZE_M = 25.0
 
 # The determinant floor below which the least-squares normal matrix `N`
 # (see `polyline_offsets`'s own docstring, "the least-squares bias
-# correction") is treated as singular: task-3-brief's controller addition
-# pins this exact value. A population sampled from segments that are all
-# (or nearly all) the same orientation makes every per-sample unit normal
-# `n` point the same way (up to sign), so `N = sum(n n^T)` degenerates
-# toward a rank-1 matrix and its determinant toward exactly 0: 1e-9 is far
-# below anything a genuinely two-orientation population produces (the
-# module's own test fixtures clear it by many orders of magnitude) and far
-# above ordinary floating-point noise around a true zero.
-_LSQ_DET_FLOOR = 1e-9
+# correction") is treated as singular. A population sampled from segments
+# that are all (or nearly all) the same orientation makes every
+# per-sample unit normal `n` point the same way (up to sign), so
+# `N = sum(n n^T)` degenerates toward a rank-1 matrix and its determinant
+# toward exactly 0.
+#
+# RELATIVE, not absolute (task-3-review.md's own Minor finding 1): a fixed
+# absolute floor does not scale with how many samples fed `N`, since every
+# accumulated sample adds exactly 1.0 to `N`'s own trace (each `n` is a
+# unit vector, so `n n^T` always has trace 1). A well-conditioned
+# two-orientation `N` built from many samples has a determinant that
+# grows with the SQUARE of the sample count, while a genuinely
+# near-singular `N` (one orientation, or two nearly parallel ones) stays
+# near zero regardless of how many samples fed it: a fixed 1e-9 floor
+# tuned against a small synthetic fixture is already far too permissive
+# once real sample counts (hundreds to thousands, an ordinary road
+# network) are plugged in, so a configuration that is genuinely too close
+# to singular to trust can clear the fixed floor by many orders of
+# magnitude and return a plausible-looking but badly wrong answer instead
+# of `None` (task-3-review.md's own executed demonstration: an absolute
+# floor left a real "explodes without tripping" window between roughly
+# 1e-4 and 3e-5 degrees of angular separation). `trace/2` is the mean of
+# `N`'s own two eigenvalues (`trace = lambda_1 + lambda_2`, always exactly
+# `interior_count` for a unit-normal accumulation); `(trace/2)**2` is the
+# determinant a WELL-CONDITIONED `N` of the same sample count would have
+# if both eigenvalues sat at that mean (a perfectly balanced
+# two-orthogonal-orientation population), so comparing the actual
+# determinant against a small fraction of that reference scales the test
+# to the sample count itself rather than to an arbitrary absolute number.
+# 1e-6 is conservative enough that the brief's own pinned 2-degree
+# near-singular case (task-3-review.md's own "Executed: nearly-singular
+# case") stays comfortably a real answer, not `None`, while trapping the
+# demonstrated bad-answer window well before it can return a wrong number
+# (see the module's own tests for both boundaries, hand-verified).
+_LSQ_DET_RELATIVE_FLOOR = 1e-6
+
+# The floor below which too few INTERIOR (never endpoint-clamped) samples
+# fed the least-squares accumulation for its answer to be trusted at all
+# (task-3-review.md's own Important finding 2, see polyline_offsets's own
+# docstring for why only interior samples are accumulated in the first
+# place): 8 is small enough that the module's own two-orientation test
+# fixtures (dozens of interior samples per line) clear it easily, and
+# large enough that a determinant computed from a literal handful of
+# samples, which the relative floor above alone cannot distinguish from a
+# well-conditioned small population, is refused outright rather than
+# reported as a number nobody should trust.
+LSQ_MIN_SAMPLES = 8
 
 
 @dataclass
@@ -371,16 +409,41 @@ class OffsetStats:
     on a single line parallel to the shift, and exactly half (0.4714
     against a true 0.9) on a two-orientation grid. The least-squares
     solve corrects this: `polyline_offsets` accumulates, over every
-    matched sample, the normal-equation terms `N += n n^T` (2x2) and
-    `V += v` (the observed offset vector, which the same derivation shows
-    equals `n n^T . s` exactly for an interior sample, so `N s = V`
-    exactly under the noiseless model), then solves that system by
-    Cramer's rule. `lsq_magnitude` is None whenever `N`'s determinant is
-    under `_LSQ_DET_FLOOR` (a population too close to one orientation to
-    separate the two components of `s`): this implementation reports that
-    case as undefined outright, even in the special case where the true
-    shift happens to lie entirely along the one well-determined axis (a
-    minimum-norm pseudo-inverse could recover that special case, but a
+    matched sample whose projection onto its winning `theirs` segment is
+    STRICTLY INTERIOR (`0 < t < 1`, never clamped to either endpoint), the
+    normal-equation terms `N += n n^T` (2x2) and `V += v` (the observed
+    offset vector, which the same derivation shows equals `n n^T . s`
+    exactly for an interior sample, so `N s = V` exactly under the
+    noiseless model), then solves that system by Cramer's rule.
+
+    The interior-only restriction is itself a correctness fix, not
+    polish (task-3-review.md's own Important finding 2): the identity
+    `v = n(n.v)` that makes the shortcut `V = sum(v)` exact holds ONLY for
+    an interior sample. A CLAMPED sample's own offset vector points
+    somewhere between the segment's normal and its own endpoint, not
+    purely along the normal, so folding a clamped sample into the same
+    accumulation biases `N s = V` toward a wrong answer that looks just as
+    plausible as a right one: the review's own executed demonstration
+    found a same-extent two-orientation grid (the realistic case, since a
+    genuine OSM way and its matching NGD roadlink describe the same
+    physical road, split at the same real-world junctions, so their
+    extents are naturally similar) overshoot to `(0.943, 0.943)` against a
+    true `(0.9, 0.9)`, and a shorter 20 m same-extent case overshoot past
+    the epoch report's own CONSISTENT upper band entirely. Excluding
+    clamped samples from `N`/`V` removes that bias source outright: they
+    still count fully in `count`, the naive mean, `std_de`/`std_dn` and
+    the percentile fields above, exactly as before, since none of those
+    statistics assumes interior-only projection.
+
+    `lsq_magnitude` is None whenever fewer than `LSQ_MIN_SAMPLES` interior
+    samples fed the accumulation, or `N`'s determinant is under the
+    RELATIVE floor `_LSQ_DET_RELATIVE_FLOOR * (trace/2)**2` (a population
+    too close to one orientation, or too thin, to separate the two
+    components of `s` with any confidence; see both constants' own
+    docstrings for why relative and why 8): this implementation reports
+    that case as undefined outright, even in the special case where the
+    true shift happens to lie entirely along the one well-determined axis
+    (a minimum-norm pseudo-inverse could recover that special case, but a
     real road network's line population is never genuinely
     single-orientation, so the extra machinery buys nothing this
     benchmark needs; see the module's own tests for this exact scenario).
@@ -465,14 +528,25 @@ def _nearest_point_on_segment(
     point: tuple[float, float],
     seg_start: tuple[float, float],
     seg_end: tuple[float, float],
-) -> tuple[float, float]:
+) -> tuple[tuple[float, float], float]:
     """The exact nearest point to `point` on the segment `seg_start` to
-    `seg_end`: the ordinary clamped-projection formula (project `point`
+    `seg_end`, paired with the CLAMPED projection parameter `t` that
+    produced it: the ordinary clamped-projection formula (project `point`
     onto the segment's own infinite line, then clamp the parameter to
     `[0, 1]` so the answer never lands past either endpoint), no
     approximation. A zero-length segment (`seg_start == seg_end`, a
-    degenerate polyline vertex repeated) answers `seg_start` itself rather
-    than dividing by zero.
+    degenerate polyline vertex repeated) answers `seg_start` itself, `t`
+    `0.0`, rather than dividing by zero.
+
+    `t` travels back with the point (task-3-review.md's own Important
+    finding 2) because `polyline_offsets`'s least-squares accumulation
+    needs to tell an interior projection (`0 < t < 1`, unclamped, the only
+    case its normal-equation shortcut is exact for) apart from one that
+    was clamped to an endpoint: a pre-clamp `t` outside `[0, 1]` comes
+    back here as exactly `0.0` or `1.0`, so a caller checking
+    `0.0 < t < 1.0` on this return value alone correctly identifies every
+    genuinely interior sample, with no separate before/after comparison
+    needed.
     """
     px, py = point
     ax, ay = seg_start
@@ -480,10 +554,10 @@ def _nearest_point_on_segment(
     dx, dy = bx - ax, by - ay
     length_sq = dx * dx + dy * dy
     if length_sq == 0.0:
-        return seg_start
+        return seg_start, 0.0
     t = ((px - ax) * dx + (py - ay) * dy) / length_sq
     t = max(0.0, min(1.0, t))
-    return (ax + dx * t, ay + dy * t)
+    return (ax + dx * t, ay + dy * t), t
 
 
 def _nearest_theirs_point(
@@ -491,20 +565,23 @@ def _nearest_theirs_point(
     segments: Sequence[tuple[tuple[float, float], tuple[float, float]]],
     index: dict[Cell, list[int]],
     search_radius: float,
-) -> tuple[tuple[float, float], int] | None:
+) -> tuple[tuple[float, float], int, float] | None:
     """The nearest point to `sample` among every segment in `segments`
     that `index` (a `OFFSET_CELL_SIZE_M` cell index over those same
     segments' own bounding boxes) places within `sample`'s own cell or one
     of its neighbours, paired with that winning segment's own index into
-    `segments`, if the nearest point is within `search_radius`; None
-    otherwise.
+    `segments` and the CLAMPED projection parameter `t` that produced the
+    point (`_nearest_point_on_segment`'s own return shape), if the nearest
+    point is within `search_radius`; None otherwise.
 
-    The segment index travels back with the point (not just the point
-    alone, which is all the caller needed before) because `polyline_offsets`
-    now needs the winning segment's own direction too, to build the
-    least-squares bias correction's per-sample unit normal (see that
-    function's own docstring): the nearest-point-on-segment distance alone
-    does not carry which segment produced it.
+    The segment index and `t` travel back with the point (not just the
+    point alone, which is all the caller needed before) because
+    `polyline_offsets` now needs the winning segment's own direction, and
+    whether the projection onto it was clamped, to build the
+    least-squares bias correction's per-sample unit normal and decide
+    whether this sample may contribute to it at all (see that function's
+    own docstring): the nearest-point-on-segment distance alone carries
+    neither.
 
     The neighbourhood span is derived from `search_radius` itself
     (`ceil(search_radius / OFFSET_CELL_SIZE_M)` cells in every direction
@@ -530,17 +607,19 @@ def _nearest_theirs_point(
     best_point: tuple[float, float] | None = None
     best_distance: float | None = None
     best_seg_index: int | None = None
+    best_t: float | None = None
     for seg_index in candidates:
         seg_start, seg_end = segments[seg_index]
-        candidate_point = _nearest_point_on_segment(sample, seg_start, seg_end)
+        candidate_point, t = _nearest_point_on_segment(sample, seg_start, seg_end)
         distance = math.hypot(candidate_point[0] - sample[0], candidate_point[1] - sample[1])
         if best_distance is None or distance < best_distance:
             best_distance = distance
             best_point = candidate_point
             best_seg_index = seg_index
+            best_t = t
 
     if best_distance is not None and best_distance <= search_radius and best_point is not None:
-        return best_point, best_seg_index
+        return best_point, best_seg_index, best_t
     return None
 
 
@@ -567,20 +646,29 @@ def polyline_offsets(
     solves for the systematic shift `s` a differently-oriented sample
     population actually supports (`OffsetStats.lsq_de`/`lsq_dn`/
     `lsq_magnitude`; see that dataclass's own docstring for the full
-    derivation and citation). For every matched sample this loop already
-    has the winning `theirs` segment (`_nearest_theirs_point` now returns
-    its index alongside the point): that segment's own unit direction
-    `t = (te, tn)` gives a unit normal `n = (-tn, te)` (the task-3-brief
-    controller addition's own pinned convention; the sign choice is
-    immaterial, since both `n n^T` and `n (n.s)` are invariant under
-    `n -> -n`). Each sample accumulates `N += n n^T` (a running 2x2
+    derivation, its interior-only restriction, and citation). For every
+    matched sample this loop already has the winning `theirs` segment and
+    the CLAMPED projection parameter that produced the point
+    (`_nearest_theirs_point` now returns both alongside the point): that
+    segment's own unit direction `(te, tn)` gives a unit normal
+    `n = (-tn, te)` (the task-3-brief controller addition's own pinned
+    convention; the sign choice is immaterial, since both `n n^T` and
+    `n (n.s)` are invariant under `n -> -n`). ONLY a STRICTLY INTERIOR
+    sample (`0.0 < t < 1.0`, never clamped to either of the winning
+    segment's own endpoints) accumulates `N += n n^T` (a running 2x2
     symmetric matrix, kept as its three distinct entries `n_xx`, `n_xy`,
-    `n_yy`) and `V += v` (the observed offset vector itself, `(de, dn)`),
-    then after the loop `N s = V` is solved for `s` by Cramer's rule.
+    `n_yy`) and `V += v` (the observed offset vector itself, `(de, dn)`);
+    a clamped sample still contributes fully to `count`, the naive mean,
+    `std_de`/`std_dn` and the percentile fields, exactly as before, only
+    never to `N`/`V`. After the loop, `N s = V` is solved for `s` by
+    Cramer's rule, gated on `LSQ_MIN_SAMPLES` interior samples and a
+    determinant clear of the relative floor (see both constants' own
+    docstrings).
 
     A zero-length winning segment (a degenerate repeated-vertex polyline
-    entry) has no direction to contribute: it is skipped for the purposes
-    of `N`/`V` alone, still counted normally in every other statistic.
+    entry) has no direction to contribute either: it is excluded from
+    `N`/`V` the same way a clamped sample is, still counted normally in
+    every other statistic.
     """
     segments = _segments(theirs)
     index: dict[Cell, list[int]] = defaultdict(list)
@@ -602,8 +690,12 @@ def polyline_offsets(
     # The least-squares normal-equation accumulators: N as its three
     # distinct symmetric entries, V as its two components. See the
     # docstring above and OffsetStats's own for the full derivation.
+    # interior_count is the number of samples that actually fed them
+    # (LSQ_MIN_SAMPLES gates the solve on this, not on `count` overall,
+    # since a clamped sample counts toward `count` but never toward this).
     n_xx = n_xy = n_yy = 0.0
     v_e = v_n = 0.0
+    interior_count = 0
 
     for polyline in ours:
         for sample in _densify_polyline(polyline, sample_every):
@@ -611,12 +703,21 @@ def polyline_offsets(
             if nearest is None:
                 unmatched_samples += 1
                 continue
-            nearest_point, seg_index = nearest
+            nearest_point, seg_index, t = nearest
             de = nearest_point[0] - sample[0]
             dn = nearest_point[1] - sample[1]
             offsets_de.append(de)
             offsets_dn.append(dn)
             magnitudes.append(math.hypot(de, dn))
+
+            # Strictly interior only (task-3-review.md's own Important
+            # finding 2): a clamped projection's offset is not purely
+            # along the segment's own normal, so folding it in here would
+            # bias N s = V toward a wrong answer (see this function's own
+            # docstring). A clamped sample has already contributed to
+            # every statistic above; it simply never reaches this block.
+            if not (0.0 < t < 1.0):
+                continue
 
             seg_start, seg_end = segments[seg_index]
             tx, ty = seg_end[0] - seg_start[0], seg_end[1] - seg_start[1]
@@ -629,6 +730,7 @@ def polyline_offsets(
                 n_yy += n_north * n_north
                 v_e += de
                 v_n += dn
+                interior_count += 1
 
     count = len(offsets_de)
     if count == 0:
@@ -653,13 +755,17 @@ def polyline_offsets(
     std_dn = math.sqrt(sum((value - mean_dn) ** 2 for value in offsets_dn) / count)
     magnitude_dist = distribution(magnitudes, fractions=(0.5, 0.9))
 
-    determinant = n_xx * n_yy - n_xy * n_xy
-    if abs(determinant) < _LSQ_DET_FLOOR:
+    if interior_count < LSQ_MIN_SAMPLES:
         lsq_de = lsq_dn = lsq_magnitude = None
     else:
-        lsq_de = (v_e * n_yy - n_xy * v_n) / determinant
-        lsq_dn = (n_xx * v_n - n_xy * v_e) / determinant
-        lsq_magnitude = math.hypot(lsq_de, lsq_dn)
+        determinant = n_xx * n_yy - n_xy * n_xy
+        trace_half = (n_xx + n_yy) / 2.0
+        if determinant < _LSQ_DET_RELATIVE_FLOOR * (trace_half ** 2):
+            lsq_de = lsq_dn = lsq_magnitude = None
+        else:
+            lsq_de = (v_e * n_yy - n_xy * v_n) / determinant
+            lsq_dn = (n_xx * v_n - n_xy * v_e) / determinant
+            lsq_magnitude = math.hypot(lsq_de, lsq_dn)
 
     return OffsetStats(
         count=count,
