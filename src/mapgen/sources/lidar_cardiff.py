@@ -99,7 +99,13 @@ from mapgen.egrid import PAD_METRES
 from mapgen.fsutil import ensure_dir
 from mapgen.geo import BBox, Tile
 from mapgen.jobs import CancelToken
-from mapgen.sources.base import Estimate, ProgressSink
+from mapgen.sources.base import (
+    FAILURE_UNKNOWN,
+    FAILURE_UNREACHABLE,
+    Estimate,
+    ProgressSink,
+    TileFailure,
+)
 
 # The archive's own flight date (probe-report.md, live 2026-08-08),
 # probed rather than assumed: appears verbatim in every user-facing
@@ -222,6 +228,27 @@ class LidarCardiffError(RuntimeError):
         self.kind = kind
 
 
+def _classify_lidar_cardiff_error(exc: LidarCardiffError) -> str:
+    """The shared failure vocabulary's term (`sources/base.py`) for this
+    source's own `LidarCardiffError`.
+
+    Mirrors `os_uprn.py`'s own `_classify_os_open_error` for the identical
+    two-kind split: `LidarCardiffError.kind` is a two-way slice of
+    `os_downloads.OsOpenError`'s own vocabulary (see that class's own
+    docstring), and `os_uprn.py`'s classifier already answers exactly this
+    question for both of the kinds this source can raise. `"download"` (a
+    transport failure, or a length mismatch) is `FAILURE_UNREACHABLE`,
+    retryable: the same bucket `os_uprn.py`'s own classifier gives
+    `OsOpenError`'s `"download"`/`"listing"` kinds. `"parse"` (a
+    right-length body that will not open as a zip) falls through to
+    `FAILURE_UNKNOWN`, the same catch-all `os_uprn.py`'s own classifier
+    gives every kind it does not special-case.
+    """
+    if exc.kind == "download":
+        return FAILURE_UNREACHABLE
+    return FAILURE_UNKNOWN
+
+
 def cache_dir() -> Path:
     """`~/.mapgen/lidar_cardiff`.
 
@@ -238,19 +265,24 @@ def cache_dir() -> Path:
 
 
 def _cache_is_warm(directory: Path) -> bool:
-    """True only when BOTH zips already sit in `directory`, non-empty.
+    """True only when BOTH zips already sit in `directory`, each exactly
+    the size `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` says it should be.
 
-    "Either zip missing" (the brief's own wording) counts as cold: a
-    resumed run that has one of the two but not the other still has to
-    make one more request, the same "both non-empty" resume guard
-    `lidar_wales.py`'s own `fetch()` checks before it will skip its own
-    download.
+    "Either zip missing, or the wrong size" counts as cold: a resumed run
+    that has one of the two but not the other, or a stale partial left by
+    an interrupted earlier version of this module, still has to make one
+    more request. The exact-size test matches `LidarCardiffSource.
+    _ensure_zip`'s own warm check precisely, on purpose (a review finding:
+    this function used to accept any non-empty file, which let `estimate()`
+    and `routing_note()` call a stale, wrong-size cache warm while
+    `fetch()` itself would still, correctly, re-download it), so `estimate()`
+    can never disagree with what `fetch()` is actually about to do.
     """
     dsm_path = directory / DSM_ZIP_NAME
     dtm_path = directory / DTM_ZIP_NAME
     return (
-        dsm_path.exists() and dsm_path.stat().st_size > 0
-        and dtm_path.exists() and dtm_path.stat().st_size > 0
+        dsm_path.exists() and dsm_path.stat().st_size == DSM_ZIP_BYTES
+        and dtm_path.exists() and dtm_path.stat().st_size == DTM_ZIP_BYTES
     )
 
 
@@ -347,6 +379,17 @@ class LidarCardiffSource:
         # tmp_path, matching every other BNG-aware source in this
         # package.
         self._ostn15_cache_dir = ostn15_cache_dir
+        # Reset at the top of every fetch(); see sources/base.py's own
+        # documentation of this optional LayerSource extension, and the
+        # module docstring's own note on why this task's review made this
+        # non-optional in practice: without it, package.py's run_survey
+        # has no account to defer a failure on, so an ordinary transient
+        # download failure here would end the whole survey immediately
+        # (SurveyRequest.force defaults to False) rather than letting
+        # later-ordered sources still run and the run fail afterward, the
+        # same deferred IncompleteSurveyError shape lidar_wales.py and
+        # os_uprn.py already get from populating this exact attribute.
+        self.tile_failures: list[TileFailure] = []
 
     # category -> tier, this source's own row of mapgen.resolver's shared
     # table: terrain only (see the module docstring's "Terrain only"
@@ -551,6 +594,24 @@ class LidarCardiffSource:
         temp_path.replace(dest)
         progress.emit("tile_done", source=self.id, tile_id=tile_id)
 
+    def _record_tile_failures(self, tiles: Sequence[Tile], kind: str, reason: str) -> None:
+        """Record why this fetch() could not deliver, once per tile.
+
+        Matches `lidar_wales.py`'s and `os_uprn.py`'s own
+        `_record_tile_failures` exactly, including the reasoning: neither
+        of this source's two units of work (the DSM zip, the DTM zip) is
+        tile-shaped, but package.py's failure handler needs one record per
+        tile the survey actually asked for regardless, so it has something
+        to defer a decision on instead of ending the run on the spot (see
+        `__init__`'s own comment on `self.tile_failures`). `reason` is
+        always composed from `LidarCardiffError`'s own message, which
+        never carries a URL, matching every other source's rule.
+        """
+        self.tile_failures = [
+            TileFailure(source=self.id, tile_id=tile.tile_id, kind=kind, reason=reason)
+            for tile in tiles
+        ]
+
     def fetch(
         self,
         bbox: BBox,
@@ -564,7 +625,7 @@ class LidarCardiffSource:
         their cached paths: `[DSM path, DTM path]`, in that order,
         documented here because a later task's `merge()` reads them.
 
-        `bbox`, `tiles` and `work_dir` are accepted only to satisfy the
+        `bbox` and `work_dir` are accepted only to satisfy the
         LayerSource protocol signature and are not otherwise used: this
         archive is static 2011 data (the module docstring's own "500 m
         lattice" section), fetched and cached whole regardless of which
@@ -574,13 +635,24 @@ class LidarCardiffSource:
         itself, never copied into `work_dir`: they are shared across
         every future survey that ever selects this source, the same
         national-cache shape `os_uprn.py`'s own `fetch()` gives its own
-        one download for the identical reason.
+        one download for the identical reason. `tiles` IS used, though
+        only to know which tiles to blame a failure on
+        (`_record_tile_failures`): see `__init__`'s own comment for why
+        that accounting exists at all for a source with no tile-shaped
+        work.
 
         `cancel` is checked before each of the two zips, never mid
         download: a unit already in flight always finishes, matching
         every other source's own reading of this optional parameter (see
         `sources/base.py`'s `LayerSource` docstring).
+
+        A `LidarCardiffError` from either zip is recorded against every
+        tile in `tiles` (`_classify_lidar_cardiff_error` maps its own
+        `kind` to the shared failure vocabulary) and then re-raised
+        unchanged, the same "record, then raise" shape `os_uprn.py`'s own
+        `fetch()` uses for its own `OsOpenError`.
         """
+        self.tile_failures = []
         if cancel is not None:
             cancel.raise_if_cancelled()
 
@@ -588,11 +660,19 @@ class LidarCardiffSource:
         dsm_path = directory / DSM_ZIP_NAME
         dtm_path = directory / DTM_ZIP_NAME
 
-        self._ensure_zip(DSM_ZIP_URL, DSM_ZIP_BYTES, dsm_path, progress, "dsm")
+        try:
+            self._ensure_zip(DSM_ZIP_URL, DSM_ZIP_BYTES, dsm_path, progress, "dsm")
+        except LidarCardiffError as exc:
+            self._record_tile_failures(tiles, _classify_lidar_cardiff_error(exc), str(exc))
+            raise
 
         if cancel is not None:
             cancel.raise_if_cancelled()
 
-        self._ensure_zip(DTM_ZIP_URL, DTM_ZIP_BYTES, dtm_path, progress, "dtm")
+        try:
+            self._ensure_zip(DTM_ZIP_URL, DTM_ZIP_BYTES, dtm_path, progress, "dtm")
+        except LidarCardiffError as exc:
+            self._record_tile_failures(tiles, _classify_lidar_cardiff_error(exc), str(exc))
+            raise
 
         return [dsm_path, dtm_path]

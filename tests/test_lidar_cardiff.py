@@ -31,16 +31,25 @@ from __future__ import annotations
 
 import socket
 import zipfile
+from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 
 from mapgen.bng import tm_inverse
 from mapgen.cog import MAX_WINDOW_PIXELS
 from mapgen.egrid import PAD_METRES
-from mapgen.geo import BBox
+from mapgen.geo import BBox, Tile
+from mapgen.package import IncompleteSurveyError, SurveyRequest, run_survey
 from mapgen.sources import lidar_cardiff
-from mapgen.sources.base import NullProgress
+from mapgen.sources.base import (
+    FAILURE_UNREACHABLE,
+    Estimate,
+    NullProgress,
+    clear_registry,
+    register,
+)
 from mapgen.sources.lidar_cardiff import (
     COVERAGE_TILES,
     DSM_ZIP_BYTES,
@@ -76,6 +85,19 @@ def _bbox_for_padded_bng_rect(e_min: float, n_min: float, e_max: float, n_max: f
     south, west = tm_inverse(e_sw, n_sw)
     north, east = tm_inverse(e_ne, n_ne)
     return BBox(west=west, south=south, east=east, north=north)
+
+
+def _write_right_size_stub(path, size: int) -> None:
+    """Plain padding bytes, sized to match one of the archive's own byte
+    constants exactly: a fixture for any warm-cache check that only ever
+    looks at `st_size` (`_cache_is_warm`, `_ensure_zip`'s own warm
+    branch) and is never opened as a zip. A short, arbitrary string used
+    to stand in for "already downloaded" here before `_cache_is_warm`
+    was tightened to an exact-size test; this is its exact-size
+    replacement, shared by the estimate()/routing_note() fixtures below
+    and the fetch() fixtures further down.
+    """
+    path.write_bytes(b"\x00" * size)
 
 
 # Comfortably inside ST1177SW (311000-311500, 177000-177500), margin 40 m
@@ -365,8 +387,10 @@ def test_estimate_treats_an_empty_zip_file_as_cold_not_a_valid_resume(tmp_path, 
 
 
 def test_estimate_is_warm_when_both_zips_are_present(tmp_path, monkeypatch):
-    (tmp_path / DSM_ZIP_NAME).write_bytes(b"already-downloaded-dsm")
-    (tmp_path / DTM_ZIP_NAME).write_bytes(b"already-downloaded-dtm")
+    dsm_path = tmp_path / DSM_ZIP_NAME
+    dtm_path = tmp_path / DTM_ZIP_NAME
+    _write_right_size_stub(dsm_path, DSM_ZIP_BYTES)
+    _write_right_size_stub(dtm_path, DTM_ZIP_BYTES)
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
 
@@ -374,6 +398,17 @@ def test_estimate_is_warm_when_both_zips_are_present(tmp_path, monkeypatch):
 
     assert estimate.bytes_estimate == 0
     assert estimate.seconds_estimate == pytest.approx(lidar_cardiff.SECONDS_FLOOR)
+
+    # Consistency, the review's own Minor finding: estimate() calling this
+    # cache warm must agree with what fetch() itself does with the exact
+    # same files, not merely with _cache_is_warm's own, separately
+    # maintained check. A network-refusing session proves fetch() also
+    # treats this fixture as warm: if the two ever disagreed again (one
+    # loosened back to a >0 check, say), this half would fail even though
+    # the assertions above still pass.
+    warm_source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    result = warm_source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+    assert result == [dsm_path, dtm_path]
 
 
 def test_estimate_ignores_bbox_and_tiles_entirely(tmp_path, monkeypatch):
@@ -405,8 +440,8 @@ def test_routing_note_warns_when_the_cache_is_cold(tmp_path, monkeypatch):
 
 
 def test_routing_note_is_none_once_both_zips_are_cached(tmp_path, monkeypatch):
-    (tmp_path / DSM_ZIP_NAME).write_bytes(b"already-downloaded-dsm")
-    (tmp_path / DTM_ZIP_NAME).write_bytes(b"already-downloaded-dtm")
+    _write_right_size_stub(tmp_path / DSM_ZIP_NAME, DSM_ZIP_BYTES)
+    _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
 
@@ -608,8 +643,8 @@ def test_fetch_does_not_download_when_both_zips_are_already_the_right_size(
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     dsm_path = tmp_path / DSM_ZIP_NAME
     dtm_path = tmp_path / DTM_ZIP_NAME
-    dsm_path.write_bytes(b"\x00" * DSM_ZIP_BYTES)
-    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)
+    _write_right_size_stub(dsm_path, DSM_ZIP_BYTES)
+    _write_right_size_stub(dtm_path, DTM_ZIP_BYTES)
 
     source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
     result = source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
@@ -622,7 +657,7 @@ def test_fetch_redownloads_a_wrong_size_cached_zip(tmp_path, monkeypatch):
     dsm_path = tmp_path / DSM_ZIP_NAME
     dtm_path = tmp_path / DTM_ZIP_NAME
     dsm_path.write_bytes(b"stale-partial-download")  # wrong size on purpose
-    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)  # already warm, right size
+    _write_right_size_stub(dtm_path, DTM_ZIP_BYTES)  # already warm, right size
 
     fresh_dsm_bytes = _build_padded_zip(tmp_path / "fresh_dsm_source.zip", "dsm.asc", DSM_ZIP_BYTES)
     session = _ScriptedSession({DSM_ZIP_URL: fresh_dsm_bytes})
@@ -641,7 +676,7 @@ def test_fetch_redownloads_a_wrong_size_cached_zip(tmp_path, monkeypatch):
 def test_fetch_raises_download_kind_with_no_url_on_a_size_mismatch(tmp_path, monkeypatch):
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     dtm_path = tmp_path / DTM_ZIP_NAME
-    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)  # already warm, right size
+    _write_right_size_stub(dtm_path, DTM_ZIP_BYTES)  # already warm, right size
 
     short_body = b"x" * (DSM_ZIP_BYTES - 1)  # one byte short of the constant
     session = _ScriptedSession({DSM_ZIP_URL: short_body})
@@ -662,7 +697,7 @@ def test_fetch_fails_validation_with_the_sources_own_error_for_a_non_zip_payload
 ):
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     dtm_path = tmp_path / DTM_ZIP_NAME
-    dtm_path.write_bytes(b"\x00" * DTM_ZIP_BYTES)  # already warm, right size
+    _write_right_size_stub(dtm_path, DTM_ZIP_BYTES)  # already warm, right size
 
     garbage = b"x" * DSM_ZIP_BYTES  # right length, not a zip at all
     session = _ScriptedSession({DSM_ZIP_URL: garbage})
@@ -676,6 +711,124 @@ def test_fetch_fails_validation_with_the_sources_own_error_for_a_non_zip_payload
     assert excinfo.value.kind == "parse"
     assert not (tmp_path / DSM_ZIP_NAME).exists()
     assert list(tmp_path.glob("*.part")) == []
+
+
+# --------------------------------------------------------------------------
+# tile_failures: the pipeline-safety account. Review finding (Critical):
+# LidarCardiffSource never set this, unlike every other production
+# LayerSource (lidar_wales, os_uprn, os_open, elevation, osm, overture,
+# inspire), so a fetch() failure took package.py's "whole layer failed,
+# nothing to retry" branch and re-raised immediately regardless of
+# request.force, ending the survey before any later-ordered source ever
+# ran. Both tests below prove the fix: the unit-level test that a
+# transport failure records a classified, URL-free TileFailure per tile,
+# and the pipeline-level test that this is what actually lets a real
+# run_survey defer the decision instead of dying on the spot.
+# --------------------------------------------------------------------------
+
+
+class _TransportFailureSession:
+    """A session whose `.get()` always raises a transport-shaped
+    `requests.RequestException`, proving `_ensure_zip`'s own `except
+    requests.RequestException` branch, not only the length-mismatch and
+    zip-validation branches the earlier tests above already cover.
+    """
+
+    def get(self, *args, **kwargs):
+        raise requests.ConnectionError("simulated connection failure")
+
+
+def test_fetch_records_a_classified_tile_failure_with_no_url_on_a_transport_failure(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)  # already warm
+
+    bbox = _any_bbox()
+    tiles = [
+        Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox),
+        Tile(tile_id="r00_c01", row=0, col=1, core_bbox=bbox, query_bbox=bbox),
+    ]
+    source = LidarCardiffSource(session=_TransportFailureSession(), ostn15_cache_dir=tmp_path)
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.fetch(bbox, tiles, tmp_path / "work", NullProgress())
+
+    assert excinfo.value.kind == "download"
+    assert source.tile_failures
+    assert {failure.tile_id for failure in source.tile_failures} == {"r00_c00", "r00_c01"}
+    for failure in source.tile_failures:
+        assert failure.source == "lidar_cardiff"
+        # classify_lidar_cardiff_error's own mapping: a "download" kind
+        # LidarCardiffError is retryable, FAILURE_UNREACHABLE.
+        assert failure.kind == FAILURE_UNREACHABLE
+        assert "http" not in failure.reason.lower()
+        assert DSM_ZIP_URL not in failure.reason
+        assert DTM_ZIP_URL not in failure.reason
+
+
+class _SecondSourceRecordingFetch:
+    """A minimal second LayerSource, registered alongside lidar_cardiff in
+    the pipeline-safety test below: its own `fetch_called` flag is the
+    proof that `run_survey` actually reached it, which it never would if
+    lidar_cardiff's own failure had re-raised immediately instead of
+    being recorded and deferred.
+    """
+
+    id = "stub_second_source"
+    display_name = "Stub Second Source"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self) -> None:
+        self.fetch_called = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress, cancel=None):
+        self.fetch_called = True
+        return []
+
+    def merge(self, parts, out_dir, stem):
+        return []
+
+
+def test_a_fetch_failure_is_deferred_not_fatal_through_a_real_run_survey(tmp_path, monkeypatch):
+    """The review's own pipeline-safety proof, reproduced as a test: with
+    tile_failures populated, a lidar_cardiff download failure must not
+    take package.py's immediate-reraise path (SurveyRequest.force
+    defaults to False). The second, later-ordered source must still run,
+    and the run must end afterward with the deferred IncompleteSurveyError,
+    the same contract lidar_wales.py and os_uprn.py already honour.
+    """
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "lidar_cardiff_cache")
+    clear_registry()
+    try:
+        register(LidarCardiffSource(session=_TransportFailureSession(), ostn15_cache_dir=tmp_path))
+        second_source = _SecondSourceRecordingFetch()
+        register(second_source)
+
+        request = SurveyRequest(
+            bbox=_any_bbox(),
+            region="Test Region",
+            site="Test Site",
+            output_root=tmp_path / "packages",
+            tile_size_m=2000.0,
+            overlap_m=50.0,
+            source_ids=("lidar_cardiff", "stub_second_source"),
+            survey_date=date(2026, 8, 1),
+            run_bridge_step=False,
+        )
+
+        with pytest.raises(IncompleteSurveyError) as excinfo:
+            run_survey(request)
+
+        assert second_source.fetch_called
+        assert "http" not in str(excinfo.value).lower()
+    finally:
+        clear_registry()
 
 
 @pytest.mark.live
