@@ -94,6 +94,40 @@ instance for one survey (never a fresh one in between), so instance
 state is the one route available for a fact `merge()` needs but its own
 protocol signature has no room for.
 
+## Task 5's bridge: how merge() gets real parts from package.py's real pipeline
+
+`package.py`'s `run_survey` never hands `merge()` `fetch()`'s own return
+value: it builds `merge()`'s `parts` argument from a LISTING of whatever
+real files `fetch()` left in the source's own `work_dir`
+(`_existing_output_files`), because a resumed run's merge has to see
+every file a PREVIOUS fetch() call on this same tiling ever produced,
+not only the ones the most recent call happened to return. Every other
+source in this package satisfies that listing by writing its own real
+survey-scoped output straight into `work_dir` (`lidar_wales.py`'s two
+rasters, `os_uprn.py`'s bbox-filtered CSV); this source cannot, because
+its two zips are a shared, NATIONAL cache (`cache_dir()`), not
+survey-scoped work product, and copying 84 MB into every survey's own
+`work_dir` merely to satisfy that listing would undo the entire point of
+caching them once.
+
+`fetch()` therefore writes two tiny pointer files into `work_dir`
+instead, `<DSM_ZIP_NAME>.cache_pointer` and `<DTM_ZIP_NAME>.cache_pointer`,
+each holding nothing but the matching zip's own absolute path in
+`cache_dir()` as plain text (never empty, so `mapgen.merge.
+assert_inputs_present`'s own empty-file check never mistakes one for a
+missing part). `merge()` resolves a pointer back to the real path it
+names via `_resolve_cache_pointer` ONLY when `parts` does not already
+hold the zip directly under its own real name (`DSM_ZIP_NAME`/
+`DTM_ZIP_NAME`): that direct, by-name lookup is tried first and is left
+completely unchanged, which is what keeps every Task 4 test, and any
+future direct caller that already has the two zip paths in hand, working
+with no knowledge that the pointer convention exists at all. Chosen over
+copying, hardlinking or symlinking the whole zip into `work_dir`: a
+pointer costs nothing to write or read and crosses the fetch()/merge()
+process boundary the same way `os_uprn.py`'s own work part does
+(`fetch()` and `merge()` may run in different processes), without
+duplicating a single byte of the 84 MB the national cache already holds.
+
 ## The budget gate lives in fetch(), first, and again in merge()
 
 The over-budget refusal (`_budget_refusal_reason`) fires in TWO places.
@@ -160,7 +194,7 @@ from mapgen.bng import best_effort_padded_bng_extent
 from mapgen.cog import MAX_WINDOW_PIXELS, USER_AGENT, BngWindow
 from mapgen.config import CONFIG_PATH
 from mapgen.egrid import PAD_METRES
-from mapgen.fsutil import ensure_dir
+from mapgen.fsutil import atomic_write_text, ensure_dir
 from mapgen.geo import BBox, Tile
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken
@@ -178,6 +212,20 @@ from mapgen.sources.base import (
 # string this module writes, matching the module docstring's "Terrain
 # only" section.
 FLOWN = "flown 23 March 2011"
+
+# Task 5 of the phase 2b-D plan: the vintage clause survey.json's
+# provenance entry carries for every package that selected this source,
+# verbatim from the plan's own Global Constraints. Built from FLOWN
+# rather than a second, independently typed date, for the identical
+# reason DSM_ZIP_NAME/DTM_ZIP_NAME below are derived from their own URLs
+# rather than retyped: two spellings of the same fact must never have a
+# chance to drift apart. Read by package.py's `_source_provenance`
+# through the same defensive, optional-attribute convention that
+# function already applies to `demtype`, `types` and `routing_note`
+# (`sources/base.py`'s own documented LayerSource convention), so a
+# future source with its own vintage caveat gets identical treatment for
+# free by defining the same attribute.
+VINTAGE_NOTE = f"{FLOWN}; buildings and ground changed since"
 
 # The ten quarter-tile envelopes this source serves, verbatim from the
 # probe (probe-report.md), each with its own gb_ng tile code in a
@@ -240,6 +288,14 @@ DTM_ZIP_BYTES = 38_784_302
 # apart.
 DSM_ZIP_NAME = DSM_ZIP_URL.rsplit("/", 1)[-1]
 DTM_ZIP_NAME = DTM_ZIP_URL.rsplit("/", 1)[-1]
+
+# The work_dir pointer names fetch() writes and merge() resolves back to
+# cache_dir() by (see the module docstring's "Task 5's bridge" section).
+# Derived from DSM_ZIP_NAME/DTM_ZIP_NAME rather than a separate literal,
+# for the same no-second-spelling reason those two are themselves derived
+# from the URLs above.
+_DSM_CACHE_POINTER_NAME = f"{DSM_ZIP_NAME}.cache_pointer"
+_DTM_CACHE_POINTER_NAME = f"{DTM_ZIP_NAME}.cache_pointer"
 
 # The archive's own published pixel size (probe-report.md: "2000x2000
 # cells at 0.5m" for the 2012 50cm flight; this 2011 flight is the 25cm
@@ -456,18 +512,48 @@ def _budget_refusal_reason(pixels: int) -> str:
     )
 
 
+def _resolve_cache_pointer(parts: Sequence[Path], pointer_name: str) -> Path | None:
+    """The real `cache_dir()` path a work_dir pointer file named
+    `pointer_name` names, read straight out of its own text content, or
+    `None` when `parts` holds no file by that name at all.
+
+    See the module docstring's "Task 5's bridge" section: `fetch()`
+    writes `_DSM_CACHE_POINTER_NAME`/`_DTM_CACHE_POINTER_NAME` into
+    `work_dir` holding nothing but the matching zip's own absolute path
+    as plain text, and `merge()` calls this only for whichever of the two
+    zips it did not already find directly, by its own real name, in
+    `parts`. Trusting the pointer's own recorded text rather than
+    recomputing `cache_dir()` here again is deliberate: the path fetch()
+    wrote is the one fact this function needs, and re-deriving it a
+    second, independent way would risk the two falling out of step for
+    no benefit, the identical reasoning `os_uprn.py`'s own module
+    docstring gives for reading OS's published WGS84 columns directly
+    rather than re-projecting them.
+    """
+    pointer = next((part for part in parts if part.name == pointer_name), None)
+    if pointer is None:
+        return None
+    return Path(pointer.read_text(encoding="utf-8").strip())
+
+
 class LidarCardiffSource:
     id = "lidar_cardiff"
     display_name = (
         "LiDAR terrain (Creigiau and Pentyrch, north-west Cardiff, 25 cm, "
         "flown 2011)"
     )
-    licence = "Open Government Licence for Public Sector Information"
+    licence = "Open Government Licence for Public Sector Information (OGL)"
     attribution = (
         "Contains Natural Resources Wales information © Natural "
         "Resources Wales and Database Right. All rights Reserved."
     )
     requires_api_key = False
+    # Task 5 of the phase 2b-D plan: read by package.py's
+    # `_source_provenance` the same defensive, optional-attribute way as
+    # `demtype`/`types`/`routing_note` (see VINTAGE_NOTE's own comment
+    # above), so survey.json's provenance entry for this source carries
+    # the flight date beside its licence and attribution.
+    vintage_note = VINTAGE_NOTE
 
     def __init__(
         self,
@@ -739,21 +825,27 @@ class LidarCardiffSource:
         cancel: CancelToken | None = None,
     ) -> list[Path]:
         """Ensures both archive zips sit in `cache_dir()`, downloading and
-        verifying whichever one is missing or the wrong size, and returns
-        their cached paths: `[DSM path, DTM path]`, in that order,
-        documented here because `merge()` reads them.
+        verifying whichever one is missing or the wrong size, writes a
+        pointer to each one's real path into `work_dir` (Task 5's bridge;
+        see the module docstring's own section), and returns their cached
+        paths directly: `[DSM path, DTM path]`, in that order, documented
+        here because a direct caller's own `merge()` call reads them by
+        name.
 
-        `work_dir` is accepted only to satisfy the LayerSource protocol
-        signature and is not otherwise used: this archive is static 2011
-        data (the module docstring's own "500 m lattice" section),
-        fetched and cached whole regardless of which part of the block a
-        given survey's own extent touches, the same reason `estimate()`
-        above needs neither `bbox` nor `tiles` to answer honestly. The
-        two zips are read back from `cache_dir()` itself, never copied
-        into `work_dir`: they are shared across every future survey that
-        ever selects this source, the same national-cache shape
-        `os_uprn.py`'s own `fetch()` gives its own one download for the
-        identical reason. `bbox` IS used for two things: the budget gate
+        `work_dir` is where package.py's `run_survey` looks to build
+        `merge()`'s real `parts` argument (a directory LISTING, not this
+        return value: see the module docstring's "Task 5's bridge"
+        section for why), so the two zips' own real, national cache
+        paths never touch it, only a pointer to each. This archive is
+        static 2011 data (the module docstring's own "500 m lattice"
+        section), fetched and cached whole regardless of which part of
+        the block a given survey's own extent touches, the same reason
+        `estimate()` above needs neither `bbox` nor `tiles` to answer
+        honestly. The two zips are read back from `cache_dir()` itself,
+        never copied into `work_dir`: they are shared across every future
+        survey that ever selects this source, the same national-cache
+        shape `os_uprn.py`'s own `fetch()` gives its own one download for
+        the identical reason. `bbox` IS used for two things: the budget gate
         immediately below, and remembered on `self._bbox` for `merge()`
         to read later, since that method's own protocol signature has no
         bbox parameter of its own (see the module docstring's "merge():
@@ -817,6 +909,18 @@ class LidarCardiffSource:
             self._record_tile_failures(tiles, _classify_lidar_cardiff_error(exc), str(exc))
             raise
 
+        # Task 5's bridge (see the module docstring's own section): both
+        # zips are confirmed present and right-sized at this point, so a
+        # pointer to each one's real cache_dir() path is written into
+        # work_dir, never the zip itself. Written only after both
+        # _ensure_zip calls above have succeeded, matching every other
+        # "nothing written on a failure path" guarantee in this file: a
+        # budget refusal or a download failure raises before reaching
+        # here, so no pointer is ever left behind for a fetch() that did
+        # not actually finish.
+        atomic_write_text(work_dir / _DSM_CACHE_POINTER_NAME, str(dsm_path))
+        atomic_write_text(work_dir / _DTM_CACHE_POINTER_NAME, str(dtm_path))
+
         return [dsm_path, dtm_path]
 
     # -- merge -------------------------------------------------------------
@@ -836,10 +940,19 @@ class LidarCardiffSource:
         as a second line of defence for a `merge()` reached by some other
         route.
 
-        `parts` holds `fetch()`'s own two zip paths, selected here BY
-        NAME (`DSM_ZIP_NAME`/`DTM_ZIP_NAME`), never by position: the
-        `ElevationSource.merge` lesson every other source's own merge()
-        in this package already follows (`lidar_wales.py`, `os_uprn.py`).
+        `parts` ordinarily holds `fetch()`'s own two zip paths, selected
+        here BY NAME (`DSM_ZIP_NAME`/`DTM_ZIP_NAME`), never by position:
+        the `ElevationSource.merge` lesson every other source's own
+        merge() in this package already follows (`lidar_wales.py`,
+        `os_uprn.py`). package.py's real pipeline hands this a different
+        shape instead, the two work_dir POINTER files Task 5's bridge
+        added (see the module docstring's own section): when neither zip
+        is found directly by name, `_resolve_cache_pointer` reads a
+        matching pointer's own text back to the real `cache_dir()` path
+        it names. The direct, by-name lookup is tried first and always
+        wins when it succeeds, so a caller that already hands this the
+        two real zip paths (every Task 4 test still does) never touches
+        the pointer path at all.
 
         `self._bbox`, set at the top of the most recent `fetch()` call on
         this same instance, is where the extent comes from: see the
@@ -872,6 +985,10 @@ class LidarCardiffSource:
         out_dir = Path(out_dir)
         dsm_zip_path = next((part for part in parts if part.name == DSM_ZIP_NAME), None)
         dtm_zip_path = next((part for part in parts if part.name == DTM_ZIP_NAME), None)
+        if dsm_zip_path is None:
+            dsm_zip_path = _resolve_cache_pointer(parts, _DSM_CACHE_POINTER_NAME)
+        if dtm_zip_path is None:
+            dtm_zip_path = _resolve_cache_pointer(parts, _DTM_CACHE_POINTER_NAME)
         if dsm_zip_path is None or dtm_zip_path is None:
             raise LidarCardiffError(
                 "Both archive zips are needed to build the 25 cm rasters, "

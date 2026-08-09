@@ -1,5 +1,6 @@
 import json
 import math
+import socket
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -11,8 +12,8 @@ from pathlib import Path
 import pytest
 import requests
 
-from mapgen.bng import BngError, to_bng
-from mapgen.cog import BngWindow
+from mapgen.bng import BngError, tm_inverse, to_bng
+from mapgen.cog import BngWindow, CogReader, FileByteSource, read_full_window
 from mapgen.geo import BBox, build_tiles
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken, EventLog, JobState
@@ -30,8 +31,11 @@ from mapgen.package import (
     register_default_sources,
     run_survey,
 )
+from mapgen.sources import lidar_cardiff
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.inspire import INSPIRE_DOWNLOAD_URL_TEMPLATE, InspireSource
+from mapgen.sources.lidar_cardiff import DSM_ZIP_NAME, DTM_ZIP_NAME, LidarCardiffSource
+from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.os_open import OsOpenSource
 from mapgen.sources.os_uprn import OsUprnSource
 from mapgen.sources.base import (
@@ -55,6 +59,12 @@ from tests.test_heights import (
     _constant_window,
     _write_single_building_osm,
     _zero_shift_grid,
+)
+from tests.test_lidar_cardiff import (
+    _build_member_zip,
+    _format_asc_member,
+    _RefusesToConnect,
+    _RefusesToOpenASocket,
 )
 from tests.test_roofs import _gable_windows, _osm_with_building
 
@@ -1663,7 +1673,8 @@ def test_register_default_sources_registers_the_five_default_sources():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_wales", "os_open", "os_uprn", "osm", "overture",
+        "elevation", "inspire", "lidar_cardiff", "lidar_wales", "os_open", "os_uprn",
+        "osm", "overture",
     ]
 
 
@@ -1675,7 +1686,8 @@ def test_register_default_sources_called_twice_is_a_no_op():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_wales", "os_open", "os_uprn", "osm", "overture",
+        "elevation", "inspire", "lidar_cardiff", "lidar_wales", "os_open", "os_uprn",
+        "osm", "overture",
     ]
 
 
@@ -8257,3 +8269,302 @@ def test_bridge_package_re_runs_boundaries_categories_idempotently_and_byte_iden
     assert rebridged == downloaded
     second_bytes = output_path.read_bytes()
     assert second_bytes == first_bytes, "a re-run must produce a byte-identical file"
+
+
+# --------------------------------------------------------------------------
+# Task 5 of the phase 2b-D plan: lidar_cardiff registered, opt-in,
+# provenance recorded. Registration itself is
+# test_register_default_sources_registers_the_five_default_sources above
+# (now naming eight ids, "lidar_cardiff" among them, and read by
+# server.py's own /api/sources as a plain registry listing, so the web
+# checklist needs no code of its own: see LidarCardiffSource's own entry
+# in register_default_sources' docstring). What follows here is the
+# provenance entry, the resolver output shape over a real Creigiau and a
+# real Barry bbox, the deliberate heights/roofs/canopy non-wiring the
+# spec's own 25 cm exclusion demands, and the real fetch-to-merge bridge
+# two prior task reviews (Task 4's own review, and the ledger's Task 5
+# handoff note) flagged as an open gap: package.py builds merge()'s own
+# `parts` from a work_dir LISTING, never fetch()'s return value, and
+# lidar_cardiff's fetch() used to leave nothing there for that listing to
+# find (its two zips live in the national cache, ~/.mapgen/lidar_cardiff,
+# never in a survey's own work_dir).
+# --------------------------------------------------------------------------
+
+
+class LidarCardiffProvenanceStubSource(StubSource):
+    """Carries the real LidarCardiffSource's own licence/attribution/
+    vintage_note under the "lidar_cardiff" id, mirroring
+    OsUprnProvenanceStubSource/InspireProvenanceStubSource above exactly:
+    cheap and network-free, because the fact under test is package.py's
+    own generic getattr read (`_source_provenance`), not this source's
+    real fetch()/merge().
+    """
+
+    def __init__(self):
+        super().__init__(source_id="lidar_cardiff")
+        self.licence = LidarCardiffSource.licence
+        self.attribution = LidarCardiffSource.attribution
+        self.vintage_note = LidarCardiffSource.vintage_note
+
+
+def test_the_lidar_cardiff_provenance_entry_carries_licence_attribution_and_vintage(
+    tmp_path,
+):
+    """survey.json's provenance entry for a package that selected
+    lidar_cardiff must carry the OGL licence, the NRW attribution
+    VERBATIM (the copyright sign included), and a vintage clause naming
+    the archive's own flight date: the same generic getattr read
+    `_source_provenance` already gives `demtype`/`routing_note`, applied
+    here to `vintage_note` for the first time.
+    """
+    register(LidarCardiffProvenanceStubSource())
+    result = run_survey(
+        _request(tmp_path, source_ids=("lidar_cardiff",), run_bridge_step=False)
+    )
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "lidar_cardiff")
+    assert entry["licence"] == "Open Government Licence for Public Sector Information (OGL)"
+    assert entry["attribution"] == (
+        "Contains Natural Resources Wales information © Natural "
+        "Resources Wales and Database Right. All rights Reserved."
+    )
+    assert entry["vintage_note"] == "flown 23 March 2011; buildings and ground changed since"
+
+
+def test_a_source_with_no_vintage_note_carries_no_such_key(tmp_path):
+    """The generic getattr read must leave the key ABSENT, not present
+    holding None, for every source that never defines vintage_note: the
+    identical "present key holding None" trap mapgen.resolver's own
+    module docstring documents avoiding for its "detail" key.
+    """
+    register(StubSource())
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    entry = next(s for s in result.survey["sources"] if s["id"] == "stub")
+    assert "vintage_note" not in entry
+
+
+# --------------------------------------------------------------------------
+# Resolver output shape: mapgen.resolver needs no code change at all
+# (covers()/tier()/detail() are source methods lidar_cardiff.py already
+# defines), but registering the real source for real must actually
+# produce the right shape once it and lidar_wales are both selected over
+# real ground. estimate_survey computes this through the identical
+# resolve() call run_survey's own survey.json uses for its "resolution"
+# key (package.py's own comment on _build_survey_json says so directly),
+# so proving the shape through the cheaper, network-free estimate call
+# proves it for both surfaces.
+# --------------------------------------------------------------------------
+
+# An unpadded 200 x 200 m BNG rectangle, comfortably inside ST1177SW
+# (311000-311500, 177000-177500) and far enough from every one of its
+# four neighbours' own outer edges that a 200 m pad on every side still
+# lands the padded extent's own touched lattice cells wholly inside the
+# solid 3x3 coverage block (lidar_cardiff.py's own module docstring).
+# Independently confirmed live against the real, unmonkeypatched
+# covers(): "full" for lidar_cardiff, "full" for lidar_wales (the
+# whole-Wales mosaic covers this ground too).
+_CREIGIAU_BNG_RECT = (311150.0, 177150.0, 311350.0, 177350.0)
+
+
+def _bbox_from_bng_rect(e_min: float, n_min: float, e_max: float, n_max: float) -> BBox:
+    south, west = tm_inverse(e_min, n_min)
+    north, east = tm_inverse(e_max, n_max)
+    return BBox(west=west, south=south, east=east, north=north)
+
+
+_CREIGIAU_BBOX = _bbox_from_bng_rect(*_CREIGIAU_BNG_RECT)
+
+
+def test_resolution_shows_lidar_cardiff_as_terrain_base_with_lidar_wales_beside_it(
+    tmp_path, monkeypatch
+):
+    """Both selected, both covered: lidar_cardiff's own tier 0 wins the
+    terrain category and becomes "base"; lidar_wales, at tier 1, stays
+    listed beside it as "fill" rather than being dropped just because a
+    better tier exists for the same ground.
+    """
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "cache")
+    register(LidarCardiffSource(ostn15_cache_dir=tmp_path / "ostn15"))
+    register(LidarWalesSource(ostn15_cache_dir=tmp_path / "ostn15"))
+    request = _request(
+        tmp_path, bbox=_CREIGIAU_BBOX, source_ids=("lidar_cardiff", "lidar_wales")
+    )
+
+    estimate = estimate_survey(request)
+
+    terrain = next(c for c in estimate["resolution"] if c["category"] == "terrain")
+    by_id = {s["id"]: s for s in terrain["sources"]}
+    assert set(by_id) == {"lidar_cardiff", "lidar_wales"}
+    assert by_id["lidar_cardiff"]["tier"] == 0
+    assert by_id["lidar_cardiff"]["role"] == "base"
+    assert by_id["lidar_cardiff"]["coverage"] == "full"
+    assert by_id["lidar_wales"]["tier"] == 1
+    assert by_id["lidar_wales"]["role"] == "fill"
+
+
+def test_resolution_over_barry_follows_resolvers_own_none_coverage_rule(tmp_path, monkeypatch):
+    """Barry is real ground lidar_cardiff has no data for at all
+    (covers() == "none"), and mapgen.resolver's own rule for "none" is
+    not "list it with some placeholder role", it is to skip the
+    candidate before it is ever added to the category's own list
+    (resolver.py: `if coverage == "none": continue`, inside the loop that
+    builds `candidates`, before role or tier are ever assigned). Read
+    that rule first, then assert what it actually does: lidar_cardiff is
+    absent from the terrain entry entirely, and lidar_wales (Wales-wide,
+    unaffected by this) is left as the sole, "base" source.
+    """
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "cache")
+    register(LidarCardiffSource(ostn15_cache_dir=tmp_path / "ostn15"))
+    register(LidarWalesSource(ostn15_cache_dir=tmp_path / "ostn15"))
+    request = _request(tmp_path, bbox=BBOX, source_ids=("lidar_cardiff", "lidar_wales"))
+
+    estimate = estimate_survey(request)
+
+    terrain = next(c for c in estimate["resolution"] if c["category"] == "terrain")
+    by_id = {s["id"]: s for s in terrain["sources"]}
+    assert "lidar_cardiff" not in by_id
+    assert by_id["lidar_wales"]["role"] == "base"
+    assert by_id["lidar_wales"]["tier"] == 1
+
+
+# --------------------------------------------------------------------------
+# Deliberate NON-wiring: the spec's own heights-and-roofs-stay-on-a-
+# later-flight exclusion, made structural. lidar_cardiff.py's merge()
+# writes `<stem>_lidar25_dsm.tif`/`<stem>_lidar25_dtm.tif`, never
+# `<stem>_lidar_dsm.tif`/`<stem>_lidar_dtm.tif`; _fuse_heights_step,
+# _fit_roofs_step, _canopy_step and _write_elevation_grid_step all key on
+# the LATTER pair by exact, literal filename, with no glob and no
+# fallback. A package holding only the 25 cm pair must therefore see
+# every one of those steps skip exactly as if no LiDAR were packaged at
+# all: no code change was needed to make this true (it already was), only
+# a test that proves it rather than trusting the filenames never to
+# collide by accident.
+# --------------------------------------------------------------------------
+
+
+class Lidar25OnlyStubSource(StubSource):
+    """Writes a real `.osm` (one flat-roofed building, the identical
+    fixture `LidarHeightsStubSource` above uses) beside a 25 cm raster
+    pair named exactly like `LidarCardiffSource.merge()`'s own real
+    output, never the `_lidar_dtm.tif`/`_lidar_dsm.tif` names the
+    heights/roofs/canopy steps key on.
+    """
+
+    def merge(self, parts, out_dir, stem):
+        osm_path = _write_single_building_osm(
+            out_dir, _BOX_BNG, way_id=501, filename=f"{stem}.osm"
+        )
+        dtm25_path = out_dir / f"{stem}_lidar25_dtm.tif"
+        dsm25_path = out_dir / f"{stem}_lidar25_dsm.tif"
+        write_bng_geotiff(dtm25_path, _constant_window(100.0))
+        write_bng_geotiff(dsm25_path, _constant_window(106.0))
+        return [osm_path, dtm25_path, dsm25_path]
+
+
+def test_the_heights_roofs_and_canopy_steps_ignore_the_25cm_lidar_cardiff_pair(tmp_path):
+    """A package holding ONLY the 25 cm pair (no `_lidar_dtm.tif`/
+    `_lidar_dsm.tif`) must see _fuse_heights_step, _fit_roofs_step and
+    _canopy_step all skip exactly as if no lidar were packaged at all,
+    and the .egrid path (_write_elevation_grid_step) must ignore the 25
+    cm files too, since this stub writes no phase-1 `<stem>.tif` either.
+    """
+    register(Lidar25OnlyStubSource())
+
+    result = run_survey(_request(tmp_path, run_bridge_step=False))
+
+    assert result.survey["lidar_heights"] == {
+        "written": None, "buildings": None, "kept_existing": None,
+        "no_data": None, "error": None,
+    }
+    assert result.survey["roof_forms"] == {
+        "buildings": None, "classified": None, "kept_existing": None,
+        "below_quality": None, "no_data": None, "relations_skipped": None,
+        "shapes": None, "skipped_reason": None, "error": None,
+    }
+    assert result.survey["canopy"] == {
+        "points": None, "skipped_small": None, "resolution_m": None, "error": None,
+    }
+    assert result.survey["elevation_grid"]["written"] is False
+    assert not (result.paths.root / f"{result.paths.stem}.egrid").exists()
+    # The 25 cm files themselves really are in the package: real LiDAR
+    # data present, just not the pair these steps are keyed on.
+    assert (result.paths.root / f"{result.paths.stem}_lidar25_dtm.tif").is_file()
+    assert (result.paths.root / f"{result.paths.stem}_lidar25_dsm.tif").is_file()
+
+
+# --------------------------------------------------------------------------
+# The known gap: two prior task reviews (Task 4's own review, and the
+# ledger's Task 5 handoff note) flagged that package.py builds merge()'s
+# `parts` from a work_dir LISTING, never fetch()'s return value, while
+# lidar_cardiff's fetch() left nothing in work_dir for that listing to
+# find (its two zips live in the national cache, never in a survey's own
+# work_dir). lidar_cardiff.py's fetch()/merge() now bridge that gap with
+# a pair of tiny work_dir pointer files (see that module's own "Task 5's
+# bridge" docstring section); this proves the bridge through the REAL
+# run_survey seam, not a direct call to source.merge() the way every
+# Task 4 test does it.
+# --------------------------------------------------------------------------
+
+
+def test_lidar_cardiff_merges_through_the_real_run_survey_pipeline(tmp_path, monkeypatch):
+    """A synthetic pair of zips staged into a monkeypatched cache_dir, a
+    small real extent wholly inside ST1177SW, and socket.socket itself
+    patched to raise: nothing about this test's own success can be
+    explained by a network request that happened to succeed. Proves the
+    bridge does more than merely avoid crashing: the two output rasters
+    carry the actual staged values back out, sampled at a point well
+    inside the synthetic member's own footprint.
+    """
+    monkeypatch.setattr(socket, "socket", _RefusesToOpenASocket())
+    cache_dir = tmp_path / "lidar_cardiff_cache"
+    cache_dir.mkdir(parents=True)
+
+    # A single small member, well inside both the coverage tile and the
+    # window `_snapped_merge_window` will compute for `_CREIGIAU_BBOX`
+    # (independently confirmed against the real, unmonkeypatched
+    # best_effort_padded_bng_extent: window e 310950.0-311550.25, n
+    # 176949.75-177550.0 at a fresh, empty ostn15_cache_dir), so the
+    # paste actually lands real values rather than leaving the whole
+    # raster NaN.
+    dsm_member = _format_asc_member(311150.0, 177150.0, 8, 8, 0.25, 123456)
+    dtm_member = _format_asc_member(311150.0, 177150.0, 8, 8, 0.25, 100000)
+    dsm_zip = cache_dir / DSM_ZIP_NAME
+    dtm_zip = cache_dir / DTM_ZIP_NAME
+    _build_member_zip(dsm_zip, {"dsm_member.asc": dsm_member})
+    _build_member_zip(dtm_zip, {"dtm_member.asc": dtm_member})
+
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: cache_dir)
+    # The staged fixtures are real, small zips, never the archive's own
+    # real 45 MB/38.8 MB payload: fetch()'s own warm check compares
+    # against the exact byte counts it once downloaded, so those two
+    # constants are monkeypatched down to match what was actually
+    # staged here, the same isolation every offline fetch() test in
+    # test_lidar_cardiff.py already keeps around cache_dir() itself.
+    monkeypatch.setattr(lidar_cardiff, "DSM_ZIP_BYTES", dsm_zip.stat().st_size)
+    monkeypatch.setattr(lidar_cardiff, "DTM_ZIP_BYTES", dtm_zip.stat().st_size)
+
+    source = LidarCardiffSource(
+        session=_RefusesToConnect(), ostn15_cache_dir=tmp_path / "ostn15"
+    )
+    register(source)
+
+    result = run_survey(
+        _request(
+            tmp_path,
+            bbox=_CREIGIAU_BBOX,
+            source_ids=("lidar_cardiff",),
+            run_bridge_step=False,
+        )
+    )
+
+    assert result.complete is True
+    dsm_output = result.paths.root / f"{result.paths.stem}_lidar25_dsm.tif"
+    dtm_output = result.paths.root / f"{result.paths.stem}_lidar25_dtm.tif"
+    assert dsm_output.is_file()
+    assert dtm_output.is_file()
+
+    dsm_window = read_full_window(CogReader.open(FileByteSource(dsm_output)))
+    dtm_window = read_full_window(CogReader.open(FileByteSource(dtm_output)))
+    assert dsm_window.sample_bng(311151.0, 177151.0) == pytest.approx(123.456)
+    assert dtm_window.sample_bng(311151.0, 177151.0) == pytest.approx(100.0)

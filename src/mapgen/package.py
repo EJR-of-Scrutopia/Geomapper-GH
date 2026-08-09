@@ -95,6 +95,7 @@ from mapgen.sources.base import (
 )
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.inspire import BOUNDARY_INDICATIVE_NOTE, InspireSource
+from mapgen.sources.lidar_cardiff import LidarCardiffSource
 from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.os_open import OsOpenSource
 from mapgen.sources.os_uprn import OsUprnSource
@@ -357,11 +358,25 @@ def register_default_sources() -> None:
     download the owner chooses, not a default), and registering it here
     is what makes "Addresses (OS Open UPRN, GB)" appear in the layer
     checklist at all.
+
+    LidarCardiffSource (Task 5 of the phase 2b-D plan) joins the same way
+    once more: opt-in (a one-time, national-cache 84 MB download over a
+    ten-tile, 2.5 sq km corner of north-west Cardiff the owner chooses,
+    mirroring `LidarWalesSource`'s own opt-in surfacing exactly), and
+    registering it here is what makes "LiDAR terrain (Creigiau and
+    Pentyrch, north-west Cardiff, 25 cm, flown 2011)" appear in the layer
+    checklist at all. No `configure()` seam: unlike `os_open`/`os_uprn`/
+    `inspire`, this source has no per-run instance state that needs a
+    fresh lifetime per survey (`tile_failures` and `self._bbox` are both
+    reset at the top of every `fetch()` call, see that method's own
+    docstring), so the one shared, registered instance is safe to reuse
+    across every survey that ever selects it, the identical reasoning
+    `LidarWalesSource` above already relies on.
     """
     by_id = {source.id: source for source in available_sources()}
     for source in (
         OsmSource(), OvertureSource(), ElevationSource(), LidarWalesSource(), InspireSource(),
-        OsOpenSource(), OsUprnSource(),
+        OsOpenSource(), OsUprnSource(), LidarCardiffSource(),
     ):
         existing = by_id.get(source.id)
         if existing is not None and type(existing) is type(source):
@@ -4697,6 +4712,17 @@ def _source_provenance(source, merged_files: Sequence[Path] = ()) -> dict[str, o
     demtype = getattr(source, "demtype", None)
     if demtype is not None:
         entry["demtype"] = demtype
+    # vintage_note is lidar_cardiff.py-specific today (Task 5 of the
+    # phase 2b-D plan), read the same defensive way: a fixed statement of
+    # this source's own flight date, folded in beside licence and
+    # attribution so a package that selected a 2011 archive says so next
+    # to the data itself, not only in the source's own display_name. Any
+    # future source with its own vintage caveat gets the same treatment
+    # for free by defining the same attribute, matching how demtype and
+    # routing_note already work above.
+    vintage_note = getattr(source, "vintage_note", None)
+    if vintage_note is not None:
+        entry["vintage_note"] = vintage_note
     check_routing_note = getattr(source, "routing_note", None)
     if callable(check_routing_note):
         note = check_routing_note()

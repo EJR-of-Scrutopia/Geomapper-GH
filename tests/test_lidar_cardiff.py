@@ -983,6 +983,101 @@ def test_fetch_stores_bbox_on_self_for_merge_to_read_later(tmp_path, monkeypatch
     assert source._bbox is bbox
 
 
+# --------------------------------------------------------------------------
+# Task 5's bridge: fetch() writes a tiny pointer file per zip into
+# work_dir, and merge() resolves a pointer back to the real cache_dir()
+# path when it is not handed the zip directly by name. See the module
+# docstring's own "Task 5's bridge" section for why this exists at all:
+# package.py's real pipeline builds merge()'s parts from a work_dir
+# LISTING (`_existing_output_files`), never fetch()'s own return value,
+# and this source's two zips live in a national cache outside any one
+# survey's own work_dir.
+# --------------------------------------------------------------------------
+
+
+def test_fetch_writes_a_cache_pointer_file_per_zip_into_work_dir(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: cache_dir)
+    _write_right_size_stub(cache_dir / DSM_ZIP_NAME, DSM_ZIP_BYTES)
+    _write_right_size_stub(cache_dir / DTM_ZIP_NAME, DTM_ZIP_BYTES)
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
+    work_dir = tmp_path / "work"
+
+    result = source.fetch(bbox, [], work_dir, NullProgress())
+
+    dsm_pointer = work_dir / lidar_cardiff._DSM_CACHE_POINTER_NAME
+    dtm_pointer = work_dir / lidar_cardiff._DTM_CACHE_POINTER_NAME
+    assert dsm_pointer.is_file()
+    assert dtm_pointer.is_file()
+    # Never empty: mapgen.merge.assert_inputs_present's own empty-file
+    # check would otherwise mistake a pointer for a missing part.
+    assert dsm_pointer.stat().st_size > 0
+    assert dtm_pointer.stat().st_size > 0
+    assert Path(dsm_pointer.read_text(encoding="utf-8").strip()) == result[0]
+    assert Path(dtm_pointer.read_text(encoding="utf-8").strip()) == result[1]
+    assert result == [cache_dir / DSM_ZIP_NAME, cache_dir / DTM_ZIP_NAME]
+
+
+def test_fetch_writes_no_pointer_file_when_the_budget_gate_refuses(tmp_path, monkeypatch):
+    """No partial output on a refusal path: the pointer files are written
+    only after both `_ensure_zip` calls have already succeeded, so a
+    budget refusal (which raises before either zip is even downloaded)
+    must leave `work_dir` without either one.
+    """
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "cache")
+    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    work_dir = tmp_path / "work"
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.fetch(
+            bbox,
+            [Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox)],
+            work_dir,
+            NullProgress(),
+        )
+
+    assert excinfo.value.kind == "budget"
+    assert not work_dir.exists()
+
+
+def test_merge_resolves_a_cache_pointer_back_to_the_real_zip_path(tmp_path, monkeypatch):
+    """`parts` holding the two work_dir pointer files, exactly what
+    package.py's real pipeline hands `merge()` today, resolves back to
+    the real zips in `cache_dir()` and produces the identical output a
+    direct-by-name call (every other merge() test in this file) does.
+    """
+    _patch_padded_extent(monkeypatch, _SEAM_WINDOW_RECT)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+    dsm_zip, dtm_zip = _seam_test_zips(cache_dir)
+    dsm_pointer = tmp_path / "work" / lidar_cardiff._DSM_CACHE_POINTER_NAME
+    dtm_pointer = tmp_path / "work" / lidar_cardiff._DTM_CACHE_POINTER_NAME
+    dsm_pointer.parent.mkdir(parents=True)
+    dsm_pointer.write_text(str(dsm_zip), encoding="utf-8")
+    dtm_pointer.write_text(str(dtm_zip), encoding="utf-8")
+
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    package_dir = tmp_path / "package"
+    outputs = source.merge([dsm_pointer, dtm_pointer], package_dir, "TestSite")
+
+    assert outputs == [
+        package_dir / "TestSite_lidar25_dsm.tif",
+        package_dir / "TestSite_lidar25_dtm.tif",
+    ]
+    dsm_window = read_full_window(CogReader.open(FileByteSource(outputs[0])))
+    # Well inside the west member, away from the seam (1.0 m, per
+    # _seam_test_zips): the identical point
+    # test_merge_pastes_two_members_with_an_exact_seam already samples
+    # for the direct-by-name path, run here through the pointer path
+    # instead.
+    assert dsm_window.sample_bng(311498.5, 177011.0) == pytest.approx(1.0, abs=1e-4)
+
+
 def _patch_padded_extent(monkeypatch, rect: tuple[float, float, float, float]) -> None:
     """Forces `merge()`'s own `best_effort_padded_bng_extent(bbox,
     PAD_METRES, ...)` call to answer `rect` regardless of `bbox`.
