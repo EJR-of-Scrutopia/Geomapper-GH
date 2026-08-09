@@ -333,6 +333,19 @@ def match_footprints(
 OFFSET_CELL_SIZE_M = 25.0
 
 
+# The determinant floor below which the least-squares normal matrix `N`
+# (see `polyline_offsets`'s own docstring, "the least-squares bias
+# correction") is treated as singular: task-3-brief's controller addition
+# pins this exact value. A population sampled from segments that are all
+# (or nearly all) the same orientation makes every per-sample unit normal
+# `n` point the same way (up to sign), so `N = sum(n n^T)` degenerates
+# toward a rank-1 matrix and its determinant toward exactly 0: 1e-9 is far
+# below anything a genuinely two-orientation population produces (the
+# module's own test fixtures clear it by many orders of magnitude) and far
+# above ordinary floating-point noise around a true zero.
+_LSQ_DET_FLOOR = 1e-9
+
+
 @dataclass
 class OffsetStats:
     """The aggregate offset between a densified sample of `ours` and the
@@ -340,19 +353,45 @@ class OffsetStats:
 
     `mean_de`/`mean_dn` is the mean offset vector (theirs minus ours, so a
     positive value means theirs sits further east/north than ours);
-    `magnitude_of_mean` is that vector's own length, the single number this
-    benchmark's epoch-shift question is really asking for.
-    `std_de`/`std_dn` are the population standard deviations of the
-    per-sample offsets on each axis (how consistent the vector is, not how
-    large it is). `p50_abs`/`p90_abs` are percentiles of each individual
-    sample's own offset MAGNITUDE (not of the mean), via `distribution`.
+    `magnitude_of_mean` is that vector's own length. `std_de`/`std_dn` are
+    the population standard deviations of the per-sample offsets on each
+    axis (how consistent the vector is, not how large it is). `p50_abs`/
+    `p90_abs` are percentiles of each individual sample's own offset
+    MAGNITUDE (not of the mean), via `distribution`.
+
+    `lsq_de`/`lsq_dn`/`lsq_magnitude` are the LEAST-SQUARES estimate of the
+    same systematic shift, the benchmark's own primary number for the
+    epoch question (task-3-brief's controller addition, evidence in
+    task-2-review.md): a straight segment's nearest-point projection only
+    ever recovers the component of a shift PERPENDICULAR to that segment
+    (task-2-review.md's own derivation, `offset = (n.s)*n` for an interior
+    sample), so the naive mean vector above UNDERSTATES a true systematic
+    shift `s` whenever the sampled population is not all one orientation:
+    the review measured this exactly, invisible (0.043 of the true value)
+    on a single line parallel to the shift, and exactly half (0.4714
+    against a true 0.9) on a two-orientation grid. The least-squares
+    solve corrects this: `polyline_offsets` accumulates, over every
+    matched sample, the normal-equation terms `N += n n^T` (2x2) and
+    `V += v` (the observed offset vector, which the same derivation shows
+    equals `n n^T . s` exactly for an interior sample, so `N s = V`
+    exactly under the noiseless model), then solves that system by
+    Cramer's rule. `lsq_magnitude` is None whenever `N`'s determinant is
+    under `_LSQ_DET_FLOOR` (a population too close to one orientation to
+    separate the two components of `s`): this implementation reports that
+    case as undefined outright, even in the special case where the true
+    shift happens to lie entirely along the one well-determined axis (a
+    minimum-norm pseudo-inverse could recover that special case, but a
+    real road network's line population is never genuinely
+    single-orientation, so the extra machinery buys nothing this
+    benchmark needs; see the module's own tests for this exact scenario).
 
     `count` is how many densified samples found a neighbour inside
     `search_radius` and contributed to every statistic above;
     `unmatched_samples` is how many did not and contributed to none of
-    them. All eight numeric fields are 0.0 (not fabricated, just inert)
-    when `count` is 0: a caller reading `count == 0` already knows none of
-    the other seven numbers describes anything real.
+    them. The eight non-lsq numeric fields are 0.0 (not fabricated, just
+    inert) when `count` is 0, and all three lsq fields are None in that
+    case too: a caller reading `count == 0` already knows none of the
+    other numbers describes anything real.
     """
 
     count: int
@@ -364,6 +403,9 @@ class OffsetStats:
     std_dn: float
     p50_abs: float
     p90_abs: float
+    lsq_de: float | None
+    lsq_dn: float | None
+    lsq_magnitude: float | None
 
 
 def _densify_polyline(
@@ -449,12 +491,20 @@ def _nearest_theirs_point(
     segments: Sequence[tuple[tuple[float, float], tuple[float, float]]],
     index: dict[Cell, list[int]],
     search_radius: float,
-) -> tuple[float, float] | None:
+) -> tuple[tuple[float, float], int] | None:
     """The nearest point to `sample` among every segment in `segments`
     that `index` (a `OFFSET_CELL_SIZE_M` cell index over those same
     segments' own bounding boxes) places within `sample`'s own cell or one
-    of its neighbours, if that nearest point is within `search_radius`;
-    None otherwise.
+    of its neighbours, paired with that winning segment's own index into
+    `segments`, if the nearest point is within `search_radius`; None
+    otherwise.
+
+    The segment index travels back with the point (not just the point
+    alone, which is all the caller needed before) because `polyline_offsets`
+    now needs the winning segment's own direction too, to build the
+    least-squares bias correction's per-sample unit normal (see that
+    function's own docstring): the nearest-point-on-segment distance alone
+    does not carry which segment produced it.
 
     The neighbourhood span is derived from `search_radius` itself
     (`ceil(search_radius / OFFSET_CELL_SIZE_M)` cells in every direction
@@ -479,6 +529,7 @@ def _nearest_theirs_point(
 
     best_point: tuple[float, float] | None = None
     best_distance: float | None = None
+    best_seg_index: int | None = None
     for seg_index in candidates:
         seg_start, seg_end = segments[seg_index]
         candidate_point = _nearest_point_on_segment(sample, seg_start, seg_end)
@@ -486,9 +537,10 @@ def _nearest_theirs_point(
         if best_distance is None or distance < best_distance:
             best_distance = distance
             best_point = candidate_point
+            best_seg_index = seg_index
 
-    if best_distance is not None and best_distance <= search_radius:
-        return best_point
+    if best_distance is not None and best_distance <= search_radius and best_point is not None:
+        return best_point, best_seg_index
     return None
 
 
@@ -508,6 +560,27 @@ def polyline_offsets(
     A sample with no `theirs` segment inside `search_radius` contributes
     to `unmatched_samples` and to nothing else: no offset is guessed for
     it, matching this module's own "nothing fabricated" standard.
+
+    ## The least-squares bias correction
+
+    Alongside the naive mean this function has always computed, it also
+    solves for the systematic shift `s` a differently-oriented sample
+    population actually supports (`OffsetStats.lsq_de`/`lsq_dn`/
+    `lsq_magnitude`; see that dataclass's own docstring for the full
+    derivation and citation). For every matched sample this loop already
+    has the winning `theirs` segment (`_nearest_theirs_point` now returns
+    its index alongside the point): that segment's own unit direction
+    `t = (te, tn)` gives a unit normal `n = (-tn, te)` (the task-3-brief
+    controller addition's own pinned convention; the sign choice is
+    immaterial, since both `n n^T` and `n (n.s)` are invariant under
+    `n -> -n`). Each sample accumulates `N += n n^T` (a running 2x2
+    symmetric matrix, kept as its three distinct entries `n_xx`, `n_xy`,
+    `n_yy`) and `V += v` (the observed offset vector itself, `(de, dn)`),
+    then after the loop `N s = V` is solved for `s` by Cramer's rule.
+
+    A zero-length winning segment (a degenerate repeated-vertex polyline
+    entry) has no direction to contribute: it is skipped for the purposes
+    of `N`/`V` alone, still counted normally in every other statistic.
     """
     segments = _segments(theirs)
     index: dict[Cell, list[int]] = defaultdict(list)
@@ -526,17 +599,36 @@ def polyline_offsets(
     magnitudes: list[float] = []
     unmatched_samples = 0
 
+    # The least-squares normal-equation accumulators: N as its three
+    # distinct symmetric entries, V as its two components. See the
+    # docstring above and OffsetStats's own for the full derivation.
+    n_xx = n_xy = n_yy = 0.0
+    v_e = v_n = 0.0
+
     for polyline in ours:
         for sample in _densify_polyline(polyline, sample_every):
             nearest = _nearest_theirs_point(sample, segments, index, search_radius)
             if nearest is None:
                 unmatched_samples += 1
                 continue
-            de = nearest[0] - sample[0]
-            dn = nearest[1] - sample[1]
+            nearest_point, seg_index = nearest
+            de = nearest_point[0] - sample[0]
+            dn = nearest_point[1] - sample[1]
             offsets_de.append(de)
             offsets_dn.append(dn)
             magnitudes.append(math.hypot(de, dn))
+
+            seg_start, seg_end = segments[seg_index]
+            tx, ty = seg_end[0] - seg_start[0], seg_end[1] - seg_start[1]
+            t_length = math.hypot(tx, ty)
+            if t_length > 0.0:
+                te, tn = tx / t_length, ty / t_length
+                n_east, n_north = -tn, te
+                n_xx += n_east * n_east
+                n_xy += n_east * n_north
+                n_yy += n_north * n_north
+                v_e += de
+                v_n += dn
 
     count = len(offsets_de)
     if count == 0:
@@ -550,6 +642,9 @@ def polyline_offsets(
             std_dn=0.0,
             p50_abs=0.0,
             p90_abs=0.0,
+            lsq_de=None,
+            lsq_dn=None,
+            lsq_magnitude=None,
         )
 
     mean_de = sum(offsets_de) / count
@@ -557,6 +652,14 @@ def polyline_offsets(
     std_de = math.sqrt(sum((value - mean_de) ** 2 for value in offsets_de) / count)
     std_dn = math.sqrt(sum((value - mean_dn) ** 2 for value in offsets_dn) / count)
     magnitude_dist = distribution(magnitudes, fractions=(0.5, 0.9))
+
+    determinant = n_xx * n_yy - n_xy * n_xy
+    if abs(determinant) < _LSQ_DET_FLOOR:
+        lsq_de = lsq_dn = lsq_magnitude = None
+    else:
+        lsq_de = (v_e * n_yy - n_xy * v_n) / determinant
+        lsq_dn = (n_xx * v_n - n_xy * v_e) / determinant
+        lsq_magnitude = math.hypot(lsq_de, lsq_dn)
 
     return OffsetStats(
         count=count,
@@ -568,6 +671,9 @@ def polyline_offsets(
         std_dn=std_dn,
         p50_abs=magnitude_dist[0.5],
         p90_abs=magnitude_dist[0.9],
+        lsq_de=lsq_de,
+        lsq_dn=lsq_dn,
+        lsq_magnitude=lsq_magnitude,
     )
 
 

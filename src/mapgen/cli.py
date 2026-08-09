@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import traceback
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from mapgen import __version__
+from mapgen.benchmark import BenchmarkError, run_benchmark
+from mapgen.bng import BngError
 from mapgen.categories import (
     CATEGORY_GROUPS,
     ROAD_SUBTYPES,
@@ -30,6 +33,7 @@ from mapgen.elevation_models import (
 )
 from mapgen.geo import BBox, BBoxError, TilingError
 from mapgen.naming import NamingError
+from mapgen.ngd import NgdError
 from mapgen.package import (
     IncompleteSurveyError,
     SurveyRequest,
@@ -444,6 +448,41 @@ def command_bridge(args: argparse.Namespace) -> int:
     return 0 if (payload.get("project_setting") or {}).get("written") else 1
 
 
+def command_benchmark(args: argparse.Namespace) -> int:
+    """`mapgen benchmark <package-dir>`: pull OS NGD survey-grade data over
+    the package's own bbox and write a local, gitignored aggregate report
+    (see `benchmark.py`'s own module docstring for the firewall this
+    command runs behind).
+
+    The key resolves `--key` first, then `OS_NGD_KEY`, matching the
+    brief's own pinned precedence; neither route is ever written to
+    `~/.mapgen/config.json`. Missing both is a two-line refusal naming
+    both routes (no URL, since the standing no-URL-in-messages rule
+    applies here too), non-zero exit, and crucially BEFORE anything below
+    this branch ever runs: no client is built and no socket is ever
+    opened for a package that has no key to use.
+    """
+    key = args.key or os.environ.get("OS_NGD_KEY")
+    if not key:
+        print(
+            "No OS NGD key was given: pass --key, or set the OS_NGD_KEY "
+            "environment variable.",
+            file=sys.stderr,
+        )
+        print(
+            "This benchmark needs a dev-mode OS Data Hub Premium key with "
+            "the NGD Features API added.",
+            file=sys.stderr,
+        )
+        return 1
+
+    out_root = args.out if args.out is not None else Path("benchmarks")
+    md_path, json_path = run_benchmark(args.package_dir, key, out_root)
+    print(f"Report: {md_path}")
+    print(f"Data:   {json_path}")
+    return 0
+
+
 def _install_windowless_safety() -> bool:
     """Redirects sys.stdout/sys.stderr to WINDOWLESS_LOG_PATH when there
     is no console attached, returning True if it actually did so.
@@ -610,6 +649,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bridge.set_defaults(func=command_bridge)
 
+    # Phase 2b item F: compares a package's own open-stack outputs against
+    # OS NGD survey-grade data over the same bbox. Local-only, gitignored
+    # reports (see benchmark.py's own module docstring for the firewall);
+    # never wired into run_survey or bridge_package, since this reads a
+    # package that already exists rather than producing one.
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="Compare a package against OS NGD survey-grade data (dev-mode, local report only).",
+    )
+    benchmark.add_argument(
+        "package_dir", type=Path,
+        help="The survey package folder, the one holding survey.json.",
+    )
+    benchmark.add_argument(
+        "--key", default=None,
+        help="OS Data Hub Premium key. Falls back to the OS_NGD_KEY environment variable.",
+    )
+    benchmark.add_argument(
+        "--out", type=Path, default=None,
+        help="Where the report is written. Defaults to ./benchmarks.",
+    )
+    benchmark.set_defaults(func=command_benchmark)
+
     sources = subparsers.add_parser("sources", help="List available data sources.")
     sources.set_defaults(func=command_sources)
 
@@ -658,6 +720,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         OsmDownloadError,
         OvertureError,
         ElevationError,
+        BenchmarkError,
+        NgdError,
+        BngError,
     ) as exc:
         # A coordinator review's Important 2: this tuple covered a request
         # that could never be BUILT (a bad name, bbox, source id or
@@ -693,6 +758,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # still missing. Its message is several lines rather than one,
         # naming every tile and why, and that is deliberate. It is the
         # command line half of "if nothing then it should say".
+        # BenchmarkError, NgdError and BngError (phase 2b item F) are the
+        # same pattern for `mapgen benchmark`: a package that cannot be
+        # read well enough to compare, an OS NGD pull that failed or was
+        # refused, or an OSTN15 projection that could not place a
+        # coordinate. All three are already plain, one-line messages
+        # engineered never to carry a URL or the NGD key (see ngd.py's and
+        # benchmark.py's own module docstrings), so str(exc) here is once
+        # again what they were always for, not a fallback.
         print(str(exc), file=sys.stderr)
         return 1
     except KeyboardInterrupt:

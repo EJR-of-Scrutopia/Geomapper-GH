@@ -240,6 +240,121 @@ def test_search_radius_wider_than_cell_size_still_finds_a_real_match():
 
 
 # --------------------------------------------------------------------------
+# polyline_offsets: the least-squares bias correction (task-3-brief's
+# controller addition, evidence in task-2-review.md). The naive mean above
+# only ever recovers the component of a shift PERPENDICULAR to whatever
+# segment a sample lands on; these three tests are the review's own two
+# executed demonstrations (the two-orientation grid, and a single line)
+# turned into pinned, hand-checkable assertions against the LSQ fields.
+# --------------------------------------------------------------------------
+
+
+def test_lsq_recovers_true_shift_on_two_orientation_grid_where_naive_mean_does_not():
+    # task-2-review.md's own second demonstration: a purely horizontal and
+    # a purely vertical line, both shifted (+0.9, +0.9), combined into one
+    # population. The naive mean only recovers about half the true shift
+    # (measured there as 0.4714 on each axis against a true 0.9) because a
+    # horizontal segment's projection can only ever reveal the north
+    # component and a vertical segment's only the east one; the
+    # least-squares solve, built from each sample's own segment normal, is
+    # designed to recover the full (0.9, 0.9) instead.
+    #
+    # `theirs` runs well past `ours` at both ends on each axis (-200 to
+    # 300 against ours's own 0 to 100): every `ours` sample's nearest
+    # point then lands strictly INSIDE its `theirs` segment, never
+    # clamped to an endpoint, matching the interior-projection model the
+    # least-squares derivation assumes exactly (see OffsetStats's own
+    # docstring).
+    #
+    # The two lines sit far apart (the vertical one at easting 500, well
+    # clear of the horizontal one's own 0-100 extent and shifted theirs
+    # segment): sharing an origin point would make that one sample
+    # genuinely equidistant from both shifted lines (both offsets have
+    # the same 0.9 m magnitude there), a real tie this test has no
+    # business depending on the implementation's tie-break to resolve.
+    shift_e, shift_n = 0.9, 0.9
+    horizontal_ours = [(0.0, 0.0), (100.0, 0.0)]
+    horizontal_theirs = [(-200.0 + shift_e, shift_n), (300.0 + shift_e, shift_n)]
+    vertical_ours = [(500.0, 0.0), (500.0, 100.0)]
+    vertical_theirs = [(500.0 + shift_e, -200.0 + shift_n), (500.0 + shift_e, 300.0 + shift_n)]
+
+    stats = polyline_offsets(
+        [horizontal_ours, vertical_ours], [horizontal_theirs, vertical_theirs]
+    )
+
+    assert isinstance(stats, OffsetStats)
+    assert stats.unmatched_samples == 0
+    # The naive mean reproduces the review's own measured understatement:
+    # exactly half the true shift here, since every clamping leak is
+    # eliminated by construction (see above).
+    assert stats.mean_de == pytest.approx(0.45, abs=0.001)
+    assert stats.mean_dn == pytest.approx(0.45, abs=0.001)
+    # The least-squares estimate recovers the true shift instead.
+    assert stats.lsq_de == pytest.approx(shift_e, abs=0.01)
+    assert stats.lsq_dn == pytest.approx(shift_n, abs=0.01)
+    assert stats.lsq_magnitude == pytest.approx(math.hypot(shift_e, shift_n), abs=0.01)
+
+
+def test_lsq_is_none_for_a_single_orientation_line_singular_system():
+    # A single straight line gives every sample the same segment direction
+    # (up to sign), so every per-sample unit normal `n` is the same
+    # vector: N = sum(n n^T) is then a scalar multiple of one rank-1
+    # matrix, determinant exactly (up to float noise) zero. The two-vector
+    # shift `s` is genuinely underdetermined from one orientation alone,
+    # so this is reported as undefined rather than guessed.
+    unit = 1.0 / math.sqrt(2.0)
+    length = 100.0
+    end = (length * unit, -length * unit)
+    ours = [[(0.0, 0.0), end]]
+    theirs = [[(0.9, 0.9), (end[0] + 0.9, end[1] + 0.9)]]
+
+    stats = polyline_offsets(ours, theirs)
+
+    assert stats.count > 0
+    assert stats.lsq_de is None
+    assert stats.lsq_dn is None
+    assert stats.lsq_magnitude is None
+
+
+def test_lsq_is_none_even_when_the_single_lines_shift_is_purely_perpendicular():
+    # A single horizontal line, shifted purely north (no east component at
+    # all): every interior sample's own offset lies exactly along that
+    # line's own normal, so in principle the "across" component of the
+    # shift is fully determined by this one orientation alone. This
+    # implementation does not special-case that: N is still a rank-1
+    # matrix (one orientation is one orientation, regardless of which way
+    # the true shift happens to point), so lsq is still reported as
+    # undefined here, not as a partial answer. Documented explicitly
+    # because the brief leaves this choice to the implementation: a
+    # minimum-norm solve could recover the well-determined axis in this
+    # special case, but a real road network is never genuinely
+    # single-orientation, so this module does not carry that extra
+    # machinery for a case its real caller never hits.
+    ours = [[(0.0, 0.0), (50.0, 0.0)]]
+    theirs = [[(0.0, 0.9), (50.0, 0.9)]]
+
+    stats = polyline_offsets(ours, theirs)
+
+    assert stats.count > 0
+    assert stats.mean_dn == pytest.approx(0.9, abs=0.01)
+    assert stats.lsq_de is None
+    assert stats.lsq_dn is None
+    assert stats.lsq_magnitude is None
+
+
+def test_lsq_fields_are_none_when_there_are_no_matches_at_all():
+    ours = [[(0.0, 0.0), (10.0, 0.0)]]
+    theirs = [[(1000.0, 1000.0), (1010.0, 1000.0)]]
+
+    stats = polyline_offsets(ours, theirs, search_radius=1.0)
+
+    assert stats.count == 0
+    assert stats.lsq_de is None
+    assert stats.lsq_dn is None
+    assert stats.lsq_magnitude is None
+
+
+# --------------------------------------------------------------------------
 # distribution
 # --------------------------------------------------------------------------
 

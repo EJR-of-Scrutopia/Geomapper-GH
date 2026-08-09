@@ -37,6 +37,11 @@ desktop.ini
 # SDD scratch workspace (ledger, briefs, review packages)
 .superpowers/
 
+# mapgen benchmark reports (phase 2b item F): OS NGD dev-mode evaluation-key
+# pulls, for internal calibration only. Never a client sees these, never a
+# commit carries one; see src/mapgen/benchmark.py's own module docstring.
+benchmarks/
+
 # Vendored front-end libraries: fetched once and committed, keep despite
 # any broad rule above.
 !src/mapgen/web/static/vendor/*
