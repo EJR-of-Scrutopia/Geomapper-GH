@@ -369,9 +369,29 @@ def register_default_sources() -> None:
     `inspire`, this source has no per-run instance state that needs a
     fresh lifetime per survey (`tile_failures` and `self._bbox` are both
     reset at the top of every `fetch()` call, see that method's own
-    docstring), so the one shared, registered instance is safe to reuse
-    across every survey that ever selects it, the identical reasoning
+    docstring), so the one shared, registered instance is reused across
+    every survey that ever selects it, the identical reasoning
     `LidarWalesSource` above already relies on.
+
+    Reset-on-entry is not, by itself, what makes that sharing safe: a
+    review finding pinned the REAL invariant precisely, because reset-
+    then-overwrite is exactly what a race would look like if two
+    `fetch()`/`merge()` cycles ever ran concurrently on the same
+    instance. What actually makes it safe is `JobManager`'s own
+    single-job-at-a-time contract (`src/mapgen/web/server.py`, its own
+    docstring: "Runs at most one survey job at a time in a background
+    thread"; `start()`, guarded by `self._lock`, raises `JobBusyError`
+    from `ensure_free()` rather than queuing a second job while
+    `self._busy` is still set), enforced in a file neither this module
+    nor `lidar_cardiff.py` references anywhere else. `LidarCardiffSource`
+    is the first source in this package whose `merge()` depends on state
+    `fetch()` left on `self` for a reason its own protocol signature has
+    no room for (`self._bbox`; `LidarWalesSource`'s own `merge()` needs
+    no such state, reading two already-windowed rasters straight out of
+    `work_dir` by name instead), which is what makes this cross-file
+    dependency worth spelling out rather than leaving implicit: a future
+    queueing change to `JobManager` that lets two jobs run at once would
+    silently invalidate this paragraph without ever touching this file.
     """
     by_id = {source.id: source for source in available_sources()}
     for source in (

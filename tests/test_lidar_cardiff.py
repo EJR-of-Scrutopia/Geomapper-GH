@@ -1078,6 +1078,69 @@ def test_merge_resolves_a_cache_pointer_back_to_the_real_zip_path(tmp_path, monk
     assert dsm_window.sample_bng(311498.5, 177011.0) == pytest.approx(1.0, abs=1e-4)
 
 
+def test_merge_raises_a_named_error_for_a_stale_pointer_whose_target_is_gone(tmp_path):
+    """A review finding: a pointer file that is present and non-empty
+    (so `mapgen.merge.assert_inputs_present` sees no problem at all) but
+    whose own recorded cache target has since been deleted (the exact
+    cross-process gap this bridge exists to survive: some other process
+    cleared `cache_dir()` between a `fetch()` and a later, resumed
+    `merge()`) used to surface as a bare, un-kinded `FileNotFoundError`
+    two calls later, deep inside `_assemble_window`'s own
+    `zipfile.ZipFile()` call. Now it raises a named `LidarCardiffError`,
+    kind `"download"` (the healing action is a fresh `fetch()`, not
+    something `merge()` alone can fix), before either zip is ever opened.
+    """
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True)
+    dsm_pointer = work_dir / lidar_cardiff._DSM_CACHE_POINTER_NAME
+    dtm_pointer = work_dir / lidar_cardiff._DTM_CACHE_POINTER_NAME
+    dsm_pointer.write_text(str(tmp_path / "cache" / "gone_dsm.zip"), encoding="utf-8")
+    dtm_pointer.write_text(str(tmp_path / "cache" / "gone_dtm.zip"), encoding="utf-8")
+
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge([dsm_pointer, dtm_pointer], tmp_path / "package", "TestSite")
+
+    assert excinfo.value.kind == "download"
+    assert "http" not in str(excinfo.value).lower()
+    # Names the pointer's own real file name, never the corruption- or
+    # attacker-controlled path text it recorded.
+    assert lidar_cardiff._DSM_CACHE_POINTER_NAME in str(excinfo.value)
+    assert "gone_dsm.zip" not in str(excinfo.value)
+
+
+def test_merge_raises_a_named_error_for_a_pointer_with_garbage_content(tmp_path):
+    """The second review-found failure mode: a pointer file whose own
+    text is not a usable path at all (an embedded NUL byte, the one case
+    this project's own filesystem calls refuse outright) used to surface
+    as a bare, un-kinded `ValueError`. Now it raises a named
+    `LidarCardiffError`, kind `"parse"`, checked explicitly before the
+    text is ever handed to a filesystem call: `Path.is_file()` itself
+    answers a NUL-bearing path with a plain `False` on this project's own
+    Windows target rather than raising (probed directly against this
+    interpreter), which would otherwise fold this case into `"download"`
+    and lose the distinction.
+    """
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True)
+    dsm_pointer = work_dir / lidar_cardiff._DSM_CACHE_POINTER_NAME
+    dtm_pointer = work_dir / lidar_cardiff._DTM_CACHE_POINTER_NAME
+    dsm_pointer.write_text("bad\x00path.zip", encoding="utf-8")
+    dtm_pointer.write_text(str(tmp_path / "cache" / DTM_ZIP_NAME), encoding="utf-8")
+
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge([dsm_pointer, dtm_pointer], tmp_path / "package", "TestSite")
+
+    assert excinfo.value.kind == "parse"
+    assert "http" not in str(excinfo.value).lower()
+    assert lidar_cardiff._DSM_CACHE_POINTER_NAME in str(excinfo.value)
+
+
 def _patch_padded_extent(monkeypatch, rect: tuple[float, float, float, float]) -> None:
     """Forces `merge()`'s own `best_effort_padded_bng_extent(bbox,
     PAD_METRES, ...)` call to answer `rect` regardless of `bbox`.

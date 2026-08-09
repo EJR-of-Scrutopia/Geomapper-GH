@@ -332,10 +332,15 @@ class LidarCardiffError(RuntimeError):
     without one; or when `merge()` itself cannot turn the two zips into
     the 25 cm rasters.
 
-    `kind` is `"download"` (a transport failure, or a downloaded body
-    whose length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly),
+    `kind` is `"download"` (a transport failure, a downloaded body whose
+    length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly, or, a
+    review finding, a work_dir pointer file (Task 5's bridge;
+    `_resolve_cache_pointer`) whose recorded `cache_dir()` target has
+    since gone missing, healable the same way any other `"download"` is,
+    by running the survey again so `fetch()` re-populates the cache),
     `"parse"` (a right-length body that did not open as a non-empty zip;
     a zip member whose header or values `asc_grid.AscGridError` refused;
+    a pointer file whose own recorded text is not a usable path at all;
     or `merge()` missing an input it needs, either the two zip paths or
     `self._bbox`), or `"budget"` (the padded extent's own intersection
     with the coverage envelope needs more pixels at 25 cm than
@@ -529,11 +534,74 @@ def _resolve_cache_pointer(parts: Sequence[Path], pointer_name: str) -> Path | N
     no benefit, the identical reasoning `os_uprn.py`'s own module
     docstring gives for reading OS's published WGS84 columns directly
     rather than re-projecting them.
+
+    A review finding: the pointer's own recorded text is trusted only
+    after it is checked here, not handed back unchecked the way an
+    earlier version of this function did. Two failure modes are
+    validated for and wrapped in a named `LidarCardiffError`, rather than
+    left to raise whatever the filesystem or `Path` itself happens to
+    throw: without this, a STALE pointer (its own recorded cache target
+    gone, the exact cross-process gap this bridge exists to survive: some
+    other process cleared `cache_dir()` between a `fetch()` and a later,
+    resumed `merge()`) used to surface as a bare `FileNotFoundError` two
+    calls later, deep inside `_assemble_window`'s own
+    `zipfile.ZipFile(zip_path)` call, and a pointer whose own text is not
+    a usable path at all (an embedded NUL byte, the one case this
+    project's own filesystem calls refuse outright) used to surface as a
+    bare `ValueError`, both un-named and un-kinded unlike every other
+    failure this module raises.
+
+    `kind="download"` for a pointer whose named file is genuinely
+    missing: the healing action is the same one `"download"` always
+    implies elsewhere in this file, running the survey again so a fresh
+    `fetch()` re-populates `cache_dir()` and overwrites this pointer with
+    a good one; `merge()` alone can never fix this, only a `fetch()` can.
+    `kind="parse"` for a pointer whose own recorded text is not a usable
+    path at all: this is "the input made no sense", the same bucket
+    every other malformed-input raise in this module falls into, checked
+    EXPLICITLY for the embedded-NUL case before the path is ever touched,
+    because `Path.is_file()` itself answers a NUL-bearing path with a
+    plain `False` on this project's own Windows target rather than
+    raising (probed directly against this interpreter), which would
+    otherwise fold this case silently into `"download"` and lose the
+    distinction the brief's own review asked this function to keep. The
+    `try`/`except` around `is_file()` below is a second line of defence
+    for whatever else a stranger platform or a future Python might raise
+    there instead, kept in the same `"parse"` bucket for the identical
+    reason.
+
+    Neither message repeats the pointer's own (corruption- or, in
+    principle, attacker-controlled) recorded text: both name only the
+    pointer's own real file NAME, matching this file's established
+    no-URL rule for every other message it raises.
     """
     pointer = next((part for part in parts if part.name == pointer_name), None)
     if pointer is None:
         return None
-    return Path(pointer.read_text(encoding="utf-8").strip())
+    text = pointer.read_text(encoding="utf-8").strip()
+    if "\x00" in text:
+        raise LidarCardiffError(
+            f"{pointer.name} does not hold a usable file path. Run the "
+            f"survey again so fetch() can rewrite it.",
+            kind="parse",
+        )
+    target = Path(text)
+    try:
+        found = target.is_file()
+    except (OSError, ValueError) as exc:
+        raise LidarCardiffError(
+            f"{pointer.name} does not hold a usable file path. Run the "
+            f"survey again so fetch() can rewrite it.",
+            kind="parse",
+        ) from exc
+    if not found:
+        raise LidarCardiffError(
+            f"{pointer.name} points to a cache file that is no longer "
+            f"there. Run the survey again so fetch() can re-fill the "
+            f"cache.",
+            kind="download",
+        )
+    return target
 
 
 class LidarCardiffSource:
@@ -952,7 +1020,14 @@ class LidarCardiffSource:
         it names. The direct, by-name lookup is tried first and always
         wins when it succeeds, so a caller that already hands this the
         two real zip paths (every Task 4 test still does) never touches
-        the pointer path at all.
+        the pointer path at all. `_resolve_cache_pointer` itself can
+        raise a named `LidarCardiffError` (kind `"download"` for a
+        pointer whose recorded cache target has since gone missing,
+        kind `"parse"` for one whose own text is not a usable path at
+        all: see that function's own docstring), which propagates
+        straight out of this call unchanged, the same "record, then
+        raise" shape every other named failure in this file already
+        follows.
 
         `self._bbox`, set at the top of the most recent `fetch()` call on
         this same instance, is where the extent comes from: see the
