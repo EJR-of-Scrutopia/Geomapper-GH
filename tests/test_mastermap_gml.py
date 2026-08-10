@@ -20,6 +20,7 @@ begin with (see its own module docstring).
 from __future__ import annotations
 
 import io
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -392,3 +393,112 @@ def test_wrong_root_error_names_the_expectation_never_a_url():
 
 def test_master_map_error_is_a_runtime_error():
     assert issubclass(MasterMapError, RuntimeError)
+
+
+# --------------------------------------------------------------------------
+# Review fix-round, Important finding: descriptiveGroup, descriptiveTerm
+# and theme are documented "Multiple" cardinality in OS's own technical
+# specification; a feature carrying more than one of a field must yield
+# ALL of them, in document order, as a list, not silently keep the first
+# and drop the rest.
+# --------------------------------------------------------------------------
+
+_MULTI_VALUED_AREA = (
+    '<osgb:topographicMember><osgb:TopographicArea fid="osgb1000000000099">'
+    "<osgb:descriptiveGroup>General Surface</osgb:descriptiveGroup>"
+    "<osgb:descriptiveGroup>Structure</osgb:descriptiveGroup>"
+    "<osgb:descriptiveTerm>Natural Ground</osgb:descriptiveTerm>"
+    "<osgb:theme>Land</osgb:theme>"
+    "<osgb:theme>Water</osgb:theme>"
+    "<osgb:polygon><gml:Polygon srsName='osgb:BNG'>"
+    "<gml:outerBoundaryIs><gml:LinearRing>"
+    f"<gml:coordinates>{_AREA_OUTER_RING}</gml:coordinates>"
+    "</gml:LinearRing></gml:outerBoundaryIs>"
+    "</gml:Polygon></osgb:polygon>"
+    "</osgb:TopographicArea></osgb:topographicMember>"
+)
+
+
+def test_multi_valued_descriptive_group_and_theme_yield_lists_in_document_order():
+    (feature,) = _features_from_body(_MULTI_VALUED_AREA)
+    assert feature.properties["descriptiveGroup"] == ["General Surface", "Structure"]
+    assert feature.properties["theme"] == ["Land", "Water"]
+    # Only one descriptiveTerm on this feature: still a plain string, not
+    # a single-item list, matching every existing test built before this
+    # finding and the brief's own singular key names.
+    assert feature.properties["descriptiveTerm"] == "Natural Ground"
+
+
+def test_single_valued_properties_are_still_plain_strings_not_lists():
+    area = next(f for f in _main_features() if f.feature_type == "TopographicArea")
+    assert area.properties["descriptiveGroup"] == "General Surface"
+    assert isinstance(area.properties["descriptiveGroup"], str)
+
+
+# --------------------------------------------------------------------------
+# Review fix-round, Critical finding: a real MasterMap Topography file can
+# interleave OTHER member wrapper names (cartographicMember, boundaryMember,
+# departedMember) between topographicMembers, sharing one root the way
+# os_gml.py's own OS Open products never do (one shared featureMember for
+# every feature, in every one of those three products). The reviewer's own
+# executed demonstration found unbounded, linear memory growth when a long
+# run of a skipped wrapper type sits between two real topographic features
+# (their own numbers: ~212 MB peak over a 300,000-member run against a flat
+# ~170 KB band on a homogeneous stream), because the old cleanup fired only
+# on "end" events matching "topographicMember" by name, never on any other
+# wrapper's own "end" event. The fix keys the sweep to iterparse DEPTH
+# instead: any direct child of root, whatever its own name, is cleared on
+# its own "end" event. This test reproduces the reviewer's own shape at a
+# scale a fast unit test can carry (a few thousand skipped members, not
+# 300,000), asserting both that memory stays in a small, bounded band and
+# that the two real features either side of the run still parse correctly.
+# --------------------------------------------------------------------------
+
+
+def _cartographic_member(n: int) -> str:
+    # osgb:cartographicMember wrapping osgb:CartographicText: a real,
+    # documented MasterMap Topography Layer member type this module never
+    # yields features out of, sharing the same root as topographicMember.
+    return (
+        '<osgb:cartographicMember><osgb:CartographicText '
+        f'fid="osgbCARTO{n:012d}">'
+        f"<osgb:textString>Padding label text for member {n:012d}, kept long "
+        "enough that thousands of these unswept would show up clearly under "
+        "tracemalloc if this module ever regressed to sweeping only "
+        "topographicMember by name again.</osgb:textString>"
+        "<osgb:anchorPosition>8</osgb:anchorPosition>"
+        "</osgb:CartographicText></osgb:cartographicMember>"
+    )
+
+
+def test_interleaved_cartographic_members_are_swept_and_features_still_parse():
+    count = 5000
+    body = (
+        _TOPOGRAPHIC_AREA
+        + "".join(_cartographic_member(n) for n in range(count))
+        + _TOPOGRAPHIC_LINE
+    )
+    data = (_WRAPPER_HEAD + body + _WRAPPER_TAIL).encode("utf-8")
+    assert len(data) > 1_000_000  # a run large enough for unswept growth to show
+
+    tracemalloc.start()
+    try:
+        features = list(mastermap_gml.iter_topography_features(io.BytesIO(data)))
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # The two real features either side of 5,000 skipped members still
+    # parse correctly, in document order, unaffected by what sits between
+    # them.
+    assert [f.feature_type for f in features] == ["TopographicArea", "TopographicLine"]
+    assert features[0].feature_id == "osgb1000000000001"
+    assert features[1].feature_id == "osgb1000000000002"
+
+    # A bounded streamer holds roughly one member's worth of tracked
+    # memory at a time, regardless of how many cartographicMembers
+    # separate the two real features. This bound is generous (the
+    # reviewer's own homogeneous-stream control held under 200 KB) but
+    # still far below where 5,000 unswept ~300-byte-plus-overhead members
+    # would land if the old by-name-only sweep regressed back in.
+    assert peak < 3_000_000

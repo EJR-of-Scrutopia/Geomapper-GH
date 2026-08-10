@@ -81,6 +81,28 @@ name only (`_local_name`, `tag.rsplit("}", 1)[-1]`), the same discipline
 DIFFERENT OS Open product namespaces from one shared walk; here the
 namespace that varies is GML's own, not the product's.
 
+## Sweeping every member wrapper, not just the ones this module reads
+
+A MasterMap Topography Layer file is not `os_gml.py`'s own shape in one
+respect that matters for memory, not just for feature dispatch: OS's own
+published material documents SIX member wrapper names sharing one root
+(`topographicMember`, `cartographicMember`, `boundaryMember` and others),
+not the single shared `os:featureMember` every OS Open product uses. This
+module only ever YIELDS features out of `topographicMember`, but it must
+still detach every OTHER member's subtree from `root` as it passes,
+whatever its own wrapper name, or a long run of, say, `cartographicMember`
+label content between two real topographic features accumulates unswept
+for as long as that run lasts, an `O(n)` growth in exactly the memory this
+streaming design exists to bound. `_walk_features` therefore tracks
+nesting DEPTH with a plain counter, incremented on every `"start"` event
+and decremented on every `"end"` one, rather than keying its cleanup to
+`topographicMember` by name: an `"end"` event that brings the counter back
+to zero is, by construction, a direct child of `root` closing, whichever
+wrapper name it carries, and `elem.clear()`/`root.clear()` run for that
+event unconditionally. Only the FEATURE dispatch inside that same branch,
+is this a `topographicMember`, does it wrap a wanted type, stays
+selective; the sweep itself is not.
+
 ## toid: the fid attribute is the TOID, not a separate element
 
 OS's own documentation states this plainly: "The TOID of the feature is
@@ -96,6 +118,29 @@ deliberate, not a redundancy to trim, since a caller reading `properties`
 alone (the shape `benchmark.py`'s own report-building code already reads
 for every other property) should never have to reach into `feature_id`
 just to find the one property MasterMap features are always keyed by.
+
+## descriptiveGroup, descriptiveTerm and theme: Multiple, honestly
+
+OS's own MasterMap Topography Layer technical specification gives
+`descriptiveGroup` (and, separately, `descriptiveTerm`) a documented
+cardinality of "Multiple," not "Single": a feature's classification is,
+in OS's own words, "wholly determined by the feature type, the
+descriptive group(s) and the descriptive term(s)" (plural in the
+original). `theme` is the same shape in practice: MasterMap's own theme
+scheme spans nine themes and a feature legitimately spanning two of them
+(a foreshore themed both `Water` and `Land`, for instance) is a real,
+documented case, not an edge case invented for this module. Silently
+keeping only the first occurrence, `os_gml.py`'s own `_child_text`
+pattern, would be a quiet, undetectable loss of classification data on
+any real extract carrying a multi-valued feature. `properties` therefore
+carries the HONEST shape instead: `descriptiveGroup`, `descriptiveTerm`
+and `theme` are each a plain string when the feature carries exactly one
+(matching the brief's own singular key names, and every existing test
+built before this was found), or a `list[str]` IN DOCUMENT ORDER when it
+carries more than one. A caller that only ever handles the singular case
+will find that out immediately (checking `"Water" in value` behaves very
+differently on a plain string than on a list), rather than silently
+reading a value that quietly dropped every occurrence past the first.
 
 ## Root validation and whole-stream failure
 
@@ -159,6 +204,25 @@ def _child_text_by_local_name(elem: ET.Element, local_name: str) -> str | None:
     if child is None:
         return None
     return child.text
+
+
+def _child_texts_by_local_name(elem: ET.Element, local_name: str) -> list[str | None]:
+    return [child.text for child in elem if _local_name(child.tag) == local_name]
+
+
+def _single_or_list(values: list[str | None]) -> str | list[str | None] | None:
+    # OS's own spec gives descriptiveGroup/descriptiveTerm a documented
+    # "Multiple" cardinality, and theme has the same real shape (a
+    # foreshore themed both Water and Land); see the module docstring's
+    # own section on this. One value stays a plain string (every existing
+    # caller's own assumption, and the brief's own singular key names);
+    # more than one becomes a list, in document order, rather than
+    # silently keeping only the first and dropping the rest.
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return values
 
 
 # --------------------------------------------------------------------------
@@ -244,12 +308,21 @@ def _toid(feature_elem: ET.Element) -> str | None:
     return _child_text_by_local_name(feature_elem, "toid")
 
 
-def _properties(feature_elem: ET.Element) -> dict[str, object]:
+def _properties(feature_elem: ET.Element, toid: str | None) -> dict[str, object]:
+    # toid is computed once by the caller (_walk_features) and passed in
+    # here, rather than this function calling _toid(feature_elem) again
+    # itself: both feature_id and properties["toid"] need the same value,
+    # and re-walking feature_elem.attrib/children a second time to get it
+    # is wasted work for no different answer.
     return {
-        "descriptiveGroup": _child_text_by_local_name(feature_elem, "descriptiveGroup"),
-        "descriptiveTerm": _child_text_by_local_name(feature_elem, "descriptiveTerm"),
-        "theme": _child_text_by_local_name(feature_elem, "theme"),
-        "toid": _toid(feature_elem),
+        "descriptiveGroup": _single_or_list(
+            _child_texts_by_local_name(feature_elem, "descriptiveGroup")
+        ),
+        "descriptiveTerm": _single_or_list(
+            _child_texts_by_local_name(feature_elem, "descriptiveTerm")
+        ),
+        "theme": _single_or_list(_child_texts_by_local_name(feature_elem, "theme")),
+        "toid": toid,
     }
 
 
@@ -269,43 +342,67 @@ def _walk_features(fh) -> Iterator[OsFeature]:
                 f"element is {_local_name(root.tag)!r}, not 'FeatureCollection' in the "
                 "MasterMap namespace every MasterMap Topography GML file uses."
             )
+        depth = 0
         for event, elem in context:
-            if event != "end" or _local_name(elem.tag) != "topographicMember":
+            if event == "start":
+                depth += 1
                 continue
+            depth -= 1
+            if depth != 0:
+                # An "end" event for something other than a direct child
+                # of root (a descendant closing inside a member still
+                # being read): nothing to sweep on its own account. The
+                # member it belongs to sweeps its whole subtree, itself
+                # included, in the branch below once ITS OWN "end" event
+                # brings depth back to zero.
+                continue
+            # elem is a direct child of root: one full member cycle,
+            # whatever ITS OWN local name is (topographicMember, or one of
+            # the other real MasterMap Topography Layer wrapper names this
+            # module never yields features out of: cartographicMember,
+            # boundaryMember, departedMember). elem.clear()/root.clear()
+            # below run for EVERY one of these, not only the ones this
+            # module dispatches on: see the module docstring's own
+            # "sweeping every member wrapper" section for why keying the
+            # sweep to depth, not to the "topographicMember" name, is the
+            # fix a real MasterMap file (six member wrapper names sharing
+            # one root, not os_gml.py's own single shared featureMember)
+            # needs.
             try:
-                if len(elem) == 0:
-                    continue
-                feature_elem = elem[0]
-                local_name = _local_name(feature_elem.tag)
-                if local_name not in _WANTED_TYPES:
-                    continue
-                try:
-                    feature = OsFeature(
-                        feature_id=_toid(feature_elem) or "",
-                        feature_type=local_name,
-                        geometry=_geometry(feature_elem),
-                        properties=_properties(feature_elem),
-                    )
-                except MasterMapError:
-                    raise
-                except Exception:
-                    # A deliberate catch-all, not a named list of exception
-                    # types, for the same reason os_gml.py's own
-                    # _walk_features gives at length in its module
-                    # docstring's "malformed feature content" section:
-                    # enumerating "the exception types we happened to
-                    # think of" has already been proven, on that exact
-                    # task, to miss one.
-                    raise MasterMapError(
-                        f"This MasterMap Topography GML file's {local_name} "
-                        f"{_local_attr(feature_elem, 'fid') or ''!r} carries GML content "
-                        "this reader could not parse (a malformed geometry or property "
-                        "value)."
-                    ) from None
+                feature = None
+                if _local_name(elem.tag) == "topographicMember" and len(elem) > 0:
+                    feature_elem = elem[0]
+                    local_name = _local_name(feature_elem.tag)
+                    if local_name in _WANTED_TYPES:
+                        try:
+                            toid = _toid(feature_elem)
+                            feature = OsFeature(
+                                feature_id=toid or "",
+                                feature_type=local_name,
+                                geometry=_geometry(feature_elem),
+                                properties=_properties(feature_elem, toid),
+                            )
+                        except MasterMapError:
+                            raise
+                        except Exception:
+                            # A deliberate catch-all, not a named list of
+                            # exception types, for the same reason os_gml.
+                            # py's own _walk_features gives at length in
+                            # its module docstring's "malformed feature
+                            # content" section: enumerating "the exception
+                            # types we happened to think of" has already
+                            # been proven, on that exact task, to miss one.
+                            raise MasterMapError(
+                                f"This MasterMap Topography GML file's {local_name} "
+                                f"{_local_attr(feature_elem, 'fid') or ''!r} carries GML "
+                                "content this reader could not parse (a malformed "
+                                "geometry or property value)."
+                            ) from None
             finally:
                 elem.clear()
                 root.clear()
-            yield feature
+            if feature is not None:
+                yield feature
     except ET.ParseError:
         raise MasterMapError(
             "This MasterMap Topography GML stream is not well-formed XML and could not "
@@ -319,10 +416,16 @@ def iter_topography_features(source) -> Iterator[OsFeature]:
     records (`feature_type` the member's own local element name;
     `geometry` GeoJSON-shaped with BNG coordinates; `properties` carrying
     `descriptiveGroup`, `descriptiveTerm`, `theme` and `toid`, `None` for
-    whichever a given feature does not carry). Every other MasterMap
-    Topography member type (`boundaryMember`, `cartographicMember`,
-    `departedMember`) is skipped, exactly like `os_gml.py`'s own readers
-    skip feature types not in their own wanted set.
+    whichever a given feature does not carry, a plain string for exactly
+    one, a `list[str]` in document order for more than one, see the
+    module docstring's own "Multiple, honestly" section). Every other
+    MasterMap Topography member type (`boundaryMember`, `cartographicMember`,
+    `departedMember`) is skipped for YIELDING, exactly like `os_gml.py`'s
+    own readers skip feature types not in their own wanted set, but its
+    subtree is still detached from the tree being parsed as it passes,
+    the same as a wanted one: see the module docstring's own "sweeping
+    every member wrapper" section for why that distinction matters here
+    in a way it does not for `os_gml.py`'s own single-wrapper products.
 
     `source` is either a file path (`str` or `pathlib.Path`, which this
     module opens for reading and closes itself, unlike `os_gml.py`'s own
