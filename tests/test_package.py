@@ -258,6 +258,44 @@ class SucceedsButWritesNothingSource:
         return [out]
 
 
+class SkipsWithReasonStubSource:
+    """Mirrors `lidar_cardiff.py`'s own skip contract exactly: `fetch()`
+    returns an empty list, writes nothing, and records `skipped_reason`
+    rather than raising, the same "two facts stop this source, and
+    neither of them is a failure" shape that module's own docstring
+    describes. `JobState.mark(tile, source, OK)` is what package.py does
+    with a skip like this (see `run_survey`'s own comment on why), which
+    is the whole reason a survey whose only source does this needs its
+    own, distinct test from `SucceedsButWritesNothingSource` above: THAT
+    one is marked FAILED, because nothing there explains the emptiness,
+    and this one is marked OK, because something does.
+    """
+
+    id = "stub"
+    display_name = "Stub Skips With Reason"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self, reason="this extent is outside ground this stub can ever serve"):
+        self._reason = reason
+        self.skipped_reason = None
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.skipped_reason = self._reason
+        for tile in tiles:
+            progress.emit(
+                "tile_skipped", source=self.id, tile_id=tile.tile_id, reason=self._reason
+            )
+        return []
+
+    def merge(self, parts, out_dir, stem):
+        return []
+
+
 class ElevationShapedStubSource:
     """Writes exactly one whole-area file with no tile id in its name, like
     ElevationSource's single TIFF, regardless of how many tiles it is asked
@@ -1012,6 +1050,53 @@ def test_a_source_that_writes_nothing_is_marked_incomplete_not_ok(tmp_path):
     assert result.complete is False
     payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
     assert all(record["stub"] == "failed" for record in payload["tiles"])
+
+
+def test_a_survey_whose_only_source_skips_is_not_reported_complete(tmp_path):
+    """2026-08-12 fix: the real, reported bug. `mapgen survey --source
+    lidar_cardiff --bbox <somewhere uncovered>` used to write `complete:
+    true` over an empty folder and exit 0 (JobState.mark(..., OK) is the
+    only way package.py has to settle a deliberately skipped tile, and
+    JobState's own pending/ok/failed vocabulary has no separate status
+    for a skip), where a no-coverage extent PREVIOUSLY raised and
+    correctly exited 1. This stub reproduces the shape with no real
+    lidar_cardiff geometry needed: one source, selected alone, that skips
+    every tile it is asked for and merges nothing.
+    """
+    register(SkipsWithReasonStubSource())
+    result = run_survey(_request(tmp_path))
+    assert result.complete is False, "an empty package must not report complete"
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["complete"] is False
+    # Every tile is still "ok", not "failed": a skip is not a failure, and
+    # this is the part of the old behaviour that stays exactly as it was
+    # (see the module docstring's own "Two facts stop this source, and
+    # NEITHER of them is a failure" reasoning).
+    assert all(record["stub"] == "ok" for record in payload["tiles"])
+    assert payload["tile_failures"] == []
+    entry = next(s for s in payload["sources"] if s["id"] == "stub")
+    assert entry["skipped_reason"] == "this extent is outside ground this stub can ever serve"
+    assert entry["merged_files"] == []
+    # The folder holds survey.json and an empty layers/ directory (always
+    # created, whether anything ever lands in it) and nothing else: the
+    # empty-folder claim the bug report names, made concrete.
+    root_contents = {p.name: p for p in result.paths.root.iterdir()}
+    assert set(root_contents) == {"survey.json", "layers"}
+    assert list(root_contents["layers"].iterdir()) == []
+
+
+def test_a_survey_with_one_real_source_beside_a_skipped_one_still_completes(tmp_path):
+    """The other half of the fix: a skip beside a source that actually
+    produced something must not drag a genuinely finished package down
+    with it. Only the "merged NOTHING at all" shape is incomplete.
+    """
+    register(StubSource(source_id="real"))
+    register(SkipsWithReasonStubSource())
+    result = run_survey(_request(tmp_path, source_ids=("real", "stub")))
+    assert result.complete is True
+    payload = json.loads(result.paths.survey_json.read_text(encoding="utf-8"))
+    assert payload["complete"] is True
+    assert (result.paths.root / "real.txt").exists()
 
 
 def test_force_run_excludes_leftover_part_files_from_a_hard_kill(tmp_path):

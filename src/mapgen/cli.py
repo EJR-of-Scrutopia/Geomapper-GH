@@ -39,6 +39,7 @@ from mapgen.package import (
     SurveyRequest,
     UnbridgeablePackageError,
     bridge_package,
+    describe_source_skips,
     describe_tile_failures,
     describe_tile_recoveries,
     estimate_survey,
@@ -288,6 +289,15 @@ def _empty_layer_lines(survey: dict) -> list[str]:
     output is. "Nothing was found here" and "we could not get it" are the
     two things this whole task exists to keep apart, and the failures have
     their own lines a few lines below this one.
+
+    A layer with a `skipped_reason` is excluded too, since 2026-08-12,
+    for the identical reason: "nothing was found in this extent" claims a
+    search happened and came up empty, which is not what a skip is. A
+    source that refused to even try (lidar_cardiff over ground its own
+    archive holds nothing for, or over an extent too large for its
+    raster budget) has its own, more specific sentence from
+    describe_source_skips further down `command_survey`, and printing
+    both would say two different things about the same empty file.
     """
     failed = {
         record.get("source") for record in (survey.get("tile_failures") or [])
@@ -295,6 +305,8 @@ def _empty_layer_lines(survey: dict) -> list[str]:
     lines = []
     for entry in survey.get("sources") or []:
         if entry.get("id") in failed:
+            continue
+        if entry.get("skipped_reason"):
             continue
         if entry.get("features_merged") != 0 or entry.get("merged_files"):
             continue
@@ -409,8 +421,32 @@ def command_survey(args: argparse.Namespace) -> int:
     # must not disagree about that (review I2).
     for line in describe_tile_recoveries(result.survey.get("retries") or []):
         print(line, file=sys.stderr)
+    # 2026-08-12 fix: the one thing this summary never said. A source that
+    # deliberately merged nothing (lidar_cardiff over ground it holds no
+    # 25 cm for, today's only example, but describe_source_skips is
+    # generic) recorded its reason on survey.json's own source entry from
+    # the day skips shipped, and nothing ever printed it: a scripted run
+    # whose only selected source skipped produced an empty package with a
+    # clean exit and nothing on screen to say why. Printed unconditionally,
+    # same as the failure and recovery lines above, so a run with nothing
+    # to say here prints nothing.
+    for line in describe_source_skips(result.survey.get("sources") or []):
+        print(f"Skipped: {line}", file=sys.stderr)
     if not result.complete:
-        print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
+        if failures:
+            print("Package is INCOMPLETE. See survey.json for which tiles failed.", file=sys.stderr)
+        else:
+            # No tile actually failed here: every requested source's own
+            # tiles are marked "ok" (JobState has no fourth status for a
+            # deliberate skip to live in), and this is the shape a survey
+            # takes when it merged nothing because every selected source
+            # skipped the whole extent instead. The lines just printed
+            # above already say which and why.
+            print(
+                "Package is INCOMPLETE: nothing was merged. See the skipped "
+                "sources above and survey.json.",
+                file=sys.stderr,
+            )
         return 1
     return 0
 

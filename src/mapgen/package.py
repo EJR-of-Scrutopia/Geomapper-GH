@@ -1244,9 +1244,15 @@ def run_survey(
     # reported_stopped here too, not the control-flow flag: the browser
     # reads this event and survey.json for the same run, and the one thing
     # they must never do is disagree about whether it was stopped.
+    #
+    # survey["complete"], not the raw state.complete: the browser and
+    # survey.json read this exact same run and must never disagree about
+    # whether it actually finished with something to show for itself (see
+    # _build_survey_json's own comment on why "complete" and
+    # state.complete parted ways, 2026-08-12).
     sink.emit(
         "job_finished",
-        complete=state.complete,
+        complete=survey["complete"],
         stopped=reported_stopped,
         root=str(paths.root),
     )
@@ -1284,8 +1290,12 @@ def run_survey(
             )
         )
 
+    # survey["complete"] here too, for the identical reason job_finished
+    # reads it above rather than state.complete directly: this is what
+    # cli.py's command_survey checks for its own exit code, and it must
+    # say the same thing survey.json says about the same run.
     return SurveyResult(
-        paths=paths, complete=state.complete, survey=survey, stopped=reported_stopped
+        paths=paths, complete=survey["complete"], survey=survey, stopped=reported_stopped
     )
 
 
@@ -4123,6 +4133,44 @@ def describe_tile_recoveries(records: Sequence[Mapping[str, object]]) -> list[st
     return lines
 
 
+def describe_source_skips(sources: Sequence[Mapping[str, object]]) -> list[str]:
+    """The account of every source that deliberately merged nothing, as
+    plain lines, one per skipped source: `"<id>: <reason>"`.
+
+    The companion `describe_tile_failures` and `describe_tile_recoveries`
+    already have: a run that has something to say about a source must say
+    it in the terminal, not only inside survey.json, because a scripted
+    run is read from its own output at the time, not opened back up in an
+    editor afterwards. This was the one thing missing from that pair:
+    `_source_provenance` has recorded `skipped_reason` on every survey.json
+    source entry since lidar_cardiff.py's own "Two facts stop this
+    source" skip design, but nothing ever printed it, so a survey whose
+    only selected source skipped produced an EMPTY package with a clean
+    exit and nothing on screen to say why, the exact silence
+    `command_survey` (cli.py) now closes by calling this alongside the
+    other two.
+
+    Reads `sources` (survey.json's own list, or the equivalent list this
+    run built in memory) rather than any tile-level record, because a
+    skip is a whole-source fact, never a per-tile one (see
+    `_source_provenance`'s own docstring on the three-way distinction a
+    reader needs: not selected, merged nothing, or failed; this is the
+    middle one, on purpose): `os_open` skipping one Greenspace tile that
+    needs no work is `tile_skipped` without a `skipped_reason` and is not
+    this function's business, but lidar_cardiff skipping the whole extent
+    IS a `skipped_reason` on its one source entry and belongs here.
+
+    Sorted by source id, matching describe_tile_failures' own sort, so
+    the same run always reads the same way.
+    """
+    lines: list[str] = []
+    for source in sorted(sources, key=lambda entry: str(entry.get("id", ""))):
+        reason = source.get("skipped_reason")
+        if reason:
+            lines.append(f"{source.get('id')}: {reason}")
+    return lines
+
+
 def _tile_has_output(
     files: Sequence[Path], tile_stamped_dirs: set[Path], tile_id: str
 ) -> bool | None:
@@ -4903,6 +4951,45 @@ def _build_survey_json(
         _enrich_os_product_provenance(
             sources_provenance, source_id, getattr(matching_source, "versions_used", None)
         )
+    # 2026-08-12 fix: state.complete alone used to be the whole of
+    # "complete", and JobState.mark(..., OK) is the ONLY way a tile a
+    # source deliberately skipped (lidar_cardiff.py's own "Two facts stop
+    # this source" design) is ever settled, because JobState's own
+    # pending/ok/failed vocabulary has no fourth state for "skipped" to
+    # live in and this fix does not add one (a narrower fix belongs here,
+    # at the survey.json level, not in JobState's own model). A source
+    # marked OK this way was never actually downloaded and merged, so a
+    # survey whose every requested source skipped every tile reached
+    # state.complete == True with NOTHING in `sources_provenance`'s own
+    # `merged_files`, an empty package reporting itself finished: exactly
+    # the fabrication this docstring's own "complete reports the survey
+    # DATA alone" sentence, two paragraphs down, already forbids, and the
+    # real reproduction was `mapgen survey --source lidar_cardiff` over
+    # ground the archive holds nothing for.
+    #
+    # produced_nothing alone is NOT the test: a source that fetched
+    # normally and genuinely found nothing over real ground (an OSM query
+    # against truly empty countryside, no `skipped_reason` at all) is the
+    # established, deliberately honest "complete" shape
+    # test_a_source_that_merged_nothing_writes_no_file_and_the_record_
+    # says_why already pins, and it must stay complete: true, exactly as
+    # it always has: an empty answer about the real world is not the same
+    # claim as a tool that refused to try. `any_skip` is what tells the
+    # two apart. Only a survey that is BOTH (every source, or the only
+    # one, produced no merged files) AND (at least one of them is empty
+    # because it skipped, never because it looked and found nothing) is
+    # the fabrication this fixes.
+    #
+    # Genuinely global, not lidar_cardiff-specific: ANY future source that
+    # can skip a whole extent the same way gets the identical honesty for
+    # free. Also correctly silent about the ordinary partial case, on
+    # purpose: a survey with one working source beside one that skipped
+    # has real files in `merged_files` from the first, so produced_nothing
+    # is False and complete is reported exactly as state.complete already
+    # says, unchanged.
+    produced_nothing = not any(entry.get("merged_files") for entry in sources_provenance)
+    any_skip = any(entry.get("skipped_reason") for entry in sources_provenance)
+    complete = state.complete and not (produced_nothing and any_skip)
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": __version__,
@@ -5000,16 +5087,25 @@ def _build_survey_json(
         # separately below. Folding a bridge failure into complete would
         # give it a second, unrelated meaning: complete already decides
         # whether a folder is safe to reuse or must be suffixed _02 (see
-        # naming.build_package_paths) and whether _work/ gets cleaned up
-        # below. An owner with no Urbano install at all, which is Task 20's
-        # real, reproduced case, would then never see complete: true no
-        # matter how many times every source downloaded cleanly, the folder
-        # would never be considered finished, and _work/ would never be
-        # swept. The data either downloaded completely or it did not; the
-        # bridge either produced Urbano's files or it did not; those are two
-        # different questions and an owner reading this file deserves a
-        # straight answer to each.
-        "complete": state.complete,
+        # naming.build_package_paths). An owner with no Urbano install at
+        # all, which is Task 20's real, reproduced case, would then never
+        # see complete: true no matter how many times every source
+        # downloaded cleanly, the folder would never be considered
+        # finished. The data either downloaded completely or it did not;
+        # the bridge either produced Urbano's files or it did not; those
+        # are two different questions and an owner reading this file
+        # deserves a straight answer to each.
+        #
+        # `complete` here is `state.complete and not produced_nothing`
+        # (see that variable's own comment above), NOT a bare echo of
+        # state.complete: run_survey's own `_work/` cleanup gate still
+        # reads state.complete directly, deliberately unchanged (a source
+        # that has skipped every one of its tiles genuinely has nothing
+        # left to resume, so the scratch directory is still dead weight),
+        # but this key, the one an owner and naming.build_package_paths
+        # both read as "is this package genuinely finished", must not say
+        # so over an empty folder.
+        "complete": complete,
         # stopped (Task 22) is what tells "short because the owner said
         # so" apart from "short because something broke", the distinction
         # complete alone cannot make: it was always a bool covering both

@@ -527,6 +527,52 @@ def _written(name="S_2026-08-01_project_setting.json", layers=("osm",)):
     return {"written": True, "file": name, "layers": list(layers), "error": None}
 
 
+def test_survey_summary_mentions_a_skipped_source_and_exits_1_when_nothing_merged(
+    tmp_path, capsys, monkeypatch
+):
+    """2026-08-12 fix: `mapgen survey --source lidar_cardiff --bbox
+    <somewhere uncovered>` used to write complete: true over an empty
+    folder and exit 0. The reason was already sitting on survey.json's
+    own source entry (`skipped_reason`, recorded since lidar_cardiff.py's
+    skip design shipped); nothing ever printed it, and command_survey's
+    exit code was reading a `complete` that had not yet been corrected to
+    account for it. Both are fixed at once here: run_survey (faked) hands
+    back exactly the shape a real skip-only run now produces.
+    """
+    fake_result = _FakeSurveyResult(
+        paths=_FakePaths(root=tmp_path, project_setting=tmp_path / "unused.json"),
+        complete=False,
+        survey={
+            "bridge": {"attempted": False, "ok": None, "error": None},
+            "project_setting": {"written": False, "file": None, "layers": [], "error": None},
+            "sources": [
+                {
+                    "id": "lidar_cardiff",
+                    "skipped_reason": (
+                        "this extent is outside the ten covered tiles at St Fagans "
+                        "and St Georges-super-Ely, west Cardiff; the 25 cm archive "
+                        "holds nothing here"
+                    ),
+                    "merged_files": [],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr("mapgen.cli.run_survey", lambda *a, **k: fake_result)
+    exit_code = main(_survey_args(tmp_path))
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert (
+        "Skipped: lidar_cardiff: this extent is outside the ten covered tiles"
+        in captured.err
+    )
+    assert "nothing was merged" in captured.err.lower()
+    # The old, generic "nothing was found" line must not ALSO appear for a
+    # source that never actually looked: that line and this one would say
+    # two different things about the same empty file.
+    assert "nothing was found in this extent" not in captured.out
+
+
 def test_survey_summary_names_the_project_setting_and_what_it_carries(
     tmp_path, capsys, monkeypatch
 ):
