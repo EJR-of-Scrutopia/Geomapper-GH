@@ -3228,6 +3228,30 @@ function ok(condition, message) {
     );
   });
 
+  await test("a non-LiDAR source with partial coverage is bulleted, not shown as fully available", async () => {
+    // The owner's own complaint: before this fix, a source that only
+    // half-covers the extent (anything other than "none" or "full") was
+    // treated exactly like "full" everywhere on this panel unless it
+    // happened to be a LiDAR source, which already gets its own "part
+    // only" qualifier from the highlight above. Not covered at all and
+    // only partly covered are both reasons to withdraw "All other layers
+    // available", and both now say so.
+    const entries = cowbridgeCoverage();
+    entries[2] = coverageEntry("inspire", "partial", "registered title extents");
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    const bullets = panelBullets(sandbox);
+    ok(
+      bullets.includes("Property boundaries: part only"),
+      `expected inspire's own partial coverage bulleted, got: ${JSON.stringify(bullets)}`
+    );
+    ok(
+      sandbox.document.getElementById("coverage-all").hidden === true,
+      "the confirmation is a claim, and it is not true with one layer only partly covering"
+    );
+  });
+
   await test("auto-selection ticks every covering source, the heavyweight ones included", async () => {
     // The owner's own decision, taken after being shown the tradeoff: a
     // 619 MB national address file is selected without being ticked by
@@ -3367,6 +3391,64 @@ function ok(condition, message) {
     ok(panelBullets(sandbox).length === 0, `expected no bullets, got: ${JSON.stringify(panelBullets(sandbox))}`);
   });
 
+  await test("the heavy bullet stays short even when its short name collides with another source's", async () => {
+    // lidar_cardiff's own display_name is the real, 79-character one
+    // (COVERAGE_SOURCE_REGISTRY's own comment says so on purpose), and
+    // its short form, "LiDAR terrain", collides with lidar_wales, which
+    // is never heavy and so never appears in this bullet list at all.
+    // Before this fix, that collision made the disambiguated, full name
+    // win here regardless, and the bullet reached 94 characters.
+    const entries = cowbridgeCoverage();
+    entries[4] = coverageEntry("lidar_cardiff", "full", "25 cm at this extent, flown 2011", true);
+    const { sandbox } = await coverageSandbox({
+      entries,
+      estimateSources: [{ id: "lidar_cardiff", bytes_estimate: 84_000_000, seconds_estimate: 6 }],
+    });
+    setField(sandbox, "bbox", ST_FAGANS);
+    setField(sandbox, "region", "Cardiff");
+    setField(sandbox, "site", "St Fagans");
+    await flush(20);
+    const bullets = panelBullets(sandbox);
+    ok(
+      bullets.join(" | ") === "LiDAR terrain: 84 MB first use",
+      `expected the short, uncollided name, got: ${JSON.stringify(bullets)}`
+    );
+    ok(
+      bullets.every((bullet) => bullet.length <= 48),
+      `the heavy bullet has grown back into the 94-character line, got: ${JSON.stringify(bullets)}`
+    );
+  });
+
+  await test("unticking a heavy source clears its bullet at once, with no round trip to wait for", async () => {
+    const { sandbox } = await coverageSandbox({
+      estimateSources: [
+        { id: "osm", bytes_estimate: 1_200_000, seconds_estimate: 20 },
+        { id: "os_uprn", bytes_estimate: 619_000_000, seconds_estimate: 300 },
+      ],
+    });
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    ok(
+      panelBullets(sandbox).join(" | ") === "Addresses: 619 MB first use",
+      `expected the heavy bullet before unticking, got: ${JSON.stringify(panelBullets(sandbox))}`
+    );
+    const boxes = [...sandbox.document.querySelectorAll("#sources input")];
+    const addressesBox = boxes.find((box) => box.value === "os_uprn");
+    addressesBox.checked = false;
+    sandbox.document.getElementById("sources").fire("change");
+    // Deliberately no flush(): renderCoveragePanel is wired to fire
+    // synchronously off the same "change" event, reading the checkbox
+    // state directly, so the bullet must already be gone before the
+    // refreshEstimate() round trip this same event also starts has any
+    // chance to come back.
+    ok(
+      panelBullets(sandbox).length === 0,
+      `expected the bullet cleared the instant the box was unticked, got: ${JSON.stringify(panelBullets(sandbox))}`
+    );
+  });
+
   await test("a failed coverage call falls back to selecting everything, and blocks nothing", async () => {
     const { sandbox } = await coverageSandbox({ status: 500 });
     setField(sandbox, "bbox", COWBRIDGE);
@@ -3382,6 +3464,60 @@ function ok(condition, message) {
       sandbox.document.getElementById("download").disabled === false,
       "an aid that cannot be fetched must never become a gate"
     );
+  });
+
+  await test("one malformed entry in a coverage payload is skipped, the rest still renders", async () => {
+    // Before this fix, every downstream reader reached straight for
+    // entry.id with no guard, so a single `null` in an otherwise
+    // well-formed array threw the moment renderSources touched it,
+    // synchronously and outside the try/catch: the whole extent update
+    // for this rectangle was abandoned, silently, with the checklist and
+    // panel left however they were before.
+    //
+    // Two "none" entries, os_uprn and lidar_cardiff, are the load-bearing
+    // part of this fixture: they must stay UNticked, which they could
+    // only do if the good entries around the bad one are still read
+    // individually rather than the whole payload falling back to
+    // always-select. inspire's own entry is the malformed one; dropping
+    // it leaves that one source with no answer of its own, which the
+    // existing per-source fallback (renderSources' own comment) reads as
+    // "assume covered" exactly as it would for a source /api/coverage
+    // never mentions at all.
+    const entries = [
+      coverageEntry("osm", "full", "traced footprints and centrelines"),
+      coverageEntry("os_uprn", "none", null, true),
+      null,
+      coverageEntry("lidar_wales", "full", "1 m at this extent"),
+      coverageEntry("lidar_cardiff", "none", null, true),
+    ];
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      tickedSources(sandbox).join(",") === "inspire,lidar_wales,osm",
+      `expected the good "none" entries respected and the bad one defaulted, got: ${tickedSources(sandbox)}`
+    );
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: 1 m",
+      `expected the panel to still render from the good entries, got: ${JSON.stringify(
+        panelPart(sandbox, "coverage-lidar")
+      )}`
+    );
+  });
+
+  await test("a coverage payload with nothing usable at all falls back to selecting everything", async () => {
+    // The other half of "degrade rather than vanish": a payload that
+    // survived the fetch but carries not one entry this page can read
+    // (every one missing even a string id) is exactly as unusable as a
+    // failed call, and gets the identical always-select fallback.
+    const { sandbox } = await coverageSandbox({ entries: [null, "garbage", 42, {}] });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      tickedSources(sandbox).length === COVERAGE_SOURCE_REGISTRY.length,
+      `expected the old always-select behaviour back, got: ${tickedSources(sandbox)}`
+    );
+    ok(panelText(sandbox) === "", `expected no panel drawn from a payload with nothing usable: ${panelText(sandbox)}`);
   });
 
   await test("the panel stays a panel: its whole text is short for a fully covered extent", async () => {
@@ -3473,12 +3609,19 @@ function ok(condition, message) {
       };
     }
     if (entry.id === "lidar_cardiff") {
+      // Re-recorded post-2026-08-12: the raster budget that produced the
+      // appended "needs an extent under about 600 x 600 m here" clause
+      // this string carried on the day this fixture was taken is gone
+      // (the owner raised the cap to the coverage envelope's own pixel
+      // count; see lidar_cardiff.py's own module docstring), so a real
+      // server asked about this identical extent today answers with the
+      // plain sentence, unconditionally, same as every other "partial"
+      // answer this source ever gives.
       return {
         id: "lidar_cardiff",
         coverage: "partial",
         heavy: true,
-        detail:
-          "25 cm over part of this extent, flown 2011; 25 cm needs an extent under about 600 x 600 m here",
+        detail: "25 cm over part of this extent, flown 2011",
       };
     }
     if (entry.id === "inspire") return { ...entry, coverage: "partial" };
@@ -3525,20 +3668,29 @@ function ok(condition, message) {
   });
 
   await test("a county-sized extent, against a real server's answer", async () => {
-    // Both LiDAR sources answer "partial" here and the finer one is over
-    // its raster budget, which is the case most easily got wrong: 25 cm
-    // appears in the prose, and 25 cm is not what this extent gets.
+    // Both LiDAR sources answer "partial" here, and since the 2026-08-12
+    // cap correction (lidar_cardiff.py's own module docstring) the finer
+    // one, 25 cm, is what this partial extent actually gets: no budget
+    // qualifier survives to say otherwise, so the finest DELIVERED level
+    // wins the highlight outright and there is nothing left to redraw for.
     const { sandbox } = await coverageSandbox({ entries: LIVE_COUNTY, sources: LIVE_REGISTRY });
     setField(sandbox, "bbox", "-3.90,51.30,-3.10,51.75");
     await flush(10);
     ok(
-      panelPart(sandbox, "coverage-lidar") ===
-        "LiDAR: 16 m at this size, part only draw under 600 m for 25 cm",
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: 25 cm, part only",
       `unexpected highlight: ${JSON.stringify(panelPart(sandbox, "coverage-lidar"))}`
     );
+    // inspire is "partial" here too (a non-LiDAR source), which item D's
+    // fix now surfaces: the confirmation is withdrawn and a bullet names
+    // it, the identical "part only" fragment the LiDAR highlight already
+    // carries for the same fact.
     ok(
-      sandbox.document.getElementById("coverage-all").hidden === false,
-      "partial coverage is coverage: nothing here is unavailable"
+      sandbox.document.getElementById("coverage-all").hidden === true,
+      "a non-LiDAR source with partial coverage must withdraw the confirmation"
+    );
+    ok(
+      panelBullets(sandbox).includes("Property boundaries: part only"),
+      `expected inspire's own partial coverage bulleted, got: ${JSON.stringify(panelBullets(sandbox))}`
     );
     ok(panelText(sandbox).length <= 120, `the panel has grown to ${panelText(sandbox).length} characters`);
   });
