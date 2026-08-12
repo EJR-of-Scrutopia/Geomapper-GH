@@ -2,12 +2,17 @@ import pytest
 
 from mapgen.categories import (
     ALL_CATEGORY_IDS,
+    CARRIAGEWAY_HIGHWAY_VALUES,
     CATEGORY_GROUPS,
+    PATH_HIGHWAY_VALUES,
+    ROAD_FAMILY_CARRIAGEWAY,
+    ROAD_FAMILY_PATH,
     ROAD_SUBTYPES,
     EmptyCategorySelectionError,
     UnknownCategoryError,
     osm_tag_clauses,
     overture_types_for_categories,
+    road_family,
     validate_categories,
 )
 from mapgen.sources.overture import DEFAULT_OVERTURE_TYPES
@@ -64,8 +69,36 @@ def test_osm_tag_clauses_translates_footpath_to_the_real_osm_tag_value():
     # label is not the tag value, and a filter built from the label
     # literally would match nothing in real OSM data.
     clauses = osm_tag_clauses(["footpath"])
-    assert clauses == ['["highway"~"^(footway)$"]']
+    assert clauses == ['["highway"~"^(footway|path|bridleway|steps)$"]']
     assert "footpath" not in clauses[0]
+
+
+def test_osm_tag_clauses_footpath_covers_path_bridleway_and_steps_not_only_footway():
+    # The defect this pins: "footpath" resolved to ("footway",) alone, so
+    # a survey that narrowed its categories and ticked Footpath silently
+    # lost highway=path, highway=bridleway and highway=steps. The
+    # selection was honoured exactly as written, the filter matched
+    # nothing for those three, and nothing anywhere said a category the
+    # person ticked had come back short. Measured on the Cowbridge
+    # benchmark package that is 28 of 156 path ways (23 path, 5 steps).
+    clause = osm_tag_clauses(["footpath"])[0]
+    for value in ("footway", "path", "bridleway", "steps"):
+        assert value in clause
+
+
+def test_the_sibling_road_entries_carry_every_value_their_own_label_promises():
+    # Read at the same time as the footpath fix, so a second entry short
+    # in the same way cannot sit unnoticed behind a passing suite.
+    # cycleway, track and service each spell exactly one real OSM highway
+    # value; residential spells one too (living_street is its own named
+    # class, not a spelling of "residential"); the four classed roads
+    # carry their own _link variants.
+    assert osm_tag_clauses(["cycleway"]) == ['["highway"~"^(cycleway)$"]']
+    assert osm_tag_clauses(["track"]) == ['["highway"~"^(track)$"]']
+    assert osm_tag_clauses(["residential"]) == ['["highway"~"^(residential)$"]']
+    assert osm_tag_clauses(["trunk"]) == ['["highway"~"^(trunk|trunk_link)$"]']
+    assert osm_tag_clauses(["primary"]) == ['["highway"~"^(primary|primary_link)$"]']
+    assert osm_tag_clauses(["secondary"]) == ['["highway"~"^(secondary|secondary_link)$"]']
 
 
 def test_osm_tag_clauses_includes_link_variants_for_classed_roads():
@@ -256,3 +289,65 @@ def test_unknown_category_error_is_a_value_error():
     # TilingError are also subclasses of it) as "a request problem to
     # report plainly, not a traceback."
     assert issubclass(UnknownCategoryError, ValueError)
+
+
+# --------------------------------------------------------------------------
+# The carriageway/path reading of the same table (road_family): what the
+# OS benchmark needs so a pavement is never measured against a
+# carriageway centreline as though the difference were a survey
+# disagreement.
+# --------------------------------------------------------------------------
+
+
+def test_road_family_reads_every_carriageway_class_as_a_carriageway():
+    for value in (
+        "motorway",
+        "motorway_link",
+        "trunk",
+        "trunk_link",
+        "primary",
+        "primary_link",
+        "secondary",
+        "secondary_link",
+        "tertiary",
+        "tertiary_link",
+        "unclassified",
+        "residential",
+        "living_street",
+        "service",
+    ):
+        assert road_family(value) == ROAD_FAMILY_CARRIAGEWAY, value
+
+
+def test_road_family_reads_every_path_class_as_a_path():
+    for value in ("footway", "path", "bridleway", "steps", "cycleway", "track"):
+        assert road_family(value) == ROAD_FAMILY_PATH, value
+
+
+def test_road_family_answers_none_for_a_highway_value_in_neither_family():
+    # None is a real answer, not a failure: a caller counts these rather
+    # than folding them into whichever family happened to be nearest.
+    for value in ("construction", "proposed", "pedestrian", "bus_stop", "raceway"):
+        assert road_family(value) is None, value
+
+
+def test_no_highway_value_belongs_to_both_families():
+    assert not (CARRIAGEWAY_HIGHWAY_VALUES & PATH_HIGHWAY_VALUES)
+
+
+def test_the_two_families_are_derived_from_the_one_road_table_not_retyped():
+    # Every value either family holds for a subtype that HAS a category
+    # id comes from _ROAD_HIGHWAY_VALUES itself, which is what stops the
+    # footpath fix above from needing to be made twice. The proof: the
+    # four values that fix added are all in PATH_HIGHWAY_VALUES without
+    # anything else having been edited to put them there.
+    for value in ("footway", "path", "bridleway", "steps"):
+        assert value in PATH_HIGHWAY_VALUES, value
+    # And every selectable road subtype id lands in exactly one family.
+    for subtype_id, _label in ROAD_SUBTYPES:
+        clause = osm_tag_clauses([subtype_id])[0]
+        families = {
+            road_family(value)
+            for value in clause.split('"^(')[1].split(')$"')[0].split("|")
+        }
+        assert families in ({ROAD_FAMILY_CARRIAGEWAY}, {ROAD_FAMILY_PATH}), subtype_id

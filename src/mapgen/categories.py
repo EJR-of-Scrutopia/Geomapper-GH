@@ -168,10 +168,12 @@ def validate_categories(categories: Sequence[str] | None) -> None:
 
 # --- OSM: Overpass tag filtering -------------------------------------------
 #
-# The UI's category ids do not always spell the real OSM tag value: OSM
-# tags a footpath highway=footway, not highway=footpath. "footpath" is the
-# id shown to a person; the translation to the real tag value lives here,
-# once, so a filter built from these never silently matches nothing.
+# The UI's category ids do not always spell the real OSM tag values: OSM
+# tags a footpath highway=footway, not highway=footpath, and spells the
+# same idea four different ways besides. "footpath" is the id shown to a
+# person; the translation to the real tag values lives here, once, so a
+# filter built from these never silently matches nothing and never
+# silently matches only part of what its own label promises.
 #
 # motorway/trunk/primary/secondary each pull in their own "_link" variant
 # (motorway_link, and so on): these are the short connecting roads at a
@@ -180,6 +182,26 @@ def validate_categories(categories: Sequence[str] | None) -> None:
 # gaps at every junction in an otherwise-selected road class, which is a
 # worse outcome than the alternative of a name that only approximately
 # matches ("motorway" pulling in one closely related tag alongside it).
+#
+# "footpath" carries FOUR tag values, not one. OSM spreads what a person
+# calls a footpath across highway=footway (a made pavement or footpath),
+# highway=path (an unspecified way, the usual tag for a field or wood
+# path), highway=bridleway (a way a horse may use, which a person walks
+# too) and highway=steps (a flight of steps, which is a footpath with a
+# gradient). Listing only "footway" made a narrowed survey lose the other
+# three silently: the selection was honoured exactly as written, the
+# Overpass filter matched nothing for them, and nothing anywhere said a
+# category the person ticked had come back short. Measured on the
+# Cowbridge benchmark package, that is 28 of 156 path ways (23 path, 5
+# steps) missing from a survey that ticked Footpath.
+#
+# The sibling entries were read for the same omission at the same time.
+# "cycleway", "track" and "service" each spell exactly one real OSM
+# highway value and there is nothing to add to them; "residential" spells
+# one too (highway=living_street is its own named class with its own
+# meaning, not a spelling of "residential", so pulling it in here would
+# widen a category rather than complete it); the four classed roads above
+# already carry their own "_link" variants. Only "footpath" was short.
 _ROAD_HIGHWAY_VALUES: dict[str, tuple[str, ...]] = {
     "motorway": ("motorway", "motorway_link"),
     "trunk": ("trunk", "trunk_link"),
@@ -187,10 +209,88 @@ _ROAD_HIGHWAY_VALUES: dict[str, tuple[str, ...]] = {
     "secondary": ("secondary", "secondary_link"),
     "residential": ("residential",),
     "service": ("service",),
-    "footpath": ("footway",),
+    "footpath": ("footway", "path", "bridleway", "steps"),
     "cycleway": ("cycleway",),
     "track": ("track",),
 }
+
+
+# --- Roads: carriageway or path ---------------------------------------------
+#
+# One further reading of the same table, for a caller that does not care
+# which road CLASS a way is but does care whether a vehicle drives on it.
+# The OS benchmark (`mapgen.benchmark`) needs exactly that split: NGD's
+# roadlink collection holds carriageway centrelines and nothing else, so
+# a pavement, a field path or a flight of steps has no counterpart in it
+# to be offset FROM. Measuring one against the nearest roadlink anyway
+# does not measure survey disagreement, it measures the width of the
+# street, and a pavement on the north side of a road and one on the south
+# side produce offset vectors of opposite sign that cancel, dragging a
+# least-squares estimate toward zero and making two datasets look like
+# they agree better than they do.
+#
+# Derived from `_ROAD_HIGHWAY_VALUES` above rather than written out again:
+# a second hand-typed list of highway values is exactly the drift this
+# module exists to prevent, and the "footpath" fix above would have had
+# to be made twice.
+ROAD_FAMILY_CARRIAGEWAY = "carriageway"
+ROAD_FAMILY_PATH = "path"
+
+_CARRIAGEWAY_SUBTYPE_IDS: tuple[str, ...] = (
+    "motorway",
+    "trunk",
+    "primary",
+    "secondary",
+    "residential",
+    "service",
+)
+_PATH_SUBTYPE_IDS: tuple[str, ...] = ("footpath", "cycleway", "track")
+
+# Real carriageway classes this vocabulary has no selectable id for at
+# all. tertiary sits between secondary and residential in the OSM road
+# hierarchy, unclassified is the standard tag for a minor public road
+# below tertiary (the commonest rural and back-street class in Britain),
+# and living_street is a residential street where a pedestrian has
+# priority. None of the three has a category id here, so none can be
+# reached through `_ROAD_HIGHWAY_VALUES`; they are named here so that a
+# CARRIAGEWAY reading of a real OSM extract is complete even though a
+# CATEGORY selection cannot yet ask for them. Measured on the Cowbridge
+# benchmark package: 9 unclassified and 3 tertiary ways, which a
+# carriageway population that ignored this list would have lost.
+_UNCATEGORISED_CARRIAGEWAY_VALUES: tuple[str, ...] = (
+    "tertiary",
+    "tertiary_link",
+    "unclassified",
+    "living_street",
+)
+
+CARRIAGEWAY_HIGHWAY_VALUES: frozenset[str] = frozenset(
+    [value for subtype in _CARRIAGEWAY_SUBTYPE_IDS for value in _ROAD_HIGHWAY_VALUES[subtype]]
+    + list(_UNCATEGORISED_CARRIAGEWAY_VALUES)
+)
+PATH_HIGHWAY_VALUES: frozenset[str] = frozenset(
+    value for subtype in _PATH_SUBTYPE_IDS for value in _ROAD_HIGHWAY_VALUES[subtype]
+)
+
+
+def road_family(highway_value: str) -> str | None:
+    """`ROAD_FAMILY_CARRIAGEWAY`, `ROAD_FAMILY_PATH`, or None for a
+    `highway=*` tag value in neither family.
+
+    None is a real answer, not a failure: OSM's `highway` key carries
+    values that are neither a carriageway nor a path (highway=bus_stop
+    is a point of street furniture, highway=construction and
+    highway=proposed are ways that are not open, highway=pedestrian is a
+    square or a precinct rather than a line a vehicle drives). A caller
+    that needs to know how many it left out can count the Nones rather
+    than have them quietly folded into whichever family happened to be
+    nearest, which is what makes the split visible instead of silent.
+    """
+    if highway_value in CARRIAGEWAY_HIGHWAY_VALUES:
+        return ROAD_FAMILY_CARRIAGEWAY
+    if highway_value in PATH_HIGHWAY_VALUES:
+        return ROAD_FAMILY_PATH
+    return None
 
 # Overpass tag-filter clause bodies (the part of nwr[...] inside the
 # brackets) for the six non-road leaf categories. A first-pass tag
