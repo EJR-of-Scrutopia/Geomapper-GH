@@ -929,6 +929,38 @@ little it would add. To build it:
 dotnet build tools/UrbanoBridge/UrbanoBridge.csproj
 ```
 
+## Benchmarking against OS NGD
+
+`mapgen benchmark <package-dir>` compares a package's own open-stack outputs
+(OSM buildings and roads, plus whatever Overture/OS OpenMap Local footprints
+`fuse_missing_buildings` injected) against Ordnance Survey's own survey-grade
+National Geographic Database over the same extent: matched building
+fractions and IoU, road centreline offsets, and an epoch-shift verdict (see
+`docs/superpowers/specs/2026-08-06-epoch-shift-note.md`). It needs an OS Data
+Hub Premium key, development mode, with the NGD Features API added to the
+project; supply it with `--key` or the `OS_NGD_KEY` environment variable
+(`--key` wins if both are given), never through `~/.mapgen/config.json`.
+
+```powershell
+$env:OS_NGD_KEY = "your-dev-mode-key"
+mapgen benchmark "C:\Surveys\South-Wales\2026-08-06_Cowbridge-with-Llanblethian"
+```
+
+Reports (`report.md` and `report.json`) are written under `benchmarks/` by
+default (`--out` to choose elsewhere), local only: `benchmarks/` is
+gitignored and nothing under it is ever meant to be committed or shipped.
+
+The firewall this command runs behind is binding, not a suggestion: premium
+NGD geometry, feature ids and attribute values are read into memory, turned
+into aggregate counts and statistics, and discarded; nothing from the pull
+itself, only class names and numbers, ever reaches the report, and nothing
+from either report ever reaches a package directory or a client. `ngd.py`,
+the client that talks to NGD, never writes to disk at all, by construction.
+
+A development-mode project throttles to 50 transactions per minute per API;
+`mapgen benchmark` paces its own requests to stay under that, and honours a
+`Retry-After` header with one bounded retry if the ceiling is hit anyway.
+
 ## Tests
 
 Python:

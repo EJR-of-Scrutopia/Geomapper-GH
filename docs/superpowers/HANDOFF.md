@@ -573,10 +573,45 @@ The addendum this section used to describe as not yet written now exists:
 covers items A through F, owner-approved, with its own build order. Item
 C (detail preview), item A (categorised property boundaries), item B
 (roofs and canopy from the LiDAR, the flagship) and item D (the Cardiff
-25 cm LiDAR source) are all shipped, see above. **Next action: item F,
-the OS benchmark, a dev-mode comparison against OS's paid developer
-tooling to calibrate the tier resolver's own tier tables against a second
-opinion, now that A through D give it a finished stack to measure.**
+25 cm LiDAR source) are all shipped, see above.
+
+**Item F, the OS benchmark, is built and unit-tested but NOT live-proven.**
+`mapgen benchmark` (`ngd.py`'s in-memory OGC API Features client,
+`benchstats.py`'s IoU/matching/least-squares offset machinery,
+`benchmark.py`'s report writer and epoch verdict, all behind the
+derived-data firewall) is complete, with dev-mode request pacing
+(`ngd.py`'s `MIN_REQUEST_INTERVAL_SECONDS`, `60 / 50 * 1.15` seconds, a
+15 percent margin over the OS Data Hub plans FAQ's documented 50
+transactions/minute/API/project dev-mode ceiling) and a bounded single
+retry on 429 honouring `Retry-After`, added and unit-tested this task
+(commit `4c648cc`). Two attempts to run it against the owner's real
+`2026-08-06_Cowbridge-with-Llanblethian` package (a roughly 4.8 x 2.9 km
+padded extent, west/south/east/north from that package's own
+`survey.json`) both stopped on a dev-mode 429 partway through the NGD
+buildingpart pull, each after roughly 57-58 paced requests over about 80
+seconds, despite this client's own dispatch rate staying under the
+documented per-minute ceiling throughout (`MIN_REQUEST_INTERVAL_SECONDS`
+paces dispatches to at most ~44/minute). Neither run reached the roads
+collection, so `run_benchmark` wrote nothing (by design, it writes only
+after every NGD pull has already succeeded): there is no report, no
+epoch verdict and no accuracy comparison from a real package yet. The
+observed failure point recurred at almost the same request count and
+elapsed time on both attempts, which does not fit a simple rolling
+60-second/50-request model this client's own pacing safely stays under;
+the owner may want to check the OS Data Hub project's own dashboard for
+its actually-enforced quota, or benchmark a smaller extent, before this
+is retried. Two further, package-specific facts this surfaced along the
+way: this particular survey predates `fuse_missing_buildings` (shipped
+2026-08-07, one day after the 2026-08-06 survey date), so its own 1,552
+buildings are 100 percent OSM-derived with no Overture/OS-OpenMap-Local
+injections to split a source count against; and it never selected the
+`os_open` source, so it carries no `<stem>_os_roads.geojson`, meaning
+the report's own OS Open roads control population would read empty
+(count 0) even had the NGD pull completed. The epoch-shift question
+(`docs/superpowers/specs/2026-08-06-epoch-shift-note.md`) and its
+config-flag proposal remain open, owner-gated, pending a completed live
+run; nothing about the epoch hypothesis has been measured yet either way.
+
 Item E (full-resolution LiDAR rasters) stays owner-gated and is not
 briefed unless the owner opens it; item B's validation gives that gate a
 measured basis, since the owner's survey-sized extents currently come
