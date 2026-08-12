@@ -23,6 +23,7 @@ hole.
 from __future__ import annotations
 
 import json
+import math
 import socket
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -32,7 +33,13 @@ import pytest
 
 from mapgen import benchmark as benchmark_module
 from mapgen import cli as cli_module
-from mapgen.benchmark import BenchmarkError, _ngd_building_rings, _read_buildings, run_benchmark
+from mapgen.benchmark import (
+    BenchmarkError,
+    _epoch_evidence_lines,
+    _ngd_building_rings,
+    _read_buildings,
+    run_benchmark,
+)
 from mapgen.bng import tm_inverse
 from mapgen.cli import main
 from mapgen.geo import BBox
@@ -970,6 +977,61 @@ def test_a_package_wholly_inside_the_rectangle_excludes_nothing(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Verification round 2, finding 1: the report's own "Counts" section opened
+# with a caption claiming EVERY count below is clipped to the pulled
+# rectangle, but the road counts printed seventeen lines later in that same
+# section never were. The caption now names buildings specifically and
+# states plainly that roads are not clipped; these two tests pin both the
+# wording and the fact that road counts genuinely are not clipped (nothing
+# here changes that behaviour, only the sentence describing it).
+# --------------------------------------------------------------------------
+
+
+def test_road_counts_are_not_clipped_and_the_caption_now_says_so(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        # 500 m past the fixture rectangle's own north-east corner, the
+        # same construction _OUT_OF_EXTENT_CORNERS uses for buildings.
+        extra_roads=[
+            ([(10_500.0, 10_500.0), (10_600.0, 10_500.0)], [("highway", "residential")])
+        ],
+    )
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    md_path, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    text = md_path.read_text(encoding="utf-8")
+
+    # The fixture's own two carriageways plus this one, well outside the
+    # pulled rectangle, are all still counted: roads carry no equivalent
+    # clip to the one buildings get.
+    assert report["counts"]["roads"]["ours_osm_carriageway"] == 3
+
+    counts_section = text.split("## Counts")[1].split("## Building footprint matching")[0]
+    assert "BUILDING counts below are CLIPPED" in counts_section
+    assert "ROAD counts further down are NOT" in counts_section
+    assert "Roads (NOT clipped to the pulled rectangle; see above):" in counts_section
+
+
+def test_the_old_blanket_clipped_caption_wording_is_gone(tmp_path):
+    # The exact false claim this fix removes: a reader could previously
+    # read "every count of ours below is CLIPPED" and believe it covered
+    # the road counts seventeen lines further down, which it never did.
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    md_path, _ = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "Every count of ours below is CLIPPED" not in text
+
+
+# --------------------------------------------------------------------------
 # FIX 2: the SUBDIVISION label is earned, not assumed. The containment
 # test compares no areas at all, so "OS split a building we hold whole"
 # and "our polygon is drawn oversized" are the same test result; one
@@ -1195,6 +1257,295 @@ def test_the_report_says_the_split_breaks_continuity_and_labels_the_path_leg(tmp
     )
     assert "DELIBERATELY breaks continuity" in text
     assert "Epoch verdict (carriageway leg alone):" in text
+
+
+# --------------------------------------------------------------------------
+# Verification round 2, finding 3: the identical contamination the split
+# above already fixed for footways survives inside the carriageway leg
+# itself, tagged highway=service rather than highway=footway. A parking
+# aisle or a private driveway has no NGD roadlink counterpart either, so
+# left in it finds the nearest real carriageway and contributes a vector
+# pointing at it. service=parking_aisle and service=driveway are excluded;
+# an ordinary service road (no service tag, or any other value) stays.
+# --------------------------------------------------------------------------
+
+
+def test_service_parking_aisle_and_driveway_are_excluded_plain_service_stays(tmp_path):
+    extra_roads = [
+        ([(2_000.0, 3_000.0), (2_010.0, 3_000.0)], [("highway", "service")]),
+        ([(2_020.0, 3_000.0), (2_030.0, 3_000.0)], [("highway", "service"), ("service", "alley")]),
+        (
+            [(2_040.0, 3_000.0), (2_050.0, 3_000.0)],
+            [("highway", "service"), ("service", "parking_aisle")],
+        ),
+        (
+            [(2_060.0, 3_000.0), (2_070.0, 3_000.0)],
+            [("highway", "service"), ("service", "driveway")],
+        ),
+    ]
+    package_dir = _build_package(tmp_path, with_os_roads=False, extra_roads=extra_roads)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    counts = json.loads(json_path.read_text(encoding="utf-8"))["counts"]["roads"]
+
+    # The fixture's own two residential ways plus the plain service way
+    # and the alley-tagged one: four real carriageways. parking_aisle and
+    # driveway are pulled out before road_family is even consulted, and
+    # never join the path leg either (service is not a path value).
+    assert counts["ours_osm_carriageway"] == 4
+    assert counts["ours_osm_excluded_service"] == {"parking_aisle": 1, "driveway": 1}
+    assert counts["ours_osm_path"] == 0
+
+
+def test_excluded_service_counts_are_named_in_the_markdown_report(tmp_path):
+    extra_roads = [
+        (
+            [(2_040.0, 3_000.0), (2_050.0, 3_000.0)],
+            [("highway", "service"), ("service", "parking_aisle")],
+        ),
+        (
+            [(2_060.0, 3_000.0), (2_070.0, 3_000.0)],
+            [("highway", "service"), ("service", "driveway")],
+        ),
+        (
+            [(2_080.0, 3_000.0), (2_090.0, 3_000.0)],
+            [("highway", "service"), ("service", "parking_aisle")],
+        ),
+    ]
+    package_dir = _build_package(tmp_path, with_os_roads=False, extra_roads=extra_roads)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    md_path, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    counts = json.loads(json_path.read_text(encoding="utf-8"))["counts"]["roads"]
+    text = md_path.read_text(encoding="utf-8")
+
+    assert counts["ours_osm_excluded_service"] == {"parking_aisle": 2, "driveway": 1}
+    assert "EXCLUDED from carriageway (no NGD roadlink counterpart" in text
+    assert "3 (driveway 1, parking_aisle 2)" in text
+
+
+def test_excluding_parking_aisle_and_driveway_moves_the_carriageway_offset(tmp_path):
+    # The same demonstration test_the_epoch_verdict_comes_from_the_
+    # carriageway_leg_alone above makes for footways, reproduced for the
+    # species that survives inside the carriageway leg itself. Three
+    # parking aisles run down the south side of the fixture's own
+    # horizontal carriageway and one driveway down the north side (the
+    # same "several samples, mixed sign" construction that made the
+    # footway contamination visible): each finds that carriageway inside
+    # the 15 m search radius and contributes an offset of several metres
+    # pointing at it, none of it a survey disagreement.
+    parking_aisles = [
+        (
+            [(0.0, offset_n), (100.0, offset_n)],
+            [("highway", "service"), ("service", "parking_aisle")],
+        )
+        for offset_n in (-6.0, -8.0, -10.0)
+    ]
+    driveways = [
+        (
+            [(0.0, 6.0), (100.0, 6.0)],
+            [("highway", "service"), ("service", "driveway")],
+        )
+    ]
+    extra_roads = parking_aisles + driveways
+    package_dir = _build_package(tmp_path, with_os_roads=False, extra_roads=extra_roads)
+    client = _StubNgdClient(buildings=[], roads=_ngd_road_features())
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    carriageway = report["roads"]["osm_carriageway"]
+
+    assert report["counts"]["roads"]["ours_osm_carriageway"] == 2
+    assert report["counts"]["roads"]["ours_osm_excluded_service"] == {
+        "parking_aisle": 3,
+        "driveway": 1,
+    }
+    # The two real carriageways alone still recover the true shift.
+    assert carriageway["lsq_de"] == pytest.approx(_SHIFT_E, abs=0.05)
+    assert carriageway["lsq_dn"] == pytest.approx(_SHIFT_N, abs=0.05)
+
+    # Folded back in, the way this benchmark used to measure them before
+    # this exclusion existed, the same parking-aisle/driveway ways pull
+    # the estimate away from the real shift: the continuity break,
+    # measured rather than asserted.
+    real_carriageway = [
+        _shift([(0.0, 0.0), (100.0, 0.0)]),
+        _shift([(500.0, 0.0), (500.0, 100.0)]),
+    ]
+    contaminated = real_carriageway + [_shift(points) for points, _ in extra_roads]
+    combined = benchmark_module.polyline_offsets(
+        contaminated, benchmark_module._ngd_road_polylines(_ngd_road_features())
+    )
+    assert combined.lsq_magnitude is not None
+    assert abs(combined.lsq_magnitude - carriageway["lsq_magnitude"]) > 0.3
+
+
+# --------------------------------------------------------------------------
+# Verification round 2, finding 4: the report never stated its own
+# strongest conclusion, that the carriageway vector and the BNG-native OS
+# Open control agree closely enough that the shared component is an OS
+# product artefact, not an epoch signal, leaving only a small OSM-specific
+# residual once it is subtracted out. _epoch_evidence_lines is the section
+# that says so, with numbers; these tests hand-check its arithmetic
+# directly against a synthetic report dict before checking that a real
+# `run_benchmark` call wires it into the rendered report at all.
+# --------------------------------------------------------------------------
+
+
+def _offset_stats_payload(lsq_de, lsq_dn, lsq_magnitude) -> dict:
+    """The subset of `benchmark._offset_stats_dict`'s own shape
+    `_epoch_evidence_lines` actually reads, for a synthetic `report["roads"]`
+    entry: the other fields (count, mean_de, ...) are never touched by
+    that function, so they are omitted here rather than faked.
+    """
+    return {"lsq_de": lsq_de, "lsq_dn": lsq_dn, "lsq_magnitude": lsq_magnitude}
+
+
+def test_epoch_evidence_computes_agreement_and_residual_by_hand():
+    # Both vectors point due south, so every angle in this test is
+    # hand-checkable without trigonometry: carriageway (0.0, -1.0),
+    # magnitude 1.0, bearing 180; control (0.0, -0.9), magnitude 0.9,
+    # bearing 180 too.
+    report = {
+        "roads": {
+            "osm_carriageway": _offset_stats_payload(0.0, -1.0, 1.0),
+            "os_open": _offset_stats_payload(0.0, -0.9, 0.9),
+        }
+    }
+
+    lines = _epoch_evidence_lines(report)
+    text = "\n".join(lines)
+
+    assert "## Epoch evidence" in text
+    # Magnitude agreement: |1.0 - 0.9| = 0.1. Bearing agreement: both due
+    # south, 0 degrees apart.
+    assert "1.000 m at bearing 180.0 degrees" in text  # carriageway
+    assert "0.900 m at bearing 180.0 degrees" in text  # control
+    assert "agree to 0.100 m in magnitude and 0 degrees in bearing" in text
+    # Residual: (0.0, -1.0) - (0.0, -0.9) = (0.0, -0.1), magnitude 0.1,
+    # due south (bearing 180) since both vectors run along the same axis.
+    assert "residual" in text.lower()
+    assert "0.100 m at bearing 180.0 degrees" in text
+    # Hypothesis gap: measured bearing 180, hypothesis bearing 45, 135
+    # degrees apart (the smaller of the two ways around the compass).
+    assert "180 degrees away from that" not in text  # sanity: not literal 180
+    assert "135 degrees away from that" in text
+
+
+def test_epoch_evidence_is_undefined_when_either_leg_lsq_is_none():
+    report = {
+        "roads": {
+            "osm_carriageway": _offset_stats_payload(-0.1, -0.2, 0.2236),
+            "os_open": _offset_stats_payload(None, None, None),
+        }
+    }
+
+    lines = _epoch_evidence_lines(report)
+    text = "\n".join(lines)
+
+    assert "## Epoch evidence" in text
+    assert "cannot be drawn" in text
+    # None of the numeric agreement/residual lines are printed when the
+    # comparison itself is refused; only the guard sentence above, which
+    # names "residual" in passing, is present.
+    assert "agree to" not in text
+    assert "OSM-specific residual" not in text
+
+
+def test_epoch_evidence_section_is_wired_into_a_real_report(tmp_path):
+    # A real end-to-end run whose OS Open control is a single-orientation
+    # line (the default fixture, see _build_package): its own lsq is
+    # undefined by construction (one orientation cannot separate the two
+    # shift components), so this pins that the section is genuinely wired
+    # into `_render_markdown`/`run_benchmark`, not only unit-tested in
+    # isolation, even though the numeric branch is not reached here.
+    package_dir = _build_package(tmp_path)
+    client = _StubNgdClient(buildings=[], roads=_ngd_road_features())
+
+    md_path, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    text = md_path.read_text(encoding="utf-8")
+
+    assert report["roads"]["osm_carriageway"]["lsq_de"] is not None
+    assert report["roads"]["os_open"]["lsq_de"] is None
+    assert "## Epoch evidence: the carriageway vector against its own control" in text
+    assert "cannot be drawn" in text
+    # The section sits after the verdict line and before the class names.
+    assert text.index("Epoch verdict (carriageway leg alone):") < text.index(
+        "## Epoch evidence"
+    )
+    assert text.index("## Epoch evidence") < text.index("## Class names")
+
+
+def test_epoch_evidence_section_reports_real_numbers_with_a_two_orientation_control(
+    tmp_path,
+):
+    # A two-orientation OS Open control, matched against the same NGD
+    # roads as the OSM carriageway leg, so both legs recover a real,
+    # well-determined least-squares vector and the agreement/residual
+    # branch actually runs end to end. The control is shifted (+0.5, +0.5)
+    # from base rather than (+0.9, +0.9): a distinct, hand-checkable
+    # vector from the carriageway leg's own recovered shift.
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    stem = "Test-Site_2026-08-09"
+    os_open_polylines = [
+        _shift([(0.0, 0.5), (100.0, 0.5)]),
+        _shift([(500.5, 0.0), (500.5, 100.0)]),
+    ]
+    (package_dir / f"{stem}_os_roads.geojson").write_text(
+        _os_roads_geojson_text(os_open_polylines), encoding="utf-8"
+    )
+    client = _StubNgdClient(buildings=[], roads=_ngd_road_features())
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    carriageway = report["roads"]["osm_carriageway"]
+    os_open = report["roads"]["os_open"]
+    assert carriageway["lsq_de"] == pytest.approx(_SHIFT_E, abs=0.05)
+    assert carriageway["lsq_dn"] == pytest.approx(_SHIFT_N, abs=0.05)
+    # The control recovers (0.9 - 0.5, 0.9 - 0.5) = (0.4, 0.4): the NGD
+    # roads sit at the same +0.9 offset from base the carriageway leg
+    # matches against, while the control itself only carries +0.5.
+    assert os_open["lsq_de"] == pytest.approx(0.4, abs=0.05)
+    assert os_open["lsq_dn"] == pytest.approx(0.4, abs=0.05)
+
+    lines = _epoch_evidence_lines(report)
+    text = "\n".join(lines)
+
+    # Both vectors point along the same (1, 1) bearing (45 degrees, since
+    # de and dn are nearly equal for each), so the two agree closely in
+    # bearing (0 degrees apart) despite differing in magnitude. The
+    # residual is computed here from the SAME two recovered vectors the
+    # report already carries (not the idealised 0.9/0.4 construction
+    # above, since floating-point projection through OSTN15 does not
+    # recover either bit-exact), so this remains a real check of the
+    # subtraction and bearing arithmetic rather than a restatement of the
+    # module's own numbers.
+    assert "agree to" in text
+    assert "0 degrees in bearing" in text
+
+    residual_de = carriageway["lsq_de"] - os_open["lsq_de"]
+    residual_dn = carriageway["lsq_dn"] - os_open["lsq_dn"]
+    residual_magnitude = math.hypot(residual_de, residual_dn)
+    residual_bearing = math.degrees(math.atan2(residual_de, residual_dn)) % 360.0
+    assert f"{residual_magnitude:.3f} m at bearing {residual_bearing:.1f} degrees" in text
+
+    # The measured carriageway bearing (45, since its own de and dn are
+    # nearly equal) sits exactly on the hypothesis's own north-east
+    # bearing: zero degrees away from it.
+    assert "0 degrees away from that" in text
 
 
 # --------------------------------------------------------------------------

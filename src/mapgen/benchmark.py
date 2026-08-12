@@ -89,12 +89,29 @@ the street, not a disagreement between two surveys, and its sign flips
 with which side of the street the pavement runs down. Taking every
 `highway=*` way as one population therefore fed the least-squares
 estimate a large block of samples that cancel each other and pull it
-toward zero: on the Cowbridge package the path family was 42.5 percent
-of the sampled length. `_read_osm_roads` splits the population by
+toward zero: on the Cowbridge package the path family was 34.6 percent
+of the sampled length (12,886.0 m of 37,198.9 m), measured as a share of
+summed way length in metres, NOT as a share of the sample COUNT (a
+different measure that answers a different question).
+`_read_osm_roads` splits the population by
 `categories.road_family` (that module's own vocabulary, read rather than
 re-typed), both legs are reported, and THE EPOCH VERDICT IS DERIVED FROM
 THE CARRIAGEWAY LEG ALONE. This deliberately breaks continuity with the
 single-population OSM offset earlier runs published.
+
+The identical disease survives inside the carriageway leg itself, tagged
+`highway=service` rather than `highway=footway`: a parking aisle
+(`service=parking_aisle`) or a private driveway (`service=driveway`) has
+no NGD roadlink counterpart either, so it too finds the nearest real
+carriageway and contributes a width-of-the-car-park vector rather than a
+survey disagreement. Measured on the Cowbridge package: 106 of 230
+carriageway-family ways are `highway=service`, and 49 of those (31
+`parking_aisle`, 18 `driveway`) carry one of these two values.
+`_read_osm_roads` excludes both before `road_family` is even consulted,
+counting them separately (`OsmRoadPopulations.excluded_service_counts`)
+rather than dropping them in silence; an ordinary `highway=service` way
+with no such tag, or any other `service` value, is a real carriageway and
+is unaffected.
 
 ## Explaining the unmatched, not just counting them
 
@@ -170,6 +187,18 @@ from mapgen.package import BUILDINGS_SOURCE_OS_OPEN, BUILDINGS_SOURCE_OVERTURE
 _BUILDING_TAG_KEY = "building"
 _HIGHWAY_TAG_KEY = "highway"
 _SOURCE_TAG_KEY = "source"
+_SERVICE_TAG_KEY = "service"
+
+# The two `service=*` sub-values that mark a `highway=service` way as NOT
+# a real carriageway at all (see `_read_osm_roads`'s own docstring): a
+# parking aisle or a private driveway has no NGD roadlink counterpart any
+# more than a pavement does, so left in the carriageway population it
+# contributes a vector pointing at the nearest real road rather than a
+# survey disagreement, exactly the contamination the carriageway/path
+# split already removes for footways. Every other `service` value (an
+# ordinary access road, an alley, no tag at all) is a real carriageway
+# and stays.
+_EXCLUDED_SERVICE_VALUES = frozenset(["parking_aisle", "driveway"])
 
 # The bucket every building way falls into UNLESS its own `source` tag is
 # one of the two EXACT values `buildings.fuse_missing_buildings` actually
@@ -485,16 +514,23 @@ class OsmRoadPopulations:
     projected to BNG and split by what they physically are.
 
     `carriageway` is every way a vehicle drives on
-    (`categories.CARRIAGEWAY_HIGHWAY_VALUES`); `path` is every way a
-    person walks, climbs or cycles (`categories.PATH_HIGHWAY_VALUES`);
-    `other_value_counts` is how many ways carried a `highway` value in
-    neither family, by value, so the ones this split leaves out of both
-    legs are named and counted rather than dropped in silence.
+    (`categories.CARRIAGEWAY_HIGHWAY_VALUES`) MINUS the parking-aisle and
+    driveway exclusion below; `path` is every way a person walks, climbs
+    or cycles (`categories.PATH_HIGHWAY_VALUES`); `other_value_counts` is
+    how many ways carried a `highway` value in neither family, by value,
+    so the ones this split leaves out of both legs are named and counted
+    rather than dropped in silence. `excluded_service_counts` is how many
+    `highway=service` ways were pulled back OUT of `carriageway` because
+    their own `service` tag named one of `_EXCLUDED_SERVICE_VALUES`, keyed
+    by that value, for the identical reason (see `_read_osm_roads`'s own
+    docstring): a plain `highway=service` way with no such tag, or one
+    carrying any other `service` value, is a real carriageway and stays.
     """
 
     carriageway: list[list[tuple[float, float]]]
     path: list[list[tuple[float, float]]]
     other_value_counts: dict[str, int]
+    excluded_service_counts: dict[str, int]
 
 
 def _read_osm_roads(
@@ -514,6 +550,22 @@ def _read_osm_roads(
     pavement is on, so they cancel and pull the least-squares estimate
     toward zero.
 
+    A second population carries the identical disease while still being
+    tagged `highway=service`, which `road_family` reads as an ordinary
+    carriageway value: a parking aisle (`service=parking_aisle`) or a
+    private driveway (`service=driveway`) has no NGD roadlink counterpart
+    any more than a pavement does, so it too finds the nearest real
+    carriageway inside the search radius and contributes a vector
+    pointing at it rather than a survey disagreement. Measured on the
+    Cowbridge benchmark package: 106 of 230 carriageway-family ways are
+    `highway=service`, and 49 of those (31 `parking_aisle`, 18
+    `driveway`) carry one of these two values. Both are excluded from
+    `carriageway` here, before `road_family` is even consulted, and
+    counted separately in `excluded_service_counts` rather than dropped
+    in silence; every other `highway=service` way (no `service` tag at
+    all, or any value other than these two) is a real carriageway and is
+    unaffected.
+
     A way whose `highway` value is in neither family (`road_family`
     answering None: highway=construction, highway=pedestrian and the
     rest) joins neither leg and is counted in `other_value_counts`.
@@ -521,6 +573,7 @@ def _read_osm_roads(
     carriageway: list[list[tuple[float, float]]] = []
     path: list[list[tuple[float, float]]] = []
     other_value_counts: dict[str, int] = {}
+    excluded_service_counts: dict[str, int] = {}
     for element in root:
         if element.tag != "way":
             continue
@@ -534,6 +587,14 @@ def _read_osm_roads(
         if polyline is None:
             continue
         value = tags[_HIGHWAY_TAG_KEY]
+
+        service_value = tags.get(_SERVICE_TAG_KEY)
+        if value == "service" and service_value in _EXCLUDED_SERVICE_VALUES:
+            excluded_service_counts[service_value] = (
+                excluded_service_counts.get(service_value, 0) + 1
+            )
+            continue
+
         family = road_family(value)
         if family == ROAD_FAMILY_CARRIAGEWAY:
             carriageway.append(polyline)
@@ -542,7 +603,10 @@ def _read_osm_roads(
         else:
             other_value_counts[value] = other_value_counts.get(value, 0) + 1
     return OsmRoadPopulations(
-        carriageway=carriageway, path=path, other_value_counts=other_value_counts
+        carriageway=carriageway,
+        path=path,
+        other_value_counts=other_value_counts,
+        excluded_service_counts=excluded_service_counts,
     )
 
 
@@ -953,6 +1017,94 @@ def _size_lines(report: dict) -> list[str]:
     return lines
 
 
+def _epoch_evidence_lines(report: dict) -> list[str]:
+    """The evidence the epoch verdict is read from, stated as numbers
+    rather than left implicit in the verdict sentence alone: the
+    carriageway vector, the OS Open control vector beside it, how closely
+    the two agree, what is left of the carriageway vector once that
+    shared component is subtracted out, and how far the measured bearing
+    sits from the epoch-shift hypothesis's own north-east bearing.
+
+    The control population (`os_open`, see the module docstring's own "OS
+    Open" section) is generalisation between two OS products already
+    reprojected through the same OSTN15 grid this project's own
+    coordinates travel through; it is BNG-native at survey time and
+    cannot carry an OSM/WGS84 epoch component AT ALL, by construction.
+    So whatever least-squares vector it shows is necessarily an artefact
+    shared by both populations alike (of generalisation, of the road
+    sampler, of OSTN15 itself), not an epoch signal: subtracting the
+    control vector from the carriageway vector isolates whatever is left
+    over that is specific to OSM's own coordinates rather than common to
+    both.
+
+    Nothing here is fabricated for a run where either leg's least-squares
+    estimate is undefined: the comparison is simply not drawn, and this
+    function says so rather than dividing by an absent vector.
+    """
+    carriageway = report["roads"]["osm_carriageway"]
+    control = report["roads"]["os_open"]
+    lines: list[str] = []
+    lines.append("## Epoch evidence: the carriageway vector against its own control")
+    lines.append("")
+    if carriageway["lsq_de"] is None or control["lsq_de"] is None:
+        lines.append(
+            "One of the two least-squares vectors above is undefined this "
+            "run (too few interior samples, or a population too close to "
+            "one orientation to separate the two shift components), so the "
+            "agreement-and-residual comparison below cannot be drawn."
+        )
+        lines.append("")
+        return lines
+
+    c_de, c_dn, c_mag = carriageway["lsq_de"], carriageway["lsq_dn"], carriageway["lsq_magnitude"]
+    o_de, o_dn, o_mag = control["lsq_de"], control["lsq_dn"], control["lsq_magnitude"]
+    c_bearing = _bearing_degrees(c_de, c_dn)
+    o_bearing = _bearing_degrees(o_de, o_dn)
+    magnitude_agreement = abs(c_mag - o_mag)
+    bearing_agreement = _angular_difference(c_bearing, o_bearing)
+
+    residual_de, residual_dn = c_de - o_de, c_dn - o_dn
+    residual_magnitude = math.hypot(residual_de, residual_dn)
+    hypothesis_gap = _angular_difference(c_bearing, _NORTHEAST_BEARING_DEG)
+
+    lines.append(
+        f"- OSM carriageway vector: {c_mag:.3f} m at bearing {c_bearing:.1f} degrees."
+    )
+    lines.append(
+        f"- OS Open control vector (BNG-native; cannot carry an epoch "
+        f"shift by construction): {o_mag:.3f} m at bearing {o_bearing:.1f} "
+        f"degrees."
+    )
+    lines.append(
+        f"- The two agree to {magnitude_agreement:.3f} m in magnitude and "
+        f"{bearing_agreement:.0f} degrees in bearing. A vector this close "
+        f"to the datum-shift-immune control is an OS product artefact "
+        f"common to both populations, not an OSM-specific signal."
+    )
+    if residual_magnitude > 0.0:
+        residual_bearing = _bearing_degrees(residual_de, residual_dn)
+        lines.append(
+            f"- OSM-specific residual, the carriageway vector with the "
+            f"control vector subtracted out: {residual_magnitude:.3f} m at "
+            f"bearing {residual_bearing:.1f} degrees."
+        )
+    else:
+        lines.append(
+            "- OSM-specific residual, the carriageway vector with the "
+            "control vector subtracted out: 0.000 m (the two vectors are "
+            "identical this run)."
+        )
+    lines.append(
+        f"- The epoch-shift hypothesis calls for roughly 0.9 m at a "
+        f"north-east bearing (around {_NORTHEAST_BEARING_DEG:.0f} degrees); "
+        f"the measured carriageway bearing sits {hypothesis_gap:.0f} "
+        f"degrees away from that, on top of whatever gap already exists in "
+        f"magnitude."
+    )
+    lines.append("")
+    return lines
+
+
 def _render_markdown(report: dict) -> str:
     lines: list[str] = []
     lines.append(f"# OS NGD benchmark: {report['package']}")
@@ -980,15 +1132,21 @@ def _render_markdown(report: dict) -> str:
     out_by_source = building_counts["ours_out_of_extent"]
     all_by_source = building_counts["ours_all"]
     lines.append(
-        "Every count of ours below is CLIPPED to the rectangle the NGD pull "
-        "was made over. The package covers more ground than the survey bbox: "
-        "the survey pads its own extent, and the OS OpenMap Local footprints "
-        "injected into it arrive over a wider footprint again. A footprint "
-        "outside that rectangle cannot match an NGD feature and cannot stand "
-        "inside one, so leaving it in the compared population would count it "
-        "as a building OS does not hold when OS was never asked about that "
-        "ground. A footprint is in when its own guaranteed-interior point "
-        "falls inside the rectangle."
+        "The BUILDING counts below are CLIPPED to the rectangle the NGD pull "
+        "was made over; the ROAD counts further down are NOT. The package "
+        "covers more ground than the survey bbox: the survey pads its own "
+        "extent, and the OS OpenMap Local footprints injected into it arrive "
+        "over a wider footprint again. A footprint outside that rectangle "
+        "cannot match an NGD feature and cannot stand inside one, so leaving "
+        "it in the compared population would count it as a building OS does "
+        "not hold when OS was never asked about that ground. A footprint is "
+        "in when its own guaranteed-interior point falls inside the "
+        "rectangle. Roads carry no equivalent clip: a road is not reduced to "
+        "one representative point the way a footprint is, and an OSM way "
+        "that runs outside the pulled rectangle simply finds no NGD segment "
+        "within the offset sampler's own search radius, landing in that "
+        "measurement's own unmatched-sample count rather than reading as a "
+        "false gap the way an unclipped BUILDING would."
     )
     lines.append("")
     lines.append("Buildings, ours by source (in extent, the compared population):")
@@ -1011,8 +1169,20 @@ def _render_markdown(report: dict) -> str:
     lines.append(f"- NGD buildingpart: {building_counts['ngd']}")
     lines.append("")
     road_counts = report["counts"]["roads"]
-    lines.append("Roads:")
+    lines.append("Roads (NOT clipped to the pulled rectangle; see above):")
     lines.append(f"- ours, OSM carriageway: {road_counts['ours_osm_carriageway']}")
+    excluded_service = road_counts["ours_osm_excluded_service"]
+    if excluded_service:
+        named = ", ".join(
+            f"{name} {excluded_service[name]}" for name in sorted(excluded_service)
+        )
+        lines.append(
+            f"- ours, OSM highway=service EXCLUDED from carriageway (no NGD "
+            f"roadlink counterpart, the same reason a pavement is excluded): "
+            f"{sum(excluded_service.values())} ({named})"
+        )
+    else:
+        lines.append("- ours, OSM highway=service excluded from carriageway: 0")
     lines.append(f"- ours, OSM path: {road_counts['ours_osm_path']}")
     other_values = road_counts["ours_osm_other_values"]
     if other_values:
@@ -1111,6 +1281,8 @@ def _render_markdown(report: dict) -> str:
     )
     lines.append("")
 
+    lines.extend(_epoch_evidence_lines(report))
+
     lines.append("## Class names")
     lines.append("")
     lines.append("NGD `description` values over this pull (names and counts only):")
@@ -1151,8 +1323,9 @@ def _reading_lines(report: dict) -> list[str]:
     boundary and this package records none, and those boundaries are
     party walls, house-to-garage joins and terrace divisions. Every one
     of them is a line an architect draws at 1:500. This section says what
-    the two datasets agree and disagree about, and does not describe
-    either half as bookkeeping.
+    the two datasets agree and disagree about, and treats both halves of
+    the unmatched table as real lines on a real drawing, never as a
+    difference in counting alone.
     """
     theirs = report["containment"]["theirs_unmatched"]
     subdivision = theirs[CONTAINMENT_SUBDIVISION]
@@ -1351,6 +1524,7 @@ def run_benchmark(
             },
             "roads": {
                 "ours_osm_carriageway": len(ours_osm_roads.carriageway),
+                "ours_osm_excluded_service": ours_osm_roads.excluded_service_counts,
                 "ours_osm_path": len(ours_osm_roads.path),
                 "ours_osm_other_values": ours_osm_roads.other_value_counts,
                 "ours_os_open": len(ours_os_open_roads),
