@@ -575,42 +575,74 @@ C (detail preview), item A (categorised property boundaries), item B
 (roofs and canopy from the LiDAR, the flagship) and item D (the Cardiff
 25 cm LiDAR source) are all shipped, see above.
 
-**Item F, the OS benchmark, is built and unit-tested but NOT live-proven.**
+**Item F, the OS benchmark, is built, unit-tested, and now live-proven.**
 `mapgen benchmark` (`ngd.py`'s in-memory OGC API Features client,
 `benchstats.py`'s IoU/matching/least-squares offset machinery,
 `benchmark.py`'s report writer and epoch verdict, all behind the
-derived-data firewall) is complete, with dev-mode request pacing
-(`ngd.py`'s `MIN_REQUEST_INTERVAL_SECONDS`, `60 / 50 * 1.15` seconds, a
-15 percent margin over the OS Data Hub plans FAQ's documented 50
-transactions/minute/API/project dev-mode ceiling) and a bounded single
-retry on 429 honouring `Retry-After`, added and unit-tested this task
-(commit `4c648cc`). Two attempts to run it against the owner's real
-`2026-08-06_Cowbridge-with-Llanblethian` package (a roughly 4.8 x 2.9 km
-padded extent, west/south/east/north from that package's own
-`survey.json`) both stopped on a dev-mode 429 partway through the NGD
-buildingpart pull, each after roughly 57-58 paced requests over about 80
-seconds, despite this client's own dispatch rate staying under the
-documented per-minute ceiling throughout (`MIN_REQUEST_INTERVAL_SECONDS`
-paces dispatches to at most ~44/minute). Neither run reached the roads
-collection, so `run_benchmark` wrote nothing (by design, it writes only
-after every NGD pull has already succeeded): there is no report, no
-epoch verdict and no accuracy comparison from a real package yet. The
-observed failure point recurred at almost the same request count and
-elapsed time on both attempts, which does not fit a simple rolling
-60-second/50-request model this client's own pacing safely stays under;
-the owner may want to check the OS Data Hub project's own dashboard for
-its actually-enforced quota, or benchmark a smaller extent, before this
-is retried. Two further, package-specific facts this surfaced along the
-way: this particular survey predates `fuse_missing_buildings` (shipped
-2026-08-07, one day after the 2026-08-06 survey date), so its own 1,552
-buildings are 100 percent OSM-derived with no Overture/OS-OpenMap-Local
-injections to split a source count against; and it never selected the
-`os_open` source, so it carries no `<stem>_os_roads.geojson`, meaning
-the report's own OS Open roads control population would read empty
-(count 0) even had the NGD pull completed. The epoch-shift question
-(`docs/superpowers/specs/2026-08-06-epoch-shift-note.md`) and its
-config-flag proposal remain open, owner-gated, pending a completed live
-run; nothing about the epoch hypothesis has been measured yet either way.
+derived-data firewall) is complete. Two live attempts against the owner's
+real `2026-08-06_Cowbridge-with-Llanblethian` package (a roughly 4.8 x
+2.9 km padded extent) both stopped on a dev-mode 429 partway through the
+NGD buildingpart pull, each after roughly 57-58 requests paced at
+43.5/minute, well under OS Data Hub's own published 50/minute
+development-mode ceiling; whatever this project's key is actually
+metered against is tighter than that in practice.
+`MIN_REQUEST_INTERVAL_SECONDS` is now set by that measurement rather than
+the specification, 3.0 seconds between requests (20/minute), commit
+`9973ac4`. That real package also cannot answer the epoch question on its
+own terms regardless of pacing: it predates `fuse_missing_buildings`
+(shipped 2026-08-07, one day after its own 2026-08-06 survey date), so
+its 1,552 buildings are 100 percent OSM-derived with no source split to
+report, and it never selected `os_open`, so it carries no
+`<stem>_os_roads.geojson`, the BNG-native control the epoch verdict needs
+to tell an OSM datum shift apart from a projection fault.
+
+A fresh, purpose-built package fixes both problems at once: a 1.2 x
+1.2 km extent over Cowbridge town centre (`--bbox
+-3.46026,51.45391,-3.44294,51.46469`), surveyed 2026-08-12 with
+`--source osm --source overture --source os_open`, so buildings fusion
+ran (499 Overture-injected, 402 OS-OpenMap-Local-injected, verified by
+grep on the `.osm` before benchmarking) and `_os_roads.geojson` exists.
+The live benchmark ran once, in the foreground, and completed in 29
+requests total (1 `verify_collections` plus 24 buildings pages plus 4
+roads pages) with no throttling.
+
+**Sanity checks, before believing the numbers**: NGD held 2,335 building
+parts against our 1,755 combined, more than ours as expected (NGD maps
+every shed and outbuilding separately). IoU p50 for matched buildings is
+0.681, well above the 0.5 floor. Road offset sample counts are in the
+thousands (5,743 OSM, 4,254 OS Open), not the tens a broken match would
+produce. Both populations' least-squares offset magnitudes are a few
+tenths of a metre, not the tens of metres a projection fault would show.
+Nothing here needed investigating.
+
+**The plain-English accuracy answer**: our package holds 1,755 buildings
+(854 traced from OSM, the rest borrowed from Overture or OS's own free
+open data) against OS's own survey-grade count of 2,335 over the same
+ground, OS counting higher because it splits sheds, porches and small
+extensions into their own features where ours does not. Of our 1,755,
+1,343 (77 percent) sit on top of a real OS building, and where they do
+match, the shapes agree well: half overlap the OS footprint by 68 percent
+or more, the best tenth by 87 percent or more. Our own OSM-traced roads
+sit, on average, about 9 cm off OS's premium road network, well inside
+ordinary digitising noise. What OS carries that we do not: 992 of its
+2,335 building parts (42 percent) have no match in our data at all, the
+finer subdivisions our building layer does not separately trace.
+
+**The epoch verdict**: the OSM road population's least-squares offset
+against NGD is 0.14 m at a bearing of about 218 degrees (south-west), and
+the OS Open control (BNG-native, immune to any OSM datum question) shows
+0.29 m at about 189 degrees (south), an offset the SAME SIZE OR LARGER
+than OSM's own. Verdict: **NOT DETECTED**. Both populations sit under the
+0.3 m "not detected" floor, neither points north-east, and the control is
+not smaller than the OSM population it is supposed to be checked against,
+so there is no evidence here of a systematic OSM-side datum shift, let
+alone the roughly 0.9 m north-east one the epoch-shift note hypothesised.
+This is one 1.2 km-wide site, not a survey of the whole country, but it
+gives the config-flag proposal in
+`docs/superpowers/specs/2026-08-06-epoch-shift-note.md` its first measured
+data point, and that data point argues against turning the flag on. The
+flag's own default stays owner-gated per that note; this task delivers
+the evidence, not the decision.
 
 Item E (full-resolution LiDAR rasters) stays owner-gated and is not
 briefed unless the owner opens it; item B's validation gives that gate a

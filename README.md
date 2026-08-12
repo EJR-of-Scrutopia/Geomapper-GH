@@ -957,9 +957,22 @@ itself, only class names and numbers, ever reaches the report, and nothing
 from either report ever reaches a package directory or a client. `ngd.py`,
 the client that talks to NGD, never writes to disk at all, by construction.
 
-A development-mode project throttles to 50 transactions per minute per API;
-`mapgen benchmark` paces its own requests to stay under that, and honours a
-`Retry-After` header with one bounded retry if the ceiling is hit anyway.
+OS Data Hub publishes a 50-transactions-per-minute development-mode ceiling,
+but a live run paced at 43.5/minute (well under that) was still throttled
+twice, at around request 58 both times. `mapgen benchmark` now paces its own
+requests to a conservative 20 per minute, set by that measurement rather
+than by OS's published figure, and honours a `Retry-After` header with one
+bounded retry if the ceiling is hit anyway.
+
+A live run against a purpose-built Cowbridge town-centre package (1.2 x
+1.2 km, osm + overture + os_open sources, 2026-08-12) completed in 29
+requests, no throttling: NGD held 2,335 building parts against our 1,755
+(854 OSM-native, 499 Overture-injected, 402 OS-OpenMap-Local-injected);
+1,343 matched, IoU p50 0.681; 5,743 OSM road-offset samples came back at a
+least-squares offset of 0.14 m, against 4,254 OS Open control samples at
+0.29 m, both consistent with ordinary noise rather than the roughly 0.9 m
+north-east epoch-shift hypothesis. Full numbers and the epoch verdict are in
+`docs/superpowers/HANDOFF.md`.
 
 ## Tests
 
