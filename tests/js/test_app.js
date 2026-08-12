@@ -2928,6 +2928,699 @@ function ok(condition, message) {
     ok(box.innerHTML === "", `expected the stale markup cleared, got: ${box.innerHTML}`);
   });
 
+  // =======================================================================
+  // GET /api/coverage, and the panel and the auto-selection it drives.
+  //
+  // This exists because a real survey went wrong. The owner drew Cowbridge
+  // with the Cardiff 25 cm LiDAR ticked, an archive covering ten tiles at
+  // St Fagans and nothing else, and the page reported honest non-coverage
+  // as a failure: red tiles, a source_failed event, two tile_failed events.
+  // Their instruction was to stop attempting what does not cover, stop
+  // making them tick anything at all, and cut the panel down to "a
+  // highlight to show the level of lidar detail, and that all elements can
+  // be captured. if one cant list it below. nothing else."
+  //
+  // Every fixture below is a real /api/coverage body shape, and every
+  // detail string is one lidar_wales.detail or lidar_cardiff.detail
+  // actually composes, because the panel reads the LEVEL out of that prose
+  // and a fixture that invented its own wording would prove nothing about
+  // the sentences those two really write.
+  // =======================================================================
+
+  const COVERAGE_SOURCE_REGISTRY = [
+    { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false },
+    {
+      id: "os_uprn",
+      display_name: "Addresses (OS Open UPRN, GB)",
+      licence: "OGL",
+      requires_api_key: false,
+    },
+    {
+      id: "inspire",
+      display_name: "Property boundaries (INSPIRE)",
+      licence: "OGL",
+      requires_api_key: false,
+    },
+    {
+      id: "lidar_wales",
+      display_name: "LiDAR terrain (Wales, 1 m)",
+      licence: "OGL",
+      requires_api_key: false,
+    },
+    {
+      id: "lidar_cardiff",
+      // The real one, verbatim, because its length is the point: this is
+      // what the bullet shortener has to cope with.
+      display_name:
+        "LiDAR terrain (St Fagans and St Georges-super-Ely, Cardiff, 25 cm, flown 2011)",
+      licence: "OGL",
+      requires_api_key: false,
+    },
+  ];
+
+  function coverageEntry(id, coverage, detail, heavy) {
+    return {
+      id,
+      coverage,
+      heavy: Boolean(heavy),
+      detail: detail === undefined ? null : detail,
+    };
+  }
+
+  // The owner's own Cowbridge extent: everything national covers it, the
+  // Wales 1 m LiDAR covers it, and the Cardiff 25 cm archive does not.
+  function cowbridgeCoverage() {
+    return [
+      coverageEntry("osm", "full", "traced footprints and centrelines, typically 1 to 5 m positional accuracy"),
+      coverageEntry("os_uprn", "full", "one point per addressable location", true),
+      coverageEntry("inspire", "full", "registered title extents"),
+      coverageEntry("lidar_wales", "full", "1 m at this extent"),
+      coverageEntry("lidar_cardiff", "none", null, true),
+    ];
+  }
+
+  const COVERAGE_ESTIMATE = {
+    tiles: 1,
+    rows: 1,
+    cols: 1,
+    extent_km: { width: 1, height: 1 },
+    bytes_estimate: 1000,
+    seconds_estimate: 60,
+    warnings: [],
+    folder: "C:\\Surveys\\R\\2026-08-12_S",
+  };
+
+  // A booted page whose /api/coverage answer can be changed between
+  // extents, which is what item 4 of the brief is about: an extent moved
+  // onto the 25 cm block gains that source silently, and moved off loses
+  // it again.
+  async function coverageSandbox(options = {}) {
+    const state = {
+      entries: options.entries || cowbridgeCoverage(),
+      estimateSources: options.estimateSources || [],
+      status: options.status || 200,
+      asked: [],
+    };
+    const { sandbox, fetchCalls } = await bootedSandbox(async (url) => {
+      if (url.pathname === "/api/sources") {
+        return jsonResponse(200, options.sources || COVERAGE_SOURCE_REGISTRY);
+      }
+      if (url.pathname === "/api/coverage") {
+        state.asked.push(url.searchParams.get("bbox"));
+        if (state.status !== 200) {
+          return jsonResponse(state.status, { error: "Coverage is unavailable." });
+        }
+        return jsonResponse(200, { sources: state.entries });
+      }
+      if (url.pathname === "/api/extent") {
+        return jsonResponse(200, { tiles: 1, rows: 1, cols: 1, extent_km: { width: 1, height: 1 } });
+      }
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, { ...COVERAGE_ESTIMATE, sources: state.estimateSources });
+      }
+      return null;
+    });
+    return { sandbox, fetchCalls, state };
+  }
+
+  const COWBRIDGE = "-3.453,51.46,-3.444,51.467";
+  const ST_FAGANS = "-3.2774,51.4847,-3.2717,51.4883";
+
+  // Tag-stripped, whitespace-collapsed text of one panel element, or ""
+  // when it is hidden. Hidden has to read as empty rather than as its last
+  // contents: "the list is not shown" and "the list is shown and says
+  // nothing" are different claims and only one of them is the brief.
+  function panelPart(sandbox, id) {
+    const element = sandbox.document.getElementById(id);
+    if (!element || element.hidden) return "";
+    const markup = element.innerHTML || element.textContent || "";
+    return String(markup).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function panelText(sandbox) {
+    return ["coverage-lidar", "coverage-all", "coverage-notes"]
+      .map((id) => panelPart(sandbox, id))
+      .filter((part) => part)
+      .join(" ");
+  }
+
+  function panelBullets(sandbox) {
+    const notes = sandbox.document.getElementById("coverage-notes");
+    if (notes.hidden) return [];
+    return Array.from(notes.innerHTML.matchAll(/<li>([\s\S]*?)<\/li>/g), (match) => match[1].trim());
+  }
+
+  function tickedSources(sandbox) {
+    return sandbox.document
+      .querySelectorAll("#sources input:checked")
+      .map((input) => input.value)
+      .sort();
+  }
+
+  await test("the highlight names the 1 m level a Wales extent actually gets", async () => {
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: 1 m",
+      `expected the level alone, got: ${JSON.stringify(panelPart(sandbox, "coverage-lidar"))}`
+    );
+  });
+
+  await test("an extent too large for 1 m says 2 m, and what to draw for 1 m", async () => {
+    // lidar_wales.detail's own wording at overview level 1, verbatim.
+    const entries = cowbridgeCoverage();
+    entries[3] = coverageEntry(
+      "lidar_wales",
+      "full",
+      "2 m at this extent (extents under about 4 x 4 km come back at 1 m)"
+    );
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    const highlight = panelPart(sandbox, "coverage-lidar");
+    ok(
+      highlight.startsWith("LiDAR: 2 m at this size"),
+      `expected the level this size gets first, got: ${JSON.stringify(highlight)}`
+    );
+    ok(
+      highlight.includes("draw under 4 km for 1 m"),
+      `expected the qualifier as a fragment, got: ${JSON.stringify(highlight)}`
+    );
+    // A fragment, not a sentence: the source's own detail() sentence is
+    // three times this long and saying it here is what the owner asked to
+    // be rid of.
+    ok(highlight.length <= 50, `the highlight has grown into prose: ${JSON.stringify(highlight)}`);
+  });
+
+  await test("an extent on the 25 cm block reads 25 cm, the finest that covers it", async () => {
+    const entries = cowbridgeCoverage();
+    entries[4] = coverageEntry("lidar_cardiff", "full", "25 cm at this extent, flown 2011", true);
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", ST_FAGANS);
+    await flush(10);
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: 25 cm",
+      `expected 25 cm to win over the 1 m source beside it, got: ${JSON.stringify(
+        panelPart(sandbox, "coverage-lidar")
+      )}`
+    );
+  });
+
+  await test("an over-budget 25 cm extent reports what it gets, and what a smaller one would", async () => {
+    // lidar_cardiff.detail's own over-budget wording. The source SKIPS an
+    // extent this size (see _skip_reason), so 25 cm must not be read as
+    // what this extent gets: 1 m is, and 25 cm is one redraw away.
+    const entries = cowbridgeCoverage();
+    entries[4] = coverageEntry(
+      "lidar_cardiff",
+      "full",
+      "25 cm needs an extent under about 600 x 600 m here (flown 2011)",
+      true
+    );
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", ST_FAGANS);
+    await flush(10);
+    const highlight = panelPart(sandbox, "coverage-lidar");
+    ok(
+      highlight.startsWith("LiDAR: 1 m at this size"),
+      `expected the level actually delivered, not the conditional one, got: ${JSON.stringify(highlight)}`
+    );
+    ok(
+      highlight.includes("draw under 600 m for 25 cm"),
+      `expected the redraw fragment, got: ${JSON.stringify(highlight)}`
+    );
+  });
+
+  await test("no LiDAR at all over this ground says so in the same one line", async () => {
+    const entries = cowbridgeCoverage();
+    entries[3] = coverageEntry("lidar_wales", "none", null);
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: none here",
+      `got: ${JSON.stringify(panelPart(sandbox, "coverage-lidar"))}`
+    );
+  });
+
+  await test("the confirmation line appears when every other layer covers the extent", async () => {
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("coverage-all").textContent === "All other layers available",
+      `got: ${JSON.stringify(sandbox.document.getElementById("coverage-all").textContent)}`
+    );
+    ok(sandbox.document.getElementById("coverage-all").hidden === false, "expected it shown");
+  });
+
+  await test("the bullet list is absent, not empty, when nothing is unavailable", async () => {
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    const notes = sandbox.document.getElementById("coverage-notes");
+    ok(notes.hidden === true, "expected no list at all when there is nothing to list");
+    ok(notes.innerHTML === "", `expected no markup either, got: ${notes.innerHTML}`);
+  });
+
+  await test("a LiDAR archive that does not reach here is never bulleted: the highlight speaks for it", async () => {
+    // The owner's exact complaint, in one check. Over Cowbridge the
+    // Cardiff 25 cm archive covers nothing, and saying so on the panel
+    // would put the noise they asked to be rid of back on the page under
+    // a different name. "LiDAR: 1 m" is the whole truth about LiDAR here.
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(panelBullets(sandbox).length === 0, `expected no bullets, got: ${JSON.stringify(panelBullets(sandbox))}`);
+    ok(
+      !panelText(sandbox).toLowerCase().includes("cardiff"),
+      `the panel named an archive that simply does not reach here: ${panelText(sandbox)}`
+    );
+  });
+
+  await test("one bullet per unavailable layer, and the confirmation withdrawn", async () => {
+    const entries = cowbridgeCoverage();
+    entries[1] = coverageEntry("os_uprn", "none", null, true);
+    entries[2] = coverageEntry("inspire", "none", null);
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    const bullets = panelBullets(sandbox);
+    ok(bullets.length === 2, `expected exactly two bullets, got: ${JSON.stringify(bullets)}`);
+    ok(
+      bullets.includes("Addresses: not covered here"),
+      `expected the shortened source name and a fragment of a reason, got: ${JSON.stringify(bullets)}`
+    );
+    ok(
+      bullets.includes("Property boundaries: not covered here"),
+      `got: ${JSON.stringify(bullets)}`
+    );
+    ok(
+      sandbox.document.getElementById("coverage-all").hidden === true,
+      "the confirmation is a claim, and it is not true with two layers missing"
+    );
+    // Fragments, not sentences: every bullet stays inside a handful of
+    // words, which is the whole of the owner's format instruction.
+    ok(
+      bullets.every((bullet) => bullet.length <= 48),
+      `a bullet has grown into prose: ${JSON.stringify(bullets)}`
+    );
+  });
+
+  await test("auto-selection ticks every covering source, the heavyweight ones included", async () => {
+    // The owner's own decision, taken after being shown the tradeoff: a
+    // 619 MB national address file is selected without being ticked by
+    // hand, and the panel tells them what it costs rather than making
+    // them find the checkbox.
+    const entries = cowbridgeCoverage();
+    entries[4] = coverageEntry("lidar_cardiff", "full", "25 cm at this extent, flown 2011", true);
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", ST_FAGANS);
+    await flush(10);
+    ok(
+      tickedSources(sandbox).join(",") === "inspire,lidar_cardiff,lidar_wales,os_uprn,osm",
+      `expected every covering source ticked, got: ${tickedSources(sandbox)}`
+    );
+  });
+
+  await test("a source reporting none is unticked and never reaches the server", async () => {
+    const { fetchCalls, sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    ok(
+      !tickedSources(sandbox).includes("lidar_cardiff"),
+      `expected the uncovering archive unticked, got: ${tickedSources(sandbox)}`
+    );
+    ok(
+      !sandbox.payload().sources.includes("lidar_cardiff"),
+      `expected it out of the payload, got: ${sandbox.payload().sources}`
+    );
+    // And out of the estimate that was actually sent, which is the half
+    // that matters: "we shouldnt be attempting to pull it if its not
+    // selected".
+    const estimate = fetchCalls.filter((call) => call.url.pathname === "/api/estimate").pop();
+    ok(estimate, "expected an estimate once the names were filled in");
+    ok(
+      !JSON.parse(estimate.options.body).sources.includes("lidar_cardiff"),
+      `the estimate asked for a source this extent is not served by: ${estimate.options.body}`
+    );
+  });
+
+  await test("the estimate for an extent goes out only after coverage has corrected the ticks", async () => {
+    // Ordering, not decoration. payload() reads the checkboxes, so an
+    // estimate fired before the answer landed would price a source this
+    // extent is known not to be served by, and a Download pressed on that
+    // estimate would attempt it.
+    const { fetchCalls, sandbox } = await coverageSandbox();
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(10);
+    fetchCalls.length = 0;
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(20);
+    const paths = fetchCalls.map((call) => call.url.pathname);
+    ok(paths.includes("/api/coverage"), `expected a coverage call, got: ${paths}`);
+    ok(paths.includes("/api/estimate"), `expected an estimate, got: ${paths}`);
+    ok(
+      paths.indexOf("/api/coverage") < paths.indexOf("/api/estimate"),
+      `expected coverage first, got: ${paths}`
+    );
+    ok(
+      fetchCalls.filter((call) => call.url.pathname === "/api/estimate").length === 1,
+      `expected exactly one estimate per extent change, got: ${paths}`
+    );
+  });
+
+  await test("moving the extent onto the 25 cm block re-derives everything, and moving off undoes it", async () => {
+    const { sandbox, state } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(panelPart(sandbox, "coverage-lidar") === "LiDAR: 1 m", "expected the Wales level first");
+    ok(!tickedSources(sandbox).includes("lidar_cardiff"), "expected the archive unticked off the block");
+
+    const onTheBlock = cowbridgeCoverage();
+    onTheBlock[4] = coverageEntry("lidar_cardiff", "full", "25 cm at this extent, flown 2011", true);
+    state.entries = onTheBlock;
+    setField(sandbox, "bbox", ST_FAGANS);
+    await flush(10);
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: 25 cm",
+      `expected the highlight to follow the extent, got: ${panelPart(sandbox, "coverage-lidar")}`
+    );
+    ok(tickedSources(sandbox).includes("lidar_cardiff"), "expected the archive silently gained");
+
+    state.entries = cowbridgeCoverage();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: 1 m",
+      `expected it silently lost again, got: ${panelPart(sandbox, "coverage-lidar")}`
+    );
+    ok(!tickedSources(sandbox).includes("lidar_cardiff"), "expected the archive unticked again");
+    ok(state.asked.length === 3, `expected one coverage call per extent, got ${state.asked.length}`);
+    ok(state.asked[1] === ST_FAGANS, `expected the drawn extent asked about, got: ${state.asked[1]}`);
+  });
+
+  await test("a heavy source that is not yet cached gets one short bullet with its size", async () => {
+    const { sandbox } = await coverageSandbox({
+      // What /api/estimate reports for a cold cache: os_uprn prices its
+      // one-time national download, everything else is per-run change.
+      estimateSources: [
+        { id: "osm", bytes_estimate: 1_200_000, seconds_estimate: 20 },
+        { id: "os_uprn", bytes_estimate: 619_000_000, seconds_estimate: 300 },
+      ],
+    });
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    const bullets = panelBullets(sandbox);
+    ok(
+      bullets.join(" | ") === "Addresses: 619 MB first use",
+      `expected exactly the one heavy bullet, got: ${JSON.stringify(bullets)}`
+    );
+    // The layer is available and selected, so the confirmation stands:
+    // this bullet is a cost, not a refusal.
+    ok(
+      sandbox.document.getElementById("coverage-all").hidden === false,
+      "a heavy download is not a missing layer"
+    );
+  });
+
+  await test("a heavy source already cached gets no bullet at all", async () => {
+    // os_uprn.estimate() returns 0 bytes once a complete cache answers for
+    // it, which is how this page knows the 619 MB has already been paid
+    // without asking a second question about it.
+    const { sandbox } = await coverageSandbox({
+      estimateSources: [
+        { id: "osm", bytes_estimate: 1_200_000, seconds_estimate: 20 },
+        { id: "os_uprn", bytes_estimate: 0, seconds_estimate: 1 },
+      ],
+    });
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    ok(panelBullets(sandbox).length === 0, `expected no bullets, got: ${JSON.stringify(panelBullets(sandbox))}`);
+  });
+
+  await test("a failed coverage call falls back to selecting everything, and blocks nothing", async () => {
+    const { sandbox } = await coverageSandbox({ status: 500 });
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    ok(
+      tickedSources(sandbox).length === COVERAGE_SOURCE_REGISTRY.length,
+      `expected the old always-select behaviour back, got: ${tickedSources(sandbox)}`
+    );
+    ok(panelText(sandbox) === "", `expected no panel drawn from an answer that never came: ${panelText(sandbox)}`);
+    ok(
+      sandbox.document.getElementById("download").disabled === false,
+      "an aid that cannot be fetched must never become a gate"
+    );
+  });
+
+  await test("the panel stays a panel: its whole text is short for a fully covered extent", async () => {
+    // The guard against this quietly growing back into what it replaced.
+    // The tier list it replaced printed one line per category, each
+    // carrying a source name and a detail sentence, and ran to several
+    // hundred characters over an ordinary extent. A future change that
+    // reintroduces a paragraph fails here rather than in front of the
+    // owner.
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    const text = panelText(sandbox);
+    ok(text.length > 0, "expected the panel to have rendered at all");
+    ok(text.length <= 120, `the panel has grown to ${text.length} characters: ${JSON.stringify(text)}`);
+  });
+
+  await test("the long per-source detail strings survive, inside Advanced", async () => {
+    // "Nothing else" on the panel is not the same as thrown away: the
+    // sentence each source writes about this extent is the reason someone
+    // opens Advanced to override a tick.
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    const html = sandbox.document.getElementById("sources").innerHTML;
+    ok(html.includes("1 m at this extent"), `expected the Wales detail sentence in the list, got: ${html}`);
+    ok(html.includes("Not covered here"), `expected the uncovered row to say so, got: ${html}`);
+    ok(
+      !panelText(sandbox).includes("1 m at this extent"),
+      `the detail sentence leaked back onto the panel: ${panelText(sandbox)}`
+    );
+  });
+
+  await test("Advanced is a collapsed native disclosure holding the checkboxes and the tier list", () => {
+    // Keyboard accessible with no JavaScript at all, which is why it is a
+    // <details> rather than a div with a click handler, and closed on
+    // arrival, which is the owner's "remove that from ui" without taking
+    // the override away.
+    const advanced = INDEX_HTML_MARKUP.indexOf("<details");
+    ok(advanced !== -1, "expected a native <details> disclosure");
+    const summary = INDEX_HTML_MARKUP.indexOf("<summary>Advanced</summary>");
+    const sources = INDEX_HTML_MARKUP.indexOf('id="sources"');
+    const tierList = INDEX_HTML_MARKUP.indexOf('id="tier-list"');
+    const closed = INDEX_HTML_MARKUP.indexOf("</details>");
+    ok(summary > advanced, "expected the summary inside the disclosure");
+    ok(sources > summary && sources < closed, "expected the checkboxes inside it");
+    ok(tierList > summary && tierList < closed, "expected the tier list inside it too, not deleted");
+    ok(
+      !/<details[^>]*\bopen\b/.test(INDEX_HTML_MARKUP),
+      "expected it collapsed: the owner asked for these selections to be off the panel"
+    );
+    // And the panel's own three elements are outside it, or the highlight
+    // would be behind the disclosure the brief exists to hide.
+    ok(INDEX_HTML_MARKUP.indexOf('id="coverage-lidar"') < advanced, "expected the highlight outside Advanced");
+    ok(INDEX_HTML_MARKUP.indexOf('id="coverage-all"') < advanced, "expected the confirmation outside Advanced");
+    ok(INDEX_HTML_MARKUP.indexOf('id="coverage-notes"') < advanced, "expected the bullets outside Advanced");
+  });
+
+  // The three bodies below were not written here. They are what a real
+  // mapgen server, with all eight sources registered, actually answered
+  // for three real extents on 2026-08-12, copied verbatim. The panel
+  // reads a level out of prose that lidar_wales.py and lidar_cardiff.py
+  // own, so a fixture in this file's own words would prove that the panel
+  // can parse this file rather than that it can parse them.
+  const LIVE_COWBRIDGE = [
+    { id: "osm", coverage: "full", heavy: false, detail: "traced footprints and centrelines, typically 1 to 5 m positional accuracy" },
+    { id: "overture", coverage: "full", heavy: false, detail: "traced footprints and centrelines, typically 1 to 5 m positional accuracy" },
+    { id: "elevation", coverage: "full", heavy: false, detail: "30 m (Copernicus GLO-30)" },
+    { id: "os_open", coverage: "full", heavy: false, detail: "1:10,000 scale, generalized footprints (OS OpenMap Local)" },
+    { id: "os_uprn", coverage: "full", heavy: true, detail: "one point per addressable location" },
+    { id: "inspire", coverage: "full", heavy: false, detail: "indicative extents, not legal boundaries" },
+    { id: "lidar_wales", coverage: "full", heavy: false, detail: "1 m at this extent" },
+    { id: "lidar_cardiff", coverage: "none", heavy: true, detail: null },
+  ];
+  const LIVE_ST_FAGANS = LIVE_COWBRIDGE.map((entry) =>
+    entry.id === "lidar_cardiff"
+      ? { id: "lidar_cardiff", coverage: "full", heavy: true, detail: "25 cm at this extent, flown 2011" }
+      : entry
+  );
+  const LIVE_COUNTY = LIVE_COWBRIDGE.map((entry) => {
+    if (entry.id === "lidar_wales") {
+      return {
+        id: "lidar_wales",
+        coverage: "partial",
+        heavy: false,
+        detail: "16 m at this extent (extents under about 4 x 4 km come back at 1 m)",
+      };
+    }
+    if (entry.id === "lidar_cardiff") {
+      return {
+        id: "lidar_cardiff",
+        coverage: "partial",
+        heavy: true,
+        detail:
+          "25 cm over part of this extent, flown 2011; 25 cm needs an extent under about 600 x 600 m here",
+      };
+    }
+    if (entry.id === "inspire") return { ...entry, coverage: "partial" };
+    return entry;
+  });
+
+  const LIVE_REGISTRY = [
+    { id: "osm", display_name: "OpenStreetMap", licence: "ODbL", requires_api_key: false },
+    { id: "overture", display_name: "Overture Maps", licence: "ODbL", requires_api_key: false },
+    { id: "elevation", display_name: "Elevation (OpenTopography)", licence: "Copernicus DEM", requires_api_key: true, api_key_config_field: "opentopography_api_key" },
+    { id: "os_open", display_name: "OS Open map data (GB)", licence: "OGL", requires_api_key: false },
+    { id: "os_uprn", display_name: "Addresses (OS Open UPRN, GB)", licence: "OGL", requires_api_key: false },
+    { id: "inspire", display_name: "Property boundaries (INSPIRE)", licence: "OGL", requires_api_key: false },
+    { id: "lidar_wales", display_name: "LiDAR terrain (Wales, 1 m)", licence: "OGL", requires_api_key: false },
+    { id: "lidar_cardiff", display_name: "LiDAR terrain (St Fagans and St Georges-super-Ely, Cardiff, 25 cm, flown 2011)", licence: "OGL", requires_api_key: false },
+  ];
+
+  await test("the owner's own Cowbridge extent, against a real server's answer", async () => {
+    // The survey that started this. Eight sources, one of which cannot
+    // serve this ground, and what the owner should see is the level they
+    // do get and no mention of a failure anywhere.
+    const { sandbox } = await coverageSandbox({ entries: LIVE_COWBRIDGE, sources: LIVE_REGISTRY });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      panelText(sandbox) === "LiDAR: 1 m All other layers available",
+      `unexpected panel: ${JSON.stringify(panelText(sandbox))}`
+    );
+    ok(
+      tickedSources(sandbox).join(",") === "elevation,inspire,lidar_wales,os_open,os_uprn,osm,overture",
+      `expected everything but the Cardiff archive selected, got: ${tickedSources(sandbox)}`
+    );
+  });
+
+  await test("the same extent moved onto the 25 cm block, against a real server's answer", async () => {
+    const { sandbox } = await coverageSandbox({ entries: LIVE_ST_FAGANS, sources: LIVE_REGISTRY });
+    setField(sandbox, "bbox", ST_FAGANS);
+    await flush(10);
+    ok(
+      panelText(sandbox) === "LiDAR: 25 cm All other layers available",
+      `unexpected panel: ${JSON.stringify(panelText(sandbox))}`
+    );
+    ok(tickedSources(sandbox).length === 8, `expected all eight selected, got: ${tickedSources(sandbox)}`);
+  });
+
+  await test("a county-sized extent, against a real server's answer", async () => {
+    // Both LiDAR sources answer "partial" here and the finer one is over
+    // its raster budget, which is the case most easily got wrong: 25 cm
+    // appears in the prose, and 25 cm is not what this extent gets.
+    const { sandbox } = await coverageSandbox({ entries: LIVE_COUNTY, sources: LIVE_REGISTRY });
+    setField(sandbox, "bbox", "-3.90,51.30,-3.10,51.75");
+    await flush(10);
+    ok(
+      panelPart(sandbox, "coverage-lidar") ===
+        "LiDAR: 16 m at this size, part only draw under 600 m for 25 cm",
+      `unexpected highlight: ${JSON.stringify(panelPart(sandbox, "coverage-lidar"))}`
+    );
+    ok(
+      sandbox.document.getElementById("coverage-all").hidden === false,
+      "partial coverage is coverage: nothing here is unavailable"
+    );
+    ok(panelText(sandbox).length <= 120, `the panel has grown to ${panelText(sandbox).length} characters`);
+  });
+
+  await test("an override in Advanced is respected by the highlight, not talked over", async () => {
+    // The highlight claims what this extent WILL GET. Unticking the only
+    // covering LiDAR source in Advanced means it gets none, and a line
+    // that went on quoting 1 m would be the same kind of untruth this
+    // whole change exists to remove.
+    const { sandbox } = await coverageSandbox();
+    setField(sandbox, "bbox", COWBRIDGE);
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    await flush(20);
+    ok(panelPart(sandbox, "coverage-lidar") === "LiDAR: 1 m", "expected the level first");
+
+    const wales = sandbox.document.querySelectorAll("#sources input").find((i) => i.value === "lidar_wales");
+    wales.checked = false;
+    sandbox.document.getElementById("sources").fire("change");
+    await flush(20);
+    ok(
+      panelPart(sandbox, "coverage-lidar") === "LiDAR: none here",
+      `expected the highlight to follow the override, got: ${JSON.stringify(
+        panelPart(sandbox, "coverage-lidar")
+      )}`
+    );
+    // And the override survives, because a tick is not an extent: only a
+    // new rectangle re-derives the selection.
+    ok(!tickedSources(sandbox).includes("lidar_wales"), "expected the override to hold");
+  });
+
+  await test("a covering source with nothing readable to say hides the highlight rather than claiming none", async () => {
+    // "We cannot tell" and "there is none here" are different claims and
+    // only one of them is true of a source that covers this ground but
+    // whose detail an older server never sent.
+    const entries = cowbridgeCoverage();
+    entries[3] = coverageEntry("lidar_wales", "full", null);
+    const { sandbox } = await coverageSandbox({ entries });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    ok(
+      sandbox.document.getElementById("coverage-lidar").hidden === true,
+      `expected no highlight at all, got: ${JSON.stringify(panelPart(sandbox, "coverage-lidar"))}`
+    );
+    ok(
+      sandbox.document.getElementById("coverage-all").hidden === false,
+      "the rest of the panel still has something true to say"
+    );
+  });
+
+  await test("a hostile coverage payload is escaped before it reaches the panel", async () => {
+    // Same reasoning as the tier list's own escaping test: this is the
+    // server's own data, but the panel builds markup out of strings a
+    // source composes, and nothing else here exercises that path.
+    const entries = [
+      coverageEntry("osm", "none", null),
+      coverageEntry("lidar_wales", "full", "1 m at this extent"),
+    ];
+    const { sandbox } = await coverageSandbox({
+      entries,
+      sources: [
+        {
+          id: "osm",
+          display_name: "<img src=x onerror=alert(1)>",
+          licence: "ODbL",
+          requires_api_key: false,
+        },
+        {
+          id: "lidar_wales",
+          display_name: "LiDAR terrain (Wales, 1 m)",
+          licence: "OGL",
+          requires_api_key: false,
+        },
+      ],
+    });
+    setField(sandbox, "bbox", COWBRIDGE);
+    await flush(10);
+    const notes = sandbox.document.getElementById("coverage-notes").innerHTML;
+    ok(notes.includes("&lt;img"), `expected the tag escaped, got: ${notes}`);
+    ok(!notes.includes("<img"), `expected no live tag in the bullet, got: ${notes}`);
+  });
+
   await test("the OpenTopography API key is never included in a job's start payload", async () => {
     const SECRET = "sk-test-secret-should-never-leak";
     const { fetchCalls, sandbox } = await bootedSandbox((url, options) => {

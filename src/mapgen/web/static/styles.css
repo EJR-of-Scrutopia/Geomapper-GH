@@ -304,8 +304,82 @@ input[type="text"], input[type="number"], input[type="search"], input[type="pass
 
 fieldset { border: 1px solid var(--line); border-radius: 3px; padding: 10px; margin: 0; }
 legend { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.7; }
-#sources label { flex-direction: row; align-items: center; gap: 8px; padding: 3px 0; }
+#sources label { flex-direction: row; align-items: flex-start; gap: 8px; padding: 3px 0; }
 #sources input[disabled] + span { opacity: 0.5; }
+/* An unticked row is one the drawn extent is not served by (see app.js's
+   renderSources). Dimmed rather than hidden or disabled: it is still the
+   control an override is made with, and it is still the row carrying the
+   reason underneath it. */
+#sources input:not(:checked) + span { opacity: 0.6; }
+
+/* The per-source detail sentence, and the only long text left anywhere in
+   the Layers block. It lives here, inside Advanced, because the owner
+   asked for the panel itself to carry a highlight and bullets and nothing
+   else. */
+.source-note {
+  display: block;
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: 0.7;
+}
+
+/* The one line the owner is looking for: what detail level this extent
+   actually gets. Sized and weighted to be read at a glance rather than
+   parsed out of a sentence, which is the whole of the brief for it. */
+.coverage-lidar {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.01em;
+}
+
+.coverage-lidar[hidden] { display: none; }
+
+/* The qualifier beside it, when a smaller extent would be given something
+   finer. Its own line, at the panel's ordinary size, so it can never be
+   mistaken for part of the number above it. */
+.coverage-lidar-note {
+  display: block;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ink);
+  opacity: 0.75;
+}
+
+.coverage-all {
+  font-size: 13px;
+  margin-top: 6px;
+}
+
+.coverage-all[hidden] { display: none; }
+
+/* Bullets, per the owner's own instruction, and only rendered at all when
+   there is something to bullet (app.js hides the list rather than leaving
+   an empty one, which would still draw this margin). */
+.coverage-notes {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.coverage-notes[hidden] { display: none; }
+
+/* The override, collapsed. A native <details>, so the disclosure works
+   with the keyboard and without a line of JavaScript; the summary is
+   styled as a control rather than as a heading because it is one. */
+.advanced { margin-top: 10px; }
+
+.advanced > summary {
+  cursor: pointer;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.7;
+  padding: 2px 0;
+}
+
+.advanced > summary:hover { opacity: 1; }
 
 #categories label { flex-direction: row; align-items: center; gap: 8px; padding: 3px 0; }
 /* "Roads" is a plain label over its own nine children, never a checkbox
@@ -339,9 +413,21 @@ legend { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; opa
 }
 
 /* Task 8 of the tier resolver plan. One line per category (see
-   renderResolution in app.js); .estimate already gives the box its
-   border, padding and background, and this is the one rule that box did
-   not already carry: spacing between the category lines it renders. */
+   renderResolution in app.js). It used to sit under the estimate box and
+   borrow .estimate's border, padding and background; it is inside
+   Advanced now, under the checkboxes it explains, so it carries its own
+   modest spacing instead of a second boxed panel's worth of furniture. */
+.tier-list {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+
+.tier-list[hidden] { display: none; }
+
 .tier-list div + div {
   margin-top: 4px;
 }

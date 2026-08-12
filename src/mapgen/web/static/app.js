@@ -1331,7 +1331,13 @@ function setBBox(next, fit = true) {
   syncExtentHandles();
   clearTimeout(suggestDebounce);
   suggestDebounce = setTimeout(suggestNames, SUGGEST_DEBOUNCE_MS);
-  refreshEstimate();
+  // refreshCoverage rather than refreshEstimate, and it is the same one
+  // call rather than a second one beside it: what covers this extent
+  // decides which layers are ticked, and the ticks are what the estimate
+  // prices. refreshCoverage calls refreshEstimate itself once it has an
+  // answer, or once it knows it will not get one, so every extent change
+  // still produces exactly one estimate.
+  refreshCoverage();
 }
 
 // --- draw extent: press, drag, release ---------------------------------
@@ -2138,6 +2144,340 @@ async function suggestNames() {
   }
 }
 
+// --- coverage ---------------------------------------------------------
+//
+// The owner drew an extent over Cowbridge with the Cardiff 25 cm LiDAR
+// ticked. That archive covers ten 25 cm tiles at St Fagans and nothing
+// else, so the run could not serve the ground, said so, and painted the
+// map red: "it is showing a red failed map tile after running, it is
+// showing because it didnt get the cardiff lidar, which is obvious so we
+// shouldnt be showing it as a fail, we shouldnt be attempting to pull it
+// if its not selected, I actually dont want all these map layer
+// selections on the right, because we want all the ones that exist in
+// tiles selected. so we can probably remove that from ui, and make sure
+// it just grabs whatever is in the bounding rectangle."
+//
+// The server half answered the first part: a source that cannot serve an
+// extent now SKIPS it with a recorded reason rather than failing (see
+// lidar_cardiff._skip_reason and package.run_survey's source_skipped).
+// This is the second part. GET /api/coverage asks every registered source
+// what it has to say about the drawn extent, with no network access
+// whatsoever (covers() and detail() are documented disk-and-arithmetic,
+// which is the whole reason this can be called on every extent change
+// rather than once behind a button), and the answer decides the ticks
+// instead of the owner having to.
+//
+// What the owner reads is deliberately three lines at most, per their own
+// brief on the panel: "just a highlight to show the level of lidar
+// detail, and that all elements can be captured. if one cant list it
+// below. nothing else. bullet point format, not long text." The tier list
+// that used to print a sentence per category is not gone, it is inside
+// Advanced, next to the checkboxes it explains.
+//
+// The one judgement call worth naming here: a LiDAR source that does not
+// cover this ground is NEVER bulleted. The highlight already states the
+// level this extent gets, which is the whole truth about LiDAR for it,
+// and a bullet saying the Cardiff archive does not reach here would
+// reappear on nearly every survey the owner ever runs. That line is the
+// noise they complained about, moved rather than removed. Everything that
+// is not LiDAR is bulleted when it cannot serve, because "all elements
+// can be captured" is a claim about those.
+
+// The last /api/coverage answer for the extent currently drawn, or null
+// when there is no extent, no answer yet, or a call that failed. null is
+// load-bearing: it is what makes the panel disappear and every checkbox
+// go back to ticked, which is exactly the behaviour this page had before
+// the endpoint existed.
+let lastCoverage = null;
+
+// A LiDAR source is one whose id starts with "lidar" (lidar_wales,
+// lidar_cardiff today). Matched on the id rather than on the display name
+// or on a hardcoded list of two, so a third archive in a later phase is
+// picked up by following the naming the first two already set; the cost
+// of that convention being broken is a source that gets bulleted instead
+// of folded into the highlight, which is wrong but not misleading.
+function isLidarSource(id) {
+  return String(id || "").toLowerCase().startsWith("lidar");
+}
+
+// One resolution figure in metres, so 25 cm and 1 m can be compared
+// without caring which unit each source chose to say it in.
+function detailMetres(value, unit) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  if (unit === "cm") return number / 100;
+  if (unit === "km") return number * 1000;
+  return number;
+}
+
+// The level a source's own detail() sentence promises, and the fragment
+// of a qualifier worth carrying beside it, pulled out of the prose rather
+// than restated here: the sources own their wording (lidar_wales.detail,
+// lidar_cardiff.detail) and this must never be able to name a level they
+// would not deliver.
+//
+// The three shapes those two write today, and what each means:
+//
+//   "1 m at this extent"                      delivered, nothing finer.
+//   "2 m at this extent (extents under about  delivered, and something
+//    4 x 4 km come back at 1 m)"              finer is one redraw away.
+//   "25 cm needs an extent under about        NOT delivered: the raster
+//    600 x 600 m here (flown 2011)"           budget refuses this size,
+//                                             and fetch() skips it.
+//
+// The third is the one that matters most to get right. An extent over
+// budget is one the source will skip, so its number must not be read as
+// what this extent gets; it is a promise conditional on drawing smaller,
+// which is what `promise` carries and `delivered` does not.
+const LIDAR_LEVEL = /^\s*([\d.]+)\s*(cm|m)\b/;
+const LIDAR_LIMIT = /under about ([\d.]+)\s*x\s*[\d.]+\s*(m|km)\b/;
+const LIDAR_FINER = /come back at ([\d.]+)\s*(cm|m)\b/;
+const LIDAR_CONDITIONAL = /needs an extent under about/;
+
+function parseLidarDetail(detail) {
+  const text = String(detail || "");
+  const level = text.match(LIDAR_LEVEL);
+  if (!level) return null;
+  const label = `${level[1]} ${level[2]}`;
+  const metres = detailMetres(level[1], level[2]);
+  if (metres === null) return null;
+  const limit = text.match(LIDAR_LIMIT);
+  const size = limit ? `${limit[1]} ${limit[2]}` : "";
+  if (LIDAR_CONDITIONAL.test(text)) {
+    return { delivered: null, promise: size ? { size, label, metres } : null };
+  }
+  const finer = text.match(LIDAR_FINER);
+  const finerMetres = finer ? detailMetres(finer[1], finer[2]) : null;
+  return {
+    delivered: { label, metres },
+    promise:
+      finer && size && finerMetres !== null
+        ? { size, label: `${finer[1]} ${finer[2]}`, metres: finerMetres }
+        : null,
+  };
+}
+
+// Which layers are actually ticked right now, as a set, or null when the
+// checklist has not rendered yet. null reads as "everything", the same
+// "nothing to say yet" convention noLayerSelected uses for a checklist
+// GET /api/sources has not filled in: a page mid-boot must not be read as
+// a page with every layer switched off.
+function selectedSourceIds() {
+  const boxes = [...document.querySelectorAll("#sources input")];
+  if (!boxes.length) return null;
+  return new Set(boxes.filter((box) => box.checked).map((box) => box.value));
+}
+
+// The one prominent line: the level this extent actually gets, and at
+// most a fragment saying what a smaller extent would get instead. Returns
+// null when the registry holds no LiDAR source at all, since a heading
+// about LiDAR on a page that has none is worse than no heading, and null
+// again when a source covers this ground but says nothing this can read a
+// level out of, since "we cannot tell" is not the same claim as "none".
+//
+// Finest wins on both halves. With the Wales 1 m source covering and the
+// Cardiff 25 cm archive refusing this size, the owner gets "LiDAR: 1 m"
+// with "draw under 600 m for 25 cm" beside it: the truth about now, and
+// the one action that changes it.
+//
+// `selected` is consulted because this line claims what the extent WILL
+// GET, not what exists over it. A layer unticked in Advanced is not going
+// to be downloaded, and a highlight that went on quoting its resolution
+// would be the same kind of untruth this whole task exists to remove.
+function lidarHighlight(entries, selected) {
+  const lidar = entries.filter((entry) => isLidarSource(entry.id));
+  if (!lidar.length) return null;
+  let best = null;
+  let promise = null;
+  let unreadable = false;
+  for (const entry of lidar) {
+    if (entry.coverage === "none") continue;
+    if (selected && !selected.has(entry.id)) continue;
+    const parsed = parseLidarDetail(entry.detail);
+    if (!parsed) {
+      unreadable = true;
+      continue;
+    }
+    if (parsed.delivered && (!best || parsed.delivered.metres < best.metres)) {
+      best = { ...parsed.delivered, coverage: entry.coverage };
+    }
+    if (parsed.promise && (!promise || parsed.promise.metres < promise.metres)) {
+      promise = parsed.promise;
+    }
+  }
+  if (!best && unreadable) return null;
+  // A promise no finer than what this extent already gets is not worth a
+  // word: redrawing smaller to be given the same number is not an offer.
+  if (promise && best && promise.metres >= best.metres) promise = null;
+  // "at this size" is the whole of the explanation for a coarser level.
+  // The qualifier beside it says what to draw instead, and between them
+  // there is nothing left for a sentence to add. "part only" comes last
+  // because it is the second question an owner asks, after the number:
+  // the real answer over a county-sized extent is "LiDAR: 16 m at this
+  // size, part only", and every word of that is carrying something.
+  const partial = best && best.coverage === "partial" ? ", part only" : "";
+  const level = best
+    ? `LiDAR: ${best.label}${promise ? " at this size" : ""}${partial}`
+    : "LiDAR: none here";
+  return { level, note: promise ? `draw under ${promise.size} for ${promise.label}` : "" };
+}
+
+// The name to call a source in a bullet. display_name is written to be
+// unambiguous in a checklist ("LiDAR terrain (St Fagans and St Georges-
+// super-Ely, Cardiff, 25 cm, flown 2011)"), which is a paragraph by the
+// standard this panel is held to, so a bullet takes what sits before the
+// first bracket.
+//
+// Unless that collides. Both LiDAR sources shorten to "LiDAR terrain",
+// and a bullet naming one of two sources equally well names neither, so a
+// short name shared by more than one source falls back to the full one
+// for every source that shares it. Computed over the whole registry, not
+// over the bullets being rendered, so which sources happen to be
+// bulleted today cannot change what a name means.
+function shortSourceNames(sources) {
+  const shortened = new Map();
+  const counts = new Map();
+  for (const source of sources || []) {
+    const full = String(source.display_name || source.id || "");
+    const short = full.split("(")[0].trim() || full;
+    shortened.set(source.id, { full, short });
+    counts.set(short, (counts.get(short) || 0) + 1);
+  }
+  return (id) => {
+    const entry = shortened.get(id);
+    if (!entry) return String(id || "");
+    return counts.get(entry.short) > 1 ? entry.full : entry.short;
+  };
+}
+
+// Everything the bullet list holds, in the order it holds it: what cannot
+// be captured first, since that is the question the line above it
+// answers, then what will cost a large download the first time.
+//
+// The heavy bullet is priced from the estimate's own per-source
+// bytes_estimate, never from a number written here, and that is also how
+// "not yet cached" is known at all: os_uprn and lidar_cardiff each report
+// 0 bytes once their one-time download already sits on disk (see their
+// estimate() methods), so a warm cache produces no bullet without this
+// page having to ask a second question about it. No estimate yet means no
+// heavy bullet, which is honest: an unpriced download is one this page
+// has not been told the size of.
+function coverageBullets(entries, sources, sourceBytes) {
+  const name = shortSourceNames(sources);
+  const bullets = [];
+  for (const entry of entries) {
+    if (entry.coverage === "none" && !isLidarSource(entry.id)) {
+      bullets.push(`${name(entry.id)}: not covered here`);
+    }
+  }
+  for (const entry of entries) {
+    if (!entry.heavy || entry.coverage === "none") continue;
+    const bytes = Number((sourceBytes || {})[entry.id]);
+    if (!Number.isFinite(bytes) || bytes <= 0) continue;
+    bullets.push(`${name(entry.id)}: ${Math.round(bytes / 1e6)} MB first use`);
+  }
+  return bullets;
+}
+
+// A layer that cannot serve this ground, LiDAR aside (see this section's
+// own opening comment for why LiDAR is the highlight's business and not
+// this list's).
+function unavailableEntries(entries) {
+  return entries.filter((entry) => entry.coverage === "none" && !isLidarSource(entry.id));
+}
+
+// Draws the three elements from the last coverage answer and the last
+// estimate, and hides all three when there is no answer to draw from. One
+// function for both, for the same reason renderResolution is one
+// function: a panel that can be left half-populated by a failed or
+// superseded call would claim a fact about an extent that has moved on.
+function renderCoveragePanel() {
+  const highlightBox = $("coverage-lidar");
+  const allBox = $("coverage-all");
+  const notesBox = $("coverage-notes");
+  if (!highlightBox || !allBox || !notesBox) return;
+  const entries = lastCoverage;
+  if (!entries || !entries.length) {
+    highlightBox.hidden = true;
+    highlightBox.innerHTML = "";
+    allBox.hidden = true;
+    allBox.textContent = "";
+    notesBox.hidden = true;
+    notesBox.innerHTML = "";
+    return;
+  }
+  const highlight = lidarHighlight(entries, selectedSourceIds());
+  highlightBox.hidden = !highlight;
+  highlightBox.innerHTML = highlight
+    ? `${escapeHtml(highlight.level)}${
+        highlight.note ? `<span class="coverage-lidar-note">${escapeHtml(highlight.note)}</span>` : ""
+      }`
+    : "";
+  // The confirmation is a claim, so it is made only when it is true: one
+  // layer that cannot serve this ground is enough to withdraw it, and the
+  // bullets below say which. Escaped through textContent rather than
+  // innerHTML because it is a fixed string and has no markup in it.
+  const everythingElse = unavailableEntries(entries).length === 0;
+  allBox.hidden = !everythingElse;
+  allBox.textContent = everythingElse ? "All other layers available" : "";
+  const bullets = coverageBullets(entries, currentSources, lastSizing && lastSizing.sourceBytes);
+  // Absent, not empty: the brief asked for the list to be gone when there
+  // is nothing to list, and an empty <ul> still draws its own margin.
+  notesBox.hidden = bullets.length === 0;
+  notesBox.innerHTML = bullets.map((text) => `<li>${escapeHtml(text)}</li>`).join("");
+}
+
+// Asks what covers the drawn extent, puts the checklist in step with the
+// answer, redraws the panel, and only then estimates.
+//
+// The order is the point. payload() reads the checkboxes, so an estimate
+// fired before the answer landed would price, and a Download pressed on
+// it would attempt, a source this extent is known not to be served by:
+// the exact thing the owner asked to stop happening. The endpoint touches
+// no network and this server is on loopback, so the wait is a few
+// milliseconds against a request that was going out anyway.
+//
+// A failed call falls all the way back to what this page did before the
+// endpoint existed: every layer ticked, no panel, nothing disabled. A
+// coverage answer is an aid, and an aid that cannot be fetched must not
+// become a gate the owner cannot get past.
+async function refreshCoverage() {
+  const asked = bbox ? `${bbox.west},${bbox.south},${bbox.east},${bbox.north}` : "";
+  if (!asked) {
+    lastCoverage = null;
+  } else {
+    try {
+      const data = await api(`/api/coverage?bbox=${encodeURIComponent(asked)}`);
+      // The extent can move while this is in flight (a drag of a corner
+      // handle is a burst of them). Whichever call was asked last is the
+      // only one whose answer describes the rectangle on screen; an older
+      // one drops out here rather than ticking boxes for ground the owner
+      // has already left, and the newer call does the rendering and the
+      // estimating this one is abandoning.
+      if (!bbox || `${bbox.west},${bbox.south},${bbox.east},${bbox.north}` !== asked) return;
+      lastCoverage = Array.isArray(data.sources) ? data.sources : null;
+    } catch (error) {
+      // Deliberately quiet, and deliberately not logged. There is nothing
+      // here the owner can act on, the fallback below leaves the page
+      // exactly as capable as it was before this endpoint existed, and a
+      // red line about a call they never made would read as a broken
+      // survey. A server that has genuinely stopped announces itself on
+      // the next estimate, which runs a few lines from here.
+      lastCoverage = null;
+    }
+  }
+  // Re-rendered rather than re-ticked in place, because the rows say more
+  // than they used to: each carries its own source's detail sentence
+  // inside Advanced, and those change with the extent exactly as the
+  // ticks do. A deliberate override made in Advanced is deliberately lost
+  // here, and only here: this runs when the EXTENT changes, which is a
+  // new question, not when a tick, a category or a field changes, which
+  // are answers to the old one.
+  if (currentSources) renderSources(currentSources, lastCoverage);
+  renderCoveragePanel();
+  refreshEstimate();
+}
+
 // --- estimate --------------------------------------------------------
 
 function payload() {
@@ -2282,17 +2622,32 @@ let lastSizing = null;
 // tileSizeCost exists to refuse to show.
 function recordSizing(tileSizeM, tiles, seconds, sources) {
   const sourceSeconds = {};
+  // And each source's own bytes, from the same one response, for the
+  // coverage panel's heavy-download bullets. This is where "has the
+  // 619 MB address file been downloaded yet" is answered: os_uprn and
+  // lidar_cardiff each price themselves at 0 bytes once their one-time
+  // download is already cached, so the bullet appears and disappears
+  // with the cache without this page keeping any state of its own about
+  // it. Recorded here rather than in a second variable beside lastSizing
+  // so it lives and dies on exactly the same lifecycle: the /api/extent
+  // branch passes [] and clears it, and a failed estimate nulls the lot.
+  const sourceBytes = {};
   for (const source of sources || []) {
+    if (!source.id) continue;
     const value = Number(source.seconds_estimate);
-    if (source.id && Number.isFinite(value)) sourceSeconds[source.id] = value;
+    if (Number.isFinite(value)) sourceSeconds[source.id] = value;
+    const bytes = Number(source.bytes_estimate);
+    if (Number.isFinite(bytes)) sourceBytes[source.id] = bytes;
   }
   lastSizing = {
     tileSizeM,
     tiles,
     seconds: Number.isFinite(Number(seconds)) ? Number(seconds) : 0,
     sourceSeconds,
+    sourceBytes,
   };
   renderTileSize();
+  renderCoveragePanel();
 }
 
 // --- tier list -------------------------------------------------------
@@ -2418,6 +2773,11 @@ function showEstimateError(message) {
   // describing the last size that worked.
   lastSizing = null;
   renderTileSize();
+  // The heavy-download bullets are priced from that same dead estimate,
+  // so they go with it. The highlight and the confirmation above them do
+  // not: those come from /api/coverage, which knows nothing about tiling
+  // and has not been contradicted by anything that happened here.
+  renderCoveragePanel();
 }
 
 async function refreshEstimate() {
@@ -3528,26 +3888,49 @@ $("stop-server").addEventListener("click", async () => {
 // boot() reads as "fetch these, render each", not one long block mixing
 // three unrelated templates together.
 
-function renderSources(sources) {
-  // Every source, elevation included, is ticked by default. Elevation
-  // needing a key is not a reason to untick it here: the owner's own
-  // ruling was to keep it selected and surface a plain warning on the
-  // estimate instead (see readiness_problem/estimate_survey), so a key
-  // typed in the settings panel takes effect without ever having to
-  // remember to re-tick a layer that was silently switched off.
-  // Escaped even though /api/sources is this same server's own data,
-  // not third-party input: it costs nothing here, and it is one fewer
-  // thing to have to reason about correctly if a future source's
-  // licence or display_name string ever comes from somewhere less
-  // trusted than a hardcoded class attribute.
+function renderSources(sources, coverage) {
+  // The checklist behind Advanced, and no longer the way a layer gets
+  // chosen. What ticks a box now is whether the drawn extent is ground
+  // that source actually serves (see the coverage section above and the
+  // owner's own decision to auto-select everything that covers, the two
+  // heavyweight one-time downloads included).
+  //
+  // With no coverage answer to go on, every box is ticked, which is what
+  // this function did unconditionally before /api/coverage existed: no
+  // extent drawn yet, or a call that failed, must not leave the owner
+  // with a page that downloads nothing.
+  //
+  // Elevation needing a key is still not a reason to untick anything
+  // here: the owner's own ruling was to keep it selected and surface a
+  // plain warning on the estimate instead (see readiness_problem/
+  // estimate_survey), so a key typed in the settings panel takes effect
+  // without ever having to remember to re-tick a layer that was silently
+  // switched off.
+  //
+  // Escaped even though /api/sources is this same server's own data, not
+  // third-party input: it costs nothing here, and it is one fewer thing
+  // to have to reason about correctly if a future source's licence,
+  // display_name or detail string ever comes from somewhere less trusted
+  // than a hardcoded class attribute.
+  const byId = new Map((coverage || []).map((entry) => [entry.id, entry]));
   $("sources").innerHTML = sources
-    .map(
-      (s) => `
+    .map((s) => {
+      const entry = byId.get(s.id);
+      const covered = !entry || entry.coverage !== "none";
+      // The long per-source sentence, in the one place there is room for
+      // it. It is the same detail() string the panel used to print in
+      // full beside every category, kept because someone who has opened
+      // Advanced to override a tick is exactly the reader it was written
+      // for.
+      const note = entry ? (covered ? entry.detail || "" : "Not covered here") : "";
+      return `
         <label title="${escapeHtml(s.licence)}">
-          <input type="checkbox" value="${escapeHtml(s.id)}" checked />
-          <span>${escapeHtml(s.display_name)}${s.requires_api_key ? " (needs an API key)" : ""}</span>
-        </label>`
-    )
+          <input type="checkbox" value="${escapeHtml(s.id)}"${covered ? " checked" : ""} />
+          <span>${escapeHtml(s.display_name)}${s.requires_api_key ? " (needs an API key)" : ""}${
+            note ? `<span class="source-note">${escapeHtml(note)}</span>` : ""
+          }</span>
+        </label>`;
+    })
     .join("");
 }
 

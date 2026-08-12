@@ -141,9 +141,60 @@
           <input id="site" type="text" placeholder="Barry Waterfront" />
         </label>
 
+        <!--
+          The owner ran a real survey over Cowbridge with the Cardiff 25 cm
+          LiDAR ticked, an archive that covers ten tiles at St Fagans and
+          nothing else, and the run reported that as a failure. Their
+          reaction settled both halves of what this block is: "we shouldnt
+          be attempting to pull it if its not selected, I actually dont
+          want all these map layer selections on the right, because we want
+          all the ones that exist in tiles selected. so we can probably
+          remove that from ui, and make sure it just grabs whatever is in
+          the bounding rectangle."
+
+          So the checklist is no longer the control. GET /api/coverage
+          answers, for the drawn extent and with no network access at all,
+          which sources actually serve this ground; app.js ticks every one
+          of them and unticks the rest, and what is left here to read is
+          three things and nothing else (the owner's second brief: "just a
+          highlight to show the level of lidar detail, and that all
+          elements can be captured. if one cant list it below. nothing
+          else. bullet point format, not long text"):
+
+            #coverage-lidar   the detail level this extent will actually
+                              get, big enough to read at a glance, with at
+                              most a fragment of a qualifier beside it.
+            #coverage-all     one line confirming the rest is available.
+            #coverage-notes   bullets, and only when there is something to
+                              bullet: a layer that cannot serve this
+                              ground, or one whose first use ever downloads
+                              hundreds of megabytes.
+
+          Everything longer than a fragment moved into Advanced below. It
+          is a native <details>, so it opens with the keyboard and needs no
+          JavaScript to work at all, and it is collapsed because the owner
+          asked for these selections to be off the panel, not for the
+          override to be taken away.
+        -->
         <fieldset>
           <legend>Layers</legend>
-          <div id="sources"></div>
+          <div id="coverage-lidar" class="coverage-lidar" hidden></div>
+          <div id="coverage-all" class="coverage-all" hidden></div>
+          <ul id="coverage-notes" class="coverage-notes" hidden></ul>
+          <details class="advanced">
+            <summary>Advanced</summary>
+            <div id="sources"></div>
+            <!--
+              Task 8's tier list, moved in here whole rather than deleted.
+              It is one line per category naming the source that serves it
+              and that source's own detail sentence, which is exactly the
+              volume the owner asked to be rid of on the panel itself, and
+              exactly what someone overriding a tick underneath it wants to
+              read. Same id, so renderResolution in app.js is untouched by
+              the move.
+            -->
+            <div id="tier-list" class="tier-list" hidden></div>
+          </details>
         </fieldset>
 
         <fieldset>
@@ -157,8 +208,6 @@
         </label>
 
         <div id="estimate" class="estimate">Draw or paste an extent to see an estimate.</div>
-
-        <div id="tier-list" class="estimate tier-list" hidden></div>
 
         <div id="folder-preview" class="folder-preview" hidden>
           <span class="folder-preview-label">Will create</span>
