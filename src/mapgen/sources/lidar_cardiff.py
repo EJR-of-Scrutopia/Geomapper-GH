@@ -142,12 +142,36 @@ duplicating a single byte of the 84 MB the national cache already holds.
 `_skip_reason` below answers one question, "is there any point running
 this source over this extent", and it has exactly two ways to say no.
 The extent's own intersection with the coverage envelope needs more
-pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows
-(`_budget_refusal_reason`), or `covers(bbox)` is "none" and this archive
-holds nothing at all for this ground (`_NO_COVERAGE_REASON`). Both are
-statements about the extent the owner drew, not about anything being
-broken, and this source can no more fix either by being asked a second
-time than it can move the flight path of a 2011 survey.
+pixels at 25 cm than `_ENVELOPE_PIXEL_CAP` allows (`_budget_refusal_reason`),
+or `covers(bbox)` is "none" and this archive holds nothing at all for this
+ground (`_NO_COVERAGE_REASON`). Both are statements about the extent the
+owner drew, not about anything being broken, and this source can no more
+fix either by being asked a second time than it can move the flight path
+of a 2011 survey.
+
+`_ENVELOPE_PIXEL_CAP`, and the correction of 2026-08-12: this used to gate
+on `cog.MAX_WINDOW_PIXELS` (16,777,216, a general-purpose ceiling
+`cog.py`'s own COG reader uses to stop a corrupt or hostile header from
+allocating a window before anything has looked at the data), which caps a
+drawable raw extent at about 600 x 600 m once `_window_pixels`' own
+padding is accounted for. The covered block itself is only 2000 x 1500 m,
+exactly 48,000,000 pixels at `PIXEL_METRES`
+(`_ENVELOPE_PIXEL_CAP`'s own value, computed from `_ENVELOPE` rather than
+pinned as a second literal so it can never drift from a future correction
+to `COVERAGE_TILES`), and that is the ABSOLUTE MAXIMUM `_window_pixels` can
+ever price a real bbox at, because `_window_pixels` prices the padded
+extent's own intersection with `_ENVELOPE`, which can never exceed
+`_ENVELOPE`'s own area. Gating on the envelope's own pixel count instead of
+`cog.py`'s unrelated, smaller ceiling makes the gate self-defining and
+mathematically unreachable by any real request: the owner hit the old
+600 x 600 m ceiling twice over a 2000 x 1500 m block that this archive can
+never be asked for more of, and authorised raising it ("Raise the cap,
+whole block in one pull"). The gate is not removed, only re-based: it
+still exists as a guard against a coding error that hands `_skip_reason` a
+pixel count computed some other, wrong way (`_window_pixels` itself
+mis-clamped, or a future caller bypassing it entirely), the same
+belt-and-braces role `merge()`'s own zero-width check on
+`_snapped_merge_window` already plays below.
 
 Both used to RAISE, each with a `tile_failures` entry per tile
 classified `FAILURE_NODE_CAP`, and the cost of that showed up on the
@@ -183,16 +207,18 @@ out of the whole survey uncaught instead of reaching the owner as an
 ordinary source outcome.
 
 The budget half of `_skip_reason` uses `_window_pixels`'s own, unsnapped
-figure, the exact number `detail()` already previewed, rather than the
-pixel count `merge()`'s own snapped window ends up with: snapping
-outward can only grow a window by under one pixel per edge, and gating
-on the snapped count would let the skip and the preview disagree by that
-same sliver, for no benefit.
+figure, rather than the pixel count `merge()`'s own snapped window ends up
+with: snapping outward can only grow a window by under one pixel per edge,
+and gating on the snapped count would let the skip disagree with the
+figure `_budget_refusal_reason` would have quoted by that same sliver, for
+no benefit. `detail()` (below) no longer previews this number at all,
+since 2026-08-12: see that method's own docstring for why there is no
+longer a "covered but over budget" shape for a preview to describe.
 
 ## Why the coverage half of that question needs covers(), not the pixel count
 
 An extent with `covers(bbox) == "none"` clears the budget test
-comfortably, because 0 pixels is well under `MAX_WINDOW_PIXELS`, and two
+comfortably, because 0 pixels is well under `_ENVELOPE_PIXEL_CAP`, and two
 shapes of "none" arrive that way. The first: the padded extent overlaps
 `_ENVELOPE`'s own bounding rectangle in ONE axis but not the other
 (eastings inside, northings nowhere near), so `_window_pixels` prices the
@@ -255,7 +281,7 @@ import requests
 
 from mapgen.asc_grid import AscGridError, parse_asc, parse_asc_header
 from mapgen.bng import best_effort_padded_bng_extent
-from mapgen.cog import MAX_WINDOW_PIXELS, USER_AGENT, BngWindow
+from mapgen.cog import USER_AGENT, BngWindow
 from mapgen.config import CONFIG_PATH
 from mapgen.egrid import PAD_METRES
 from mapgen.fsutil import atomic_write_text, ensure_dir
@@ -330,6 +356,19 @@ _ENVELOPE = (
 # survey convention.
 _LATTICE_CELL_METRES = 500.0
 
+# How many decimal places `covers()` rounds a padded extent's own
+# e_min/n_min/e_max/n_max to before any lattice floor/ceil arithmetic
+# ever sees them (see `covers()`'s own "Fixed 2026-08-12" boundary-noise
+# section): the nearest millimetre. Measured directly, the round trip
+# through `tm_forward`/`tm_inverse` or a cached grid's own bilinear
+# interpolation leaves an edge that was meant to land exactly on a 500 m
+# lattice line at most a few millionths of a metre off it; three decimal
+# places is a thousand times coarser than that worst case and still half
+# a million times finer than the lattice this rounds for, so it can never
+# mask a real difference between two genuinely different extents while
+# reliably absorbing the noise this exists to remove.
+_LATTICE_ROUNDING_DECIMALS = 3
+
 # The same ten tiles, as integer (column, row) lattice indices rather
 # than float bounds: `tile_e_min // 500 == column`, `tile_n_min // 500 ==
 # row`, exact because every COVERAGE_TILES edge already sits on the 500 m
@@ -374,6 +413,28 @@ _DTM_CACHE_POINTER_NAME = f"{DTM_ZIP_NAME}.cache_pointer"
 # cells at 0.5m" for the 2012 50cm flight; this 2011 flight is the 25cm
 # one the same catalogue lists at half that cell size).
 PIXEL_METRES = 0.25
+
+# The absolute ceiling `_window_pixels` can ever return for a REAL bbox:
+# the coverage envelope's own full pixel count at PIXEL_METRES. Computed
+# from `_ENVELOPE` and `PIXEL_METRES` rather than pinned as a second,
+# independently typed literal (48,000,000 today), so this stays correct
+# without a second edit if `COVERAGE_TILES` is ever corrected: the module
+# docstring's own 2026-08-12 correction note is the reason that caution
+# exists at all here.
+#
+# `_window_pixels` always prices the padded extent's own intersection
+# with `_ENVELOPE`, and an intersection with a rectangle can never exceed
+# that rectangle's own area, so gating `_skip_reason` on exactly this
+# number (rather than `cog.MAX_WINDOW_PIXELS`, an unrelated, smaller
+# ceiling `cog.py`'s own COG reader uses to stop a corrupt header from
+# allocating memory before anything has looked at the data) makes the
+# budget gate self-defining: no bbox a real survey can ever be asked to
+# draw can price over this cap. See the module docstring's own "Two facts
+# stop this source" section for the fuller reasoning and the owner's own
+# authorisation to raise it.
+_ENVELOPE_PIXEL_CAP = round((_ENVELOPE[2] - _ENVELOPE[0]) / PIXEL_METRES) * round(
+    (_ENVELOPE[3] - _ENVELOPE[1]) / PIXEL_METRES
+)
 
 # Task 3's own live cold-run measurement (task-3-report.md): both zips,
 # 83,795,893 bytes combined, in about 4.09 s (pytest-reported test
@@ -664,36 +725,33 @@ def _window_pixels(bbox: BBox, ostn15_cache_dir: Path | None) -> int:
 
 
 def _budget_refusal_reason(pixels: int) -> str:
-    """The over-budget skip reason, with only the pixel count substituted
-    (thousands separated: part of the pinned text, not incidental
-    formatting).
+    """The over-budget skip reason, with the pixel count and the cap both
+    substituted (thousands separated: part of the pinned text, not
+    incidental formatting).
 
     Names no place at all, and does not need to: the sentence is about
     how large the extent is, not about where it sits, so the 2026-08-12
     place-name correction (see the module docstring) left it untouched.
 
-    The plan's own original wording said "under about 1 x 1 km," which is
-    the PADDED window's own threshold (`MAX_WINDOW_PIXELS` at
-    `PIXEL_METRES`: 4096 x 4096 px * 0.25 m = 1024 m of padded window),
-    not a raw, drawable extent size. `_window_pixels` pads every extent by
-    `PAD_METRES` (200 m) on every side before pricing it, so a raw extent
-    has only `1024 - 2 * 200 = 624 m` per side of headroom before this
-    gate fires, not 1024 m. A Task 6 review caught the drift (that task's
-    own live run had already measured it: a 900 m raw extent comes back
-    27,039,999 pixels, 61% over budget, despite reading as safely "under
-    1 km"); "under about 600 x 600 m," rounded DOWN from the true 624 m
-    edge rather than up to it, is what every user-facing sentence in this
-    module says now.
+    Unreachable by any real bbox since the 2026-08-12 cap correction (see
+    `_ENVELOPE_PIXEL_CAP`'s own comment and the module docstring's "Two
+    facts stop this source" section): `_skip_reason` gates on the coverage
+    envelope's own full pixel count, and `_window_pixels` can never price
+    a real extent above that. This sentence, and the "under about
+    600 x 600 m" guidance it used to carry (a figure derived from
+    `cog.MAX_WINDOW_PIXELS`, an unrelated, smaller ceiling), survives only
+    as what a coding error would say if `_skip_reason` were ever handed a
+    pixel count computed some other, wrong way: it names the actual cap
+    rather than a place or a size an owner could draw to avoid it, because
+    there is no longer any real extent this sentence describes.
 
     Reached only through `_skip_reason`, which both `fetch()` and
-    `merge()` ask: one function is what keeps those two, and `detail()`'s
-    own preview, from ever drifting apart in wording about the same
-    extent.
+    `merge()` ask: one function is what keeps those two from ever drifting
+    apart in wording about the same extent.
     """
     return (
-        f"this extent needs {pixels:,} pixels at 25 cm and the raster "
-        f"budget is 16,777,216; extents under about 600 x 600 m inside "
-        f"the covered block come back at 25 cm"
+        f"this extent needs {pixels:,} pixels at 25 cm, over the covered "
+        f"block's own {_ENVELOPE_PIXEL_CAP:,}-pixel raster budget"
     )
 
 
@@ -954,10 +1012,47 @@ class LidarCardiffSource:
         gridless projection otherwise (see that helper's own docstring in
         `bng.py`), close enough at the 500 m grain this decides "full",
         "partial" or "none" at.
+
+        Fixed 2026-08-12, a second boundary bug distinct from the one
+        above: `best_effort_padded_bng_extent` round-trips `bbox` through
+        `tm_forward`/`tm_inverse` (or, with a cached grid, `to_bng`'s own
+        bilinear interpolation), and either path leaves an edge that was
+        MEANT to land exactly on a 500 m lattice line a few millionths of
+        a metre off it (measured directly: up to a few microns, on either
+        side, unpredictably). `math.floor`/`math.ceil`, inside
+        `_lattice_index_bounds` below, are exactly the wrong functions to
+        hand that noise to: both are discontinuous AT an integer, so an
+        edge meant to sit exactly on a lattice line that lands a hair
+        ABOVE it makes `math.ceil` jump to the next multiple, one whole
+        extra row or column the real extent never reached. That extra
+        row or column inflates `total` (a RECTANGLE over the touched
+        index range) without inflating `covered` by the same amount
+        whenever the block's own concave shape means the extra cell is
+        not itself one of the ten (which is exactly the case at every
+        outer edge of the block, and was reproduced directly against an
+        extent sitting exactly on the block's own west edge, one whole
+        real tile, reading "partial"): `covered < total` follows, and an
+        extent wholly inside the covered footprint reads "partial"
+        instead of "full". Rounding to the nearest millimetre before any
+        floor/ceil ever sees these four numbers (`_LATTICE_ROUNDING_
+        DECIMALS`, a thousand times coarser than the worst noise measured
+        and half a million times finer than the 500 m lattice itself)
+        absorbs that noise, so a coordinate meant to land exactly on a
+        lattice line does, deterministically, however it arrived.
+        `_window_pixels` needs no equivalent fix: it prices a continuous
+        pixel COUNT (`width / PIXEL_METRES * height / PIXEL_METRES`) via
+        `min`/`max`, never `floor`/`ceil` on the 500 m lattice, and `min`/
+        `max` are continuous at the exact values this noise perturbs, so
+        the same few microns can shift the reported pixel count by, at
+        most, a fraction of one pixel, never an extra lattice cell.
         """
         e_min, n_min, e_max, n_max = best_effort_padded_bng_extent(
             bbox, PAD_METRES, cache_dir=self._ostn15_cache_dir
         )
+        e_min = round(e_min, _LATTICE_ROUNDING_DECIMALS)
+        n_min = round(n_min, _LATTICE_ROUNDING_DECIMALS)
+        e_max = round(e_max, _LATTICE_ROUNDING_DECIMALS)
+        n_max = round(n_max, _LATTICE_ROUNDING_DECIMALS)
         covered = sum(
             1
             for tile_i, tile_j in _COVERAGE_INDEX_SET
@@ -1005,18 +1100,24 @@ class LidarCardiffSource:
         Two facts, in the order they are cheapest to be wrong about, and
         neither of them a failure: an extent whose own intersection with
         the coverage envelope needs more pixels at 25 cm than
-        `cog.MAX_WINDOW_PIXELS` allows, and an extent with no overlap
-        with any of the ten `COVERAGE_TILES` at all. See the module
-        docstring's "Two facts stop this source, and NEITHER of them is
-        a failure" section for why both are skips, and the section after
-        it for why the second question has to be `covers()`'s lattice
-        test rather than a pixel count that reads 0 for both a
-        no-coverage extent and a degenerate one.
+        `_ENVELOPE_PIXEL_CAP` allows, and an extent with no overlap with
+        any of the ten `COVERAGE_TILES` at all. See the module docstring's
+        "Two facts stop this source, and NEITHER of them is a failure"
+        section for why both are skips, and the section after it for why
+        the second question has to be `covers()`'s lattice test rather
+        than a pixel count that reads 0 for both a no-coverage extent and
+        a degenerate one.
 
         The budget test comes first only for continuity with the gate
         order this replaced; the two never both apply to the same extent
         in any case, since an extent with no overlap prices at 0 pixels
-        and can never be over budget.
+        and can never be over budget. Since the 2026-08-12 cap correction
+        (`_ENVELOPE_PIXEL_CAP`'s own comment), the budget half is also
+        unreachable by any real bbox: `_window_pixels` can never price a
+        real extent above the coverage envelope's own full pixel count,
+        which is exactly what this now gates on. It stays, ordered first,
+        as a guard against a coding error handing this a pixel count some
+        other, wrong way, never as a check a real survey extent can trip.
 
         Never touches the network: `_window_pixels` and `covers()` are
         both cache-only, the same guarantee `detail()` and `estimate()`
@@ -1024,7 +1125,7 @@ class LidarCardiffSource:
         turning a merge into a request.
         """
         pixels = _window_pixels(bbox, self._ostn15_cache_dir)
-        if pixels > MAX_WINDOW_PIXELS:
+        if pixels > _ENVELOPE_PIXEL_CAP:
             return _budget_refusal_reason(pixels)
         if self.covers(bbox) == "none":
             return _NO_COVERAGE_REASON
@@ -1034,48 +1135,36 @@ class LidarCardiffSource:
 
     def detail(self, bbox: BBox) -> str | None:
         """The resolution and vintage this extent would actually get,
-        computed from `covers()` and `_window_pixels`, never guessed:
+        computed from `covers()` alone:
 
-        - "full" and within `MAX_WINDOW_PIXELS`:
-          "25 cm at this extent, flown 2011"
-        - "full" but over budget:
-          "25 cm needs an extent under about 600 x 600 m here (flown 2011)"
-        - "partial":
-          "25 cm over part of this extent, flown 2011", with
-          "; 25 cm needs an extent under about 600 x 600 m here" appended
-          when the padded extent's own intersection with the coverage
-          envelope is itself over budget
+        - "full": "25 cm at this extent, flown 2011"
+        - "partial": "25 cm over part of this extent, flown 2011"
         - "none": `None`
 
-        "About 600 x 600 m" is a RAW, drawable extent size, not the padded
-        window `MAX_WINDOW_PIXELS` itself gates on: the budget is 4096 x
-        4096 pixels at `PIXEL_METRES` (0.25 m), 1024 m of PADDED window,
-        but `_window_pixels` pads every extent by `PAD_METRES` (200 m) on
-        every side before pricing it, so a raw extent only has
-        `1024 - 2 * 200 = 624 m` per side of headroom before the gate
-        fires. "600 x 600 m," rounded DOWN from that 624 m edge (never up
-        to it, and never the padded 1024 m figure a Task 6 review found
-        this sentence wrongly quoting), is what every user-facing string
-        in this module says: honest-conservative, so an owner who draws
-        exactly what this sentence says never lands on the wrong side of
-        the gate.
+        No budget qualifier anywhere, and none is possible: since the
+        2026-08-12 cap correction (see `_ENVELOPE_PIXEL_CAP`'s own comment
+        and the module docstring's "Two facts stop this source" section),
+        `_window_pixels` can never price a real, covered extent over the
+        budget `_skip_reason` gates on, because that budget is now exactly
+        the coverage envelope's own full pixel count. There is therefore
+        no longer a "covered but over budget" shape for this preview to
+        describe: a "full" or "partial" answer from `covers()` always gets
+        25 cm, at whatever share of the extent is covered, full stop. This
+        method used to also call `_window_pixels` and append an "under
+        about 600 x 600 m" clause when the result was over
+        `cog.MAX_WINDOW_PIXELS`, an unrelated, smaller ceiling
+        `cog.py`'s own COG reader uses for a different purpose entirely;
+        that clause is gone along with the gate it described.
 
-        Never touches the network: `covers()` and `_window_pixels` are
-        both cache-only, the same guarantee `estimate()` itself carries.
+        Never touches the network: `covers()` is cache-only, the same
+        guarantee `estimate()` itself carries.
         """
         coverage = self.covers(bbox)
         if coverage == "none":
             return None
-        pixels = _window_pixels(bbox, self._ostn15_cache_dir)
-        over_budget = pixels > MAX_WINDOW_PIXELS
         if coverage == "full":
-            if over_budget:
-                return "25 cm needs an extent under about 600 x 600 m here (flown 2011)"
             return "25 cm at this extent, flown 2011"
-        sentence = "25 cm over part of this extent, flown 2011"
-        if over_budget:
-            sentence += "; 25 cm needs an extent under about 600 x 600 m here"
-        return sentence
+        return "25 cm over part of this extent, flown 2011"
 
     # -- estimate / routing_note ----------------------------------------------
 

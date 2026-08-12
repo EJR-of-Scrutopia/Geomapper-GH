@@ -41,7 +41,7 @@ import pytest
 import requests
 
 from mapgen.bng import tm_inverse
-from mapgen.cog import MAX_WINDOW_PIXELS, CogReader, FileByteSource, read_full_window
+from mapgen.cog import CogReader, FileByteSource, read_full_window
 from mapgen.egrid import PAD_METRES
 from mapgen.geo import BBox, Tile
 from mapgen.jobs import EventLog
@@ -106,20 +106,27 @@ def _write_right_size_stub(path, size: int) -> None:
 
 # Comfortably inside ST1177SW (311000-311500, 177000-177500), margin 40 m
 # on every side: covers() == "full", and small enough to stay well under
-# MAX_WINDOW_PIXELS.
+# _ENVELOPE_PIXEL_CAP.
 _FULL_UNDER_BUDGET = (311040.0, 177040.0, 311460.0, 177460.0)
 
 # Inside the solid 3x3 block (310500-312000, 176500-178000), margin
-# 100-200 m from every real coverage edge: covers() == "full", but at
-# 1200 x 1200 m the intersection with the coverage envelope clears
-# MAX_WINDOW_PIXELS.
-_FULL_OVER_BUDGET = (310600.0, 176600.0, 311800.0, 177800.0)
+# 100-200 m from every real coverage edge: covers() == "full", and at
+# 1200 x 1200 m (23,040,000 pixels) comfortably under _ENVELOPE_PIXEL_CAP
+# (48,000,000) even though it is well over the OLD, pre-2026-08-12 cap of
+# cog.MAX_WINDOW_PIXELS (16,777,216): this is the fixture that proves the
+# owner's own authorised raise actually widened what a real extent can
+# ask for, not merely relabelled the same ceiling.
+_FULL_LARGE_STILL_UNDER_BUDGET = (310600.0, 176600.0, 311800.0, 177800.0)
 
 # The whole ten-tile block's own bounding rectangle: touches all twelve
 # 500 m cells in its 4x3 span, ten of them real tiles and two of them the
-# gap either side of ST1277SW (see the module docstring). 2000 x 1500 m
-# at 0.25 m is 48,000,000 pixels, over MAX_WINDOW_PIXELS (16,777,216).
-_WHOLE_BLOCK_PARTIAL_OVER_BUDGET = (310500.0, 176500.0, 312500.0, 178000.0)
+# gap either side of ST1277SW (see the module docstring). 2000 x 1500 m at
+# 0.25 m is 48,000,000 pixels, exactly _ENVELOPE_PIXEL_CAP: this fixture IS
+# the envelope, so it is the largest, most-pixels-needing extent this
+# source can ever be asked to price, and it sits AT the cap, never over
+# it. Proves the cap is self-defining: the one extent that could ever come
+# closest to tripping it is the one this fixture builds, and it does not.
+_WHOLE_BLOCK_PARTIAL_AT_CAP = (310500.0, 176500.0, 312500.0, 178000.0)
 
 # Straddles the coverage block's own west edge (e=310500) while staying
 # inside a single covered n-band (176500-177000, ST1076NE's own band):
@@ -182,7 +189,7 @@ def test_covers_is_full_wholly_inside_one_tile(tmp_path):
 
 def test_covers_is_full_over_the_solid_three_by_three_block(tmp_path):
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    bbox = _bbox_for_padded_bng_rect(*_FULL_OVER_BUDGET)
+    bbox = _bbox_for_padded_bng_rect(*_FULL_LARGE_STILL_UNDER_BUDGET)
     assert source.covers(bbox) == "full"
 
 
@@ -198,7 +205,7 @@ def test_covers_is_partial_over_the_whole_blocks_bounding_rectangle(tmp_path):
     # would wrongly read "full" if covers() ever regressed to a
     # bounding-rectangle test instead of the lattice, cell-for-cell one.
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_AT_CAP)
     assert source.covers(bbox) == "partial"
 
 
@@ -211,6 +218,49 @@ def test_covers_is_partial_never_full_at_the_concave_corner(tmp_path):
     result = source.covers(bbox)
     assert result != "full"
     assert result == "partial"
+
+
+# Exactly one covered tile, ST1076NE, both e and n edges landing exactly
+# on 500 m lattice lines (310500/311000/176500/177000, all multiples of
+# 500): the fixture that reproduced the 2026-08-12 boundary bug directly.
+# `_bbox_for_padded_bng_rect`'s own round trip through tm_inverse/
+# tm_forward left the recovered padded extent a few millionths of a metre
+# off these exact values (measured directly), and `math.ceil`'s own
+# discontinuity at an integer turned that into one whole extra,
+# uncovered lattice cell in the "total" count: covers() read "partial"
+# for ground that is wholly and exactly one real tile.
+_WEST_EDGE_SINGLE_TILE_EXACT_LATTICE_FULL = (310500.0, 176500.0, 311000.0, 177000.0)
+
+# The solid block's own north row, ST1077NE/ST1177NW/ST1177NE, every one
+# of its four edges (310500, 178000, and the two mid-row lattice lines) an
+# exact multiple of 500: three real, adjacent tiles, still "full", still
+# exercising the same near/far, e/n edges the single-tile fixture above
+# does, at a larger span.
+_NORTH_ROW_EXACT_LATTICE_FULL = (310500.0, 177500.0, 312000.0, 178000.0)
+
+
+def test_covers_is_full_at_a_single_tiles_own_exact_lattice_edges(tmp_path):
+    """The 2026-08-12 boundary fix, pinned: an extent whose padded edges
+    land EXACTLY on a 500 m lattice line (here, exactly one whole real
+    tile, ST1076NE) must read "full", deterministically, regardless of
+    which side of the line the BNG round trip's own sub-micron noise
+    happens to leave the recovered extent on. See covers()'s own
+    docstring, "Fixed 2026-08-12", for the mechanism: without the
+    millimetre rounding that fix added, this exact fixture read "partial"
+    on this machine.
+    """
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    bbox = _bbox_for_padded_bng_rect(*_WEST_EDGE_SINGLE_TILE_EXACT_LATTICE_FULL)
+    assert source.covers(bbox) == "full"
+
+
+def test_covers_is_full_across_a_whole_row_at_its_own_exact_lattice_edges(tmp_path):
+    """The same fix, at a larger span: three real, adjacent tiles whose
+    every edge sits exactly on the lattice, still "full".
+    """
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    bbox = _bbox_for_padded_bng_rect(*_NORTH_ROW_EXACT_LATTICE_FULL)
+    assert source.covers(bbox) == "full"
 
 
 def test_covers_is_none_far_from_the_block(tmp_path):
@@ -295,13 +345,16 @@ def test_covers_and_detail_on_antimeridian_normalised_extent_are_bounded(tmp_pat
     # covered tiles and billions of others: "partial" is the honest
     # answer, not "full" or "none", and reaching it must never build the
     # billions-strong list the old covers() did.
+    # detail() carries no budget clause of any kind since the 2026-08-12
+    # cap correction (see lidar_cardiff.py's own module docstring): even
+    # this pathological, billions-of-cells-touching extent can never
+    # price _window_pixels above _ENVELOPE_PIXEL_CAP, because that
+    # function clips to _ENVELOPE before counting, so the plain "partial"
+    # sentence is the honest and only answer here too.
     bbox = BBox.parse("179,-1,-179,1")
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
     assert _call_bounded(source.covers, bbox) == "partial"
-    assert _call_bounded(source.detail, bbox) == (
-        "25 cm over part of this extent, flown 2011; "
-        "25 cm needs an extent under about 600 x 600 m here"
-    )
+    assert _call_bounded(source.detail, bbox) == "25 cm over part of this extent, flown 2011"
 
 
 def test_covers_and_detail_on_reversed_corners_extent_are_bounded(tmp_path):
@@ -330,10 +383,7 @@ def test_covers_and_detail_on_globe_spanning_extent_are_bounded(tmp_path):
     bbox = BBox(west=-180.0, south=-1.0, east=180.0, north=1.0)
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
     assert _call_bounded(source.covers, bbox) == "partial"
-    assert _call_bounded(source.detail, bbox) == (
-        "25 cm over part of this extent, flown 2011; "
-        "25 cm needs an extent under about 600 x 600 m here"
-    )
+    assert _call_bounded(source.detail, bbox) == "25 cm over part of this extent, flown 2011"
 
 
 # --------------------------------------------------------------------------
@@ -365,49 +415,64 @@ def test_window_pixels_clips_to_the_coverage_envelope_not_the_whole_padded_exten
     assert _window_pixels(bbox, tmp_path) == pytest.approx(expected, rel=1e-4)
 
 
-def test_window_pixels_over_the_whole_block_is_48_million_and_over_budget(tmp_path):
-    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+def test_window_pixels_over_the_whole_block_is_48_million_exactly_the_cap(tmp_path):
+    # The absolute maximum this source can ever be asked to price (see
+    # _ENVELOPE_PIXEL_CAP's own comment): AT the cap, never over it, which
+    # is the whole point of deriving the cap from the envelope itself.
+    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_AT_CAP)
     pixels = _window_pixels(bbox, tmp_path)
-    assert pixels == pytest.approx(48_000_000, rel=1e-5)
-    assert pixels > MAX_WINDOW_PIXELS
+    # The projection round trip (tm_inverse/tm_forward) can leave `pixels`
+    # a handful under the exact cap, never over it: pytest.approx covers
+    # that noise, and the `not >` assertion is the one that actually
+    # matters (the gate itself uses a bare `>`, never approx).
+    assert pixels == pytest.approx(lidar_cardiff._ENVELOPE_PIXEL_CAP, rel=1e-5)
+    assert not pixels > lidar_cardiff._ENVELOPE_PIXEL_CAP
 
 
 # --------------------------------------------------------------------------
-# detail(): the four outcomes, verbatim.
+# detail(): full / partial / none, verbatim. No budget qualifier appears
+# anywhere any more (2026-08-12: the cap is now the coverage envelope's
+# own pixel count, so a covered extent can never be over it; see
+# lidar_cardiff.py's own module docstring).
 # --------------------------------------------------------------------------
 
 
-def test_detail_full_and_within_budget(tmp_path):
+def test_detail_full_gets_the_plain_sentence(tmp_path):
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
     bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
     assert source.covers(bbox) == "full"
     assert source.detail(bbox) == "25 cm at this extent, flown 2011"
 
 
-def test_detail_full_but_over_budget(tmp_path):
+def test_detail_full_and_large_still_gets_the_plain_sentence(tmp_path):
+    # _FULL_LARGE_STILL_UNDER_BUDGET is well over the OLD cap
+    # (cog.MAX_WINDOW_PIXELS) and comfortably under the new,
+    # envelope-derived one: proof the raised cap actually changed what
+    # detail() previews for a real extent, not just the arithmetic behind
+    # it.
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    bbox = _bbox_for_padded_bng_rect(*_FULL_OVER_BUDGET)
+    bbox = _bbox_for_padded_bng_rect(*_FULL_LARGE_STILL_UNDER_BUDGET)
     assert source.covers(bbox) == "full"
-    assert source.detail(bbox) == (
-        "25 cm needs an extent under about 600 x 600 m here (flown 2011)"
-    )
+    assert source.detail(bbox) == "25 cm at this extent, flown 2011"
 
 
-def test_detail_partial_under_budget_has_no_appended_clause(tmp_path):
+def test_detail_partial_never_appends_anything(tmp_path):
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
     bbox = _bbox_for_padded_bng_rect(*_STRADDLES_WEST_EDGE_PARTIAL_UNDER_BUDGET)
     assert source.covers(bbox) == "partial"
     assert source.detail(bbox) == "25 cm over part of this extent, flown 2011"
 
 
-def test_detail_partial_and_over_budget_appends_the_extra_sentence(tmp_path):
+def test_detail_partial_over_the_whole_block_still_has_no_appended_clause(tmp_path):
+    # The whole block's own bounding rectangle prices at exactly
+    # _ENVELOPE_PIXEL_CAP (see test_window_pixels_over_the_whole_block_is_
+    # 48_million_exactly_the_cap): the single largest, most-pixels-needing
+    # extent this source can ever be handed, and even it gets the plain
+    # "partial" sentence with nothing appended.
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_AT_CAP)
     assert source.covers(bbox) == "partial"
-    assert source.detail(bbox) == (
-        "25 cm over part of this extent, flown 2011; "
-        "25 cm needs an extent under about 600 x 600 m here"
-    )
+    assert source.detail(bbox) == "25 cm over part of this extent, flown 2011"
 
 
 def test_detail_is_none_when_covers_is_none(tmp_path):
@@ -546,7 +611,7 @@ def test_estimate_ignores_bbox_and_tiles_entirely(tmp_path, monkeypatch):
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
 
     small = source.estimate(_bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET), [])
-    large = source.estimate(_bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET), [])
+    large = source.estimate(_bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_AT_CAP), [])
 
     assert small.bytes_estimate == large.bytes_estimate
     assert small.seconds_estimate == pytest.approx(large.seconds_estimate)
@@ -883,11 +948,27 @@ class _RecordingProgress:
         self.events.append((event, fields))
 
 
-def test_fetch_skips_an_over_budget_extent_instead_of_failing(tmp_path, monkeypatch):
+def test_fetch_skips_when_window_pixels_reports_over_the_cap_a_coding_error_guard(
+    tmp_path, monkeypatch
+):
+    """No real bbox can price over `_ENVELOPE_PIXEL_CAP` any more (see
+    that constant's own comment: `_window_pixels` always clips to
+    `_ENVELOPE`, and an intersection with a rectangle can never exceed the
+    rectangle's own area), so `_WHOLE_BLOCK_PARTIAL_AT_CAP` above is now
+    the closest any fixture can get, and it sits AT the cap rather than
+    over it. This test proves the GUARD `_skip_reason` still carries
+    (`_budget_refusal_reason`, both sentence and gate) still fires and
+    `fetch()` still skips cleanly rather than downloading if
+    `_window_pixels` is ever wrong regardless, a coding error simulated
+    here by monkeypatching it to answer one pixel over the cap for an
+    otherwise perfectly ordinary, fully-covered extent.
+    """
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
-    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
-    pixels = _window_pixels(bbox, tmp_path)
-    assert pixels > MAX_WINDOW_PIXELS
+    inflated_pixels = lidar_cardiff._ENVELOPE_PIXEL_CAP + 1
+    monkeypatch.setattr(
+        lidar_cardiff, "_window_pixels", lambda bbox, cache_dir: inflated_pixels
+    )
+    bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
 
     tiles = [
         Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox),
@@ -903,13 +984,12 @@ def test_fetch_skips_an_over_budget_extent_instead_of_failing(tmp_path, monkeypa
     assert source.fetch(bbox, tiles, tmp_path / "work", progress) == []
 
     # Pin the substitution, not just the prose (the item B lesson, same
-    # as the merge()-side test): re-derive the exact pixel count rather
-    # than hard-coding a number that can drift with tm_inverse/tm_forward
-    # round-trip noise.
+    # as the merge()-side test): re-derive the exact pixel count and cap
+    # rather than hard-coding either number.
     expected_reason = (
-        f"this extent needs {pixels:,} pixels at 25 cm and the raster "
-        f"budget is 16,777,216; extents under about 600 x 600 m inside "
-        f"the covered block come back at 25 cm"
+        f"this extent needs {inflated_pixels:,} pixels at 25 cm, over the "
+        f"covered block's own {lidar_cardiff._ENVELOPE_PIXEL_CAP:,}-pixel "
+        f"raster budget"
     )
     assert source.skipped_reason == expected_reason
     # Nothing failed, so nothing is recorded as having failed.
@@ -1385,7 +1465,7 @@ def test_fetch_writes_a_cache_pointer_file_per_zip_into_work_dir(tmp_path, monke
     assert result == [cache_dir / DSM_ZIP_NAME, cache_dir / DTM_ZIP_NAME]
 
 
-def test_fetch_writes_no_pointer_file_when_it_skips_an_over_budget_extent(
+def test_fetch_writes_no_pointer_file_when_the_budget_guard_fires(
     tmp_path, monkeypatch
 ):
     """No output on a skip path: the pointer files are written only after
@@ -1398,9 +1478,21 @@ def test_fetch_writes_no_pointer_file_when_it_skips_an_over_budget_extent(
     merge()'s own `parts` from a LISTING of this directory, so a pointer
     left behind here would send merge() looking for zips a skipped fetch
     never fetched.
+
+    The budget half of `_skip_reason` is unreachable by any real bbox
+    since the 2026-08-12 cap correction (see `_ENVELOPE_PIXEL_CAP`'s own
+    comment): `_window_pixels` is monkeypatched here to simulate the
+    coding error that guard still exists to catch, the same technique
+    `test_fetch_skips_when_window_pixels_reports_over_the_cap_a_coding_
+    error_guard` above uses.
     """
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "cache")
-    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    monkeypatch.setattr(
+        lidar_cardiff,
+        "_window_pixels",
+        lambda bbox, cache_dir: lidar_cardiff._ENVELOPE_PIXEL_CAP + 1,
+    )
+    bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
     source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
     work_dir = tmp_path / "work"
 
@@ -1657,17 +1749,25 @@ def test_merge_never_fully_parses_a_member_wholly_outside_the_window(tmp_path, m
     assert all("1000" in text and "2000" not in text for text in calls)
 
 
-def test_merge_skips_an_over_budget_extent_and_records_the_same_reason(tmp_path):
-    bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
-    pixels = _window_pixels(bbox, tmp_path)
-    # Sanity: this fixture really is the ~48 million pixel, over-budget
-    # extent test_window_pixels_over_the_whole_block_is_48_million_and_
-    # over_budget already pins; the exact int can drift by a handful of
-    # pixels from the tm_inverse/tm_forward round trip, which is why the
-    # message assertion below re-derives it rather than hard-coding
-    # "48,000,000".
-    assert pixels == pytest.approx(48_000_000, rel=1e-3)
-    assert pixels > MAX_WINDOW_PIXELS
+def test_merge_skips_when_the_budget_guard_fires_and_records_the_same_reason(
+    tmp_path, monkeypatch
+):
+    """The budget half of `_skip_reason` is unreachable by any real bbox
+    since the 2026-08-12 cap correction (see `_ENVELOPE_PIXEL_CAP`'s own
+    comment: `_window_pixels` always clips to `_ENVELOPE`, so it can never
+    price a real extent above the envelope's own full pixel count, which
+    is exactly what the gate now uses). `_window_pixels` is monkeypatched
+    here to simulate the coding error that guard still exists to catch,
+    proving `merge()` still skips cleanly, with the identical reason
+    `fetch()` would have recorded (both ask the same `_skip_reason`),
+    rather than trying to assemble a window this large.
+    """
+    monkeypatch.setattr(
+        lidar_cardiff,
+        "_window_pixels",
+        lambda bbox, cache_dir: lidar_cardiff._ENVELOPE_PIXEL_CAP + 1,
+    )
+    bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
 
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
     source._bbox = bbox
@@ -1678,21 +1778,25 @@ def test_merge_skips_an_over_budget_extent_and_records_the_same_reason(tmp_path)
 
     # The item B lesson: pin the SUBSTITUTION, not just the surrounding
     # prose. The thousands separator is part of the pinned reason string
-    # itself, not incidental formatting. Identical to what fetch() would
-    # have recorded for the same extent, because both ask _skip_reason.
-    assert "," in f"{pixels:,}"
+    # itself, not incidental formatting.
+    inflated_pixels = lidar_cardiff._ENVELOPE_PIXEL_CAP + 1
     assert source.skipped_reason == (
-        f"this extent needs {pixels:,} pixels at 25 cm and the raster "
-        f"budget is 16,777,216; extents under about 600 x 600 m inside "
-        f"the covered block come back at 25 cm"
+        f"this extent needs {inflated_pixels:,} pixels at 25 cm, over the "
+        f"covered block's own {lidar_cardiff._ENVELOPE_PIXEL_CAP:,}-pixel "
+        f"raster budget"
     )
 
 
-def test_merge_skips_over_budget_before_opening_either_zip_and_writes_no_file(
+def test_merge_skips_when_the_budget_guard_fires_before_opening_either_zip(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(
+        lidar_cardiff,
+        "_window_pixels",
+        lambda bbox, cache_dir: lidar_cardiff._ENVELOPE_PIXEL_CAP + 1,
+    )
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    source._bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
+    source._bbox = _bbox_for_padded_bng_rect(*_FULL_UNDER_BUDGET)
 
     calls: list[str] = []
     monkeypatch.setattr(
