@@ -58,6 +58,34 @@ Every one of our own coordinates reaches BNG the same way `heights.py`'s
 first, `ensure_ostn15()` only if that misses (this module's own only
 network call apart from the NGD pull itself).
 
+## Explaining the unmatched, not just counting them
+
+A raw unmatched count is the one number in this report that cannot be
+read at face value. NGD counts building PARTS, so a terrace this project
+holds as one footprint arrives from OS as several parts, and every part
+after the one that wins the greedy pairing lands in "unmatched theirs"
+even though nothing whatever is missing from our side. Two additions
+separate that bookkeeping difference from a real gap, both aggregate,
+both firewall-safe:
+
+  * CONTAINMENT (`benchstats.classify_containment`). Every unmatched
+    footprint on one side is reduced to a single guaranteed-interior
+    point (`buildings.representative_point`, the scanline label point,
+    never a vertex average that a concave footprint puts outside itself)
+    and tested against the other side's footprints. One of theirs
+    standing inside one of ours is a SUBDIVISION; one standing on ground
+    we hold nothing on is ABSENT, the genuine gap. Mirrored the other
+    way for ours: `SPURIOUS_OR_NEWER` and `ABSENT_FROM_OS` (see the four
+    constants' own comment for what each does and does not prove).
+  * SIZE (`benchstats.ring_area`, `area_histogram`). Every footprint,
+    matched and unmatched, is bucketed by shoelace area in square metres,
+    and the unmatched buckets are cross-tabulated against the
+    containment classes above. The architectural question a bare count
+    cannot answer is whether a gap is bin stores and sheds or dwellings.
+
+Only bucket COUNTS and class COUNTS reach the report from either, never a
+per-feature area, never which feature fell where.
+
 ## Nothing fabricated
 
 An empty NGD pull reports zeros honestly: `matched_fraction_ours`/
@@ -79,7 +107,10 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from mapgen.benchstats import (
+    AREA_BUCKET_LABELS,
     OffsetStats,
+    area_histogram,
+    classify_containment,
     distribution,
     match_footprints,
     polyline_offsets,
@@ -123,6 +154,39 @@ _NORTHEAST_BEARING_DEG = 45.0
 _EPOCH_BEARING_TOLERANCE_DEG = 45.0
 
 _IOU_PERCENTILE_LABELS = {0.1: "p10", 0.5: "p50", 0.9: "p90"}
+
+# The four names this report gives `benchstats.classify_containment`'s own
+# deliberately neutral `contained`/`not_contained` split (that dataclass's
+# own docstring: the reading belongs to whoever knows which dataset is
+# which). Read them as questions already answered:
+#
+#   SUBDIVISION      one of theirs that matched nothing of ours, but whose
+#                    own interior point stands inside a footprint we DO
+#                    hold. Nothing is missing here: NGD counts building
+#                    PARTS, so a terrace we carry as one footprint arrives
+#                    from them as several, and every part after the one
+#                    that won the greedy pairing lands in the unmatched
+#                    pile by construction. A bookkeeping difference, not a
+#                    gap.
+#   ABSENT           one of theirs that matched nothing of ours and stands
+#                    on ground where we hold nothing at all. This is the
+#                    real gap, the only one of the four worth acting on.
+#   SPURIOUS_OR_NEWER one of ours that matched nothing of theirs but stands
+#                    inside a footprint they DO hold: we are splitting or
+#                    duplicating something they carry whole, or our own
+#                    footprint sits far enough off theirs for the sampled
+#                    IoU to refuse the pair while the point still lands
+#                    inside. Three readings, and this test cannot separate
+#                    them, so the label says so rather than picking one.
+#   ABSENT_FROM_OS   one of ours on ground THEY hold nothing on: new
+#                    construction since their survey, a demolition they
+#                    have not caught, or an error of ours. Again three
+#                    readings and no way to choose between them from
+#                    geometry alone.
+CONTAINMENT_SUBDIVISION = "subdivision"
+CONTAINMENT_ABSENT = "absent"
+CONTAINMENT_SPURIOUS_OR_NEWER = "spurious_or_newer"
+CONTAINMENT_ABSENT_FROM_OS = "absent_from_os"
 
 
 class BenchmarkError(RuntimeError):
@@ -582,6 +646,136 @@ def _epoch_verdict(osm_offsets: OffsetStats) -> str:
 # The report itself.
 # --------------------------------------------------------------------------
 
+# The size table's own column headings, in `AREA_BUCKET_LABELS` order:
+# the label a machine reads (`under_10`) is not the label a person
+# reads over a column of a markdown table, and the report is written for
+# a person first.
+_BUCKET_HEADINGS = {
+    "under_10": "<10",
+    "10_to_30": "10-30",
+    "30_to_80": "30-80",
+    "80_to_200": "80-200",
+    "200_to_1000": "200-1000",
+    "over_1000": ">1000",
+}
+
+
+def _containment_lines(report: dict) -> list[str]:
+    """The "what the unmatched footprints are standing on" section: the
+    one part of this report that turns an unmatched COUNT into an
+    answerable question (see the module docstring's own "explaining the
+    unmatched" section).
+    """
+    theirs = report["containment"]["theirs_unmatched"]
+    ours = report["containment"]["ours_unmatched"]
+    lines: list[str] = []
+    lines.append("## What the unmatched footprints are standing on")
+    lines.append("")
+    lines.append(
+        "NGD counts building PARTS, so a terrace held here as one footprint "
+        "arrives from OS as several, and every part after the one that won "
+        "the pairing lands in the unmatched column with nothing actually "
+        "missing. Each unmatched footprint below is reduced to one "
+        "guaranteed-interior point and tested against the other dataset's "
+        "own footprints: standing inside one of them means the two datasets "
+        "disagree about where the lines fall, standing on ground the other "
+        "dataset holds nothing on means a real gap."
+    )
+    lines.append("")
+    lines.append(f"NGD footprints that matched nothing of ours ({sum(theirs.values())}):")
+    lines.append(
+        f"- Subdivision (stands inside a footprint we hold): "
+        f"{theirs[CONTAINMENT_SUBDIVISION]}"
+    )
+    lines.append(
+        f"- Absent (we hold nothing on that ground): {theirs[CONTAINMENT_ABSENT]}"
+    )
+    lines.append("")
+    lines.append(f"Our footprints that matched nothing of theirs ({sum(ours.values())}):")
+    lines.append(
+        f"- Spurious or newer (stands inside a footprint they hold, so we are "
+        f"splitting, duplicating or offsetting something they carry): "
+        f"{ours[CONTAINMENT_SPURIOUS_OR_NEWER]}"
+    )
+    lines.append(
+        f"- Absent from OS (they hold nothing on that ground: new build, a "
+        f"demolition they have not caught, or an error of ours): "
+        f"{ours[CONTAINMENT_ABSENT_FROM_OS]}"
+    )
+    lines.append("")
+    return lines
+
+
+def _size_table(rows: Sequence[tuple[str, dict]], buckets: Sequence[str]) -> list[str]:
+    """A markdown table of `rows` (each a label and its own
+    `area_histogram` dict) against `buckets`, with a total column so a
+    reader can check any row against the counts above it rather than
+    adding six numbers by hand.
+    """
+    header = " | ".join(_BUCKET_HEADINGS.get(bucket, bucket) for bucket in buckets)
+    lines = [f"| Population | {header} | total |", "| --- |" + " --- |" * (len(buckets) + 1)]
+    for label, histogram in rows:
+        cells = " | ".join(str(histogram[bucket]) for bucket in buckets)
+        lines.append(f"| {label} | {cells} | {sum(histogram.values())} |")
+    return lines
+
+
+def _size_lines(report: dict) -> list[str]:
+    """The footprint-area section: every population bucketed by square
+    metres, and the unmatched ones cross-tabulated against the
+    containment classes above.
+    """
+    size = report["size"]
+    buckets = size["buckets"]
+    lines: list[str] = []
+    lines.append("## Footprint size, square metres")
+    lines.append("")
+    lines.append(
+        "Planar shoelace area on the BNG rings, bucketed. Under 10 m2 is a "
+        "bin store or a garden shed; 10 to 30 m2 a garage; 30 to 80 m2 a "
+        "small dwelling or a terrace part; 80 to 200 m2 an ordinary house; "
+        "above that, large houses and commercial or institutional buildings. "
+        "The question this answers is whether a gap is sheds, which do not "
+        "matter to a site survey, or dwellings, which do."
+    )
+    lines.append("")
+    lines.extend(
+        _size_table(
+            [
+                ("ours, matched", size["ours_matched"]),
+                ("ours, unmatched", size["ours_unmatched"]),
+                ("NGD, matched", size["theirs_matched"]),
+                ("NGD, unmatched", size["theirs_unmatched"]),
+            ],
+            buckets,
+        )
+    )
+    lines.append("")
+    lines.append("Unmatched, split by what each one is standing on:")
+    lines.append("")
+    lines.extend(
+        _size_table(
+            [
+                (
+                    "NGD, subdivision",
+                    size["theirs_unmatched_by_class"][CONTAINMENT_SUBDIVISION],
+                ),
+                ("NGD, absent", size["theirs_unmatched_by_class"][CONTAINMENT_ABSENT]),
+                (
+                    "ours, spurious or newer",
+                    size["ours_unmatched_by_class"][CONTAINMENT_SPURIOUS_OR_NEWER],
+                ),
+                (
+                    "ours, absent from OS",
+                    size["ours_unmatched_by_class"][CONTAINMENT_ABSENT_FROM_OS],
+                ),
+            ],
+            buckets,
+        )
+    )
+    lines.append("")
+    return lines
+
 
 def _render_markdown(report: dict) -> str:
     lines: list[str] = []
@@ -629,6 +823,9 @@ def _render_markdown(report: dict) -> str:
     lines.append(f"- Unmatched ours: {buildings['unmatched_ours']}")
     lines.append(f"- Unmatched NGD: {buildings['unmatched_theirs']}")
     lines.append("")
+
+    lines.extend(_containment_lines(report))
+    lines.extend(_size_lines(report))
 
     lines.append("## Road offsets and the epoch question")
     lines.append("")
@@ -766,6 +963,25 @@ def run_benchmark(
     match = match_footprints(ours_building_rings, ngd_building_rings)
     ious = [iou for _, _, iou in match.matched]
 
+    # The four populations the containment and size sections describe,
+    # gathered once here as plain ring lists so every index below is an
+    # index into ITS OWN list: `classify_containment` and `area_histogram`
+    # both speak positions into the sequence handed to them, which is
+    # exactly what lets the cross-tabulation reuse one without
+    # re-deriving the other.
+    ours_matched_rings = [ours_building_rings[i] for i, _, _ in match.matched]
+    theirs_matched_rings = [ngd_building_rings[j] for _, j, _ in match.matched]
+    ours_unmatched_rings = [ours_building_rings[i] for i in match.unmatched_ours]
+    theirs_unmatched_rings = [ngd_building_rings[j] for j in match.unmatched_theirs]
+
+    # Each side's unmatched footprints tested against the OTHER side's
+    # FULL population, not against its unmatched remainder: the whole
+    # question is whether the ground is already covered, and a footprint
+    # of ours that matched some other part of the same terrace covers
+    # that ground just as much as an unmatched one does.
+    theirs_containment = classify_containment(theirs_unmatched_rings, ours_building_rings)
+    ours_containment = classify_containment(ours_unmatched_rings, ngd_building_rings)
+
     offsets_osm = polyline_offsets(ours_osm_roads, ngd_road_polylines)
     offsets_os_open = polyline_offsets(ours_os_open_roads, ngd_road_polylines)
 
@@ -800,6 +1016,39 @@ def run_benchmark(
             "iou": _iou_percentiles(ious),
             "unmatched_ours": len(match.unmatched_ours),
             "unmatched_theirs": len(match.unmatched_theirs),
+        },
+        "containment": {
+            "theirs_unmatched": {
+                CONTAINMENT_SUBDIVISION: len(theirs_containment.contained),
+                CONTAINMENT_ABSENT: len(theirs_containment.not_contained),
+            },
+            "ours_unmatched": {
+                CONTAINMENT_SPURIOUS_OR_NEWER: len(ours_containment.contained),
+                CONTAINMENT_ABSENT_FROM_OS: len(ours_containment.not_contained),
+            },
+        },
+        "size": {
+            "buckets": list(AREA_BUCKET_LABELS),
+            "ours_matched": area_histogram(ours_matched_rings),
+            "ours_unmatched": area_histogram(ours_unmatched_rings),
+            "theirs_matched": area_histogram(theirs_matched_rings),
+            "theirs_unmatched": area_histogram(theirs_unmatched_rings),
+            "theirs_unmatched_by_class": {
+                CONTAINMENT_SUBDIVISION: area_histogram(
+                    theirs_unmatched_rings, theirs_containment.contained
+                ),
+                CONTAINMENT_ABSENT: area_histogram(
+                    theirs_unmatched_rings, theirs_containment.not_contained
+                ),
+            },
+            "ours_unmatched_by_class": {
+                CONTAINMENT_SPURIOUS_OR_NEWER: area_histogram(
+                    ours_unmatched_rings, ours_containment.contained
+                ),
+                CONTAINMENT_ABSENT_FROM_OS: area_histogram(
+                    ours_unmatched_rings, ours_containment.not_contained
+                ),
+            },
         },
         "roads": {
             "osm": _offset_stats_dict(offsets_osm),

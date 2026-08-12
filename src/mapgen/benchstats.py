@@ -2,7 +2,7 @@
 
 Pure comparison machinery for the OS benchmark (plan item F): no network, no
 disk, no `random` anywhere in this module. Everything here answers one of
-three questions about two independently produced datasets over the same
+five questions about two independently produced datasets over the same
 ground, both already loaded into memory as plain BNG `(easting, northing)`
 sequences by whatever caller owns the disk and network side of the
 benchmark:
@@ -11,6 +11,18 @@ benchmark:
     overlap, as a fraction (`sampled_iou`)?
   * Which of our footprints corresponds to which of theirs, if any
     (`match_footprints`)?
+  * For a footprint that matched NOTHING, is it standing on ground the
+    other dataset already covers with some other footprint, or on ground
+    the other dataset holds nothing at all (`classify_containment`)? This
+    is the difference between two datasets DISAGREEING about where the
+    building lines fall and one of them being genuinely EMPTY there, and
+    a raw unmatched count cannot tell them apart: OS NGD counts building
+    PARTS, so a terrace held here as one footprint arrives from them as
+    several, every part after the first landing in the unmatched pile
+    even though nothing at all is missing from either side.
+  * How big are those footprints, bucketed (`ring_area`,
+    `area_histogram`)? A gap made of bin stores and garden sheds and a
+    gap made of dwellings are the same number and a different problem.
   * Averaged over many matched samples, which direction and how far is our
     survey offset from theirs (`polyline_offsets`)? This is the module's
     own answer to the project's epoch-shift question: OSTN15 (`bng.py`)
@@ -34,7 +46,10 @@ reuse) rather than reimplementing it.
 
 `sampled_iou` returns 0.0, not a guess, when its grid never lands inside
 either ring. `match_footprints` leaves a feature unmatched rather than
-forcing a pairing below `MATCH_IOU_FLOOR`. `polyline_offsets` counts a
+forcing a pairing below `MATCH_IOU_FLOOR`. `classify_containment` answers
+only the question it can actually test, whether ONE guaranteed-interior
+point of a footprint lands inside another footprint, and never dresses
+that up as a claim about overlapping area. `polyline_offsets` counts a
 sample with no neighbour inside `search_radius` as `unmatched_samples` and
 folds it into no average. `distribution` returns `{}` for no values rather
 than inventing a percentile of nothing. Every one of these is the same
@@ -47,9 +62,9 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterable, Sequence
 
-from mapgen.buildings import point_in_ring
+from mapgen.buildings import point_in_ring, representative_point
 from mapgen.heights import _percentile
 
 Cell = tuple[int, int]
@@ -96,6 +111,30 @@ def _cells_for_bbox(bbox: Bbox, cell_size: float) -> list[Cell]:
 
 def _bboxes_overlap(a: Bbox, b: Bbox) -> bool:
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
+
+
+def _bbox_holds(bbox: Bbox, x: float, y: float) -> bool:
+    return bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
+
+
+def _cell_index(bboxes: Sequence[Bbox], cell_size: float) -> dict[Cell, list[int]]:
+    """Every bbox's own index, bucketed under every cell it touches: the
+    one shared construction `match_footprints` and `classify_containment`
+    both build their candidate lookups on, written once here rather than
+    twice at each call site.
+
+    The "register under every cell the bbox touches" convention
+    (`_cells_for_bbox`) is what makes a POINT query exhaustive from one
+    cell alone: any shape whose bbox holds a given point necessarily
+    touches the cell that point falls in, so it is necessarily registered
+    there. `classify_containment` relies on exactly that; a bbox
+    registered only under its own corner cell would not support it.
+    """
+    index: dict[Cell, list[int]] = defaultdict(list)
+    for position, bbox in enumerate(bboxes):
+        for cell in _cells_for_bbox(bbox, cell_size):
+            index[cell].append(position)
+    return index
 
 
 # --------------------------------------------------------------------------
@@ -277,10 +316,7 @@ def match_footprints(
     ours_bboxes = [_ring_bbox(ring) for ring in ours]
     theirs_bboxes = [_ring_bbox(ring) for ring in theirs]
 
-    theirs_index: dict[Cell, list[int]] = defaultdict(list)
-    for j, bbox in enumerate(theirs_bboxes):
-        for cell in _cells_for_bbox(bbox, MATCH_CELL_SIZE_M):
-            theirs_index[cell].append(j)
+    theirs_index = _cell_index(theirs_bboxes, MATCH_CELL_SIZE_M)
 
     candidate_pairs: set[tuple[int, int]] = set()
     for i, bbox in enumerate(ours_bboxes):
@@ -316,6 +352,196 @@ def match_footprints(
     return MatchResult(
         matched=matched, unmatched_ours=unmatched_ours, unmatched_theirs=unmatched_theirs
     )
+
+
+# --------------------------------------------------------------------------
+# classify_containment: what an unmatched footprint is actually standing on
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ContainmentResult:
+    """Which of `subjects` stand on ground `others` already covers, from
+    `classify_containment`.
+
+    `contained` is the indices INTO `subjects` (ascending) whose own
+    guaranteed-interior representative point falls inside at least one
+    ring of `others`; `not_contained` is every other index. The two lists
+    partition `range(len(subjects))` exactly: every subject lands in one
+    of them and no subject lands in both, so a caller can add the two
+    lengths and get its own input count back, with nothing quietly
+    dropped in between.
+
+    Deliberately NEUTRAL names. What "contained" MEANS depends entirely
+    on which way round the caller asked the question (one dataset
+    subdividing a footprint the other holds whole, or duplicating one,
+    or simply drawing it in a different place), and that reading belongs
+    to the caller that knows which dataset is which, not to a geometry
+    module that only knows two bags of rings.
+    """
+
+    contained: list[int]
+    not_contained: list[int]
+
+
+def classify_containment(
+    subjects: Sequence[Sequence[tuple[float, float]]],
+    others: Sequence[Sequence[tuple[float, float]]],
+    cell_size: float = MATCH_CELL_SIZE_M,
+) -> ContainmentResult:
+    """Split `subjects` by whether each one's own interior point lands
+    inside any ring of `others`.
+
+    ## Why a representative point, not a centroid
+
+    The test point per subject is `buildings.representative_point`, the
+    scanline label point that module already carries, NOT a vertex
+    average: a vertex average is not guaranteed interior to a concave
+    ring at all (that function's own docstring, code review task-6-review
+    Critical C1: a U-shaped footprint's vertex average falls squarely in
+    its own notch, outside the ring entirely). A courtyard block, an
+    L-plan house and a terrace with a rear return are all ordinary
+    building shapes, so a centroid here would answer a question about a
+    point that is not in the building at all, and would do it silently.
+
+    ## Why one point, and what that does and does not prove
+
+    A single interior point inside another footprint is strong evidence
+    of the same physical building being described twice with different
+    lines, and it is exactly the evidence needed to tell "the other
+    dataset splits what we hold whole" from "the other dataset holds
+    something here that we do not". It is not, and is not reported as, a
+    measurement of overlapping area: `sampled_iou` already exists for
+    that, and `match_footprints` has already run it over every candidate
+    pair before anything reaches here, which is precisely why the
+    subjects that reach here are the ones a sampled IoU could NOT pair
+    (see `MATCH_IOU_FLOOR`).
+
+    ## Not quadratic
+
+    `others` is bucketed into a `cell_size` metre cell index over its own
+    bounding boxes (`_cell_index`, the same construction
+    `match_footprints` uses). A point query then needs exactly ONE cell,
+    the one the point itself falls in: any ring whose bbox holds the
+    point touches that cell and is therefore registered under it, so
+    checking that single bucket misses nothing, and a ring whose bbox
+    does NOT hold the point cannot possibly contain it. The bbox is
+    re-checked per candidate before the ray cast, so a large ring
+    registered under many cells is rejected cheaply rather than ray cast
+    against.
+
+    Every ring in `subjects` needs at least 3 points, the same floor both
+    of this benchmark's own readers already apply before a ring reaches
+    any comparison at all (`benchmark._read_buildings`,
+    `benchmark._ngd_building_rings`).
+    """
+    others_bboxes = [_ring_bbox(ring) for ring in others]
+    index = _cell_index(others_bboxes, cell_size)
+
+    contained: list[int] = []
+    not_contained: list[int] = []
+    for position, ring in enumerate(subjects):
+        point_e, point_n = representative_point(ring)
+        hit = False
+        for other in index.get(_cell(point_e, point_n, cell_size), ()):
+            if not _bbox_holds(others_bboxes[other], point_e, point_n):
+                continue
+            if point_in_ring(point_e, point_n, others[other]):
+                hit = True
+                break
+        if hit:
+            contained.append(position)
+        else:
+            not_contained.append(position)
+    return ContainmentResult(contained=contained, not_contained=not_contained)
+
+
+# --------------------------------------------------------------------------
+# ring_area and area_histogram: how big are the footprints in question
+# --------------------------------------------------------------------------
+
+# The bucket boundaries, in square metres, and the labels either side of
+# them. Chosen as building sizes rather than round numbers: under 10 m2 is
+# a bin store, a meter cabinet or a garden shed; 10 to 30 m2 a garage or a
+# large outbuilding; 30 to 80 m2 a small dwelling, a terrace part or a flat;
+# 80 to 200 m2 an ordinary house; 200 to 1000 m2 a large house, a shop
+# terrace read as one, a small commercial unit; over 1000 m2 a school, a
+# supermarket, an industrial shed. The point of bucketing at all is that a
+# count of unmatched footprints says nothing about whether the gap matters
+# and a count PER SIZE says most of it.
+AREA_BUCKET_BOUNDS: tuple[float, ...] = (10.0, 30.0, 80.0, 200.0, 1000.0)
+AREA_BUCKET_LABELS: tuple[str, ...] = (
+    "under_10",
+    "10_to_30",
+    "30_to_80",
+    "80_to_200",
+    "200_to_1000",
+    "over_1000",
+)
+
+
+def ring_area(ring: Sequence[tuple[float, float]]) -> float:
+    """`ring`'s own planar area in square metres, by the shoelace formula
+    over its BNG `(easting, northing)` vertices.
+
+    Absolute, so a ring wound clockwise and the same ring wound
+    anticlockwise report the same area rather than one of them reporting
+    a negative one: neither this module nor either dataset it reads
+    guarantees a winding direction, and a signed area would turn that
+    into a silently wrong number.
+
+    Closed or unclosed alike, exactly like `point_in_ring`: the sum wraps
+    from the last vertex back to the first, and an explicitly repeated
+    closing vertex (every GeoJSON ring has one, every OSM closed way has
+    one) contributes a term of exactly zero, so both spellings of the
+    same ring answer identically with no stripping step needed.
+
+    PLANAR, on the projected grid, not on the ellipsoid: BNG is a
+    transverse Mercator projection whose scale factor departs from true
+    by under a part in 2500 anywhere in Great Britain, which on a 100 m2
+    house is under 0.1 m2. That is far inside the difference between the
+    two datasets being compared, and the buckets this feeds are metres
+    wide.
+    """
+    total = 0.0
+    prev_e, prev_n = ring[-1]
+    for east, north in ring:
+        total += prev_e * north - east * prev_n
+        prev_e, prev_n = east, north
+    return abs(total) / 2.0
+
+
+def area_bucket(area: float) -> str:
+    """Which of `AREA_BUCKET_LABELS` `area` falls in, half open on each
+    boundary (`10.0` reads as `10_to_30`, never as `under_10`), so every
+    real number lands in exactly one bucket and no area is ever counted
+    twice or dropped between two of them.
+    """
+    for bound, label in zip(AREA_BUCKET_BOUNDS, AREA_BUCKET_LABELS):
+        if area < bound:
+            return label
+    return AREA_BUCKET_LABELS[-1]
+
+
+def area_histogram(
+    rings: Sequence[Sequence[tuple[float, float]]],
+    positions: Iterable[int] | None = None,
+) -> dict[str, int]:
+    """`{bucket label: count}` over `rings`, or over just the subset
+    `positions` names (`ContainmentResult.contained` and
+    `not_contained` are exactly that shape, which is what lets a caller
+    cross-tabulate size against containment without re-deriving either).
+
+    EVERY label in `AREA_BUCKET_LABELS` is present, zeros included, in
+    that fixed order: an explicit zero is a fact ("nothing of ours in
+    this size band went unmatched"), while an absent key would leave a
+    reader guessing whether the bucket was empty or was never counted.
+    """
+    counts = {label: 0 for label in AREA_BUCKET_LABELS}
+    chosen = range(len(rings)) if positions is None else positions
+    for position in chosen:
+        counts[area_bucket(ring_area(rings[position]))] += 1
+    return counts
 
 
 # --------------------------------------------------------------------------

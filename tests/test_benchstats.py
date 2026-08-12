@@ -6,13 +6,20 @@ import pytest
 
 from mapgen import benchstats
 from mapgen.benchstats import (
+    AREA_BUCKET_LABELS,
     LSQ_MIN_SAMPLES,
+    MATCH_CELL_SIZE_M,
     MATCH_IOU_FLOOR,
+    ContainmentResult,
     MatchResult,
     OffsetStats,
+    area_bucket,
+    area_histogram,
+    classify_containment,
     distribution,
     match_footprints,
     polyline_offsets,
+    ring_area,
     sampled_iou,
 )
 
@@ -134,6 +141,276 @@ def test_sliver_overlap_under_the_floor_stays_unmatched():
     assert result.matched == []
     assert result.unmatched_ours == [0]
     assert result.unmatched_theirs == [0]
+
+
+# --------------------------------------------------------------------------
+# classify_containment
+#
+# The question underneath every test here: an unmatched footprint is either
+# standing on ground the other dataset already covers (the two datasets
+# drawing the same building differently, an NGD building PART against a
+# whole terrace of ours) or standing on ground the other dataset holds
+# nothing on (a real gap). A raw unmatched count cannot tell those apart.
+# --------------------------------------------------------------------------
+
+
+def _u_shape() -> list[tuple[float, float]]:
+    """A U opening east: a 10 m wide spine at easting 0 to 10 running the
+    full 0 to 30 m height, with two 20 m arms at the bottom and the top,
+    and a notch (easting 10 to 30, northing 10 to 20) that is OUTSIDE the
+    shape entirely.
+
+    Its own VERTEX AVERAGE is (17.5, 15), squarely in that notch and so
+    outside the shape; its scanline representative point is (5, 15), in
+    the spine. Every ordinary building shape with a rear return, a
+    courtyard or an L plan has this property, which is why
+    `classify_containment` uses `buildings.representative_point` and not
+    a centroid (that function's own docstring, code review task-6-review
+    Critical C1).
+    """
+    return [
+        (0.0, 0.0),
+        (30.0, 0.0),
+        (30.0, 10.0),
+        (10.0, 10.0),
+        (10.0, 20.0),
+        (30.0, 20.0),
+        (30.0, 30.0),
+        (0.0, 30.0),
+    ]
+
+
+def test_containment_footprint_wholly_inside_another_is_contained():
+    subject = _rect(4.0, 4.0, 6.0, 6.0)
+    other = _rect(0.0, 0.0, 20.0, 20.0)
+
+    result = classify_containment([subject], [other])
+
+    assert isinstance(result, ContainmentResult)
+    assert result.contained == [0]
+    assert result.not_contained == []
+
+
+def test_containment_footprint_wholly_outside_is_not_contained():
+    subject = _rect(100.0, 100.0, 110.0, 110.0)
+    other = _rect(0.0, 0.0, 20.0, 20.0)
+
+    result = classify_containment([subject], [other])
+
+    assert result.contained == []
+    assert result.not_contained == [0]
+
+
+def test_containment_straddling_an_edge_is_decided_by_the_point_not_the_bbox():
+    # Both subjects overlap the other footprint's own bounding box, and
+    # both genuinely straddle its eastern edge at easting 20. The first
+    # has most of its own body inside, so its interior point (17.0, 10.0)
+    # lands inside; the second has most of its body outside, so its
+    # interior point (23.0, 10.0) does not. A bbox-overlap test alone
+    # would call both of them contained, which is exactly the wrong
+    # answer for the second: a footprint mostly on empty ground is not
+    # evidence that the ground is covered.
+    other = _rect(0.0, 0.0, 20.0, 20.0)
+    mostly_inside = _rect(12.0, 8.0, 22.0, 12.0)
+    mostly_outside = _rect(18.0, 8.0, 28.0, 12.0)
+
+    result = classify_containment([mostly_inside, mostly_outside], [other])
+
+    assert result.contained == [0]
+    assert result.not_contained == [1]
+
+
+def test_containment_uses_the_scanline_point_never_the_vertex_average():
+    # The U's own vertex average (17.5, 15) sits in its notch, outside
+    # both the U itself and the `other` rectangle below; its real interior
+    # point (5, 15) sits inside both. `other` is drawn deliberately narrow
+    # (easting 0 to 8) so the two candidate points give OPPOSITE answers:
+    # a centroid-based implementation reports this U as standing on empty
+    # ground, when it is standing squarely on covered ground.
+    subject = _u_shape()
+    other = _rect(0.0, 12.0, 8.0, 18.0)
+
+    result = classify_containment([subject], [other])
+
+    assert result.contained == [0]
+    assert result.not_contained == []
+
+
+def test_containment_finds_a_large_other_registered_across_many_cells():
+    # MATCH_CELL_SIZE_M is 50 m, so a 200 m building spans five cell
+    # columns and five cell rows. The subject sits deep inside it, four
+    # cells away from the big ring's own corner: found only because every
+    # ring is registered under EVERY cell its bbox touches, which is what
+    # makes a single-cell point query exhaustive (`_cell_index`'s own
+    # docstring). A corner-cell-only index would answer "not contained"
+    # here, and would do it silently.
+    assert MATCH_CELL_SIZE_M == 50.0
+    subject = _rect(120.0, 130.0, 122.0, 132.0)
+    other = _rect(0.0, 0.0, 200.0, 200.0)
+
+    result = classify_containment([subject], [other])
+
+    assert result.contained == [0]
+
+
+def test_containment_partitions_every_subject_exactly_once():
+    subjects = [
+        _rect(4.0, 4.0, 6.0, 6.0),  # inside
+        _rect(100.0, 100.0, 101.0, 101.0),  # outside
+        _rect(1.0, 1.0, 2.0, 2.0),  # inside
+        _rect(500.0, 500.0, 501.0, 501.0),  # outside
+    ]
+    others = [_rect(0.0, 0.0, 20.0, 20.0)]
+
+    result = classify_containment(subjects, others)
+
+    assert result.contained == [0, 2]
+    assert result.not_contained == [1, 3]
+    assert sorted(result.contained + result.not_contained) == list(range(len(subjects)))
+
+
+def test_containment_against_an_empty_other_population_is_all_not_contained():
+    subjects = [_rect(0.0, 0.0, 10.0, 10.0), _rect(50.0, 50.0, 60.0, 60.0)]
+
+    result = classify_containment(subjects, [])
+
+    assert result.contained == []
+    assert result.not_contained == [0, 1]
+
+
+def test_containment_of_no_subjects_is_two_empty_lists():
+    result = classify_containment([], [_rect(0.0, 0.0, 10.0, 10.0)])
+
+    assert result.contained == []
+    assert result.not_contained == []
+
+
+def test_containment_reads_the_subdivision_case_the_benchmark_exists_to_separate():
+    # The real shape of the problem: one footprint of ours (a terrace held
+    # whole, 30 m by 10 m) against three of theirs (the same terrace as
+    # three building PARTS). Whichever part won the pairing is gone by the
+    # time this function runs; the other two are what reach it, and both
+    # stand inside our single footprint. Nothing is missing here, and this
+    # is the classification that says so.
+    ours_terrace = _rect(0.0, 0.0, 30.0, 10.0)
+    unmatched_parts = [_rect(10.0, 0.0, 20.0, 10.0), _rect(20.0, 0.0, 30.0, 10.0)]
+
+    result = classify_containment(unmatched_parts, [ours_terrace])
+
+    assert result.contained == [0, 1]
+    assert result.not_contained == []
+
+
+# --------------------------------------------------------------------------
+# ring_area, area_bucket, area_histogram
+# --------------------------------------------------------------------------
+
+
+def test_ring_area_of_known_squares():
+    assert ring_area(_rect(0.0, 0.0, 10.0, 10.0)) == pytest.approx(100.0)
+    assert ring_area(_rect(0.0, 0.0, 3.0, 7.0)) == pytest.approx(21.0)
+    assert ring_area(_rect(1000.0, 2000.0, 1002.0, 2002.5)) == pytest.approx(5.0)
+
+
+def test_ring_area_of_an_l_shape():
+    # A 10x10 square with its top-right 5x5 corner removed: 100 - 25 = 75,
+    # by hand. The same L this file's own sampled_iou test uses.
+    l_shape = [(0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (5.0, 5.0), (5.0, 10.0), (0.0, 10.0)]
+    assert ring_area(l_shape) == pytest.approx(75.0)
+
+
+def test_ring_area_ignores_winding_direction():
+    anticlockwise = _rect(0.0, 0.0, 10.0, 10.0)
+    clockwise = list(reversed(anticlockwise))
+    assert ring_area(clockwise) == pytest.approx(ring_area(anticlockwise))
+    assert ring_area(clockwise) > 0.0
+
+
+def test_ring_area_is_identical_closed_or_unclosed():
+    # Every GeoJSON ring repeats its first vertex at the end and every
+    # closed OSM way repeats its first node; the wraparound sum makes that
+    # repeated edge contribute exactly zero, so both spellings answer the
+    # same with no stripping step anywhere.
+    unclosed = _rect(0.0, 0.0, 10.0, 10.0)
+    closed = unclosed + [unclosed[0]]
+    assert ring_area(closed) == pytest.approx(ring_area(unclosed))
+
+
+def test_ring_area_of_a_degenerate_zero_width_ring_is_zero():
+    assert ring_area([(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)]) == pytest.approx(0.0)
+
+
+def test_area_bucket_boundaries_are_half_open_upward():
+    assert area_bucket(0.0) == "under_10"
+    assert area_bucket(9.999) == "under_10"
+    assert area_bucket(10.0) == "10_to_30"
+    assert area_bucket(29.999) == "10_to_30"
+    assert area_bucket(30.0) == "30_to_80"
+    assert area_bucket(79.999) == "30_to_80"
+    assert area_bucket(80.0) == "80_to_200"
+    assert area_bucket(199.999) == "80_to_200"
+    assert area_bucket(200.0) == "200_to_1000"
+    assert area_bucket(999.999) == "200_to_1000"
+    assert area_bucket(1000.0) == "over_1000"
+    assert area_bucket(50_000.0) == "over_1000"
+
+
+def test_area_histogram_holds_every_bucket_including_the_empty_ones():
+    rings = [
+        _rect(0.0, 0.0, 2.0, 2.0),  # 4 m2: a bin store
+        _rect(0.0, 0.0, 5.0, 4.0),  # 20 m2: a garage
+        _rect(0.0, 0.0, 10.0, 10.0),  # 100 m2: an ordinary house
+        _rect(0.0, 0.0, 10.0, 12.0),  # 120 m2: another
+        _rect(0.0, 0.0, 100.0, 50.0),  # 5000 m2: a supermarket
+    ]
+
+    histogram = area_histogram(rings)
+
+    assert list(histogram) == list(AREA_BUCKET_LABELS)
+    assert histogram == {
+        "under_10": 1,
+        "10_to_30": 1,
+        "30_to_80": 0,
+        "80_to_200": 2,
+        "200_to_1000": 0,
+        "over_1000": 1,
+    }
+    assert sum(histogram.values()) == len(rings)
+
+
+def test_area_histogram_over_a_subset_of_positions_cross_tabulates():
+    # The exact shape the report's own cross-tabulation needs:
+    # ContainmentResult.contained / not_contained are position lists into
+    # the same ring sequence, so one histogram per class comes straight
+    # out of them with no re-derivation.
+    rings = [
+        _rect(0.0, 0.0, 2.0, 2.0),  # 4 m2
+        _rect(0.0, 0.0, 10.0, 10.0),  # 100 m2
+        _rect(0.0, 0.0, 10.0, 12.0),  # 120 m2
+    ]
+
+    assert area_histogram(rings, [0])["under_10"] == 1
+    assert sum(area_histogram(rings, [0]).values()) == 1
+    assert area_histogram(rings, [1, 2])["80_to_200"] == 2
+    assert sum(area_histogram(rings, [1, 2]).values()) == 2
+    assert area_histogram(rings, []) == {label: 0 for label in AREA_BUCKET_LABELS}
+
+
+def test_area_histogram_subsets_from_a_containment_split_add_back_to_the_whole():
+    subjects = [
+        _rect(4.0, 4.0, 6.0, 6.0),  # 4 m2, inside
+        _rect(100.0, 100.0, 110.0, 110.0),  # 100 m2, outside
+        _rect(1.0, 1.0, 11.0, 11.0),  # 100 m2, inside
+    ]
+    others = [_rect(0.0, 0.0, 20.0, 20.0)]
+
+    result = classify_containment(subjects, others)
+    whole = area_histogram(subjects)
+    contained = area_histogram(subjects, result.contained)
+    not_contained = area_histogram(subjects, result.not_contained)
+
+    for label in AREA_BUCKET_LABELS:
+        assert whole[label] == contained[label] + not_contained[label]
 
 
 # --------------------------------------------------------------------------

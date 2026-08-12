@@ -26,6 +26,7 @@ import json
 import socket
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Sequence
 
 import pytest
 
@@ -104,7 +105,13 @@ def _os_roads_geojson_text(polylines_bng) -> str:
     return json.dumps({"type": "FeatureCollection", "features": features})
 
 
-def _build_package(tmp_path: Path, *, stem: str = "Test-Site_2026-08-09", with_os_roads: bool = True) -> Path:
+def _build_package(
+    tmp_path: Path,
+    *,
+    stem: str = "Test-Site_2026-08-09",
+    with_os_roads: bool = True,
+    extra_buildings: Sequence[tuple[Sequence[tuple[float, float]], list[tuple[str, str]]]] = (),
+) -> Path:
     """A package directory holding `survey.json`, `<stem>.osm`, and
     (unless `with_os_roads` is False) `<stem>_os_roads.geojson`.
 
@@ -121,6 +128,13 @@ def _build_package(tmp_path: Path, *, stem: str = "Test-Site_2026-08-09", with_o
     construction so a real, non-None least-squares offset comes out the
     other end of a full `run_benchmark` call, not only out of
     `benchstats.polyline_offsets` in isolation).
+
+    `extra_buildings` appends further `(corners, tags)` building ways,
+    each corner sequence in the same UNSHIFTED BNG convention as the two
+    above (`_shift` is applied here). Empty by default, so every test
+    written against the two-building fixture keeps its own counts
+    unchanged; the containment tests use it to place a footprint of ours
+    precisely enough to pin a classification.
     """
     root = tmp_path / "package"
     root.mkdir()
@@ -161,6 +175,11 @@ def _build_package(tmp_path: Path, *, stem: str = "Test-Site_2026-08-09", with_o
         *h_nodes, h_way,
         *v_nodes, v_way,
     ]
+    for offset, (corners, tags) in enumerate(extra_buildings):
+        extra_nodes, extra_way = _closed_way(
+            9301 + offset, _shift(corners), 101 + offset * 20, tags
+        )
+        elements.extend([*extra_nodes, extra_way])
     (root / f"{stem}.osm").write_text(_dump_osm(elements), encoding="utf-8")
 
     if with_os_roads:
@@ -592,6 +611,201 @@ def test_report_counts_every_part_of_an_ngd_multipolygon_building(tmp_path):
     assert report["counts"]["buildings"]["ngd"] == 2
     assert report["buildings"]["matched"] == 1
     assert report["buildings"]["unmatched_theirs"] == 1
+
+
+# --------------------------------------------------------------------------
+# Containment and size: explaining the unmatched footprints rather than
+# only counting them (see benchmark.py's own "explaining the unmatched"
+# section). The fixture below is the real problem in miniature.
+# --------------------------------------------------------------------------
+
+# A 2 m by 2 m outbuilding of ours, 4 m2, sitting inside the footprint of
+# the 100 m by 100 m NGD building below: unmatchable by sampled IoU
+# (0.0004, far under MATCH_IOU_FLOOR) yet plainly standing on ground OS
+# already covers, which is exactly the SPURIOUS_OR_NEWER case.
+_TINY_OURS_CORNERS = [(8_010.0, 8_010.0), (8_012.0, 8_010.0), (8_012.0, 8_012.0), (8_010.0, 8_012.0)]
+
+
+def _square_feature(feature_id: str, e0: float, n0: float, width: float, height: float) -> dict:
+    """A BNG-coordinate NGD building feature, offset from the fixture's own
+    _BASE_E/_BASE_N exactly like `_matched_ngd_building_feature`.
+    """
+    e, n = _BASE_E + e0, _BASE_N + n0
+    return {
+        "type": "Feature",
+        "id": feature_id,
+        "properties": {"description": "Building"},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[e, n], [e + width, n], [e + width, n + height], [e, n + height], [e, n]]
+            ],
+        },
+    }
+
+
+def _containment_ngd_buildings() -> list[dict]:
+    """Four NGD footprints over the fixture package, one per outcome.
+
+    The first two are building A of ours (a 10 m square) cut into two 10 m
+    by 5 m PARTS, which is precisely what NGD does to a terrace this
+    project holds whole: one part wins the greedy pairing at IoU 0.5, the
+    other cannot pair with anything and lands unmatched with nothing
+    actually missing. The third stands on empty ground (a genuine gap).
+    The fourth is a 100 m square that swallows the tiny outbuilding of
+    ours, whose own interior point sits nowhere near it.
+    """
+    return [
+        _square_feature("lower-half-of-A", 0.0, 0.0, 10.0, 5.0),
+        _square_feature("upper-half-of-A", 0.0, 5.0, 10.0, 5.0),
+        _square_feature("far-from-everything", 9_000.0, 9_000.0, 10.0, 10.0),
+        _square_feature("swallows-our-outbuilding", 7_950.0, 7_950.0, 100.0, 100.0),
+    ]
+
+
+def test_containment_splits_the_unmatched_into_subdivisions_and_real_gaps(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_buildings=[(_TINY_OURS_CORNERS, [("building", "shed")])],
+    )
+    client = _StubNgdClient(buildings=_containment_ngd_buildings(), roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    # Building A pairs with one of its own two NGD halves at IoU 0.5.
+    assert report["buildings"]["matched"] == 1
+    assert report["buildings"]["unmatched_theirs"] == 3
+    assert report["buildings"]["unmatched_ours"] == 2
+
+    containment = report["containment"]
+    # The other half of A stands inside A: a bookkeeping difference, not a
+    # gap. The far square and the 100 m square stand on ground we hold
+    # nothing on.
+    assert containment["theirs_unmatched"] == {"subdivision": 1, "absent": 2}
+    # Our outbuilding stands inside their 100 m square; building B stands
+    # on ground they hold nothing on.
+    assert containment["ours_unmatched"] == {"spurious_or_newer": 1, "absent_from_os": 1}
+
+    # Both splits add back to the unmatched counts above: nothing is
+    # dropped between the two classes.
+    assert sum(containment["theirs_unmatched"].values()) == report["buildings"]["unmatched_theirs"]
+    assert sum(containment["ours_unmatched"].values()) == report["buildings"]["unmatched_ours"]
+
+
+def test_size_breakdown_buckets_every_population_and_cross_tabulates(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_buildings=[(_TINY_OURS_CORNERS, [("building", "shed")])],
+    )
+    client = _StubNgdClient(buildings=_containment_ngd_buildings(), roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    size = json.loads(json_path.read_text(encoding="utf-8"))["size"]
+
+    assert size["buckets"] == [
+        "under_10",
+        "10_to_30",
+        "30_to_80",
+        "80_to_200",
+        "200_to_1000",
+        "over_1000",
+    ]
+
+    # Ours: A (100 m2) matched; B (100 m2) and the 4 m2 outbuilding not.
+    assert size["ours_matched"]["80_to_200"] == 1
+    assert sum(size["ours_matched"].values()) == 1
+    assert size["ours_unmatched"] == {
+        "under_10": 1,
+        "10_to_30": 0,
+        "30_to_80": 0,
+        "80_to_200": 1,
+        "200_to_1000": 0,
+        "over_1000": 0,
+    }
+
+    # Theirs: one 50 m2 half matched; the other 50 m2 half, a 100 m2
+    # square and a 10,000 m2 square not.
+    assert size["theirs_matched"]["30_to_80"] == 1
+    assert sum(size["theirs_matched"].values()) == 1
+    assert size["theirs_unmatched"] == {
+        "under_10": 0,
+        "10_to_30": 0,
+        "30_to_80": 1,
+        "80_to_200": 1,
+        "200_to_1000": 0,
+        "over_1000": 1,
+    }
+
+    # The cross-tabulation: which sizes fall in which containment class.
+    assert size["theirs_unmatched_by_class"]["subdivision"]["30_to_80"] == 1
+    assert sum(size["theirs_unmatched_by_class"]["subdivision"].values()) == 1
+    assert size["theirs_unmatched_by_class"]["absent"]["80_to_200"] == 1
+    assert size["theirs_unmatched_by_class"]["absent"]["over_1000"] == 1
+    assert size["ours_unmatched_by_class"]["spurious_or_newer"]["under_10"] == 1
+    assert size["ours_unmatched_by_class"]["absent_from_os"]["80_to_200"] == 1
+
+    # Every cross-tabulated class adds back to its own unmatched row.
+    for bucket in size["buckets"]:
+        assert size["theirs_unmatched"][bucket] == (
+            size["theirs_unmatched_by_class"]["subdivision"][bucket]
+            + size["theirs_unmatched_by_class"]["absent"][bucket]
+        )
+        assert size["ours_unmatched"][bucket] == (
+            size["ours_unmatched_by_class"]["spurious_or_newer"][bucket]
+            + size["ours_unmatched_by_class"]["absent_from_os"][bucket]
+        )
+
+
+def test_report_md_carries_the_containment_and_size_sections(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_buildings=[(_TINY_OURS_CORNERS, [("building", "shed")])],
+    )
+    client = _StubNgdClient(buildings=_containment_ngd_buildings(), roads=[])
+
+    md_path, _ = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "## What the unmatched footprints are standing on" in text
+    assert "## Footprint size, square metres" in text
+    assert "Subdivision (stands inside a footprint we hold): 1" in text
+    assert "Absent (we hold nothing on that ground): 2" in text
+    assert "| NGD, subdivision |" in text
+    assert "| ours, absent from OS |" in text
+    assert "—" not in text  # no em dashes anywhere in the report
+
+
+def test_an_empty_ngd_pull_reports_empty_containment_and_size_honestly(tmp_path):
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    # Both of ours matched nothing, and both stand on ground OS holds
+    # nothing on, because OS returned nothing at all: an honest reading of
+    # an empty pull, not a special case.
+    assert report["containment"]["theirs_unmatched"] == {"subdivision": 0, "absent": 0}
+    assert report["containment"]["ours_unmatched"] == {
+        "spurious_or_newer": 0,
+        "absent_from_os": 2,
+    }
+    assert sum(report["size"]["theirs_unmatched"].values()) == 0
+    assert sum(report["size"]["ours_unmatched"].values()) == 2
+    # Every bucket is still present, zeros included.
+    assert len(report["size"]["theirs_matched"]) == len(report["size"]["buckets"])
 
 
 def test_missing_os_roads_file_is_an_empty_control_population_not_an_error(tmp_path):
