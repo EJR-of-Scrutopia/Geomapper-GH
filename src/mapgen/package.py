@@ -361,15 +361,16 @@ def register_default_sources() -> None:
 
     LidarCardiffSource (Task 5 of the phase 2b-D plan) joins the same way
     once more: opt-in (a one-time, national-cache 84 MB download over a
-    ten-tile, 2.5 sq km corner of north-west Cardiff the owner chooses,
+    ten-tile, 2.5 sq km corner of west Cardiff the owner chooses,
     mirroring `LidarWalesSource`'s own opt-in surfacing exactly), and
-    registering it here is what makes "LiDAR terrain (Creigiau and
-    Pentyrch, north-west Cardiff, 25 cm, flown 2011)" appear in the layer
+    registering it here is what makes "LiDAR terrain (St Fagans and
+    St Georges-super-Ely, Cardiff, 25 cm, flown 2011)" appear in the layer
     checklist at all. No `configure()` seam: unlike `os_open`/`os_uprn`/
     `inspire`, this source has no per-run instance state that needs a
-    fresh lifetime per survey (`tile_failures` and `self._bbox` are both
-    reset at the top of every `fetch()` call, see that method's own
-    docstring), so the one shared, registered instance is reused across
+    fresh lifetime per survey (`tile_failures`, `skipped_reason` and
+    `self._bbox` are all reset at the top of every `fetch()` call, see
+    that method's own docstring), so the one shared, registered instance
+    is reused across
     every survey that ever selects it, the identical reasoning
     `LidarWalesSource` above already relies on.
 
@@ -789,6 +790,59 @@ def run_survey(
                             current_tile_ids, sink, ledger,
                         )
                         raise
+
+            # A source can also come back having done nothing ON PURPOSE,
+            # and that is a third outcome, not a quiet kind of failure.
+            # lidar_cardiff is the one that has it today: an extent
+            # outside the ten quarter-tiles it covers, or one too large
+            # for its 25 cm raster budget, is ground it can never serve
+            # however many times it is asked, so it emits tile_skipped
+            # per tile with the reason attached, records that same reason
+            # on skipped_reason, and returns nothing. Read here through
+            # getattr, the same defensive optional-attribute convention
+            # sources/base.py documents for tile_failures and every other
+            # source-specific extension: a source that has no such
+            # concept never defines it and never reaches this branch.
+            #
+            # Three things follow, and each one is the difference between
+            # this and the failure path above.
+            #
+            #   The tiles are recorded OK, not FAILED. Without this they
+            #   would be failed by _record_tile_outcomes' own rule that a
+            #   fetch() returning cleanly while leaving nothing on disk
+            #   is "vacuous, not done", which is exactly right for a
+            #   source that says nothing about why, and exactly wrong for
+            #   one that has just said precisely why. There is no work
+            #   left here for a resume to do: this source's business with
+            #   these tiles is genuinely finished.
+            #
+            #   The source is NOT added to `fetched`, so neither the
+            #   verify pass nor the retry pass walks it. Both believe the
+            #   filesystem alone, and the filesystem has nothing to say
+            #   about a source that deliberately wrote nothing; verifying
+            #   it would only lower these tiles straight back to failed
+            #   for the same wrong reason. This is the same exclusion a
+            #   source a stop caught before its turn already gets, for
+            #   the same stated reason: nothing on disk to reconcile
+            #   against.
+            #
+            #   No merge is attempted and no source_done is emitted, but
+            #   source_skipped is, carrying the reason, so the live log
+            #   and (through _source_provenance) survey.json both say why
+            #   the package holds nothing from this layer. The browser
+            #   needs no new vocabulary for it: the per-tile tile_skipped
+            #   events already settled the tiles, and the event log
+            #   prints every event in full.
+            #
+            # The owner's own words, on the real run that produced this:
+            # "it is showing because it didnt get the cardiff lidar,
+            # which is obvious so we shouldnt be showing it as a fail".
+            skipped_reason = getattr(source, "skipped_reason", None) if fetch_succeeded else None
+            if skipped_reason:
+                sink.emit("source_skipped", source=source.id, reason=str(skipped_reason))
+                for tile in pending:
+                    state.mark(tile.tile_id, source.id, OK)
+                continue
 
             fetched.append((source, source_work))
 
@@ -4743,6 +4797,23 @@ def _source_provenance(source, merged_files: Sequence[Path] = ()) -> dict[str, o
     vintage_note = getattr(source, "vintage_note", None)
     if vintage_note is not None:
         entry["vintage_note"] = vintage_note
+    # skipped_reason is lidar_cardiff.py-specific today, read the same
+    # defensive way as demtype and vintage_note above, and it closes the
+    # one gap in the three-way distinction this entry's own comment draws
+    # further up. "Merged nothing" was previously indistinguishable from
+    # "merged nothing FOR A REASON THE SOURCE KNOWS": both wrote
+    # merged_files: [] with no tile_failures entry, leaving the reader to
+    # guess. A source that skipped this extent on purpose says so here,
+    # in the same sentence the live log carried, so a package that holds
+    # no 25 cm rasters explains itself months later to somebody who never
+    # saw the run.
+    #
+    # Absent, not empty, for every ordinary run: a key that appears only
+    # when there is something to say cannot be mistaken for a source
+    # claiming it skipped nothing.
+    skipped_reason = getattr(source, "skipped_reason", None)
+    if skipped_reason:
+        entry["skipped_reason"] = str(skipped_reason)
     check_routing_note = getattr(source, "routing_note", None)
     if callable(check_routing_note):
         note = check_routing_note()

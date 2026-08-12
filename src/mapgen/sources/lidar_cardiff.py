@@ -1,27 +1,36 @@
 """LidarCardiffSource: NRW's 2011 historic 25 cm LiDAR archive over ten
-quarter-tiles in Creigiau and Pentyrch, north-west Cardiff, as an opt-in
-LayerSource. `covers`, `tier`, `detail`, `estimate`, `routing_note` and
-`cache_dir` are the source's disk-and-arithmetic half, every one of them
-pure arithmetic and, at most, a cache-only OSTN15 read or a directory
-listing. `fetch()` is the network half: it ensures the two archive zips
-sit in `cache_dir()`, downloaded and verified once each, and hands their
-paths back for `merge()` (below) to unpack the ESRI ASCII grid members
-inside them (see probe-report.md's own "Zip members are ESRI ASCII
-grids" section).
+quarter-tiles at St Fagans and St Georges-super-Ely, west Cardiff, as an
+opt-in LayerSource. `covers`, `tier`, `detail`, `estimate`,
+`routing_note` and `cache_dir` are the source's disk-and-arithmetic half,
+every one of them pure arithmetic and, at most, a cache-only OSTN15 read
+or a directory listing. `fetch()` is the network half: it ensures the two
+archive zips sit in `cache_dir()`, downloaded and verified once each, and
+hands their paths back for `merge()` (below) to unpack the ESRI ASCII
+grid members inside them (see probe-report.md's own "Zip members are ESRI
+ASCII grids" section).
 
-## Location honesty ruling
+## Location honesty ruling, and the correction of 2026-08-12
 
 The phase 2b spec named this source's coverage "part of central
 Cardiff". The plan-time probe (probe-report.md, 2026-08-08, live against
-the NRW WFS catalogue) disproved that: the ten tiles this module actually
-serves sit in the Creigiau and Pentyrch corner of north-west Cardiff,
-about 2.5 sq km, nowhere near the civic centre "central Cardiff" implies.
-Task zero had the location right; the spec's own wording drifted from
-it. `display_name` below states the true place rather than repeating the
-spec's premise, the same choice `sources/elevation.py`'s own module
+the NRW WFS catalogue) disproved that, and every user-facing string in
+this module was written to state the measured place rather than repeat
+the spec's premise, the same choice `sources/elevation.py`'s own module
 docstring makes about which DEM model is actually fetched: state the
 measured fact, not the plan's working assumption, once the two have come
 apart.
+
+The place those strings named was itself wrong. "Creigiau and Pentyrch,
+north-west Cardiff" came from the phase 2 task-zero report, was carried
+forward unverified into the plan, the display name, the routing note and
+both refusal sentences, and nobody ever put `COVERAGE_TILES`' own
+envelopes through a geocoder. Corrected 2026-08-12 against those
+envelopes directly (BNG E 310500 to 312500, N 176500 to 178000): the
+centre of the block reverse-geocodes to St Fagans and its south-west
+corner to St Georges-super-Ely. Creigiau and Pentyrch sit about 3 km to
+the north-west and hold no 25 cm data at all, so the old name was not
+merely untidy, it sent the owner to draw an extent this archive covers
+nothing of. Every user-facing string below names the corrected place.
 
 ## Terrain only, deliberately narrower than lidar_wales
 
@@ -128,76 +137,84 @@ process boundary the same way `os_uprn.py`'s own work part does
 (`fetch()` and `merge()` may run in different processes), without
 duplicating a single byte of the 84 MB the national cache already holds.
 
-## The budget gate lives in fetch(), first, and again in merge()
+## Two facts stop this source, and NEITHER of them is a failure
 
-The over-budget refusal (`_budget_refusal_reason`) fires in TWO places.
-`fetch()` checks it first, before either zip is downloaded: this is the
-gate that actually reaches the owner, because package.py's `run_survey`
-wraps `fetch()` in the deferred-failure/retry machinery
-(`tile_failures`, the same account `_record_tile_failures` already
-populates for a download failure) but does not currently wrap `merge()`
-in anything at all, so an exception raised only from `merge()` would
-propagate out of `run_survey` uncaught rather than reaching the owner
-through the ordinary source-failure event. `merge()` keeps its own copy
-of the same gate regardless, as a second line of defence for a call
-reached by some other route (a resumed run, a future caller); it must
-never be the ONLY gate, but removing it would leave a `merge()` invoked
-without a preceding `fetch()`'s own refusal building the full window's
-worth of NaN for nothing.
+`_skip_reason` below answers one question, "is there any point running
+this source over this extent", and it has exactly two ways to say no.
+The extent's own intersection with the coverage envelope needs more
+pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows
+(`_budget_refusal_reason`), or `covers(bbox)` is "none" and this archive
+holds nothing at all for this ground (`_NO_COVERAGE_REASON`). Both are
+statements about the extent the owner drew, not about anything being
+broken, and this source can no more fix either by being asked a second
+time than it can move the flight path of a 2011 survey.
 
-Both gates use `_window_pixels`'s own, unsnapped figure, the exact
-number `detail()` already previewed, rather than the pixel count
-`merge()`'s own snapped window ends up with: snapping outward can only
-grow a window by under one pixel per edge, and gating on the snapped
-count instead would let the refusal and the preview disagree by that
+Both used to RAISE, each with a `tile_failures` entry per tile
+classified `FAILURE_NODE_CAP`, and the cost of that showed up on the
+first real survey to hit it: an extent over Cowbridge with this source
+selected produced `source_failed`, a `tile_failed` per tile and a grid
+painted red, for a source behaving exactly as designed. The controller's
+earlier ruling was that a no-coverage refusal should fail loudly rather
+than skip silently, because a silent skip hides the truth. That was
+right about silence and wrong about the only two options: this pipeline
+already has a third, `tile_skipped`, which `os_open.py` emits for a
+Greenspace square that needs no work and `package.py` emits for a tile a
+resume already found on disk.
+
+So both are SKIPS now, and neither is silent. `fetch()` emits
+`tile_skipped` once per tile with `reason` carrying the sentence,
+records the same sentence on `self.skipped_reason`, and returns no
+parts; `package.py` reads that attribute, emits its own
+`source_skipped`, records every tile as settled rather than failed and
+folds the reason into survey.json's provenance entry for this source
+(`_source_provenance`). The survey completes, the package holds no 25 cm
+rasters, and both the live log and the package's own record say exactly
+why. A skip with a recorded reason is honest; only an unexplained one
+hides anything.
+
+`merge()` asks `_skip_reason` the identical question, from the bbox
+`fetch()` stashed on `self._bbox`, and answers it the same way: no
+output, no exception. It is the second line of defence for a `merge()`
+reached by some other route (a resumed run, a future direct caller),
+never the only gate, and it matters that it does not raise: `run_survey`
+wraps `fetch()` in the deferred-failure/retry machinery but wraps
+`merge()` in nothing at all, so an exception from here would propagate
+out of the whole survey uncaught instead of reaching the owner as an
+ordinary source outcome.
+
+The budget half of `_skip_reason` uses `_window_pixels`'s own, unsnapped
+figure, the exact number `detail()` already previewed, rather than the
+pixel count `merge()`'s own snapped window ends up with: snapping
+outward can only grow a window by under one pixel per edge, and gating
+on the snapped count would let the skip and the preview disagree by that
 same sliver, for no benefit.
 
-## The none-coverage gate: 0 pixels is not the same fact as "nothing to refuse"
+## Why the coverage half of that question needs covers(), not the pixel count
 
-A final whole-branch review (Critical 1) found the budget gate alone is
-not enough: an extent with `covers(bbox) == "none"` can still pass it,
-because 0 pixels is comfortably under `MAX_WINDOW_PIXELS`. Two shapes of
-"none" reach this gap. The first, and the one the review executed
-against a real extent: the padded extent overlaps `_ENVELOPE`'s own
-bounding rectangle in ONE axis but not the other (eastings inside,
-northings nowhere near), so `_window_pixels` prices the intersection at
-0 (one axis clamped to zero width by its own `max(0.0, ...)`) and the
-budget gate waves it through; `merge()` then builds a window that is
-wide but zero pixels TALL (or the reverse), and `write_bng_geotiff`
-refuses that shape outright (`GeoTiffWriteError`), uncaught, since
-`merge()`'s own exceptions are not wrapped by `run_survey`. The second,
-milder shape: an extent that lands entirely inside one of the two 500 m
-cells `COVERAGE_TILES` does NOT include (the gaps beside ST1277SW, see
-the module docstring's "500 m lattice" section) sits wholly inside
-`_ENVELOPE` with a perfectly ordinary, non-degenerate pixel count, so it
-sails through both the coverage question and the budget question and
-would otherwise package an all-NaN 25 cm pair for ground the resolver
-itself already told the owner this source has nothing for.
+An extent with `covers(bbox) == "none"` clears the budget test
+comfortably, because 0 pixels is well under `MAX_WINDOW_PIXELS`, and two
+shapes of "none" arrive that way. The first: the padded extent overlaps
+`_ENVELOPE`'s own bounding rectangle in ONE axis but not the other
+(eastings inside, northings nowhere near), so `_window_pixels` prices the
+intersection at 0 (one axis clamped to zero width by its own
+`max(0.0, ...)`); `merge()` would then build a window that is wide but
+zero pixels TALL, or the reverse, and `write_bng_geotiff` refuses that
+shape outright (`GeoTiffWriteError`). The second, milder shape: an extent
+that lands entirely inside one of the two 500 m cells `COVERAGE_TILES`
+does NOT include (the gaps beside ST1277SW, see the "500 m lattice"
+section above) sits wholly inside `_ENVELOPE` with a perfectly ordinary,
+non-degenerate pixel count, and would otherwise package an all-NaN 25 cm
+pair for ground the resolver itself already told the owner this source
+has nothing for.
 
-Both shapes are the same underlying fact (`covers(bbox) == "none"`), and
-`fetch()`'s own gate answers both of them at once, correctly, because it
-asks `covers()` itself, the exact lattice test that already tells the two
-shapes apart from a genuine "full" or "partial" extent: it runs AFTER the
-budget gate (reachable only once an extent has already cleared that one),
-with the same two-gate shape and the same pinned-string discipline
-(`_NO_COVERAGE_REASON`) the budget refusal established.
-
-`merge()`'s own second-line-of-defence copy is narrower, and deliberately
-so: it cannot repeat the `covers()` lattice test cheaply at that point (it
-no longer has a convenient bbox-shaped question to ask; it already has a
-window), so it guards only on the one fact the FIRST shape above is
-proven to leave behind, `_snapped_merge_window`'s own `width` or `height`
-coming back zero, which is also the only shape that would otherwise reach
-`write_bng_geotiff` and crash it. The second, milder shape (a gap-cell
-extent, wholly inside `_ENVELOPE` with an ordinary, non-degenerate pixel
-count) does NOT trip this guard: nothing in `merge()` alone can tell that
-window apart from a genuinely thin sliver of real partial coverage
-without re-running the lattice test, so guarding against it here would
-need `merge()` to duplicate `covers()`'s own logic for a case `fetch()`'s
-gate has already refused before `merge()` is ever reached in the ordinary
-path. The guard's job is narrower: never let a `merge()` invoked some
-other way (a resumed run, a future direct caller) reach the one shape
-that would otherwise crash the writer.
+Both shapes are one underlying fact, and asking `covers()` itself
+answers both at once, because that is the exact lattice test that tells
+them apart from a genuine "full" or "partial" extent. `merge()` keeps a
+narrower guard as well, on `_snapped_merge_window`'s own `width` or
+`height` coming back zero, and it is now a skip like everything else
+here rather than a raise: it can only be reached if `_skip_reason` ever
+disagreed with the window arithmetic, and the answer to that is still
+"write nothing", never "crash the writer".
 
 ## One failed member fails the whole merge
 
@@ -246,7 +263,6 @@ from mapgen.geo import BBox, Tile
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken
 from mapgen.sources.base import (
-    FAILURE_NODE_CAP,
     FAILURE_UNKNOWN,
     FAILURE_UNREACHABLE,
     Estimate,
@@ -387,16 +403,22 @@ SECONDS_FLOOR = 0.1
 # estimate-warnings pass (see os_uprn.py's own `routing_note` docstring
 # for the convention this matches).
 _ROUTING_NOTE = (
-    "LiDAR terrain (Creigiau and Pentyrch): first use downloads two zip "
-    "files (about 84 MB total, cached for every later survey)."
+    "LiDAR terrain (St Fagans and St Georges-super-Ely): first use "
+    "downloads two zip files (about 84 MB total, cached for every later "
+    "survey)."
 )
 
 
 class LidarCardiffError(RuntimeError):
     """Raised when `fetch()` cannot obtain or verify one of the two
-    archive zips, refuses an over-budget extent, or is asked to `merge()`
-    without one; or when `merge()` itself cannot turn the two zips into
+    archive zips, or when `merge()` itself cannot turn the two zips into
     the 25 cm rasters.
+
+    An extent this source cannot serve, for either of the two reasons
+    `_skip_reason` knows about, does NOT raise anything at all: see the
+    module docstring's "Two facts stop this source, and NEITHER of them
+    is a failure" section. This exception is for things that genuinely
+    went wrong.
 
     `kind` is `"download"` (a transport failure, a downloaded body whose
     length did not match `DSM_ZIP_BYTES`/`DTM_ZIP_BYTES` exactly, or, a
@@ -408,31 +430,15 @@ class LidarCardiffError(RuntimeError):
     a zip member whose header or values `asc_grid.AscGridError` refused;
     a pointer file whose own recorded text is not a usable path at all;
     or `merge()` missing an input it needs, either the two zip paths or
-    `self._bbox`), `"budget"` (the padded extent's own intersection with
-    the coverage envelope needs more pixels at 25 cm than
-    `cog.MAX_WINDOW_PIXELS` allows, the same number `detail()` already
-    previewed), or `"no_coverage"` (the extent has no overlap with any of
-    the ten `COVERAGE_TILES` at all: `covers(bbox) == "none"`, or, the
-    narrower case `merge()`'s own guard catches, a window whose snapped
-    intersection with `_ENVELOPE` is zero pixels wide or tall in at least
-    one axis, which implies the identical fact). `"download"` is the only
-    retryable kind (`_classify_lidar_cardiff_error`); `"budget"` and
-    `"no_coverage"` both map to `FAILURE_NODE_CAP` there, the same "the
-    answer is a different extent, not another identical request"
-    vocabulary entry `sources/base.py` documents for OsmSource's own,
-    unrelated failure, since asking again never changes either fact;
-    `"parse"` falls through to `FAILURE_UNKNOWN`.
+    `self._bbox`). `"download"` is the only retryable kind
+    (`_classify_lidar_cardiff_error`); `"parse"` falls through to
+    `FAILURE_UNKNOWN`.
 
-    `"budget"` and `"no_coverage"` are each raised from two places:
-    `fetch()`, BEFORE either zip is downloaded (the primary gate: this is
-    what actually reaches package.py's ordinary source-failure/
-    tile_failures path, since `merge()`'s own exceptions are not
-    currently caught by `run_survey`), and `merge()` itself, kept as a
-    second line of defence for a call reached by some other route. Every
-    gate builds its message from one shared function
-    (`_budget_refusal_reason`, `_NO_COVERAGE_REASON`) so no two call
-    sites, and no gate and `detail()`'s or `covers()`'s own preview, can
-    ever disagree about the same extent.
+    There is deliberately no kind here for an extent this archive cannot
+    serve. `"budget"` and `"no_coverage"` were two such kinds, both
+    mapped to `FAILURE_NODE_CAP`, and both are gone: those two facts are
+    skips now, and a skip raises nothing to classify (see the module
+    docstring's "Two facts stop this source" section).
 
     Every message names the zip's own file name (`DSM_ZIP_NAME` /
     `DTM_ZIP_NAME`) or the pixel arithmetic itself, never `DSM_ZIP_URL` /
@@ -454,21 +460,20 @@ def _classify_lidar_cardiff_error(exc: LidarCardiffError) -> str:
     `FAILURE_UNREACHABLE`, retryable: the same bucket `os_uprn.py`'s own
     `_classify_os_open_error` gives `OsOpenError`'s `"download"`/
     `"listing"` kinds, which this mirrors for the identical reason.
-    `"budget"` and `"no_coverage"` are both `FAILURE_NODE_CAP`: neither
-    extent gets more pixels, or moves inside the covered block, by
-    retrying the identical request, so nothing about a second attempt
-    could ever answer differently, the same reasoning `osm.py`'s own
-    `NodeCapExceededError` mapping already documents for an unrelated
-    too-dense-to-serve failure. `"parse"` (a right-length body that will
-    not open as a zip, a member `asc_grid.AscGridError` refused, or
-    `merge()` missing a required input) falls through to
-    `FAILURE_UNKNOWN`, the same catch-all `os_uprn.py`'s own classifier
-    gives every kind it does not special-case.
+    `"parse"` (a right-length body that will not open as a zip, a member
+    `asc_grid.AscGridError` refused, or `merge()` missing a required
+    input) falls through to `FAILURE_UNKNOWN`, the same catch-all
+    `os_uprn.py`'s own classifier gives every kind it does not
+    special-case.
+
+    Nothing maps to `FAILURE_NODE_CAP` here any more. `"budget"` and
+    `"no_coverage"` did, on the sound reasoning that no retry moves an
+    extent inside the covered block; what was wrong was calling either
+    one a failure in the first place, and both are skips now, which this
+    classifier is never asked about.
     """
     if exc.kind == "download":
         return FAILURE_UNREACHABLE
-    if exc.kind in ("budget", "no_coverage"):
-        return FAILURE_NODE_CAP
     return FAILURE_UNKNOWN
 
 
@@ -572,9 +577,13 @@ def _window_pixels(bbox: BBox, ostn15_cache_dir: Path | None) -> int:
 
 
 def _budget_refusal_reason(pixels: int) -> str:
-    """The refusal reason string, with only the pixel count substituted
+    """The over-budget skip reason, with only the pixel count substituted
     (thousands separated: part of the pinned text, not incidental
     formatting).
+
+    Names no place at all, and does not need to: the sentence is about
+    how large the extent is, not about where it sits, so the 2026-08-12
+    place-name correction (see the module docstring) left it untouched.
 
     The plan's own original wording said "under about 1 x 1 km," which is
     the PADDED window's own threshold (`MAX_WINDOW_PIXELS` at
@@ -589,12 +598,10 @@ def _budget_refusal_reason(pixels: int) -> str:
     edge rather than up to it, is what every user-facing sentence in this
     module says now.
 
-    Shared by two gates: `fetch()`'s own, which runs first and refuses
-    before either zip is downloaded, and `merge()`'s own, kept as the
-    second line of defence for a `merge()` reached by some other route
-    (a resumed run, a future caller that skips straight to it). One
-    function is what keeps the two gates, and `detail()`'s own preview,
-    from ever drifting apart in wording.
+    Reached only through `_skip_reason`, which both `fetch()` and
+    `merge()` ask: one function is what keeps those two, and `detail()`'s
+    own preview, from ever drifting apart in wording about the same
+    extent.
     """
     return (
         f"this extent needs {pixels:,} pixels at 25 cm and the raster "
@@ -603,14 +610,19 @@ def _budget_refusal_reason(pixels: int) -> str:
     )
 
 
-# Pinned verbatim (final whole-branch review, Critical 1's fix). Shared by
-# both gates below for the identical reason `_budget_refusal_reason` is
-# shared: `fetch()`'s own gate is what actually reaches the owner, and
-# `merge()`'s copy is the second line of defence, and the two must never
-# say two different things about the same fact.
+# Pinned verbatim. Reached only through `_skip_reason`, for the identical
+# reason `_budget_refusal_reason` is: `fetch()` and `merge()` must never
+# say two different things about the same extent.
+#
+# The place name here was "Creigiau and Pentyrch, north-west Cardiff"
+# until 2026-08-12 and was wrong: see the module docstring's own
+# correction note. It matters more in this sentence than anywhere else
+# in the file, because this is the one string an owner reads at the exact
+# moment they are deciding where to draw the extent again.
 _NO_COVERAGE_REASON = (
-    "this extent is outside the ten covered tiles at Creigiau and Pentyrch, "
-    "north-west Cardiff; the 25 cm archive holds nothing here"
+    "this extent is outside the ten covered tiles at St Fagans and "
+    "St Georges-super-Ely, west Cardiff; the 25 cm archive holds nothing "
+    "here"
 )
 
 
@@ -704,9 +716,19 @@ def _resolve_cache_pointer(parts: Sequence[Path], pointer_name: str) -> Path | N
 class LidarCardiffSource:
     id = "lidar_cardiff"
     display_name = (
-        "LiDAR terrain (Creigiau and Pentyrch, north-west Cardiff, 25 cm, "
+        "LiDAR terrain (St Fagans and St Georges-super-Ely, Cardiff, 25 cm, "
         "flown 2011)"
     )
+    # The one-time cost this source's first ever use imposes: 84 MB of
+    # archive zips (DSM_ZIP_BYTES + DTM_ZIP_BYTES), downloaded whole and
+    # then cached nationally for every later survey. Read by the browser
+    # through /api/coverage the same defensive, optional-attribute way
+    # `sources/base.py` documents for every other source-specific
+    # extension (getattr(source, "heavy_one_time", False)), so the
+    # interface can auto-select every covering source while still
+    # flagging the two that are not free the first time. Only this source
+    # and os_uprn.py set it; the getattr default answers for the rest.
+    heavy_one_time = True
     licence = "Open Government Licence for Public Sector Information (OGL)"
     attribution = (
         "Contains Natural Resources Wales information © Natural "
@@ -749,6 +771,18 @@ class LidarCardiffSource:
         # same deferred IncompleteSurveyError shape lidar_wales.py and
         # os_uprn.py already get from populating this exact attribute.
         self.tile_failures: list[TileFailure] = []
+        # The other half of the account, and the one this source actually
+        # uses in anger: the sentence saying why this extent got nothing,
+        # for the two facts that are skips rather than failures (see the
+        # module docstring's "Two facts stop this source" section).
+        # Reset at the top of every fetch() exactly as tile_failures is,
+        # so it always describes the most recent call; read by
+        # package.py's run_survey (which turns it into a source_skipped
+        # event and records the tiles settled rather than failed) and by
+        # `_source_provenance` (which folds it into survey.json), both
+        # through getattr, the same optional-attribute convention
+        # sources/base.py documents for every other extension here.
+        self.skipped_reason: str | None = None
         # Set at the top of every fetch(); merge() reads it back. See the
         # module docstring's "merge(): no bbox in its own signature"
         # section: LayerSource.merge's own protocol carries no bbox
@@ -806,6 +840,40 @@ class LidarCardiffSource:
         source does not serve it. See `_TIERS` above.
         """
         return self._TIERS.get(category)
+
+    # -- the one skip question, asked by both fetch() and merge() ------------
+
+    def _skip_reason(self, bbox: BBox) -> str | None:
+        """The one sentence saying why this source has nothing to deliver
+        over `bbox`, or None when it genuinely can serve it.
+
+        Two facts, in the order they are cheapest to be wrong about, and
+        neither of them a failure: an extent whose own intersection with
+        the coverage envelope needs more pixels at 25 cm than
+        `cog.MAX_WINDOW_PIXELS` allows, and an extent with no overlap
+        with any of the ten `COVERAGE_TILES` at all. See the module
+        docstring's "Two facts stop this source, and NEITHER of them is
+        a failure" section for why both are skips, and the section after
+        it for why the second question has to be `covers()`'s lattice
+        test rather than a pixel count that reads 0 for both a
+        no-coverage extent and a degenerate one.
+
+        The budget test comes first only for continuity with the gate
+        order this replaced; the two never both apply to the same extent
+        in any case, since an extent with no overlap prices at 0 pixels
+        and can never be over budget.
+
+        Never touches the network: `_window_pixels` and `covers()` are
+        both cache-only, the same guarantee `detail()` and `estimate()`
+        carry, which is what lets `merge()` ask this again without
+        turning a merge into a request.
+        """
+        pixels = _window_pixels(bbox, self._ostn15_cache_dir)
+        if pixels > MAX_WINDOW_PIXELS:
+            return _budget_refusal_reason(pixels)
+        if self.covers(bbox) == "none":
+            return _NO_COVERAGE_REASON
+        return None
 
     # -- detail (mapgen.resolver) --------------------------------------------
 
@@ -989,6 +1057,36 @@ class LidarCardiffSource:
             for tile in tiles
         ]
 
+    def _record_skip(
+        self, tiles: Sequence[Tile], progress: ProgressSink, reason: str
+    ) -> None:
+        """Record that this extent gets nothing from this source, and
+        say so once per tile.
+
+        The skip counterpart of `_record_tile_failures` above, and
+        deliberately the same shape: neither of this source's two units
+        of work is tile-shaped, but the pipeline and the browser both
+        account per tile, so one event per tile the survey asked for is
+        what keeps the tile grid honest instead of leaving those tiles
+        looking un-attempted for the rest of the run.
+
+        `tile_skipped` is the pipeline's own existing vocabulary for
+        "there was nothing to do here", emitted by `os_open.py` for a
+        Greenspace square already sharded and by `package.py` for a tile
+        a resume found already on disk. `reason` rides along as an extra
+        field, exactly as `os_open.py` sends `product` and `square`: the
+        browser reads unqualified `tile_skipped` events as "this source
+        has finished with this tile" without needing to know the field
+        is there, and the event log at the bottom of the page prints
+        every field of every event, so the sentence reaches the owner
+        whether or not anything formats it by name.
+        """
+        self.skipped_reason = reason
+        for tile in tiles:
+            progress.emit(
+                "tile_skipped", source=self.id, tile_id=tile.tile_id, reason=reason
+            )
+
     def fetch(
         self,
         bbox: BBox,
@@ -1018,69 +1116,53 @@ class LidarCardiffSource:
         never copied into `work_dir`: they are shared across every future
         survey that ever selects this source, the same national-cache
         shape `os_uprn.py`'s own `fetch()` gives its own one download for
-        the identical reason. `bbox` IS used for two things: the budget gate
-        immediately below, and remembered on `self._bbox` for `merge()`
-        to read later, since that method's own protocol signature has no
-        bbox parameter of its own (see the module docstring's "merge():
-        no bbox in its own signature" section). `tiles` is used too,
-        though only to know which tiles to blame a failure on
-        (`_record_tile_failures`): see `__init__`'s own comment for why
-        that accounting exists at all for a source with no tile-shaped
-        work.
+        the identical reason. `bbox` IS used for two things: the skip
+        question immediately below, and remembered on `self._bbox` for
+        `merge()` to read later, since that method's own protocol
+        signature has no bbox parameter of its own (see the module
+        docstring's "merge(): no bbox in its own signature" section).
+        `tiles` is used too, to know which tiles to blame a failure on
+        (`_record_tile_failures`) or to report a skip against
+        (`_record_skip`): see `__init__`'s own comment for why that
+        accounting exists at all for a source with no tile-shaped work.
 
-        The budget gate runs FIRST, before either zip is downloaded: an
-        extent whose own intersection with the coverage envelope needs
-        more pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows is
-        refused here, with a recorded `tile_failures` entry
-        (`FAILURE_NODE_CAP`, never retryable) and a raised
-        `LidarCardiffError` (kind `"budget"`), rather than only inside
-        `merge()`: see the module docstring's "The budget gate lives in
-        fetch(), first, and again in merge()" section for why this is
-        the gate that actually has to reach the owner.
-
-        The none-coverage gate runs SECOND, once an extent has already
-        cleared the budget gate: `covers(bbox) == "none"` means this
-        extent has no overlap with any of the ten `COVERAGE_TILES` at
-        all (a final whole-branch review's own Critical finding: 0
-        pixels, the budget gate's own price for exactly this extent, is
-        comfortably under budget, so that gate alone waves it through).
-        Refused here the same way, kind `"no_coverage"`, before either
-        zip is downloaded: see the module docstring's "The none-coverage
-        gate" section for the two shapes of "none" this closes and why
-        `fetch()`, not `merge()`, is where this has to live to actually
-        reach the owner.
+        The skip question runs FIRST, before either zip is downloaded.
+        An extent this archive cannot serve, either because it is over
+        the pixel budget or because it lies outside the ten covered
+        tiles, gets no download, no output, no exception and no failure:
+        `tile_skipped` per tile carrying the reason, the same reason
+        recorded on `self.skipped_reason` for package.py and survey.json,
+        and an empty list back. See the module docstring's "Two facts
+        stop this source, and NEITHER of them is a failure" section for
+        why this replaced two raises that painted a working source's
+        tiles red.
 
         `cancel` is checked before each of the two zips, never mid
         download: a unit already in flight always finishes, matching
         every other source's own reading of this optional parameter (see
         `sources/base.py`'s `LayerSource` docstring).
 
-        A `LidarCardiffError` from either zip, or from either gate, is
-        recorded against every tile in `tiles`
-        (`_classify_lidar_cardiff_error` maps its own `kind` to the
-        shared failure vocabulary) and then re-raised unchanged, the
-        same "record, then raise" shape `os_uprn.py`'s own `fetch()` uses
-        for its own `OsOpenError`.
+        A `LidarCardiffError` from either zip is recorded against every
+        tile in `tiles` (`_classify_lidar_cardiff_error` maps its own
+        `kind` to the shared failure vocabulary) and then re-raised
+        unchanged, the same "record, then raise" shape `os_uprn.py`'s own
+        `fetch()` uses for its own `OsOpenError`. That path is for things
+        that genuinely went wrong, and nothing above reaches it.
         """
         self.tile_failures = []
+        self.skipped_reason = None
         self._bbox = bbox
         if cancel is not None:
             cancel.raise_if_cancelled()
 
-        pixels = _window_pixels(bbox, self._ostn15_cache_dir)
-        if pixels > MAX_WINDOW_PIXELS:
-            error = LidarCardiffError(_budget_refusal_reason(pixels), kind="budget")
-            self._record_tile_failures(
-                tiles, _classify_lidar_cardiff_error(error), str(error)
-            )
-            raise error
-
-        if self.covers(bbox) == "none":
-            error = LidarCardiffError(_NO_COVERAGE_REASON, kind="no_coverage")
-            self._record_tile_failures(
-                tiles, _classify_lidar_cardiff_error(error), str(error)
-            )
-            raise error
+        skip_reason = self._skip_reason(bbox)
+        if skip_reason is not None:
+            self._record_skip(tiles, progress, skip_reason)
+            # No pointer files, no work_dir, nothing on disk at all: a
+            # skip leaves exactly as little behind as the refusals it
+            # replaced did, so package.py's own merge sees no parts and
+            # the package holds no half-written 25 cm anything.
+            return []
 
         directory = cache_dir()
         dsm_path = directory / DSM_ZIP_NAME
@@ -1120,17 +1202,27 @@ class LidarCardiffSource:
     def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
         """Assembles the two archive zips' own ASCII grid members into
         `<stem>_lidar25_dsm.tif` and `<stem>_lidar25_dtm.tif` (spec-pinned
-        names), refusing the extent up front, with kind `"budget"`, when
-        its own intersection with the coverage envelope needs more
-        pixels at 25 cm than `cog.MAX_WINDOW_PIXELS` allows: the same
-        figure `detail()` already previewed (`_window_pixels`), so the
-        preview and the refusal can never disagree. `fetch()` checks the
-        identical gate first, before either zip is even downloaded (see
-        the module docstring's "The budget gate lives in fetch(), first,
-        and again in merge()" section for why that copy, not this one, is
-        the one that actually reaches the owner today); this copy stays
-        as a second line of defence for a `merge()` reached by some other
-        route.
+        names), or writes nothing at all and returns an empty list when
+        this extent is one this source skips.
+
+        The skip question is `_skip_reason`, the identical one `fetch()`
+        asks and answers first, from the same `self._bbox` and the same
+        two pinned sentences, so the two can never disagree about the
+        same extent. It is asked again here as a second line of defence
+        for a `merge()` reached by some other route (a resumed run, a
+        future direct caller), and it returns rather than raises for a
+        reason that matters: `run_survey` wraps `fetch()` in the
+        deferred-failure machinery and wraps `merge()` in nothing at all,
+        so an exception from here would take the whole survey down
+        uncaught instead of reaching the owner as an ordinary outcome.
+
+        An empty `parts` is the ordinary shape of the skip path through
+        package.py's real pipeline, and it also returns an empty list.
+        `fetch()` writes no pointer files when it skips, so the directory
+        listing package.py builds `parts` from comes back empty, and
+        there is nothing here to build a raster out of. This is the one
+        case where "handed nothing" is not a contradiction; being handed
+        SOME of what it needs still is, and still raises below.
 
         `parts` ordinarily holds `fetch()`'s own two zip paths, selected
         here BY NAME (`DSM_ZIP_NAME`/`DTM_ZIP_NAME`), never by position:
@@ -1164,13 +1256,11 @@ class LidarCardiffSource:
         would otherwise follow from a bare `None`.
 
         A window whose snapped intersection with the coverage envelope
-        comes back zero pixels wide or tall in either axis (kind
-        `"no_coverage"`) is refused before either zip is even opened,
-        rather than handed to `write_bng_geotiff`, which refuses that
-        shape outright: see the module docstring's "The none-coverage
-        gate" section for why this is a narrower, second-line-of-defence
-        copy of `fetch()`'s own gate rather than a full replacement for
-        it.
+        comes back zero pixels wide or tall in either axis is left
+        unbuilt too, rather than handed to `write_bng_geotiff`, which
+        refuses that shape outright: `_skip_reason` above already covers
+        every extent that can produce one, and this is the belt to its
+        braces.
 
         Neither raster is written until both have been fully assembled:
         a member that fails to parse, in either zip, raises before either
@@ -1190,6 +1280,23 @@ class LidarCardiffSource:
                 kind="parse",
             )
 
+        skip_reason = self._skip_reason(self._bbox)
+        if skip_reason is not None:
+            # Recorded here as well as in fetch(), so a merge() reached
+            # by some other route still leaves survey.json able to say
+            # why this package holds no 25 cm rasters.
+            self.skipped_reason = skip_reason
+            return []
+
+        if not parts:
+            # The ordinary skip path through package.py: fetch() wrote no
+            # pointer files, so the listing that builds `parts` is empty.
+            # It is also where a forced run lands when a download failed
+            # and the run was told to carry on regardless: either way
+            # there is nothing to assemble and nothing to say that
+            # fetch() has not already said.
+            return []
+
         out_dir = Path(out_dir)
         dsm_zip_path = next((part for part in parts if part.name == DSM_ZIP_NAME), None)
         dtm_zip_path = next((part for part in parts if part.name == DTM_ZIP_NAME), None)
@@ -1204,21 +1311,19 @@ class LidarCardiffSource:
                 kind="parse",
             )
 
-        pixels = _window_pixels(self._bbox, self._ostn15_cache_dir)
-        if pixels > MAX_WINDOW_PIXELS:
-            raise LidarCardiffError(_budget_refusal_reason(pixels), kind="budget")
-
         window_e_min, window_n_max, window_width, window_height = (
             _snapped_merge_window(self._bbox, self._ostn15_cache_dir)
         )
         if window_width == 0 or window_height == 0:
-            # Second line of defence, never the only one: see the module
-            # docstring's "The none-coverage gate" section for why this
-            # narrower guard exists beside fetch()'s own covers()-based
-            # gate rather than instead of it. Raised before either zip is
-            # opened, the same "refuse before doing any real work" shape
-            # every other gate in this file already follows.
-            raise LidarCardiffError(_NO_COVERAGE_REASON, kind="no_coverage")
+            # Unreachable while _skip_reason above and the window
+            # arithmetic agree: a covers() answer other than "none"
+            # guarantees a real overlap with the envelope in both axes.
+            # Kept, and kept as a skip rather than a raise, so that if
+            # they ever stop agreeing the result is a package without a
+            # raster rather than a GeoTiffWriteError out of an unwrapped
+            # merge().
+            self.skipped_reason = _NO_COVERAGE_REASON
+            return []
 
         dsm_window = _assemble_window(
             dsm_zip_path, window_e_min, window_n_max, window_width, window_height

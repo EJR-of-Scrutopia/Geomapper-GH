@@ -42,10 +42,10 @@ from mapgen.bng import tm_inverse
 from mapgen.cog import MAX_WINDOW_PIXELS, CogReader, FileByteSource, read_full_window
 from mapgen.egrid import PAD_METRES
 from mapgen.geo import BBox, Tile
+from mapgen.jobs import EventLog
 from mapgen.package import IncompleteSurveyError, SurveyRequest, run_survey
 from mapgen.sources import lidar_cardiff
 from mapgen.sources.base import (
-    FAILURE_NODE_CAP,
     FAILURE_UNREACHABLE,
     Estimate,
     NullProgress,
@@ -452,8 +452,9 @@ def test_routing_note_warns_when_the_cache_is_cold(tmp_path, monkeypatch):
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
 
     assert source.routing_note() == (
-        "LiDAR terrain (Creigiau and Pentyrch): first use downloads two "
-        "zip files (about 84 MB total, cached for every later survey)."
+        "LiDAR terrain (St Fagans and St Georges-super-Ely): first use "
+        "downloads two zip files (about 84 MB total, cached for every "
+        "later survey)."
     )
 
 
@@ -516,11 +517,23 @@ def test_covers_tier_detail_estimate_and_routing_note_never_touch_the_network(
 def test_declares_the_briefs_exact_strings():
     source = LidarCardiffSource()
     assert source.id == "lidar_cardiff"
+    # Corrected 2026-08-12: this said "Creigiau and Pentyrch, north-west
+    # Cardiff" until the ten COVERAGE_TILES envelopes were finally put
+    # through a geocoder, and the wrong name had already sent the owner
+    # to draw an extent this archive covers nothing of. See the module
+    # docstring's own correction note.
     assert source.display_name == (
-        "LiDAR terrain (Creigiau and Pentyrch, north-west Cardiff, 25 cm, "
+        "LiDAR terrain (St Fagans and St Georges-super-Ely, Cardiff, 25 cm, "
         "flown 2011)"
     )
     assert source.requires_api_key is False
+
+
+def test_declares_itself_a_heavy_one_time_download():
+    # 84 MB of archive zips on first use ever, cached nationally after
+    # that: the browser reads this to auto-select every covering source
+    # while still flagging the two that are not free the first time.
+    assert LidarCardiffSource().heavy_one_time is True
 
 
 def test_flown_string_is_pinned():
@@ -732,17 +745,35 @@ def test_fetch_fails_validation_with_the_sources_own_error_for_a_non_zip_payload
 
 
 # --------------------------------------------------------------------------
-# fetch()'s own budget gate (review Important #2): the primary refusal now
-# lives here, before either zip is downloaded, because package.py's
-# run_survey wraps fetch() in the deferred-failure/retry machinery but does
-# not currently wrap merge() in anything, so a merge()-only refusal would
-# never reach the owner through the ordinary source-failure event. merge()
-# keeps its own copy of the same gate as a second line of defence (tested
-# separately, further down); this section proves the fetch()-side one.
+# fetch()'s two skips. Both of these used to RAISE, each with a
+# tile_failures entry per tile classified FAILURE_NODE_CAP, and the first
+# real survey to hit one came back with source_failed, a tile_failed per
+# tile and a grid painted red for a source doing exactly what it was
+# designed to do. An extent this archive cannot serve is a fact about the
+# extent, not a breakage, so both are now skips: tile_skipped per tile
+# carrying the reason, the same reason on skipped_reason, no parts, no
+# exception. The reason is never dropped, which is what makes this honest
+# rather than merely quiet.
 # --------------------------------------------------------------------------
 
 
-def test_fetch_refuses_over_budget_before_downloading_anything(tmp_path, monkeypatch):
+class _RecordingProgress:
+    """A ProgressSink that keeps every event, so a test can assert on
+    what the owner would actually see in the log.
+
+    NullProgress (used by every test above that only cares about return
+    values) discards them, and what these two tests are about is
+    precisely that the skip is visible.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def emit(self, event: str, **fields) -> None:
+        self.events.append((event, fields))
+
+
+def test_fetch_skips_an_over_budget_extent_instead_of_failing(tmp_path, monkeypatch):
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
     pixels = _window_pixels(bbox, tmp_path)
@@ -752,61 +783,50 @@ def test_fetch_refuses_over_budget_before_downloading_anything(tmp_path, monkeyp
         Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox),
         Tile(tile_id="r00_c01", row=0, col=1, core_bbox=bbox, query_bbox=bbox),
     ]
-    # A socket-refusing session: if the gate ran after either zip started
-    # downloading rather than before both, this fixture is what turns
-    # that regression into a test failure rather than a slow real request.
+    # A socket-refusing session: if the skip were decided after either
+    # zip started downloading rather than before both, this fixture is
+    # what turns that regression into a test failure rather than a slow
+    # real request.
     source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+    progress = _RecordingProgress()
 
-    with pytest.raises(LidarCardiffError) as excinfo:
-        source.fetch(bbox, tiles, tmp_path / "work", NullProgress())
+    assert source.fetch(bbox, tiles, tmp_path / "work", progress) == []
 
-    assert excinfo.value.kind == "budget"
     # Pin the substitution, not just the prose (the item B lesson, same
     # as the merge()-side test): re-derive the exact pixel count rather
     # than hard-coding a number that can drift with tm_inverse/tm_forward
     # round-trip noise.
-    assert str(excinfo.value) == (
+    expected_reason = (
         f"this extent needs {pixels:,} pixels at 25 cm and the raster "
         f"budget is 16,777,216; extents under about 600 x 600 m inside "
         f"the covered block come back at 25 cm"
     )
+    assert source.skipped_reason == expected_reason
+    # Nothing failed, so nothing is recorded as having failed.
+    assert source.tile_failures == []
 
-    assert source.tile_failures
-    assert {failure.tile_id for failure in source.tile_failures} == {"r00_c00", "r00_c01"}
-    for failure in source.tile_failures:
-        assert failure.source == "lidar_cardiff"
-        # Never retryable: asking again cannot shrink the extent.
-        assert failure.kind == FAILURE_NODE_CAP
-        assert failure.reason == str(excinfo.value)
-        assert "http" not in failure.reason.lower()
+    skipped = [fields for event, fields in progress.events if event == "tile_skipped"]
+    assert {fields["tile_id"] for fields in skipped} == {"r00_c00", "r00_c01"}
+    for fields in skipped:
+        assert fields["source"] == "lidar_cardiff"
+        assert fields["reason"] == expected_reason
+        assert "http" not in fields["reason"].lower()
 
-    # Neither zip exists: the gate ran before _ensure_zip touched either.
+    # Neither zip exists: the skip was decided before _ensure_zip touched
+    # either one.
     assert not (tmp_path / DSM_ZIP_NAME).exists()
     assert not (tmp_path / DTM_ZIP_NAME).exists()
     assert list(tmp_path.glob("*.part")) == []
 
 
-# --------------------------------------------------------------------------
-# fetch()'s own none-coverage gate (final whole-branch review, Critical 1):
-# an extent with covers() == "none" used to sail past the budget gate at 0
-# pixels (0 is comfortably under MAX_WINDOW_PIXELS) and crash run_survey
-# uncaught inside merge(), from a degenerate width-by-zero-height window
-# handed to write_bng_geotiff. This section proves the fetch()-side fix;
-# the merge()-level second-line-of-defence guard is proven separately,
-# further down, beside the rest of the merge() tests.
-# --------------------------------------------------------------------------
-
-
-def test_fetch_refuses_none_coverage_extents_before_downloading_anything(
-    tmp_path, monkeypatch
-):
+def test_fetch_skips_a_none_coverage_extent_instead_of_failing(tmp_path, monkeypatch):
     # Warm-cache scenario, deliberately: the owner's own real cache can
     # already be warm (a completed live run leaves both zips cached
     # permanently), so this test does not rely on a cold cache to prove
-    # the gate never reaches _ensure_zip. Right-size stubs (never opened
+    # the skip never reaches _ensure_zip. Right-size stubs (never opened
     # as real zips; see _write_right_size_stub's own docstring) stand in
     # for an already-warm cache, and the assertions below confirm no zip
-    # OPEN, and not even a pointer write, is needed for the refusal.
+    # OPEN, and not even a pointer write, happens.
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
     _write_right_size_stub(tmp_path / DSM_ZIP_NAME, DSM_ZIP_BYTES)
     _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)
@@ -816,7 +836,7 @@ def test_fetch_refuses_none_coverage_extents_before_downloading_anything(
     # against a real extent (raw 310800-311600 x 165500-166300). covers()
     # is "none" here, and _window_pixels prices it at 0 (one axis clamped
     # to zero by its own max(0.0, ...)), which is exactly why the budget
-    # gate alone cannot catch this and a separate gate is needed.
+    # half of _skip_reason cannot catch this and the covers() half must.
     bbox = _any_bbox()
     assert LidarCardiffSource(ostn15_cache_dir=tmp_path).covers(bbox) == "none"
     assert _window_pixels(bbox, tmp_path) == 0
@@ -827,50 +847,114 @@ def test_fetch_refuses_none_coverage_extents_before_downloading_anything(
     ]
     source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
     work_dir = tmp_path / "work"
+    progress = _RecordingProgress()
 
-    with pytest.raises(LidarCardiffError) as excinfo:
-        source.fetch(bbox, tiles, work_dir, NullProgress())
+    assert source.fetch(bbox, tiles, work_dir, progress) == []
 
-    assert excinfo.value.kind == "no_coverage"
-    assert str(excinfo.value) == (
-        "this extent is outside the ten covered tiles at Creigiau and "
-        "Pentyrch, north-west Cardiff; the 25 cm archive holds nothing here"
+    # The corrected place name, verbatim: this is the one sentence an
+    # owner reads at the exact moment they are deciding where to draw the
+    # extent again, and it named the wrong village until 2026-08-12.
+    expected_reason = (
+        "this extent is outside the ten covered tiles at St Fagans and "
+        "St Georges-super-Ely, west Cardiff; the 25 cm archive holds "
+        "nothing here"
     )
+    assert source.skipped_reason == expected_reason
+    assert source.tile_failures == []
 
-    assert source.tile_failures
-    assert {failure.tile_id for failure in source.tile_failures} == {"r00_c00", "r00_c01"}
-    for failure in source.tile_failures:
-        assert failure.source == "lidar_cardiff"
-        # Never retryable: asking again does not move the extent.
-        assert failure.kind == FAILURE_NODE_CAP
-        assert failure.reason == str(excinfo.value)
-        assert "http" not in failure.reason.lower()
+    skipped = [fields for event, fields in progress.events if event == "tile_skipped"]
+    assert {fields["tile_id"] for fields in skipped} == {"r00_c00", "r00_c01"}
+    for fields in skipped:
+        assert fields["source"] == "lidar_cardiff"
+        assert fields["reason"] == expected_reason
+        assert "http" not in fields["reason"].lower()
 
-    # No pointer written either: the gate runs before fetch() reaches the
-    # point where it would trust even an already-warm cache.
+    # No pointer written either: the skip happens before fetch() reaches
+    # the point where it would trust even an already-warm cache.
     assert not (work_dir / lidar_cardiff._DSM_CACHE_POINTER_NAME).exists()
     assert not (work_dir / lidar_cardiff._DTM_CACHE_POINTER_NAME).exists()
 
 
-def test_a_none_coverage_extent_is_deferred_not_fatal_and_writes_survey_json(
-    tmp_path, monkeypatch
-):
-    """The final-review Critical 1 finding, reproduced and proven fixed: a
-    covers() == "none" extent with lidar_cardiff selected used to crash
-    run_survey UNCAUGHT (merge() built a degenerate window and
-    write_bng_geotiff refused it, with no try/except anywhere above it),
-    so no survey.json was ever written, contradicting server.py's own
-    documented guarantee. The fetch()-side none-coverage gate is what
-    actually reaches this pipeline: it fires from fetch(), which package.py
-    already wraps in the same deferred-failure/retry machinery
-    test_a_fetch_failure_is_deferred_not_fatal_through_a_real_run_survey
-    proves for a transport failure, above.
+def test_a_second_fetch_over_covered_ground_clears_the_recorded_skip(tmp_path, monkeypatch):
+    """skipped_reason is reset at the top of every fetch(), exactly as
+    tile_failures is, so it always describes the most recent call.
+
+    package.py registers ONE LidarCardiffSource for the life of the
+    process and reuses it across every survey that selects it, so a
+    reason left standing from an earlier extent would follow the next
+    survey into its own survey.json.
+    """
+    monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path)
+    _write_right_size_stub(tmp_path / DSM_ZIP_NAME, DSM_ZIP_BYTES)
+    _write_right_size_stub(tmp_path / DTM_ZIP_NAME, DTM_ZIP_BYTES)
+    source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
+
+    source.fetch(_any_bbox(), [], tmp_path / "work", NullProgress())
+    assert source.skipped_reason is not None
+
+    source.fetch(_covered_bbox(), [], tmp_path / "work2", NullProgress())
+    assert source.skipped_reason is None
+
+
+class _WritesEveryTile:
+    """A second LayerSource that behaves like a real one: it writes a
+    tile-stamped file for every tile it is handed and merges them.
+
+    Needed by the whole-run test below, which is about a survey
+    COMPLETING. `_SecondSourceRecordingFetch` further down writes nothing
+    at all, which package.py correctly reads as "vacuous, not done" and
+    records as failed, so it can only ever produce an incomplete run: it
+    is right for the deferred-failure tests it serves and wrong for this
+    one.
+    """
+
+    id = "stub_second_source"
+    display_name = "Stub Second Source"
+    licence = "CC0"
+    attribution = "nobody"
+    requires_api_key = False
+
+    def __init__(self) -> None:
+        self.fetch_called = False
+
+    def estimate(self, bbox, tiles):
+        return Estimate(bytes_estimate=0, seconds_estimate=0.0)
+
+    def fetch(self, bbox, tiles, work_dir, progress):
+        self.fetch_called = True
+        written = []
+        work_dir.mkdir(parents=True, exist_ok=True)
+        for tile in tiles:
+            path = work_dir / f"{tile.tile_id}.txt"
+            path.write_text(tile.tile_id, encoding="utf-8")
+            progress.emit("tile_done", source=self.id, tile_id=tile.tile_id)
+            written.append(path)
+        return written
+
+    def merge(self, parts, out_dir, stem):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{stem}_stub.txt"
+        out.write_text("merged", encoding="utf-8")
+        return [out]
+
+
+def test_a_none_coverage_extent_completes_the_survey_and_says_why(tmp_path, monkeypatch):
+    """The owner's own run, reproduced: lidar_cardiff selected over ground
+    it does not cover used to end the survey with source_failed, a
+    tile_failed per tile and a red grid. It now finishes.
+
+    Every claim the brief makes about the fixed behaviour is asserted
+    here against a real run_survey rather than against fetch() alone: no
+    exception, no tile_failed of any kind, a visible skip carrying the
+    reason, a complete package, and a survey.json that explains the
+    missing rasters instead of leaving a silent hole where they would
+    have been.
     """
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "lidar_cardiff_cache")
     clear_registry()
     try:
         register(LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path))
-        second_source = _SecondSourceRecordingFetch()
+        second_source = _WritesEveryTile()
         register(second_source)
 
         bbox = _any_bbox()  # Barry: covers() == "none".
@@ -886,17 +970,56 @@ def test_a_none_coverage_extent_is_deferred_not_fatal_and_writes_survey_json(
             run_bridge_step=False,
         )
 
-        with pytest.raises(IncompleteSurveyError) as excinfo:
-            run_survey(request)
+        log = EventLog()
+        result = run_survey(request, progress=log)
 
         assert second_source.fetch_called
-        assert "http" not in str(excinfo.value).lower()
+        assert result.complete is True
 
-        # The bug this closes, made concrete: survey.json exists at all.
+        events = log.snapshot()
+        # The heart of it: not one failure event anywhere in the run.
+        assert [e for e in events if e["event"] == "tile_failed"] == []
+        assert [e for e in events if e["event"] == "source_failed"] == []
+
+        expected_reason = (
+            "this extent is outside the ten covered tiles at St Fagans and "
+            "St Georges-super-Ely, west Cardiff; the 25 cm archive holds "
+            "nothing here"
+        )
+        skipped = [
+            e for e in events
+            if e["event"] == "tile_skipped" and e.get("source") == "lidar_cardiff"
+        ]
+        assert skipped
+        assert all(e["reason"] == expected_reason for e in skipped)
+        source_skipped = [e for e in events if e["event"] == "source_skipped"]
+        assert source_skipped == [
+            {
+                "event": "source_skipped",
+                "source": "lidar_cardiff",
+                "reason": expected_reason,
+            }
+        ]
+
         survey_json_paths = list((tmp_path / "packages").rglob("survey.json"))
         assert len(survey_json_paths) == 1
         payload = json.loads(survey_json_paths[0].read_text(encoding="utf-8"))
-        assert payload["complete"] is False
+        assert payload["complete"] is True
+        # Every tile settled for both sources, none of them failed.
+        for record in payload["tiles"]:
+            assert record["lidar_cardiff"] == "ok"
+            assert record["stub_second_source"] == "ok"
+        assert payload["tile_failures"] == []
+
+        # The record explains itself: no rasters, and the sentence saying
+        # why, in the package the owner keeps.
+        entry = next(s for s in payload["sources"] if s["id"] == "lidar_cardiff")
+        assert entry["merged_files"] == []
+        assert entry["skipped_reason"] == expected_reason
+        assert "http" not in entry["skipped_reason"].lower()
+
+        package_dir = survey_json_paths[0].parent
+        assert list(package_dir.glob("*_lidar25_*.tif")) == []
     finally:
         clear_registry()
 
@@ -1152,26 +1275,33 @@ def test_fetch_writes_a_cache_pointer_file_per_zip_into_work_dir(tmp_path, monke
     assert result == [cache_dir / DSM_ZIP_NAME, cache_dir / DTM_ZIP_NAME]
 
 
-def test_fetch_writes_no_pointer_file_when_the_budget_gate_refuses(tmp_path, monkeypatch):
-    """No partial output on a refusal path: the pointer files are written
-    only after both `_ensure_zip` calls have already succeeded, so a
-    budget refusal (which raises before either zip is even downloaded)
-    must leave `work_dir` without either one.
+def test_fetch_writes_no_pointer_file_when_it_skips_an_over_budget_extent(
+    tmp_path, monkeypatch
+):
+    """No output on a skip path: the pointer files are written only after
+    both `_ensure_zip` calls have already succeeded, so an extent this
+    source skips (decided before either zip is even downloaded) must
+    leave `work_dir` without either one, and in fact without existing at
+    all.
+
+    That emptiness is load-bearing rather than tidy: package.py builds
+    merge()'s own `parts` from a LISTING of this directory, so a pointer
+    left behind here would send merge() looking for zips a skipped fetch
+    never fetched.
     """
     monkeypatch.setattr(lidar_cardiff, "cache_dir", lambda: tmp_path / "cache")
     bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
     source = LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path)
     work_dir = tmp_path / "work"
 
-    with pytest.raises(LidarCardiffError) as excinfo:
-        source.fetch(
-            bbox,
-            [Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox)],
-            work_dir,
-            NullProgress(),
-        )
+    assert source.fetch(
+        bbox,
+        [Tile(tile_id="r00_c00", row=0, col=0, core_bbox=bbox, query_bbox=bbox)],
+        work_dir,
+        NullProgress(),
+    ) == []
 
-    assert excinfo.value.kind == "budget"
+    assert source.skipped_reason is not None
     assert not work_dir.exists()
 
 
@@ -1230,7 +1360,11 @@ def test_merge_raises_a_named_error_for_a_stale_pointer_whose_target_is_gone(tmp
     dtm_pointer.write_text(str(tmp_path / "cache" / "gone_dtm.zip"), encoding="utf-8")
 
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    source._bbox = _any_bbox()
+    # A covered extent, not _any_bbox(): merge() asks _skip_reason first,
+    # and over ground this archive does not cover there is nothing for a
+    # pointer to point AT, so the skip would answer before the pointer
+    # check this test is about ever ran.
+    source._bbox = _covered_bbox()
 
     with pytest.raises(LidarCardiffError) as excinfo:
         source.merge([dsm_pointer, dtm_pointer], tmp_path / "package", "TestSite")
@@ -1263,7 +1397,11 @@ def test_merge_raises_a_named_error_for_a_pointer_with_garbage_content(tmp_path)
     dtm_pointer.write_text(str(tmp_path / "cache" / DTM_ZIP_NAME), encoding="utf-8")
 
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
-    source._bbox = _any_bbox()
+    # A covered extent, not _any_bbox(): merge() asks _skip_reason first,
+    # and over ground this archive does not cover there is nothing for a
+    # pointer to point AT, so the skip would answer before the pointer
+    # check this test is about ever ran.
+    source._bbox = _covered_bbox()
 
     with pytest.raises(LidarCardiffError) as excinfo:
         source.merge([dsm_pointer, dtm_pointer], tmp_path / "package", "TestSite")
@@ -1409,7 +1547,7 @@ def test_merge_never_fully_parses_a_member_wholly_outside_the_window(tmp_path, m
     assert all("1000" in text and "2000" not in text for text in calls)
 
 
-def test_merge_refuses_over_budget_with_the_pixel_count_substituted(tmp_path):
+def test_merge_skips_an_over_budget_extent_and_records_the_same_reason(tmp_path):
     bbox = _bbox_for_padded_bng_rect(*_WHOLE_BLOCK_PARTIAL_OVER_BUDGET)
     pixels = _window_pixels(bbox, tmp_path)
     # Sanity: this fixture really is the ~48 million pixel, over-budget
@@ -1426,22 +1564,21 @@ def test_merge_refuses_over_budget_with_the_pixel_count_substituted(tmp_path):
     dsm_zip = tmp_path / DSM_ZIP_NAME
     dtm_zip = tmp_path / DTM_ZIP_NAME
 
-    with pytest.raises(LidarCardiffError) as excinfo:
-        source.merge([dsm_zip, dtm_zip], tmp_path / "package", "TestSite")
+    assert source.merge([dsm_zip, dtm_zip], tmp_path / "package", "TestSite") == []
 
-    assert excinfo.value.kind == "budget"
     # The item B lesson: pin the SUBSTITUTION, not just the surrounding
     # prose. The thousands separator is part of the pinned reason string
-    # itself, not incidental formatting.
+    # itself, not incidental formatting. Identical to what fetch() would
+    # have recorded for the same extent, because both ask _skip_reason.
     assert "," in f"{pixels:,}"
-    assert str(excinfo.value) == (
+    assert source.skipped_reason == (
         f"this extent needs {pixels:,} pixels at 25 cm and the raster "
         f"budget is 16,777,216; extents under about 600 x 600 m inside "
         f"the covered block come back at 25 cm"
     )
 
 
-def test_merge_refuses_over_budget_before_opening_either_zip_and_writes_no_file(
+def test_merge_skips_over_budget_before_opening_either_zip_and_writes_no_file(
     tmp_path, monkeypatch
 ):
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
@@ -1452,21 +1589,55 @@ def test_merge_refuses_over_budget_before_opening_either_zip_and_writes_no_file(
         lidar_cardiff, "parse_asc", lambda text, value_scale=1.0: calls.append(text)
     )
 
-    # Never created: proof the budget gate never even tries to open
-    # either zip, let alone parse a member out of it.
+    # Never created: proof the skip never even tries to open either zip,
+    # let alone parse a member out of it.
     dsm_zip = tmp_path / DSM_ZIP_NAME
     dtm_zip = tmp_path / DTM_ZIP_NAME
     assert not dsm_zip.exists()
     assert not dtm_zip.exists()
 
     package_dir = tmp_path / "package"
-    with pytest.raises(LidarCardiffError) as excinfo:
-        source.merge([dsm_zip, dtm_zip], package_dir, "TestSite")
+    assert source.merge([dsm_zip, dtm_zip], package_dir, "TestSite") == []
 
-    assert excinfo.value.kind == "budget"
+    assert source.skipped_reason is not None
     assert calls == []
     assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
     assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
+
+
+def test_merge_returns_nothing_when_fetch_left_no_parts_at_all(tmp_path, monkeypatch):
+    """The shape package.py's own pipeline hands merge() after a skip: a
+    covered, in-budget extent, and an empty parts list, because fetch()
+    wrote no pointer files.
+
+    An exception here would propagate straight out of run_survey, which
+    wraps merge() in nothing at all, and would take down a survey the
+    skip path exists to let finish. The narrower "handed one of the two"
+    case still raises: see the test immediately below.
+    """
+    _patch_padded_extent(monkeypatch, _SEAM_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+    assert source._skip_reason(source._bbox) is None  # nothing to skip
+
+    package_dir = tmp_path / "package"
+    assert source.merge([], package_dir, "TestSite") == []
+    assert not package_dir.exists()
+
+
+def test_merge_still_raises_when_handed_one_zip_but_not_the_other(tmp_path, monkeypatch):
+    """Being handed NOTHING is the skip path's own ordinary shape; being
+    handed half of what it needs is still a genuine inconsistency, and
+    still a named error rather than a silent empty package.
+    """
+    _patch_padded_extent(monkeypatch, _SEAM_WINDOW_RECT)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    source._bbox = _any_bbox()
+
+    with pytest.raises(LidarCardiffError) as excinfo:
+        source.merge([tmp_path / DSM_ZIP_NAME], tmp_path / "package", "TestSite")
+
+    assert excinfo.value.kind == "parse"
 
 
 # Straddles ST1277SW's own south edge (n=177000, 312000-312500 x
@@ -1614,38 +1785,36 @@ def test_merge_leaves_no_files_when_the_second_write_fails(tmp_path, monkeypatch
 _DEGENERATE_WINDOW_RECT = (311000.0, 100000.0, 311100.0, 100100.0)
 
 
-def test_merge_refuses_a_degenerate_window_as_the_second_line_of_defence(
+def test_merge_skips_a_degenerate_window_as_the_second_line_of_defence(
     tmp_path, monkeypatch
 ):
     """final-review Critical 1's fix, merge()-side half: a window whose
     snapped intersection with _ENVELOPE comes back zero pixels in one
     axis (width 400, height 0 here) used to reach write_bng_geotiff and
     crash with GeoTiffWriteError. This is deliberately reached directly,
-    bypassing fetch()'s own primary gate, to prove merge()'s copy holds
-    even when nothing upstream of it has already refused.
+    bypassing fetch(), to prove merge()'s own copy holds even when
+    nothing upstream of it has already skipped.
     """
     _patch_padded_extent(monkeypatch, _DEGENERATE_WINDOW_RECT)
     source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
     source._bbox = _any_bbox()
 
-    # Passes the budget gate at 0 pixels (one axis clamped to zero width
-    # by _window_pixels' own max(0.0, ...)), which is exactly what makes
-    # the degenerate-window guard a genuinely necessary second check
-    # rather than something the budget gate would already have caught.
+    # Prices at 0 pixels (one axis clamped to zero width by
+    # _window_pixels' own max(0.0, ...)), which is exactly why the
+    # coverage half of _skip_reason has to ask covers() rather than read
+    # a pixel count: 0 is comfortably under budget.
     assert _window_pixels(source._bbox, tmp_path) == 0
 
     package_dir = tmp_path / "package"
-    with pytest.raises(LidarCardiffError) as excinfo:
-        # Nonexistent zip paths: the guard must fire before either is
-        # ever opened.
-        source.merge(
-            [tmp_path / DSM_ZIP_NAME, tmp_path / DTM_ZIP_NAME], package_dir, "TestSite"
-        )
+    # Nonexistent zip paths: nothing may be opened on this path.
+    assert source.merge(
+        [tmp_path / DSM_ZIP_NAME, tmp_path / DTM_ZIP_NAME], package_dir, "TestSite"
+    ) == []
 
-    assert excinfo.value.kind == "no_coverage"
-    assert str(excinfo.value) == (
-        "this extent is outside the ten covered tiles at Creigiau and "
-        "Pentyrch, north-west Cardiff; the 25 cm archive holds nothing here"
+    assert source.skipped_reason == (
+        "this extent is outside the ten covered tiles at St Fagans and "
+        "St Georges-super-Ely, west Cardiff; the 25 cm archive holds "
+        "nothing here"
     )
     assert not (package_dir / "TestSite_lidar25_dsm.tif").exists()
     assert not (package_dir / "TestSite_lidar25_dtm.tif").exists()
