@@ -806,3 +806,59 @@ def test_distribution_matches_heights_percentile_hand_check():
     assert result[0.1] == pytest.approx(1.9)
     assert result[0.5] == pytest.approx(5.5)
     assert result[0.9] == pytest.approx(9.1)
+
+
+# --------------------------------------------------------------------------
+# ContainmentResult.containers: WHICH ring a contained subject was found
+# inside, which is what lets a caller compare the two areas and tell "they
+# split what we hold whole" from "our polygon is drawn oversized".
+# --------------------------------------------------------------------------
+
+
+def test_containment_names_the_ring_each_contained_subject_was_found_inside():
+    others = [_rect(0.0, 0.0, 20.0, 20.0), _rect(100.0, 100.0, 140.0, 140.0)]
+    subjects = [
+        _rect(4.0, 4.0, 6.0, 6.0),  # inside others[0]
+        _rect(110.0, 110.0, 112.0, 112.0),  # inside others[1]
+        _rect(500.0, 500.0, 501.0, 501.0),  # inside nothing
+    ]
+
+    result = classify_containment(subjects, others)
+
+    assert result.contained == [0, 1]
+    assert result.not_contained == [2]
+    assert result.containers == {0: 0, 1: 1}
+
+
+def test_containment_containers_keys_are_exactly_the_contained_list():
+    # The two are two readings of the same fact, so a caller can index one
+    # by the other without a membership check of its own.
+    others = [_rect(0.0, 0.0, 20.0, 20.0)]
+    subjects = [_rect(4.0, 4.0, 6.0, 6.0), _rect(90.0, 90.0, 92.0, 92.0)]
+
+    result = classify_containment(subjects, others)
+
+    assert sorted(result.containers) == result.contained
+
+
+def test_containment_containers_is_empty_when_nothing_is_contained():
+    result = classify_containment([_rect(0.0, 0.0, 10.0, 10.0)], [])
+
+    assert result.containers == {}
+
+
+def test_containment_container_supports_the_reversed_subdivision_reading():
+    # The benchmark's own question, in miniature: their part stands inside
+    # a footprint of ours, but is the LARGER of the two, so "OS split a
+    # building we hold whole" is the wrong reading and "our polygon is
+    # drawn small inside theirs" is the right one. The containment test
+    # cannot tell them apart on its own; the container plus `ring_area`
+    # can.
+    ours = [_rect(0.0, 0.0, 10.0, 10.0)]
+    theirs = [_rect(-15.0, -15.0, 25.0, 25.0)]
+
+    result = classify_containment(theirs, ours)
+
+    assert result.contained == [0]
+    container = result.containers[0]
+    assert ring_area(theirs[0]) > ring_area(ours[container])

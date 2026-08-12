@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 from mapgen.buildings import point_in_ring, representative_point
@@ -372,6 +372,23 @@ class ContainmentResult:
     lengths and get its own input count back, with nothing quietly
     dropped in between.
 
+    `containers` maps each index in `contained` to the index INTO
+    `others` of the ring its point was found inside (the first such ring
+    the search meets; a point inside two overlapping rings of `others`
+    has no single right answer and this function does not invent one).
+    Every key of `containers` is in `contained` and every entry of
+    `contained` is a key, so the two are two readings of the same fact.
+
+    `containers` exists because "contained" on its own cannot tell a
+    caller WHICH way round the disagreement runs. A footprint of theirs
+    standing inside one of ours reads as "they split what we hold whole"
+    only while their part is the SMALLER of the two; if their part is the
+    larger, the same test result reads as "our polygon is drawn oversized
+    and swallowed a corner of theirs", which is the opposite fault and
+    ours. Handing back the container lets a caller compare the two areas
+    (`ring_area`) and count how often the reversed reading is the live
+    one, instead of asserting one reading over the other.
+
     Deliberately NEUTRAL names. What "contained" MEANS depends entirely
     on which way round the caller asked the question (one dataset
     subdividing a footprint the other holds whole, or duplicating one,
@@ -382,6 +399,7 @@ class ContainmentResult:
 
     contained: list[int]
     not_contained: list[int]
+    containers: dict[int, int] = field(default_factory=dict)
 
 
 def classify_containment(
@@ -390,7 +408,10 @@ def classify_containment(
     cell_size: float = MATCH_CELL_SIZE_M,
 ) -> ContainmentResult:
     """Split `subjects` by whether each one's own interior point lands
-    inside any ring of `others`.
+    inside any ring of `others`, and record which ring each contained
+    subject was found inside (`ContainmentResult.containers`, see that
+    dataclass's own docstring for why the container itself, and not only
+    the fact of containment, is part of the answer).
 
     ## Why a representative point, not a centroid
 
@@ -440,20 +461,24 @@ def classify_containment(
 
     contained: list[int] = []
     not_contained: list[int] = []
+    containers: dict[int, int] = {}
     for position, ring in enumerate(subjects):
         point_e, point_n = representative_point(ring)
-        hit = False
+        hit: int | None = None
         for other in index.get(_cell(point_e, point_n, cell_size), ()):
             if not _bbox_holds(others_bboxes[other], point_e, point_n):
                 continue
             if point_in_ring(point_e, point_n, others[other]):
-                hit = True
+                hit = other
                 break
-        if hit:
+        if hit is not None:
             contained.append(position)
+            containers[position] = hit
         else:
             not_contained.append(position)
-    return ContainmentResult(contained=contained, not_contained=not_contained)
+    return ContainmentResult(
+        contained=contained, not_contained=not_contained, containers=containers
+    )
 
 
 # --------------------------------------------------------------------------
