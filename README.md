@@ -508,10 +508,11 @@ A survey of "Barry Waterfront" in region "South Wales" produces:
   Barry-Waterfront_2026-08-03_canopy.geojson          canopy points, only if
                                                       the LiDAR found above-
                                                       ground clusters
-  Barry-Waterfront_2026-08-03_lidar25_dsm.tif         Creigiau/Pentyrch 25 cm,
-  Barry-Waterfront_2026-08-03_lidar25_dtm.tif         only if `lidar_cardiff`
-                                                      was selected and the
-                                                      extent falls inside the
+  Barry-Waterfront_2026-08-03_lidar25_dsm.tif         St Fagans/St Georges-
+  Barry-Waterfront_2026-08-03_lidar25_dtm.tif         super-Ely 25 cm, only if
+                                                      `lidar_cardiff` was
+                                                      selected and the extent
+                                                      falls inside the
                                                       ten-tile block
   Barry-Waterfront_2026-08-03_boundaries.geojson      HM Land Registry property
                                                       boundary curves, only if
@@ -629,17 +630,16 @@ Each file:
 - **`<stem>_lidar25_dsm.tif`, `<stem>_lidar25_dtm.tif`**: 25 cm terrain
   (surface and bare-earth) from Natural Resources Wales' 2011 historic
   archive, packaged whenever the `lidar_cardiff` source is selected and
-  the extent falls inside the ten quarter-tiles it covers: Creigiau and
-  Pentyrch, north-west Cardiff, about 2.5 km2, the only 25 cm the archive
-  holds anywhere near Cardiff. **Not central Cardiff, and not current
-  ground**: flown 23 March 2011, fifteen years of change since, so
+  the extent falls inside the ten quarter-tiles it covers: St Fagans and
+  St Georges-super-Ely, west Cardiff, about 2.5 km2, the only 25 cm the
+  archive holds anywhere near Cardiff. **Not central Cardiff, and not
+  current ground**: flown 23 March 2011, fifteen years of change since, so
   buildings and ground both may differ from what stands there today.
-  Extents under about 600 x 600 m inside the block come back at 25 cm
-  (the raster budget itself is a 1024 m padded window, but a 200 m pad
-  on every side eats into it, leaving about 624 m of raw, drawable
-  extent; 600 rounds that down, never up); a larger covered extent is
-  refused outright, with the pixel count and the reason recorded rather
-  than silently downsampled. Terrain only:
+  Every covered extent comes back at 25 cm, however much of the ten-tile
+  block it spans: the raster budget is the covered block's own full size
+  (2000 x 1500 m, 48,000,000 pixels at 25 cm), the absolute most this
+  archive can ever be asked for, so no covered extent can ever be refused
+  on size. Terrain only:
   fused building heights, roof forms, canopy points, `<stem>.egrid` and
   every contour file above stay on the 2020-2023 1 m data
   (`lidar_wales`) regardless of whether `lidar_cardiff` is also
@@ -1016,8 +1016,8 @@ DSM-minus-DTM building heights into the `.osm`, and feeds the `.egrid` from
 that same 1 m DTM with the 30 m OpenTopography DEM as fallback beyond its
 edge. The resolution promise here is 1 m, not finer: the 25 cm data in NRW's
 own archive catalogue turned out, on checking, to be ten 2011 quarter-tiles,
-about 2.5 km2, in the Creigiau and Pentyrch corner of north-west Cardiff,
-nowhere near most Welsh sites, which is why `lidar_wales` itself never
+about 2.5 km2, in the St Fagans and St Georges-super-Ely corner of west
+Cardiff, nowhere near most Welsh sites, which is why `lidar_wales` itself never
 claims 25 cm. That corner is served separately, honestly, by its own
 source; see item D below. (This paragraph used to say no copy anywhere in
 this project claims 25 cm at all. That was true before item D existed; the
@@ -1071,13 +1071,14 @@ artifact rather than pipeline code).
 **Build item D, the Cardiff 25 cm LiDAR source, has shipped.**
 `lidar_cardiff` packages Natural Resources Wales' 2011 historic 25 cm
 archive as `<stem>_lidar25_dsm.tif` and `<stem>_lidar25_dtm.tif` over the
-ten quarter-tiles it actually covers, Creigiau and Pentyrch in north-west
-Cardiff, about 2.5 km2; see "What a survey folder contains" above for the
-full detail (location honesty, the flown-2011 vintage, the budget rule,
-and why heights, roofs, canopy, the `.egrid` and every contour file still
-read from the 2020-2023 1 m data regardless). Proven live over a real,
-sub-budget extent inside the block: both rasters at 0.25 m exactly, real
-Creigiau/Pentyrch heights sampled off them, a real cache-warm survey
+ten quarter-tiles it actually covers, St Fagans and St Georges-super-Ely
+in west Cardiff, about 2.5 km2; see "What a survey folder contains" above
+for the full detail (location honesty, the flown-2011 vintage, the raster
+budget, and why heights, roofs, canopy, the `.egrid` and every contour
+file still read from the 2020-2023 1 m data regardless). Proven live over
+a real extent inside the block: both rasters at 0.25 m exactly, real
+St Fagans/St Georges-super-Ely heights sampled off them, a real cache-warm
+survey
 running in about 22 seconds end to end (the merge itself accounting for
 nearly all of that), and the Grasshopper reader
 (`docs/grasshopper/lidar_to_mesh.py`) confirmed against the live DSM. The

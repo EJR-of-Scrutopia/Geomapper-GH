@@ -489,9 +489,15 @@ raster budget allows; and `package.py` registers it opt-in, alongside
 the flown-2011 caveat onto every package that selects it.
 
 The plan-time probe (`probe-report.md`) corrected the spec's own premise
-twice before any task was briefed: these ten tiles are Creigiau and
-Pentyrch in north-west Cardiff, about 2.5 km2, not "central Cardiff" as
-the spec's own wording had drifted to say, and they are not the only
+twice before any task was briefed: these ten tiles are in St Fagans and
+St Georges-super-Ely, west Cardiff, about 2.5 km2, not "central Cardiff"
+as the spec's own wording had drifted to say (a second correction, on
+2026-08-12, replaced "Creigiau and Pentyrch", the place every user-facing
+string here originally named: carried forward unverified from the phase 2
+task-zero report and never checked against `COVERAGE_TILES`'s own
+envelopes, which reverse-geocode to St Fagans and St Georges-super-Ely
+instead. Creigiau and Pentyrch sit about 3 km to the north-west and hold
+no 25 cm data at all), and they are not the only
 25 cm LiDAR in Wales (1,470 records nationally), just the only one this
 source serves. **The owner's own 2026-08-08 decision, recorded here so it
 is not re-opened from the probe report alone:** ship the spec as written,
@@ -506,9 +512,9 @@ inside the block (BNG roughly 311150-311750 by 177050-177650, chosen over
 the plan's own illustrative example once that example's padded window
 was checked and found to clear the raster budget by 61%, a plan-time
 arithmetic slip rather than a code defect): both rasters landed at
-0.25 m exactly, `covers()` full, real Creigiau/Pentyrch heights sampled
-off both (roughly 10-68 m OD across the whole ten-tile footprint, well
-under the pre-run guess of 90-130 m OD, again the ground correcting the
+0.25 m exactly, `covers()` full, real St Fagans/St Georges-super-Ely
+heights sampled off both (roughly 10-68 m OD across the whole ten-tile
+footprint, well under the pre-run guess of 90-130 m OD, again the ground correcting the
 assumption rather than a bug, independently confirmed straight off the
 raw archive members before any of this project's own code touched them),
 and the Grasshopper reader (`docs/grasshopper/lidar_to_mesh.py`)'s own

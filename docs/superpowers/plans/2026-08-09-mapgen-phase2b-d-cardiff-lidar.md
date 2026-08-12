@@ -33,7 +33,14 @@ Carried from the phase 2 spec and the addendum, plus item D's own:
   reason (exact string pinned in Task 4); `detail()` says which outcome
   an extent will get BEFORE download. No overview fallback exists in
   this source: the archive published one resolution and mapgen either
-  delivers it or says why not.
+  delivers it or says why not. (Post-2026-08-12 correction: this cap
+  turned out to be an unrelated, smaller ceiling `cog.py` uses for a
+  different purpose, and it capped a drawable extent at about 600 x
+  600 m against a covered block that is 2000 x 1500 m; the owner hit it
+  twice and authorised raising the cap to the coverage envelope's own
+  pixel count, 48,000,000 at 0.25 m, the absolute maximum this source can
+  ever be asked for. A real, covered extent can no longer trip this gate;
+  it stays only as a guard against a coding error.)
 - **Licence:** Open Government Licence for Public Sector Information
   (OGL). Attribution verbatim, probed from the layer page:
   `Contains Natural Resources Wales information © Natural Resources Wales and Database Right. All rights Reserved.`
@@ -164,16 +171,20 @@ new. No network anywhere in this task's code paths.
     cell to be one of the ten (the tiles ARE 500 m lattice cells, so
     this is exact, not approximate).
   - `detail(bbox) -> str | None`, computed, never guessed:
-    - covered ("full") and within budget: `25 cm at this extent, flown 2011`
-    - covered ("full") but over budget: `25 cm needs an extent under
-      about 600 x 600 m here (flown 2011)` (post-Task-6-review correction:
-      the original wording here, "1 x 1 km," was the PADDED window's own
-      threshold, not a raw drawable extent; see Task 6's review and
-      fix-round report for the arithmetic)
-    - "partial": `25 cm over part of this extent, flown 2011` (with the
-      over-budget sentence appended when the INTERSECTION is over
-      budget)
+    - covered ("full"): `25 cm at this extent, flown 2011`
+    - "partial": `25 cm over part of this extent, flown 2011`
     - "none": None
+    (post-2026-08-12 correction: the budget-refused shapes this section
+    used to list here, `25 cm needs an extent under about 600 x 600 m
+    here (flown 2011)` for "full" and the same clause appended for
+    "partial", gated on `cog.MAX_WINDOW_PIXELS`. The owner authorised
+    raising the cap to the coverage envelope's own pixel count, 48M at
+    0.25 m, the absolute maximum this source can ever be asked for; a
+    real, covered extent can no longer be over budget, so those two
+    shapes and the "600 x 600 m" guidance describing them are gone. The
+    budget gate itself stays in the code as a guard against a coding
+    error, just re-based on the envelope rather than `cog.py`'s own,
+    unrelated, smaller ceiling.)
     Budget arithmetic shared with Task 4 as one helper
     `_window_pixels(bbox) -> int`: the pixel count of the padded
     extent's intersection with the coverage envelope at 0.25 m, the
@@ -194,7 +205,10 @@ new. No network anywhere in this task's code paths.
   310500-311000 x 176000-176500, the missing SW cell UNDER ST1076NE,
   must be "partial" or "none" by the lattice test, never "full");
   detail() strings verbatim for all four outcomes (an over-budget case:
-  the whole 2 x 1.5 km block = 40M pixels > 16,777,216); tier
+  the whole 2 x 1.5 km block = 40M pixels > 16,777,216; post-2026-08-12,
+  the cap moved to the envelope's own 48,000,000 pixels and the whole
+  block sits AT it, never over, so this is no longer an over-budget case
+  at all: see the detail() entry above); tier
   ordering (0, above lidar_wales's 1); estimate cold vs warm via a
   monkeypatched cache_dir; zero network proven by a socket-refusing
   fixture if the suite has one (search tests/ for the existing
@@ -272,7 +286,13 @@ Mechanics, pinned:
   is 16,777,216; extents under about 600 x 600 m inside the covered block
   come back at 25 cm` (post-Task-6-review correction: "1 x 1 km" was the
   padded window's own threshold, not a raw drawable extent; see Task 6's
-  review and fix-round report)
+  review and fix-round report). Superseded again post-2026-08-12: the two
+  facts this used to RAISE on are both SKIPS now (see Task 6's own
+  "no-coverage as failure" review finding), and the gate itself moved
+  from `cog.MAX_WINDOW_PIXELS` to `_ENVELOPE_PIXEL_CAP`, the coverage
+  envelope's own pixel count (48,000,000), so a real, covered extent can
+  no longer reach this sentence at all; see `lidar_cardiff.py`'s own
+  module docstring for the current shape.
 - Window: the padded extent's intersection with the coverage envelope,
   snapped OUTWARD to the 0.25 m pixel lattice anchored at integer
   metres (xllcorner values are integers, so pixel edges sit at
@@ -384,8 +404,11 @@ Mechanics:
     honesty (flown 23 March 2011, fifteen years of change since), the
     budget rule (extents under about 600 x 600 m, corrected post-Task-6-
     review from this brief's own original "1 x 1 km," which was the
-    padded window's own threshold, not a raw drawable extent), and the
-    exclusions
+    padded window's own threshold, not a raw drawable extent; superseded
+    again post-2026-08-12, when the owner authorised raising the cap to
+    the coverage envelope's own pixel count, so any extent inside the
+    covered block now comes back at 25 cm with no size qualifier at all),
+    and the exclusions
     (heights, roofs, canopy, terrain grid and contours all stay on the
     2020-2023 1 m data). UPDATE the roadmap's old "no copy anywhere in
     this project claims 25 cm" sentence honestly: the claim was written
