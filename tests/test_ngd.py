@@ -26,7 +26,10 @@ import pytest
 
 from mapgen.ngd import (
     BUILDING_COLLECTION,
+    DEV_MODE_TRANSACTIONS_PER_MINUTE,
     MAX_PAGES,
+    MAX_RETRY_AFTER_SLEEP_SECONDS,
+    MIN_REQUEST_INTERVAL_SECONDS,
     NGD_ROOT,
     NgdClient,
     NgdError,
@@ -34,6 +37,41 @@ from mapgen.ngd import (
 from tests.test_os_downloads import _FakeHTTPResponse
 
 _TEST_KEY = "sekrit-dev-mode-key-do-not-leak"
+
+
+class _FakeClock:
+    """A monotonic clock a test controls completely: starts at `start`,
+    advances only when `advance()` is called (never on its own), so a
+    test can pin exactly how much wall time `NgdClient._pace` believes
+    has passed between two requests without a single real sleep.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _RecordingSleeper:
+    """Records every requested sleep duration and, since the whole point
+    of pacing is "time has now passed", advances the paired `_FakeClock`
+    by exactly that amount rather than actually blocking: this is what
+    lets `NgdClient._pace`'s own "how much time has passed since the
+    last request" arithmetic see a realistic elapsed time on the very
+    next call, with no test ever sleeping for real.
+    """
+
+    def __init__(self, clock: _FakeClock) -> None:
+        self.clock = clock
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        self.clock.advance(seconds)
 
 
 class _ScriptedOpener:
@@ -89,7 +127,9 @@ def test_items_follows_the_next_link_and_the_key_travels_only_in_the_header():
             _response(_feature_page("p2", 100, None)),
         ]
     )
-    client = NgdClient(key=_TEST_KEY, session=opener)
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
 
     features, pages = client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
 
@@ -155,21 +195,168 @@ def test_items_maps_401_to_auth_with_no_key_or_url_in_the_message():
     )
 
 
-def test_items_maps_429_with_retry_after_to_cap():
+def _http_429(retry_after: str | None) -> urllib.error.HTTPError:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return urllib.error.HTTPError("https://api.os.uk/x", 429, "Too Many Requests", headers, None)
+
+
+def test_items_429_with_retry_after_under_ceiling_sleeps_then_succeeds():
+    """The one bounded retry: a 429 carrying a Retry-After under the
+    ceiling is honoured (slept via the sleeper seam, never for real),
+    then the same request is retried once and this time succeeds.
+    """
     opener = _ScriptedOpener(
         [
-            urllib.error.HTTPError(
-                "https://api.os.uk/x", 429, "Too Many Requests", {"Retry-After": "7"}, None
-            )
+            _http_429("7"),
+            _response(_feature_page("p1", 10, None)),
         ]
     )
-    client = NgdClient(key=_TEST_KEY, session=opener)
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
+
+    features, pages = client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
+
+    assert len(features) == 10
+    assert pages == 1
+    assert len(opener.requests_made) == 2
+    # Exactly the advertised 7 seconds, once: the pacing gate itself adds
+    # nothing further here, since the retry sleep already moved the fake
+    # clock well past MIN_REQUEST_INTERVAL_SECONDS.
+    assert sleeper.calls == [7.0]
+
+
+def test_items_two_consecutive_429s_raise_cap():
+    """A second 429, arriving right after the one bounded retry already
+    granted, is not retried again: it raises kind "cap" immediately.
+    """
+    opener = _ScriptedOpener([_http_429("3"), _http_429("3")])
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
 
     with pytest.raises(NgdError) as excinfo:
         client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
 
     assert excinfo.value.kind == "cap"
-    assert excinfo.value.retry_after_seconds == 7.0
+    assert excinfo.value.retry_after_seconds == 3.0
+    # The first 429's own Retry-After was honoured once (one sleep of 3
+    # seconds); the second 429 was never slept for, it raised outright.
+    assert sleeper.calls == [3.0]
+    assert len(opener.requests_made) == 2
+
+
+def test_items_429_retry_after_beyond_ceiling_raises_without_sleeping():
+    """A Retry-After above MAX_RETRY_AFTER_SLEEP_SECONDS is not honoured
+    at all: this client fails fast rather than blocking a benchmark run
+    for an unbounded time.
+    """
+    opener = _ScriptedOpener([_http_429(str(MAX_RETRY_AFTER_SLEEP_SECONDS + 1.0))])
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
+
+    with pytest.raises(NgdError) as excinfo:
+        client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
+
+    assert excinfo.value.kind == "cap"
+    assert excinfo.value.retry_after_seconds == MAX_RETRY_AFTER_SLEEP_SECONDS + 1.0
+    assert sleeper.calls == []
+    assert len(opener.requests_made) == 1
+
+
+def test_items_429_without_retry_after_raises_cap_immediately():
+    """No Retry-After header at all means this client has nothing to
+    honour: it raises kind "cap" on the first 429, no retry attempted.
+    """
+    opener = _ScriptedOpener([_http_429(None)])
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
+
+    with pytest.raises(NgdError) as excinfo:
+        client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
+
+    assert excinfo.value.kind == "cap"
+    assert excinfo.value.retry_after_seconds is None
+    assert sleeper.calls == []
+    assert len(opener.requests_made) == 1
+
+
+# --------------------------------------------------------------------------
+# Dev-mode pacing: NgdClient._pace, the monotonic-clock gate.
+# --------------------------------------------------------------------------
+
+
+def test_pacing_constants():
+    assert DEV_MODE_TRANSACTIONS_PER_MINUTE == 50
+    assert MIN_REQUEST_INTERVAL_SECONDS == pytest.approx(60.0 / 50 * 1.15)
+    assert MAX_RETRY_AFTER_SLEEP_SECONDS == 120.0
+
+
+def test_pacing_never_sleeps_before_the_first_request():
+    opener = _ScriptedOpener([_response(_feature_page("p1", 10, None))])
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
+
+    client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
+
+    assert sleeper.calls == []
+
+
+def test_pacing_sleeps_the_expected_interval_between_successive_pages():
+    """Two pages, no real time elapsing between them on the fake clock
+    (the opener answers instantly): the gate must sleep exactly
+    MIN_REQUEST_INTERVAL_SECONDS before the second page's own request,
+    and nothing before the first.
+    """
+    next_href = f"{NGD_ROOT}/collections/{BUILDING_COLLECTION}/items?cursor=page2"
+    opener = _ScriptedOpener(
+        [
+            _response(_feature_page("p1", 100, next_href)),
+            _response(_feature_page("p2", 100, next_href)),
+            _response(_feature_page("p3", 100, None)),
+        ]
+    )
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
+
+    features, pages = client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
+
+    assert pages == 3
+    assert len(features) == 300
+    assert sleeper.calls == [MIN_REQUEST_INTERVAL_SECONDS, MIN_REQUEST_INTERVAL_SECONDS]
+
+
+def test_pacing_does_not_sleep_when_enough_real_time_already_passed():
+    """A caller-provided clock that shows more than MIN_REQUEST_INTERVAL_
+    SECONDS already elapsed between two requests (real processing time,
+    or a prior Retry-After sleep) owes no further wait.
+    """
+    next_href = f"{NGD_ROOT}/collections/{BUILDING_COLLECTION}/items?cursor=page2"
+    opener = _ScriptedOpener(
+        [
+            _response(_feature_page("p1", 100, next_href)),
+            _response(_feature_page("p2", 100, None)),
+        ]
+    )
+    clock = _FakeClock()
+    sleeper = _RecordingSleeper(clock)
+
+    real_open = opener.open
+
+    def _open_and_advance(request, timeout=None):
+        clock.advance(MIN_REQUEST_INTERVAL_SECONDS * 2)
+        return real_open(request, timeout=timeout)
+
+    opener.open = _open_and_advance
+    client = NgdClient(key=_TEST_KEY, session=opener, sleeper=sleeper, clock=clock)
+
+    client.items(BUILDING_COLLECTION, (317000.0, 176000.0, 317200.0, 176200.0))
+
+    assert sleeper.calls == []
 
 
 # --------------------------------------------------------------------------

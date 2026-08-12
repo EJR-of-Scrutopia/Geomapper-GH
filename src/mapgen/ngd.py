@@ -63,14 +63,59 @@ seam convention `os_downloads.py`'s own module-level `_build_opener()`
 establishes, here as a constructor parameter instead of a module-level
 function because this module's natural shape is one client object per
 key, not a set of free functions sharing no state.
+
+## Dev-mode pacing
+
+OS Data Hub's own plans FAQ states development mode throttles a project
+to `DEV_MODE_TRANSACTIONS_PER_MINUTE` (50) transactions per minute per
+API (live mode raises this to 600). A Cowbridge-sized benchmark pull is
+roughly 40 requests across the two collections (a few hundred to a
+couple-thousand features each at `_ITEMS_LIMIT`), which sits close
+enough to that ceiling that two runs inside a minute, or one run whose
+own paging happens to burst, would plausibly trip it; the API answers a
+tripped ceiling with 429, which `_fetch` used to turn straight into
+`NgdError` kind `"cap"` with no attempt to pace or wait it out.
+
+`MIN_REQUEST_INTERVAL_SECONDS` is the gate: `60 / 50 = 1.2` seconds is
+the interval that would land a client EXACTLY on the ceiling with no
+margin at all, so it is widened by 15 percent (`* 1.15`) for the two
+clocks that matter here (this process's own and OS's own request-
+counting window) never being perfectly aligned. `NgdClient._pace`, a
+monotonic-clock gate in the same shape as `mapgen.sources.osm.
+RateLimiter` (the same "space calls so an API is not hammered" job,
+here on the OS NGD API instead of the free OSM one), sleeps only as
+much as the elapsed time since this instance's own last request still
+falls short of that interval, and never sleeps before a client's first
+request ever: an instance that pages 40 times paces itself to roughly
+48 seconds of `sleeper` calls total, spread across the run, not paid up
+front. `clock`/`sleeper` are constructor seams, defaulting to
+`time.monotonic`/`time.sleep`, the same convention `RateLimiter` and
+`geocode.GeocodeRateLimiter` both already use, so a test can prove the
+pacing arithmetic without a single real sleep.
+
+A 429 that DOES arrive (the ceiling was hit despite pacing, or another
+process on the same project used up the minute's own budget) is worth
+one bounded retry rather than an immediate failure, since the service
+told this client exactly how long to wait in its own `Retry-After`
+header. `_fetch` honours that once: sleep the advertised interval (via
+the same `sleeper` seam), then retry the same request exactly once. A
+`Retry-After` above `MAX_RETRY_AFTER_SLEEP_SECONDS` (120, a ceiling this
+client will not simply sit and wait past, since that is no longer
+"paced" behaviour, it is the service telling this client to come back
+later) is not honoured at all: the request fails immediately as
+`"cap"` rather than blocking a benchmark run for an unbounded time. A
+second consecutive 429, or the absence of a `Retry-After` header
+entirely, also fails as `"cap"` immediately: this is ONE retry, not a
+backoff loop.
 """
 
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
-from typing import Sequence
+from typing import Callable, Sequence
 from urllib.parse import quote, urlencode
 
 from mapgen.sources.base import parse_retry_after
@@ -78,6 +123,25 @@ from mapgen.sources.base import parse_retry_after
 USER_AGENT = "mapgen/1.0 (architectural survey tool)"
 
 NGD_ROOT = "https://api.os.uk/features/ngd/ofa/v1"
+
+# The OS Data Hub plans FAQ's own stated development-mode ceiling: 50
+# transactions per minute per API per project (live mode: 600). See the
+# module docstring's "Dev-mode pacing" section for the arithmetic this
+# feeds and why a 15 percent margin is added on top of it.
+DEV_MODE_TRANSACTIONS_PER_MINUTE = 50
+
+# 60 seconds / 50 transactions/minute = 1.2 s/request, the interval that
+# would land exactly on the ceiling with no margin; widened by 15 percent
+# (module docstring's own reasoning) so this client's own clock and OS's
+# own request-counting window never having to agree exactly still leaves
+# room to spare.
+MIN_REQUEST_INTERVAL_SECONDS = 60.0 / DEV_MODE_TRANSACTIONS_PER_MINUTE * 1.15
+
+# The longest Retry-After this client will actually sleep out before
+# retrying a 429 once. Above this, waiting it out is no longer pacing,
+# it is the service asking to be left alone for a long time, and this
+# client fails fast instead of blocking a benchmark run indefinitely.
+MAX_RETRY_AFTER_SLEEP_SECONDS = 120.0
 
 # Physical building footprints and road centrelines: the plan's own two
 # collections (probed-facts table, "94 collections. The benchmark uses
@@ -182,6 +246,14 @@ class NgdClient:
     rather than requests, and why the seam is a constructor parameter
     rather than a module-level function the way os_downloads.py's own
     `_build_opener()` is.
+
+    `min_interval_seconds`, `sleeper` and `clock` are the dev-mode
+    pacing seam (see the module docstring's "Dev-mode pacing" section):
+    `sleeper`/`clock` default to `time.sleep`/`time.monotonic`, the same
+    convention `mapgen.sources.osm.RateLimiter` and
+    `mapgen.geocode.GeocodeRateLimiter` both already use, so a test can
+    inject a fake pair and prove the pacing arithmetic without ever
+    sleeping for real.
     """
 
     def __init__(
@@ -189,10 +261,45 @@ class NgdClient:
         key: str,
         session: object | None = None,
         timeout_seconds: float = 30.0,
+        min_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
+        sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.key = key
         self.session = session if session is not None else urllib.request.build_opener()
         self.timeout_seconds = timeout_seconds
+        self.min_interval_seconds = min_interval_seconds
+        self._sleeper = sleeper
+        self._clock = clock
+        # None until this instance's first request; _pace() reads that
+        # as "never sleep before the first request" rather than as an
+        # elapsed time of zero.
+        self._last_request_at: float | None = None
+
+    def _pace(self) -> None:
+        """Sleeps just long enough, since this instance's own last
+        request, to respect `min_interval_seconds`; sleeps nothing
+        before the first request this instance ever makes, and nothing
+        at all when enough real time has already passed on its own
+        (an instance that pages slowly, or one that just served a
+        `Retry-After` sleep in `_fetch`'s own retry, typically owes no
+        further wait here).
+
+        Exactly `mapgen.sources.osm.RateLimiter.wait`'s own shape,
+        reused as a private method here rather than imported: that
+        class is built to be shared by unrelated call sites (osm.py
+        constructs one directly), while this gate is intrinsic to one
+        `NgdClient` instance's own request stream, the same reasoning
+        `NgdClient.__init__`'s own docstring already gives for the
+        session seam being a constructor parameter rather than a
+        module-level function.
+        """
+        now = self._clock()
+        if self._last_request_at is not None:
+            remaining = self.min_interval_seconds - (now - self._last_request_at)
+            if remaining > 0:
+                self._sleeper(remaining)
+        self._last_request_at = self._clock()
 
     def _fetch(self, url: str, *, headers: dict[str, str], default_kind: str) -> object:
         """GET `url`, decode the body as JSON, return whatever it parsed
@@ -207,40 +314,68 @@ class NgdClient:
         429 (`"cap"`) are universal regardless of which endpoint asked,
         since a refused or throttled key means the same thing wherever
         it happens.
+
+        Every attempt, including a retried one, is paced through
+        `_pace()` first: the retry sleep below already waits out
+        whatever the service asked for, so `_pace()` on the following
+        loop iteration ordinarily adds nothing further, but it is what
+        keeps a *rejected-without-Retry-After* 429 (which raises
+        immediately, no retry) from leaving this instance's own pacing
+        clock stale for whatever request comes after it.
         """
-        request = urllib.request.Request(url, headers=headers)
-        try:
-            with self.session.open(request, timeout=self.timeout_seconds) as response:
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            if status in (401, 403):
+        retried = False
+        while True:
+            self._pace()
+            request = urllib.request.Request(url, headers=headers)
+            try:
+                with self.session.open(request, timeout=self.timeout_seconds) as response:
+                    body = response.read()
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                if status in (401, 403):
+                    raise NgdError(
+                        "the OS NGD key was refused; a dev-mode Premium "
+                        "project with the NGD Features API added is what "
+                        "answers here",
+                        kind="auth",
+                        status_code=status,
+                    ) from None
+                if status == 429:
+                    retry_after = parse_retry_after(getattr(exc, "headers", None))
+                    if (
+                        not retried
+                        and retry_after is not None
+                        and retry_after <= MAX_RETRY_AFTER_SLEEP_SECONDS
+                    ):
+                        # One bounded retry (module docstring's "Dev-mode
+                        # pacing" section): sleep exactly what the service
+                        # asked for, then go around the loop once more.
+                        # `retried` guarantees this branch can fire at
+                        # most once per _fetch() call, so two consecutive
+                        # 429s always fall through to the raise below on
+                        # the second one.
+                        self._sleeper(retry_after)
+                        retried = True
+                        continue
+                    raise NgdError(
+                        "the OS NGD API asked mapgen to slow down.",
+                        kind="cap",
+                        status_code=status,
+                        retry_after_seconds=retry_after,
+                    ) from None
                 raise NgdError(
-                    "the OS NGD key was refused; a dev-mode Premium "
-                    "project with the NGD Features API added is what "
-                    "answers here",
-                    kind="auth",
+                    f"the OS NGD API answered HTTP {status}.",
+                    kind=default_kind,
                     status_code=status,
                 ) from None
-            if status == 429:
+            except NgdError:
+                raise
+            except Exception:
                 raise NgdError(
-                    "the OS NGD API asked mapgen to slow down.",
-                    kind="cap",
-                    status_code=status,
-                    retry_after_seconds=parse_retry_after(getattr(exc, "headers", None)),
+                    "could not reach the OS NGD API.",
+                    kind=default_kind,
                 ) from None
-            raise NgdError(
-                f"the OS NGD API answered HTTP {status}.",
-                kind=default_kind,
-                status_code=status,
-            ) from None
-        except NgdError:
-            raise
-        except Exception:
-            raise NgdError(
-                "could not reach the OS NGD API.",
-                kind=default_kind,
-            ) from None
+            break
 
         try:
             return json.loads(body)
