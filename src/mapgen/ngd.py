@@ -68,27 +68,25 @@ key, not a set of free functions sharing no state.
 
 OS Data Hub's own plans FAQ states development mode throttles a project
 to `DEV_MODE_TRANSACTIONS_PER_MINUTE` (50) transactions per minute per
-API (live mode raises this to 600). A Cowbridge-sized benchmark pull is
-roughly 40 requests across the two collections (a few hundred to a
-couple-thousand features each at `_ITEMS_LIMIT`), which sits close
-enough to that ceiling that two runs inside a minute, or one run whose
-own paging happens to burst, would plausibly trip it; the API answers a
-tripped ceiling with 429, which `_fetch` used to turn straight into
-`NgdError` kind `"cap"` with no attempt to pace or wait it out.
+API (live mode raises this to 600). That published figure turned out not
+to be the enforced one: a live task-5 run paced at 43.5 requests per
+minute (a 1.38 s interval, `60/50 * 1.15`, the margin this module used to
+carry) was throttled with a 429 twice, independently, both times around
+57 to 58 requests and 80 seconds of elapsed wall time, well before either
+run's own paging reached the roads collection. Whatever this project's
+dev-mode key is actually metered against, it is materially tighter in
+practice than OS's own documented number.
 
-`MIN_REQUEST_INTERVAL_SECONDS` is the gate: `60 / 50 = 1.2` seconds is
-the interval that would land a client EXACTLY on the ceiling with no
-margin at all, so it is widened by 15 percent (`* 1.15`) for the two
-clocks that matter here (this process's own and OS's own request-
-counting window) never being perfectly aligned. `NgdClient._pace`, a
+`MIN_REQUEST_INTERVAL_SECONDS` is now pinned to a conservative
+`60.0 / 20.0 = 3.0` seconds, i.e. 20 requests per minute: not derived
+from any OS specification, chosen by measurement, well below the 43.5/min
+pace that still failed twice at the same point. `NgdClient._pace`, a
 monotonic-clock gate in the same shape as `mapgen.sources.osm.
 RateLimiter` (the same "space calls so an API is not hammered" job,
 here on the OS NGD API instead of the free OSM one), sleeps only as
 much as the elapsed time since this instance's own last request still
 falls short of that interval, and never sleeps before a client's first
-request ever: an instance that pages 40 times paces itself to roughly
-48 seconds of `sleeper` calls total, spread across the run, not paid up
-front. `clock`/`sleeper` are constructor seams, defaulting to
+request ever. `clock`/`sleeper` are constructor seams, defaulting to
 `time.monotonic`/`time.sleep`, the same convention `RateLimiter` and
 `geocode.GeocodeRateLimiter` both already use, so a test can prove the
 pacing arithmetic without a single real sleep.
@@ -125,17 +123,21 @@ USER_AGENT = "mapgen/1.0 (architectural survey tool)"
 NGD_ROOT = "https://api.os.uk/features/ngd/ofa/v1"
 
 # The OS Data Hub plans FAQ's own stated development-mode ceiling: 50
-# transactions per minute per API per project (live mode: 600). See the
-# module docstring's "Dev-mode pacing" section for the arithmetic this
-# feeds and why a 15 percent margin is added on top of it.
+# transactions per minute per API per project (live mode: 600). Recorded
+# here as documentation only: a live task-5 run paced at 43.5 requests
+# per minute (60/50 * 1.15, this constant's own former value) was
+# throttled with a 429 twice, at around 58 requests and 80 seconds
+# elapsed both times, well under this published ceiling. See the module
+# docstring's "Dev-mode pacing" section.
 DEV_MODE_TRANSACTIONS_PER_MINUTE = 50
 
-# 60 seconds / 50 transactions/minute = 1.2 s/request, the interval that
-# would land exactly on the ceiling with no margin; widened by 15 percent
-# (module docstring's own reasoning) so this client's own clock and OS's
-# own request-counting window never having to agree exactly still leaves
-# room to spare.
-MIN_REQUEST_INTERVAL_SECONDS = 60.0 / DEV_MODE_TRANSACTIONS_PER_MINUTE * 1.15
+# NOT derived from DEV_MODE_TRANSACTIONS_PER_MINUTE: measurement showed
+# the real enforced ceiling is tighter than OS's own published 50/minute
+# (see above), so this is set by observation rather than by
+# specification. 60 seconds / 20 requests per minute = 3.0 seconds
+# between requests, a conservative pace an actual 43.5/minute run had
+# already failed twice under.
+MIN_REQUEST_INTERVAL_SECONDS = 60.0 / 20.0
 
 # The longest Retry-After this client will actually sleep out before
 # retrying a 429 once. Above this, waiting it out is no longer pacing,

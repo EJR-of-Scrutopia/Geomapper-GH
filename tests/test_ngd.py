@@ -290,7 +290,10 @@ def test_items_429_without_retry_after_raises_cap_immediately():
 
 def test_pacing_constants():
     assert DEV_MODE_TRANSACTIONS_PER_MINUTE == 50
-    assert MIN_REQUEST_INTERVAL_SECONDS == pytest.approx(60.0 / 50 * 1.15)
+    # Set by measurement, not by OS's published figure: a live run paced
+    # at 43.5 requests/minute was throttled twice around request 58. 20
+    # requests/minute is a conservative default well under that.
+    assert MIN_REQUEST_INTERVAL_SECONDS == pytest.approx(3.0)
     assert MAX_RETRY_AFTER_SLEEP_SECONDS == 120.0
 
 
