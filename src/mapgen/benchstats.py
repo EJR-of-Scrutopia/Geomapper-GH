@@ -51,8 +51,13 @@ only the question it can actually test, whether ONE guaranteed-interior
 point of a footprint lands inside another footprint, and never dresses
 that up as a claim about overlapping area. `polyline_offsets` counts a
 sample with no neighbour inside `search_radius` as `unmatched_samples` and
-folds it into no average. `distribution` returns `{}` for no values rather
-than inventing a percentile of nothing. Every one of these is the same
+folds it into no average, and additionally suppresses every aggregate
+field outright, not merely leaves a small-sample number standing, once
+fewer than `MIN_SAMPLES_FOR_OFFSET_STATS` samples matched at all: below
+that floor an "aggregate" offset is close enough to one contributing
+sample's own exact vector to reconstruct a premium coordinate, which is a
+firewall rule rather than a numerical one. `distribution` returns `{}`
+for no values rather than inventing a percentile of nothing. Every one of these is the same
 "nothing fabricated" rule this project already holds everywhere else
 (`heights.py`, `buildings.py`), applied to a comparison instead of a fusion.
 """
@@ -634,6 +639,31 @@ _LSQ_DET_RELATIVE_FLOOR = 1e-6
 # reported as a number nobody should trust.
 LSQ_MIN_SAMPLES = 8
 
+# The floor below which the AGGREGATE statistics themselves (mean_de,
+# mean_dn, std_de, std_dn, p50_abs, p90_abs, and the three lsq fields) are
+# suppressed outright, regardless of what the raw accumulation would have
+# computed. This is a firewall guard, not a numerical one, and it exists
+# because "aggregate" stops meaning anything at a small enough count: at
+# count == 1, mean_de/mean_dn/p50_abs ARE the one sample's own exact
+# offset vector, at full float precision, from a known public sample
+# point (densified from OUR OWN OSM geometry, on disk before this
+# function is ever called) to the nearest premium vertex. That is not an
+# aggregate statistic reconstructing a rough trend; it is a coordinate
+# reconstruction of exactly the kind `benchmark.py`'s own module
+# docstring forbids outright ("nothing from any OS premium product may
+# enter... any output a client could receive"). At counts of 2 to 4 a
+# mean is still dominated by whichever single sample the search radius
+# happened to catch, close enough to one contributing point that a
+# caller holding the same public geometry this benchmark started from
+# could still narrow a premium vertex to a small search ellipse from the
+# reported mean and std alone. 5 is the smallest count at which an
+# averaged vector can no longer be walked back to any one contributing
+# sample with useful precision, so it is the floor chosen here; `count`
+# and `unmatched_samples` themselves are never suppressed, since neither
+# is a coordinate and both are needed to see that a value went missing
+# because of this guard rather than because nothing matched at all.
+MIN_SAMPLES_FOR_OFFSET_STATS = 5
+
 
 @dataclass
 class OffsetStats:
@@ -703,9 +733,15 @@ class OffsetStats:
     `search_radius` and contributed to every statistic above;
     `unmatched_samples` is how many did not and contributed to none of
     them. The eight non-lsq numeric fields are 0.0 (not fabricated, just
-    inert) when `count` is 0, and all three lsq fields are None in that
-    case too: a caller reading `count == 0` already knows none of the
-    other numbers describes anything real.
+    inert) whenever `count` is under `MIN_SAMPLES_FOR_OFFSET_STATS`, not
+    only when it is exactly 0 (see that constant's own docstring: below
+    it, an "aggregate" vector is not really aggregated at all, and at
+    count == 1 the mean IS one sample's own exact offset vector, which
+    reconstructs a premium coordinate the derived-data firewall forbids
+    outright). All three lsq fields are None in that case too: a caller
+    reading `count < MIN_SAMPLES_FOR_OFFSET_STATS` already knows none of
+    the other numbers describes anything real, exactly as a reader of
+    `count == 0` always could.
     """
 
     count: int
@@ -891,6 +927,16 @@ def polyline_offsets(
     to `unmatched_samples` and to nothing else: no offset is guessed for
     it, matching this module's own "nothing fabricated" standard.
 
+    Separately, once fewer than `MIN_SAMPLES_FOR_OFFSET_STATS` samples
+    matched at all (`count`, never `unmatched_samples`), every one of the
+    eight non-lsq fields and all three lsq fields is suppressed to
+    0.0/None regardless of what the raw accumulation below would have
+    computed, `count` itself excepted (see that constant's own
+    docstring): a firewall guard against reconstructing a premium
+    coordinate from a too-small sample, not a numerical judgement about
+    whether the accumulation is trustworthy (`LSQ_MIN_SAMPLES` already
+    exists for that, separately, for the lsq fields alone).
+
     ## The least-squares bias correction
 
     Alongside the naive mean this function has always computed, it also
@@ -984,9 +1030,16 @@ def polyline_offsets(
                 interior_count += 1
 
     count = len(offsets_de)
-    if count == 0:
+    if count < MIN_SAMPLES_FOR_OFFSET_STATS:
+        # Firewall guard, not a numerical one (see that constant's own
+        # docstring): below this floor an "aggregate" vector is not
+        # aggregated at all, up to and including count == 1 reporting the
+        # exact offset from one known public point to a premium vertex.
+        # `count` itself travels back honestly (it is not a coordinate),
+        # everything else is suppressed exactly as it already was for
+        # count == 0.
         return OffsetStats(
-            count=0,
+            count=count,
             unmatched_samples=unmatched_samples,
             mean_de=0.0,
             mean_dn=0.0,

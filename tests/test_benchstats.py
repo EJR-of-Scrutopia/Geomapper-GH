@@ -10,6 +10,7 @@ from mapgen.benchstats import (
     LSQ_MIN_SAMPLES,
     MATCH_CELL_SIZE_M,
     MATCH_IOU_FLOOR,
+    MIN_SAMPLES_FOR_OFFSET_STATS,
     ContainmentResult,
     MatchResult,
     OffsetStats,
@@ -494,24 +495,33 @@ def test_search_radius_wider_than_cell_size_still_finds_a_real_match():
     # task-2-review.md's own Important finding: a fixed 3x3 cell-block
     # search (span=1) only reaches one OFFSET_CELL_SIZE_M (25m) cell in
     # every direction, so it silently misses a real match once
-    # search_radius is widened past that cell size. Sample at (24, 0) sits
-    # in cell column 0 (floor(24/25)); a real segment at e=50 sits in cell
-    # column 2 (floor(50/25)), two columns over, at a true distance of 26m.
-    ours = [[(24.0, 0.0), (24.0, 0.0)]]
-    theirs = [[(50.0, -5.0), (50.0, 5.0)]]
+    # search_radius is widened past that cell size. Every sample below
+    # sits at easting 24, cell column 0 (floor(24/25)); the real segment
+    # sits at easting 50, cell column 2 (floor(50/25)), two columns over,
+    # at a true distance of 26m.
+    #
+    # Five samples, not the original one-point degenerate line, so the
+    # matched count in the "widened" case below clears
+    # MIN_SAMPLES_FOR_OFFSET_STATS and this test's own mean_de assertion
+    # reads the real accumulation rather than the firewall guard's
+    # suppression: the guard is a separate, deliberately tested concern
+    # (see the small-sample tests above), and conflating the two here
+    # would make this test's own pass/fail depend on both at once.
+    ours = [[(24.0, -10.0), (24.0, 10.0)]]
+    theirs = [[(50.0, -20.0), (50.0, 20.0)]]
 
     # Control: at the default-sized 15m radius, 26m is correctly out of
     # range regardless of the cell search span, so this must be unchanged
     # by the fix.
     control = polyline_offsets(ours, theirs, search_radius=15.0)
     assert control.count == 0
-    assert control.unmatched_samples == 2
+    assert control.unmatched_samples == 5
 
     # At search_radius=30.0, 26m is well inside it: the neighbourhood span
     # must now be derived from the actual radius (ceil(30 / 25) == 2) to
     # reach cell column 2, two columns over from the sample's own column 0.
     widened = polyline_offsets(ours, theirs, search_radius=30.0)
-    assert widened.count == 2
+    assert widened.count == 5
     assert widened.unmatched_samples == 0
     assert widened.mean_de == pytest.approx(26.0, abs=0.001)
     assert widened.mean_dn == pytest.approx(0.0, abs=0.001)
@@ -789,6 +799,74 @@ def test_lsq_relative_determinant_floor_traps_the_window_a_fixed_floor_missed():
     )
     assert clean.lsq_de == pytest.approx(shift_e, abs=0.001)
     assert clean.lsq_dn == pytest.approx(shift_n, abs=0.001)
+
+
+# --------------------------------------------------------------------------
+# polyline_offsets: the small-sample firewall guard. Below
+# MIN_SAMPLES_FOR_OFFSET_STATS, an "aggregate" statistic is not aggregated
+# at all: at count == 1 the mean IS the one sample's own exact offset
+# vector from a known public point to a premium vertex, which reconstructs
+# a premium coordinate outright. `count` and `unmatched_samples` still
+# travel back honestly; everything else is suppressed.
+# --------------------------------------------------------------------------
+
+
+def test_a_single_matched_sample_reports_a_count_with_no_vector():
+    # ours is a 100m line sampled every 5m (21 samples: 0, 5, ..., 100);
+    # theirs is a point-like segment sitting at the very start, so only
+    # the sample at e=0 lands within the 2m search radius and every other
+    # sample is more than 2m from it. Exactly one matched sample, the
+    # sharpest form of the hazard this floor closes: at full precision,
+    # mean_de/mean_dn/p50_abs would otherwise BE the exact vector from a
+    # known public point (e=0 on our own OSM way) to the premium vertex.
+    assert MIN_SAMPLES_FOR_OFFSET_STATS == 5
+    ours = [[(0.0, 0.0), (100.0, 0.0)]]
+    theirs = [[(0.0, 1.0), (0.0, 1.0)]]
+
+    stats = polyline_offsets(ours, theirs, sample_every=5.0, search_radius=2.0)
+
+    assert stats.count == 1
+    assert stats.unmatched_samples == 20
+    # The count and the "how many did not match" figure are the only two
+    # numbers this call ever reveals; every offset field reads inert, not
+    # the real vector.
+    assert stats.mean_de == 0.0
+    assert stats.mean_dn == 0.0
+    assert stats.magnitude_of_mean == 0.0
+    assert stats.std_de == 0.0
+    assert stats.std_dn == 0.0
+    assert stats.p50_abs == 0.0
+    assert stats.p90_abs == 0.0
+    assert stats.lsq_de is None
+    assert stats.lsq_dn is None
+    assert stats.lsq_magnitude is None
+
+
+def test_offset_stats_are_suppressed_below_the_floor_and_reported_at_it():
+    # A degenerate point-like `theirs` at the origin: every sample's own
+    # offset is exactly (-e, 0) (the fixed point minus the sample), so the
+    # matched count is controlled precisely by `search_radius` alone (a
+    # sample at easting e matches when e <= search_radius). This pins the
+    # exact boundary: one sample under the floor suppresses everything,
+    # one sample AT the floor reports the real, honestly-averaged vector.
+    ours = [[(0.0, 0.0), (100.0, 0.0)]]
+    theirs = [[(0.0, 0.0), (0.0, 0.0)]]
+
+    below_floor = polyline_offsets(ours, theirs, sample_every=5.0, search_radius=15.0)
+    assert below_floor.count == MIN_SAMPLES_FOR_OFFSET_STATS - 1
+    assert below_floor.mean_de == 0.0
+    assert below_floor.mean_dn == 0.0
+    assert below_floor.std_de == 0.0
+    assert below_floor.p50_abs == 0.0
+
+    at_floor = polyline_offsets(ours, theirs, sample_every=5.0, search_radius=20.0)
+    assert at_floor.count == MIN_SAMPLES_FOR_OFFSET_STATS
+    # At the floor, the real accumulation is reported rather than
+    # suppressed: samples at e in {0, 5, 10, 15, 20}, each offset by
+    # exactly (-e, 0), average to -10.0 on the east axis and 0.0 on north.
+    assert at_floor.mean_de == pytest.approx(-10.0)
+    assert at_floor.mean_dn == pytest.approx(0.0)
+    assert at_floor.std_de > 0.0
 
 
 # --------------------------------------------------------------------------
