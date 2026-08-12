@@ -45,18 +45,56 @@ known values instead is correct regardless of what else a real OSM
 extract's own `source` tag ever says.
 
 Roads are every `highway=*` way in the same file (OSM-derived, so subject
-to the epoch question) PLUS, when `<stem>_os_roads.geojson` exists (OS
-OpenMap Local's own road layer, `mapgen.sources.os_open`), its LineStrings
-as a SEPARATE population labelled `os_open`: that file is written in
-WGS84 (`OsOpenSource.merge`'s own `_reproject_geometry`, `from_bng`) but
-its underlying survey is BNG-native already, so its own offset against
-NGD measures generalisation between two OS products, not an epoch gap,
-and the report says so.
+to the epoch question), SPLIT into carriageways and paths (see
+"carriageways are not paths" below), PLUS, when
+`<stem>_os_roads.geojson` exists (OS OpenMap Local's own road layer,
+`mapgen.sources.os_open`), its LineStrings as a SEPARATE population
+labelled `os_open`: that file is written in WGS84
+(`OsOpenSource.merge`'s own `_reproject_geometry`, `from_bng`) but its
+underlying survey is BNG-native already, so its own offset against NGD
+measures generalisation between two OS products, not an epoch gap, and
+the report says so.
 
 Every one of our own coordinates reaches BNG the same way `heights.py`'s
 `_fuse_heights_step` does: `to_bng` per node, `load_ostn15()` cache-only
 first, `ensure_ostn15()` only if that misses (this module's own only
 network call apart from the NGD pull itself).
+
+## Comparing over the same ground
+
+A package covers MORE ground than the rectangle the NGD pull is made
+over: the survey pads its own extent, and the OS OpenMap Local
+footprints `buildings.fuse_missing_buildings` injects arrive over a
+wider footprint again. Our own building population is therefore CLIPPED
+to the exact bbox sent to the API (`_split_by_extent`) before anything
+is matched, using the same guaranteed-interior representative point the
+containment test already reduces a footprint to. A footprint outside
+that rectangle can neither pair with an NGD feature nor stand inside
+one, so leaving it in put it in "absent from OS" by construction, which
+reads as a finding about OS's coverage when it is really a statement
+about which ground was asked about. Measured on the Cowbridge benchmark
+package: 367 of 1755 footprints of ours fell outside, 346 of them from
+the single OS OpenMap Local injection layer, and both the "absent from
+OS" count and the matched fraction of ours were wrong because of it.
+The clipping is never silent: the report prints the excluded count per
+source layer beside the kept one. Their side needs no equivalent, since
+it arrived from the query itself.
+
+## Carriageways are not paths
+
+NGD's roadlink collection holds carriageway centrelines and nothing
+else. A pavement, a field path, a bridleway or a flight of steps has no
+counterpart in it at all, so an offset measured from one is the width of
+the street, not a disagreement between two surveys, and its sign flips
+with which side of the street the pavement runs down. Taking every
+`highway=*` way as one population therefore fed the least-squares
+estimate a large block of samples that cancel each other and pull it
+toward zero: on the Cowbridge package the path family was 42.5 percent
+of the sampled length. `_read_osm_roads` splits the population by
+`categories.road_family` (that module's own vocabulary, read rather than
+re-typed), both legs are reported, and THE EPOCH VERDICT IS DERIVED FROM
+THE CARRIAGEWAY LEG ALONE. This deliberately breaks continuity with the
+single-population OSM offset earlier runs published.
 
 ## Explaining the unmatched, not just counting them
 
@@ -64,9 +102,9 @@ A raw unmatched count is the one number in this report that cannot be
 read at face value. NGD counts building PARTS, so a terrace this project
 holds as one footprint arrives from OS as several parts, and every part
 after the one that wins the greedy pairing lands in "unmatched theirs"
-even though nothing whatever is missing from our side. Two additions
-separate that bookkeeping difference from a real gap, both aggregate,
-both firewall-safe:
+even though the ground itself is covered on both sides. Two additions
+separate a difference about where the LINES fall from a real gap in
+coverage, both aggregate, both firewall-safe:
 
   * CONTAINMENT (`benchstats.classify_containment`). Every unmatched
     footprint on one side is reduced to a single guaranteed-interior
@@ -76,7 +114,11 @@ both firewall-safe:
     standing inside one of ours is a SUBDIVISION; one standing on ground
     we hold nothing on is ABSENT, the genuine gap. Mirrored the other
     way for ours: `SPURIOUS_OR_NEWER` and `ABSENT_FROM_OS` (see the four
-    constants' own comment for what each does and does not prove).
+    constants' own comment for what each does and does not prove). One
+    further aggregate integer earns the SUBDIVISION label rather than
+    assuming it: how many of those cases have their part LARGER than the
+    footprint of ours containing it, which is the reversed reading (our
+    polygon drawn oversized) the point test alone cannot separate out.
   * SIZE (`benchstats.ring_area`, `area_histogram`). Every footprint,
     matched and unmatched, is bucketed by shoelace area in square metres,
     and the unmatched buckets are cross-tabulated against the
@@ -102,6 +144,7 @@ from __future__ import annotations
 import json
 import math
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Callable, Sequence
@@ -114,8 +157,11 @@ from mapgen.benchstats import (
     distribution,
     match_footprints,
     polyline_offsets,
+    ring_area,
 )
 from mapgen.bng import BngError, Ostn15Grid, ensure_ostn15, load_ostn15, padded_bng_extent, to_bng
+from mapgen.buildings import representative_point
+from mapgen.categories import ROAD_FAMILY_CARRIAGEWAY, ROAD_FAMILY_PATH, road_family
 from mapgen.fsutil import atomic_write_bytes, atomic_write_text
 from mapgen.geo import BBox
 from mapgen.ngd import BUILDING_COLLECTION, ROAD_COLLECTION, NgdClient
@@ -162,12 +208,21 @@ _IOU_PERCENTILE_LABELS = {0.1: "p10", 0.5: "p50", 0.9: "p90"}
 #
 #   SUBDIVISION      one of theirs that matched nothing of ours, but whose
 #                    own interior point stands inside a footprint we DO
-#                    hold. Nothing is missing here: NGD counts building
+#                    hold. The ground is covered on both sides; what
+#                    differs is where the LINES fall. NGD counts building
 #                    PARTS, so a terrace we carry as one footprint arrives
 #                    from them as several, and every part after the one
 #                    that won the greedy pairing lands in the unmatched
-#                    pile by construction. A bookkeeping difference, not a
-#                    gap.
+#                    pile. Not a gap in coverage, and not merely a
+#                    difference in counting either: each one is a
+#                    boundary OS records and we do not, a party wall, a
+#                    house-to-garage join, a terrace division, every one
+#                    of them a line an architect draws at 1:500. The
+#                    subdivision count is reported beside a second count
+#                    (how many of them are LARGER than the footprint of
+#                    ours containing them) because the point test on its
+#                    own cannot tell this reading from its reverse, our
+#                    own polygon drawn oversized.
 #   ABSENT           one of theirs that matched nothing of ours and stands
 #                    on ground where we hold nothing at all. This is the
 #                    real gap, the only one of the four worth acting on.
@@ -323,25 +378,31 @@ def _project(
 
 def _read_buildings(
     root: ET.Element, nodes: dict[str, tuple[float, float]], grid: Ostn15Grid
-) -> tuple[list[list[tuple[float, float]]], dict[str, int], dict[str, int]]:
+) -> tuple[list[list[tuple[float, float]]], list[str], dict[str, int], dict[str, int]]:
     """Every `building=*` way in `root`, projected to BNG.
 
-    Returns `(rings, counts_by_source, tag_value_counts)`: `rings` is the
-    population `match_footprints` runs against; `counts_by_source` is how
-    many buildings carry each of the two KNOWN injection `source` values
-    (`_KNOWN_INJECTION_SOURCES`), with everything else, tagged or not,
-    counted `OSM_SOURCE_LABEL` (task-3-review.md's own Important finding
-    1: an unrelated upstream `source=*` tag, `source=Bing` for instance,
-    must never be counted as an Overture/OS-OpenMap-Local injection that
-    never happened); `tag_value_counts` is how many carry each `building=
-    <value>` tag value, the report's own comparison against NGD's
-    `description` frequency table. The latter two are counted for every
-    building=* way regardless of whether its own footprint could be
-    projected, since they describe what this package's own tagging looks
-    like, not what could be compared: an unprojectable footprint is a
-    fact about that one way, not a reason to hide it from a tag count.
+    Returns `(rings, ring_sources, counts_by_source, tag_value_counts)`.
+    `rings` is the population that (once clipped to the NGD query
+    rectangle, `_split_by_extent`) `match_footprints` runs against;
+    `ring_sources` is the source label of each of those rings, at the
+    same position, so a count of what the clipping excluded can be broken
+    down by layer rather than reported as one opaque total.
+    `counts_by_source` is how many buildings carry each of the two KNOWN
+    injection `source` values (`_KNOWN_INJECTION_SOURCES`), with
+    everything else, tagged or not, counted `OSM_SOURCE_LABEL`
+    (task-3-review.md's own Important finding 1: an unrelated upstream
+    `source=*` tag, `source=Bing` for instance, must never be counted as
+    an Overture/OS-OpenMap-Local injection that never happened);
+    `tag_value_counts` is how many carry each `building=<value>` tag
+    value, the report's own comparison against NGD's `description`
+    frequency table. The latter two are counted for every building=* way
+    regardless of whether its own footprint could be projected, since
+    they describe what this package's own tagging looks like, not what
+    could be compared: an unprojectable footprint is a fact about that
+    one way, not a reason to hide it from a tag count.
     """
     rings: list[list[tuple[float, float]]] = []
+    ring_sources: list[str] = []
     counts_by_source: dict[str, int] = {}
     tag_value_counts: dict[str, int] = {}
     for element in root:
@@ -363,17 +424,103 @@ def _read_buildings(
         ring = _project(latlon, grid)
         if ring is not None:
             rings.append(ring)
-    return rings, counts_by_source, tag_value_counts
+            ring_sources.append(source)
+    return rings, ring_sources, counts_by_source, tag_value_counts
+
+
+# --------------------------------------------------------------------------
+# Clipping our own population to the rectangle the NGD pull actually
+# covered (see the module docstring's "comparing over the same ground").
+# --------------------------------------------------------------------------
+
+
+def _in_extent(ring: Sequence[tuple[float, float]], extent: tuple[float, float, float, float]) -> bool:
+    """Whether `ring`'s own guaranteed-interior representative point falls
+    inside the BNG rectangle `extent` (`e_min, n_min, e_max, n_max`).
+
+    The interior point, not a bbox overlap and not "every vertex inside":
+    it is the same point `benchstats.classify_containment` already reduces
+    a footprint to, so a footprint counted in the compared population and
+    a footprint tested for containment are the same footprint by the same
+    rule, and the two sections of this report cannot disagree about which
+    footprints exist. It is also already computed for the unmatched ones,
+    so this costs nothing new for them.
+
+    Inclusive on all four edges: a footprint whose point lands exactly on
+    the boundary is in, which is the same closed-interval convention
+    `benchstats._bbox_holds` uses.
+    """
+    e_min, n_min, e_max, n_max = extent
+    point_e, point_n = representative_point(ring)
+    return e_min <= point_e <= e_max and n_min <= point_n <= n_max
+
+
+def _split_by_extent(
+    rings: Sequence[Sequence[tuple[float, float]]],
+    sources: Sequence[str],
+    extent: tuple[float, float, float, float],
+) -> tuple[list[list[tuple[float, float]]], dict[str, int], dict[str, int]]:
+    """`rings` split into the ones inside `extent` and a count of the ones
+    outside it, both broken down by source layer.
+
+    Returns `(in_extent_rings, in_extent_by_source, out_of_extent_by_source)`.
+    Nothing is thrown away silently: the second and third dicts add back
+    to the population handed in, per layer, and the report prints both.
+    """
+    kept: list[list[tuple[float, float]]] = []
+    inside: dict[str, int] = {}
+    outside: dict[str, int] = {}
+    for ring, source in zip(rings, sources):
+        if _in_extent(ring, extent):
+            kept.append(list(ring))
+            inside[source] = inside.get(source, 0) + 1
+        else:
+            outside[source] = outside.get(source, 0) + 1
+    return kept, inside, outside
+
+
+@dataclass
+class OsmRoadPopulations:
+    """`_read_osm_roads`'s own answer: the package's `highway=*` ways
+    projected to BNG and split by what they physically are.
+
+    `carriageway` is every way a vehicle drives on
+    (`categories.CARRIAGEWAY_HIGHWAY_VALUES`); `path` is every way a
+    person walks, climbs or cycles (`categories.PATH_HIGHWAY_VALUES`);
+    `other_value_counts` is how many ways carried a `highway` value in
+    neither family, by value, so the ones this split leaves out of both
+    legs are named and counted rather than dropped in silence.
+    """
+
+    carriageway: list[list[tuple[float, float]]]
+    path: list[list[tuple[float, float]]]
+    other_value_counts: dict[str, int]
 
 
 def _read_osm_roads(
     root: ET.Element, nodes: dict[str, tuple[float, float]], grid: Ostn15Grid
-) -> list[list[tuple[float, float]]]:
-    """Every `highway=*` way in `root`, projected to BNG: the OSM-derived
-    road population the epoch section interprets (see the module
-    docstring).
+) -> OsmRoadPopulations:
+    """Every `highway=*` way in `root`, projected to BNG and SPLIT by
+    `categories.road_family` into carriageways and paths.
+
+    One population was wrong here, and wrong in a direction that
+    flattered the answer (see the module docstring's "carriageways are
+    not paths"): NGD's roadlink collection holds carriageway centrelines
+    only, so a pavement or a field path has no counterpart in it at all,
+    yet each one still finds the nearest carriageway inside the offset
+    sampler's own search radius and contributes an offset vector pointing
+    at it. Those vectors are the width of the street, not a survey
+    disagreement, and their sign flips with which side of the street the
+    pavement is on, so they cancel and pull the least-squares estimate
+    toward zero.
+
+    A way whose `highway` value is in neither family (`road_family`
+    answering None: highway=construction, highway=pedestrian and the
+    rest) joins neither leg and is counted in `other_value_counts`.
     """
-    polylines: list[list[tuple[float, float]]] = []
+    carriageway: list[list[tuple[float, float]]] = []
+    path: list[list[tuple[float, float]]] = []
+    other_value_counts: dict[str, int] = {}
     for element in root:
         if element.tag != "way":
             continue
@@ -384,9 +531,19 @@ def _read_osm_roads(
         if latlon is None:
             continue
         polyline = _project(latlon, grid)
-        if polyline is not None:
-            polylines.append(polyline)
-    return polylines
+        if polyline is None:
+            continue
+        value = tags[_HIGHWAY_TAG_KEY]
+        family = road_family(value)
+        if family == ROAD_FAMILY_CARRIAGEWAY:
+            carriageway.append(polyline)
+        elif family == ROAD_FAMILY_PATH:
+            path.append(polyline)
+        else:
+            other_value_counts[value] = other_value_counts.get(value, 0) + 1
+    return OsmRoadPopulations(
+        carriageway=carriageway, path=path, other_value_counts=other_value_counts
+    )
 
 
 def _read_os_open_roads(geojson_path: Path, grid: Ostn15Grid) -> list[list[tuple[float, float]]]:
@@ -607,6 +764,12 @@ def _epoch_verdict(osm_offsets: OffsetStats) -> str:
     "std under twice the magnitude" band was written before the
     least-squares field existed and names no lsq-specific standard
     deviation of its own to use instead.
+
+    `osm_offsets` is the CARRIAGEWAY leg alone, never the whole
+    `highway=*` population (see `_read_osm_roads` and the module
+    docstring): a path measured against NGD's carriageway-only roadlink
+    collection contributes the width of the street, not a survey
+    disagreement, and enough of them cancel the estimate toward zero.
     """
     if osm_offsets.count == 0:
         return "INCONCLUSIVE: no matched road samples to measure an offset from."
@@ -668,14 +831,15 @@ def _containment_lines(report: dict) -> list[str]:
     """
     theirs = report["containment"]["theirs_unmatched"]
     ours = report["containment"]["ours_unmatched"]
+    larger = report["containment"]["theirs_subdivision_larger_than_ours"]
     lines: list[str] = []
     lines.append("## What the unmatched footprints are standing on")
     lines.append("")
     lines.append(
         "NGD counts building PARTS, so a terrace held here as one footprint "
         "arrives from OS as several, and every part after the one that won "
-        "the pairing lands in the unmatched column with nothing actually "
-        "missing. Each unmatched footprint below is reduced to one "
+        "the pairing lands in the unmatched column while the ground itself "
+        "is still covered. Each unmatched footprint below is reduced to one "
         "guaranteed-interior point and tested against the other dataset's "
         "own footprints: standing inside one of them means the two datasets "
         "disagree about where the lines fall, standing on ground the other "
@@ -686,6 +850,18 @@ def _containment_lines(report: dict) -> list[str]:
     lines.append(
         f"- Subdivision (stands inside a footprint we hold): "
         f"{theirs[CONTAINMENT_SUBDIVISION]}"
+    )
+    lines.append(
+        f"- of those, NGD part LARGER than the footprint of ours containing it: {larger}"
+    )
+    lines.append(
+        "  The containment test asks only whether their interior point lands "
+        "inside one of our rings; it never compares areas, so on its own it "
+        "cannot tell \"OS split a building we hold whole\" from \"our polygon "
+        "is drawn oversized and swallowed part of theirs\". Where their part "
+        "is the larger of the two, the reversed reading is the live one and "
+        "the fault is ours, not a difference in counting. That is what this "
+        "one number bounds."
     )
     lines.append(
         f"- Absent (we hold nothing on that ground): {theirs[CONTAINMENT_ABSENT]}"
@@ -799,15 +975,54 @@ def _render_markdown(report: dict) -> str:
 
     lines.append("## Counts")
     lines.append("")
-    lines.append("Buildings, ours by source:")
-    ours_by_source = report["counts"]["buildings"]["ours"]
+    building_counts = report["counts"]["buildings"]
+    ours_by_source = building_counts["ours"]
+    out_by_source = building_counts["ours_out_of_extent"]
+    all_by_source = building_counts["ours_all"]
+    lines.append(
+        "Every count of ours below is CLIPPED to the rectangle the NGD pull "
+        "was made over. The package covers more ground than the survey bbox: "
+        "the survey pads its own extent, and the OS OpenMap Local footprints "
+        "injected into it arrive over a wider footprint again. A footprint "
+        "outside that rectangle cannot match an NGD feature and cannot stand "
+        "inside one, so leaving it in the compared population would count it "
+        "as a building OS does not hold when OS was never asked about that "
+        "ground. A footprint is in when its own guaranteed-interior point "
+        "falls inside the rectangle."
+    )
+    lines.append("")
+    lines.append("Buildings, ours by source (in extent, the compared population):")
     for source in sorted(ours_by_source):
         lines.append(f"- {source}: {ours_by_source[source]}")
-    lines.append(f"- NGD buildingpart: {report['counts']['buildings']['ngd']}")
+    lines.append(f"- total: {sum(ours_by_source.values())}")
+    lines.append("")
+    lines.append("Buildings, ours EXCLUDED as out of extent, by source:")
+    if out_by_source:
+        for source in sorted(out_by_source):
+            lines.append(f"- {source}: {out_by_source[source]}")
+        lines.append(f"- total: {sum(out_by_source.values())}")
+    else:
+        lines.append("- (none: every footprint of ours falls inside the pulled rectangle)")
+    lines.append("")
+    lines.append(
+        f"Buildings, ours before clipping (every building=* way in the "
+        f"package): {sum(all_by_source.values())}"
+    )
+    lines.append(f"- NGD buildingpart: {building_counts['ngd']}")
     lines.append("")
     road_counts = report["counts"]["roads"]
     lines.append("Roads:")
-    lines.append(f"- ours, OSM highway=*: {road_counts['ours_osm']}")
+    lines.append(f"- ours, OSM carriageway: {road_counts['ours_osm_carriageway']}")
+    lines.append(f"- ours, OSM path: {road_counts['ours_osm_path']}")
+    other_values = road_counts["ours_osm_other_values"]
+    if other_values:
+        named = ", ".join(f"{name} {other_values[name]}" for name in sorted(other_values))
+        lines.append(
+            f"- ours, OSM highway=* in neither family (measured against "
+            f"nothing): {sum(other_values.values())} ({named})"
+        )
+    else:
+        lines.append("- ours, OSM highway=* in neither family: 0")
     lines.append(f"- ours, OS Open roads: {road_counts['ours_os_open']}")
     lines.append(f"- NGD roadlink: {road_counts['ngd']}")
     lines.append("")
@@ -839,7 +1054,26 @@ def _render_markdown(report: dict) -> str:
         "printed only as a control."
     )
     lines.append("")
-    for label, key in (("OSM", "osm"), ("OS Open (control)", "os_open")):
+    lines.append(
+        "The OSM population is SPLIT into carriageways and paths, and the "
+        "epoch verdict is read off the carriageway leg alone. NGD's roadlink "
+        "collection holds carriageway centrelines and nothing else, so a "
+        "pavement, a field path or a flight of steps has no counterpart in it "
+        "to be offset from: each one still finds the nearest carriageway "
+        "inside the sampler's search radius and contributes a vector that is "
+        "the width of the street rather than a survey disagreement, and those "
+        "vectors flip sign with which side of the street the pavement is on, "
+        "so enough of them cancel and drag the estimate toward zero. This "
+        "DELIBERATELY breaks continuity with the single-population OSM offset "
+        "earlier runs of this benchmark published: that number was measured "
+        "over both legs at once and read low because of it."
+    )
+    lines.append("")
+    for label, key in (
+        ("OSM carriageway (the epoch measurement)", "osm_carriageway"),
+        ("OSM path (pavement-to-carriageway distance, NOT survey disagreement)", "osm_path"),
+        ("OS Open (control)", "os_open"),
+    ):
         stats = report["roads"][key]
         lines.append(f"### {label}")
         lines.append("")
@@ -872,7 +1106,9 @@ def _render_markdown(report: dict) -> str:
             f"{stats['p90_abs']:.3f} m"
         )
         lines.append("")
-    lines.append(f"Epoch verdict: {report['epoch_verdict']}")
+    lines.append(
+        f"Epoch verdict (carriageway leg alone): {report['epoch_verdict']}"
+    )
     lines.append("")
 
     lines.append("## Class names")
@@ -885,7 +1121,12 @@ def _render_markdown(report: dict) -> str:
     else:
         lines.append("- (none carried a description value)")
     lines.append("")
-    lines.append("Our own `building=*` tag values:")
+    lines.append(
+        "Our own `building=*` tag values, over the WHOLE package and not "
+        "clipped to the pulled rectangle (this table describes how this "
+        "package is tagged, which is a fact about the package rather than "
+        "about the comparison above):"
+    )
     our_classes = report["classes"]["counts"]
     if our_classes:
         for name in sorted(our_classes):
@@ -894,7 +1135,67 @@ def _render_markdown(report: dict) -> str:
         lines.append("- (no buildings in this package)")
     lines.append("")
 
+    lines.extend(_reading_lines(report))
+
     return "\n".join(lines) + "\n"
+
+
+def _reading_lines(report: dict) -> list[str]:
+    """The closing paragraph: what the numbers above actually say.
+
+    Written against the numbers in `report` rather than around them,
+    because the easy closing line here is a false one. An earlier reading
+    of this benchmark called the unmatched NGD footprints "not anything
+    you would draw", which the subdivision half of the same table
+    contradicts: a subdivision is a place where OS records a building
+    boundary and this package records none, and those boundaries are
+    party walls, house-to-garage joins and terrace divisions. Every one
+    of them is a line an architect draws at 1:500. This section says what
+    the two datasets agree and disagree about, and does not describe
+    either half as bookkeeping.
+    """
+    theirs = report["containment"]["theirs_unmatched"]
+    subdivision = theirs[CONTAINMENT_SUBDIVISION]
+    absent = theirs[CONTAINMENT_ABSENT]
+    larger = report["containment"]["theirs_subdivision_larger_than_ours"]
+    ours_absent = report["containment"]["ours_unmatched"][CONTAINMENT_ABSENT_FROM_OS]
+    matched_fraction = report["buildings"]["matched_fraction_ours"]
+
+    lines: list[str] = []
+    lines.append("## What this says")
+    lines.append("")
+    lines.append(
+        f"Over the ground both datasets actually cover, the package and OS "
+        f"agree about where the buildings are: {matched_fraction:.3f} of our "
+        f"in-extent footprints pair with an NGD building part, at the IoU "
+        f"quoted above. What they disagree about is outbuildings, and where "
+        f"one building stops and the next begins."
+    )
+    lines.append("")
+    lines.append(
+        f"- {subdivision} NGD parts stand inside a footprint we hold. These "
+        f"are boundaries OS records and this package does not: party walls, "
+        f"house-to-garage joins, terrace divisions. They are lines an "
+        f"architect draws at 1:500, so this half is a real difference in "
+        f"what is drawn, not a difference in how the two datasets count. In "
+        f"{larger} of them the NGD part is LARGER than the footprint of ours "
+        f"containing it, which reads the other way round: our polygon is the "
+        f"oversized one."
+    )
+    lines.append(
+        f"- {absent} NGD parts stand on ground we hold nothing on. The size "
+        f"table above says which of those matter: the small buckets are bin "
+        f"stores, meter cabinets and garden sheds, the 80 to 200 m2 bucket is "
+        f"houses."
+    )
+    lines.append(
+        f"- {ours_absent} footprints of ours stand on ground OS holds nothing "
+        f"on. Read against the same size table, and against the count of "
+        f"footprints the clipping excluded: this is the column an injected "
+        f"open-data layer inflates fastest."
+    )
+    lines.append("")
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -943,13 +1244,34 @@ def run_benchmark(
     if grid is None:
         grid = ensure_ostn15()
 
-    ours_building_rings, building_counts_by_source, building_tag_counts = _read_buildings(
-        root, nodes, grid
-    )
+    (
+        all_building_rings,
+        all_building_sources,
+        building_counts_by_source,
+        building_tag_counts,
+    ) = _read_buildings(root, nodes, grid)
     ours_osm_roads = _read_osm_roads(root, nodes, grid)
     ours_os_open_roads = _read_os_open_roads(package_dir / f"{stem}_os_roads.geojson", grid)
 
     bbox_bng = padded_bng_extent(bbox, grid, 0.0)
+
+    # Clip OUR OWN building population to the exact rectangle the NGD pull
+    # is about to be made over, BEFORE anything is matched or classified.
+    # The package covers roughly 1.8 times this ground (the survey pads
+    # its extent, and injected OS OpenMap Local footprints arrive over a
+    # wider footprint again), and a footprint outside the rectangle can
+    # neither match an NGD feature nor stand inside one: it lands in
+    # "absent from OS" by construction, which is not a finding about OS,
+    # it is a finding about which ground was asked about. Measured on the
+    # Cowbridge benchmark package, 367 of 1755 footprints of ours had
+    # their interior point outside the queried rectangle, 346 of them
+    # from the single OS OpenMap Local injection layer, and the two
+    # headline numbers that flowed from leaving them in ("absent from
+    # OS", and the matched fraction of ours) were both wrong because of
+    # it. Their side needs no equivalent clipping: it came from the query.
+    ours_building_rings, building_in_extent_by_source, building_out_of_extent_by_source = (
+        _split_by_extent(all_building_rings, all_building_sources, bbox_bng)
+    )
 
     client = client_factory(key)
     client.verify_collections([BUILDING_COLLECTION, ROAD_COLLECTION])
@@ -982,10 +1304,28 @@ def run_benchmark(
     theirs_containment = classify_containment(theirs_unmatched_rings, ours_building_rings)
     ours_containment = classify_containment(ours_unmatched_rings, ngd_building_rings)
 
-    offsets_osm = polyline_offsets(ours_osm_roads, ngd_road_polylines)
+    # How many of the SUBDIVISION cases are the reversed reading: their
+    # part is bigger than the footprint of ours it stands inside, so what
+    # the containment test found is not OS splitting a building we hold
+    # whole, it is our polygon drawn oversized around a corner of theirs.
+    # One aggregate integer, computed from two areas neither of which
+    # leaves this function: a count, not a coordinate and not a
+    # per-feature area, so the firewall is untouched.
+    subdivision_larger_than_ours = sum(
+        1
+        for position in theirs_containment.contained
+        if ring_area(theirs_unmatched_rings[position])
+        > ring_area(ours_building_rings[theirs_containment.containers[position]])
+    )
+
+    offsets_osm_carriageway = polyline_offsets(ours_osm_roads.carriageway, ngd_road_polylines)
+    offsets_osm_path = polyline_offsets(ours_osm_roads.path, ngd_road_polylines)
     offsets_os_open = polyline_offsets(ours_os_open_roads, ngd_road_polylines)
 
-    epoch_verdict = _epoch_verdict(offsets_osm)
+    # The carriageway leg ALONE (see `_read_osm_roads`): the path leg is
+    # printed beside it as the pavement-to-carriageway distance it
+    # actually measures, and never feeds the verdict.
+    epoch_verdict = _epoch_verdict(offsets_osm_carriageway)
     pulled_date = date.today()
 
     report = {
@@ -994,13 +1334,25 @@ def run_benchmark(
         "package": stem,
         "bbox": [bbox.west, bbox.south, bbox.east, bbox.north],
         "pages": {"buildings": building_pages, "roads": road_pages},
+        "extent_bng": list(bbox_bng),
         "counts": {
             "buildings": {
-                "ours": building_counts_by_source,
+                # The headline: our own footprints INSIDE the pulled
+                # rectangle, the only ones the comparison below is about.
+                "ours": building_in_extent_by_source,
+                # What the clipping excluded, so it is visible rather
+                # than silent.
+                "ours_out_of_extent": building_out_of_extent_by_source,
+                # Every building=* way in the package, clipped or not:
+                # the pre-clip population, kept so the three numbers can
+                # be read against each other.
+                "ours_all": building_counts_by_source,
                 "ngd": len(ngd_building_rings),
             },
             "roads": {
-                "ours_osm": len(ours_osm_roads),
+                "ours_osm_carriageway": len(ours_osm_roads.carriageway),
+                "ours_osm_path": len(ours_osm_roads.path),
+                "ours_osm_other_values": ours_osm_roads.other_value_counts,
                 "ours_os_open": len(ours_os_open_roads),
                 "ngd": len(ngd_road_polylines),
             },
@@ -1022,6 +1374,7 @@ def run_benchmark(
                 CONTAINMENT_SUBDIVISION: len(theirs_containment.contained),
                 CONTAINMENT_ABSENT: len(theirs_containment.not_contained),
             },
+            "theirs_subdivision_larger_than_ours": subdivision_larger_than_ours,
             "ours_unmatched": {
                 CONTAINMENT_SPURIOUS_OR_NEWER: len(ours_containment.contained),
                 CONTAINMENT_ABSENT_FROM_OS: len(ours_containment.not_contained),
@@ -1051,7 +1404,8 @@ def run_benchmark(
             },
         },
         "roads": {
-            "osm": _offset_stats_dict(offsets_osm),
+            "osm_carriageway": _offset_stats_dict(offsets_osm_carriageway),
+            "osm_path": _offset_stats_dict(offsets_osm_path),
             "os_open": _offset_stats_dict(offsets_os_open),
         },
         "classes": {
@@ -1059,6 +1413,11 @@ def run_benchmark(
             "counts": building_tag_counts,
         },
         "epoch_verdict": epoch_verdict,
+        # Which road population the verdict above was read off, named in
+        # the machine-readable report as well as in the prose, so a later
+        # reader comparing two runs can see that the basis changed rather
+        # than reading a moved number as a moved measurement.
+        "epoch_basis": "osm_carriageway",
     }
 
     md_text = _render_markdown(report)

@@ -43,7 +43,23 @@ _TEST_KEY = "sekrit-dev-mode-key-do-not-leak"
 _SENTINEL_ID = "SENTINEL-PREMIUM-FEATURE-ID-771"
 _SENTINEL_COORD = 918273.456
 
-_BBOX = BBox(west=-3.45, south=51.45, east=-3.44, north=51.46)
+# The survey bbox, and therefore (via `padded_bng_extent`) the exact
+# rectangle `run_benchmark` pulls NGD over and now CLIPS our own building
+# population to. Chosen by projecting two BNG corners back out through
+# `tm_inverse` (the same zero-shift round trip `_nodes_for` uses) and
+# rounding to the 7 decimal places `BBox.to_dict` writes into
+# survey.json, so the rectangle this fixture's own coordinates are
+# checked against is a known BNG box rather than an accident of where
+# -3.45/51.45 happens to land:
+#
+#     easting  299_800 to 310_000   (_BASE_E - 200 to _BASE_E + 10_000)
+#     northing 179_800 to 190_000   (_BASE_N - 200 to _BASE_N + 10_000)
+#
+# Every building and road this module places sits inside it (the furthest
+# is the tiny outbuilding at +8_012 m), so the clipping excludes nothing
+# by accident; `_OUT_OF_EXTENT_CORNERS` below is the one fixture written
+# to fall outside it deliberately.
+_BBOX = BBox(west=-3.4438096, south=51.5075354, east=-3.2994883, north=51.6009432)
 
 # The two-orientation road shift (+0.9, +0.9), the exact construction
 # test_benchstats.py's own LSQ-recovery test uses: `theirs` runs well past
@@ -111,6 +127,7 @@ def _build_package(
     stem: str = "Test-Site_2026-08-09",
     with_os_roads: bool = True,
     extra_buildings: Sequence[tuple[Sequence[tuple[float, float]], list[tuple[str, str]]]] = (),
+    extra_roads: Sequence[tuple[Sequence[tuple[float, float]], list[tuple[str, str]]]] = (),
 ) -> Path:
     """A package directory holding `survey.json`, `<stem>.osm`, and
     (unless `with_os_roads` is False) `<stem>_os_roads.geojson`.
@@ -134,7 +151,13 @@ def _build_package(
     above (`_shift` is applied here). Empty by default, so every test
     written against the two-building fixture keeps its own counts
     unchanged; the containment tests use it to place a footprint of ours
-    precisely enough to pin a classification.
+    precisely enough to pin a classification, and the extent test uses it
+    to place one deliberately outside the pulled rectangle.
+
+    `extra_roads` does the same for open `highway=*` ways, which is what
+    the carriageway/path split test needs: the two roads above are both
+    `highway=residential` (carriageways), so a test that wants a path
+    population adds its own.
     """
     root = tmp_path / "package"
     root.mkdir()
@@ -180,6 +203,11 @@ def _build_package(
             9301 + offset, _shift(corners), 101 + offset * 20, tags
         )
         elements.extend([*extra_nodes, extra_way])
+    for offset, (points, tags) in enumerate(extra_roads):
+        road_nodes, road_way = _open_way(
+            9401 + offset, _shift(points), 501 + offset * 20, tags
+        )
+        elements.extend([*road_nodes, road_way])
     (root / f"{stem}.osm").write_text(_dump_osm(elements), encoding="utf-8")
 
     if with_os_roads:
@@ -380,10 +408,18 @@ def test_report_json_schema_and_counts(tmp_path):
     assert report["pages"] == {"buildings": 1, "roads": 1}
 
     # Two OSM buildings written by way (house, no source; yes, source
-    # overture), the relation's own building tag never counted.
+    # overture), the relation's own building tag never counted. Both sit
+    # inside the pulled rectangle, so the clipped headline and the
+    # pre-clip population agree and nothing was excluded.
     assert report["counts"]["buildings"]["ours"] == {"osm": 1, "overture": 1}
+    assert report["counts"]["buildings"]["ours_all"] == {"osm": 1, "overture": 1}
+    assert report["counts"]["buildings"]["ours_out_of_extent"] == {}
     assert report["counts"]["buildings"]["ngd"] == 2
-    assert report["counts"]["roads"]["ours_osm"] == 2
+    # Both fixture roads are highway=residential, so both land in the
+    # carriageway leg and the path leg is empty.
+    assert report["counts"]["roads"]["ours_osm_carriageway"] == 2
+    assert report["counts"]["roads"]["ours_osm_path"] == 0
+    assert report["counts"]["roads"]["ours_osm_other_values"] == {}
     assert report["counts"]["roads"]["ours_os_open"] == 1
     assert report["counts"]["roads"]["ngd"] == 2
 
@@ -397,15 +433,18 @@ def test_report_json_schema_and_counts(tmp_path):
     assert report["classes"]["ngd_only"] == {"Detached": 1, "Shed": 1}
     assert report["classes"]["counts"] == {"house": 1, "yes": 1}
 
-    # The two-orientation OSM road population recovers the true shift via
-    # least squares; the naive mean understates it (see test_benchstats.py).
-    osm = report["roads"]["osm"]
+    # The two-orientation OSM carriageway population recovers the true
+    # shift via least squares; the naive mean understates it (see
+    # test_benchstats.py).
+    osm = report["roads"]["osm_carriageway"]
     assert osm["lsq_de"] == pytest.approx(_SHIFT_E, abs=0.05)
     assert osm["lsq_dn"] == pytest.approx(_SHIFT_N, abs=0.05)
     assert osm["mean_de"] < osm["lsq_de"]
 
+    assert "osm_path" in report["roads"]
     assert "os_open" in report["roads"]
     assert isinstance(report["epoch_verdict"], str) and report["epoch_verdict"]
+    assert report["epoch_basis"] == "osm_carriageway"
 
 
 def test_report_md_mirrors_the_json_sections(tmp_path):
@@ -425,8 +464,9 @@ def test_report_md_mirrors_the_json_sections(tmp_path):
     assert "## Building footprint matching" in text
     assert "## Road offsets and the epoch question" in text
     assert "Least-squares offset" in text
-    assert "Epoch verdict:" in text
+    assert "Epoch verdict (carriageway leg alone):" in text
     assert "## Class names" in text
+    assert "## What this says" in text
     assert "—" not in text  # no em dashes anywhere in the report
 
 
@@ -443,8 +483,9 @@ def test_an_empty_ngd_pull_reports_zeros_honestly_never_invents(tmp_path):
     assert report["buildings"]["matched_fraction_ours"] == 0.0
     assert report["buildings"]["matched_fraction_theirs"] == 0.0
     assert report["buildings"]["iou"] == {"p10": 0.0, "p50": 0.0, "p90": 0.0}
-    assert report["roads"]["osm"]["count"] == 0
-    assert report["roads"]["osm"]["lsq_de"] is None
+    assert report["roads"]["osm_carriageway"]["count"] == 0
+    assert report["roads"]["osm_carriageway"]["lsq_de"] is None
+    assert report["roads"]["osm_path"]["count"] == 0
     assert report["roads"]["os_open"]["count"] == 0
     assert "no matched road samples" in report["epoch_verdict"]
 
@@ -490,11 +531,14 @@ def test_read_buildings_counts_an_upstream_source_bing_tag_as_osm():
         if element.tag == "node"
     }
 
-    rings, counts_by_source, tag_value_counts = _read_buildings(root, nodes, _zero_shift_grid())
+    rings, ring_sources, counts_by_source, tag_value_counts = _read_buildings(
+        root, nodes, _zero_shift_grid()
+    )
 
     assert counts_by_source == {"osm": 1}
     assert tag_value_counts == {"house": 1}
     assert len(rings) == 1
+    assert ring_sources == ["osm"]
 
 
 def test_report_counts_an_upstream_source_bing_building_as_osm(tmp_path):
@@ -543,9 +587,12 @@ def test_read_buildings_still_buckets_the_two_known_injection_labels():
         if element.tag == "node"
     }
 
-    _, counts_by_source, _ = _read_buildings(root, nodes, _zero_shift_grid())
+    _, ring_sources, counts_by_source, _ = _read_buildings(root, nodes, _zero_shift_grid())
 
     assert counts_by_source == {"overture": 1, "os_openmap_local": 1}
+    # The per-ring labels carry the same two values, in ring order: this
+    # is what lets the extent clipping report what it excluded per layer.
+    assert ring_sources == ["overture", "os_openmap_local"]
 
 
 # --------------------------------------------------------------------------
@@ -806,6 +853,376 @@ def test_an_empty_ngd_pull_reports_empty_containment_and_size_honestly(tmp_path)
     assert sum(report["size"]["ours_unmatched"].values()) == 2
     # Every bucket is still present, zeros included.
     assert len(report["size"]["theirs_matched"]) == len(report["size"]["buckets"])
+
+
+# --------------------------------------------------------------------------
+# FIX 1: our own population is CLIPPED to the rectangle the NGD pull was
+# actually made over, and what the clipping excluded is reported per
+# source layer rather than dropped in silence.
+#
+# The defect this pins: a package covers roughly 1.8 times the NGD query
+# extent (the survey pads its own extent, and injected OS OpenMap Local
+# footprints arrive over a wider footprint again), and every footprint
+# outside the rectangle landed in "absent from OS" by construction, since
+# it could neither match nor be contained. On the real Cowbridge package
+# that was 367 of 1755 footprints, 346 of them from one injection layer.
+# --------------------------------------------------------------------------
+
+# 500 m past the fixture rectangle's own north-east corner (which sits at
+# _BASE + 10_000 m; see `_BBOX`). Far enough out that the 7-decimal-place
+# rounding survey.json applies to the bbox cannot move it back inside.
+_OUT_OF_EXTENT_CORNERS = [
+    (10_500.0, 10_500.0),
+    (10_510.0, 10_500.0),
+    (10_510.0, 10_510.0),
+    (10_500.0, 10_510.0),
+]
+
+
+def test_a_footprint_outside_the_pulled_rectangle_is_excluded_and_counted(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_buildings=[
+            (_OUT_OF_EXTENT_CORNERS, [("building", "yes"), ("source", "os_openmap_local")])
+        ],
+    )
+    client = _StubNgdClient(buildings=[_matched_ngd_building_feature()], roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+    counts = report["counts"]["buildings"]
+
+    # Three building=* ways in the package; only the two inside the pulled
+    # rectangle are compared, and the excluded one is named by its own
+    # source layer rather than folded into a single opaque total.
+    assert counts["ours_all"] == {"osm": 1, "overture": 1, "os_openmap_local": 1}
+    assert counts["ours"] == {"osm": 1, "overture": 1}
+    assert counts["ours_out_of_extent"] == {"os_openmap_local": 1}
+    # Nothing is lost between the two: kept plus excluded is the whole
+    # projectable population.
+    assert sum(counts["ours"].values()) + sum(counts["ours_out_of_extent"].values()) == sum(
+        counts["ours_all"].values()
+    )
+
+    # The out-of-extent footprint never reaches the comparison at all, so
+    # it cannot inflate "absent from OS" the way it did before the clip:
+    # only building B (in extent, unmatched) is counted there.
+    assert report["buildings"]["unmatched_ours"] == 1
+    assert report["containment"]["ours_unmatched"]["absent_from_os"] == 1
+    # And the matched fraction is taken over the clipped population (1 of
+    # 2), never over the whole package (which would read 1 of 3).
+    assert report["buildings"]["matched"] == 1
+    assert report["buildings"]["matched_fraction_ours"] == pytest.approx(0.5)
+
+
+def test_the_clipping_is_printed_in_the_markdown_report(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_buildings=[
+            (_OUT_OF_EXTENT_CORNERS, [("building", "yes"), ("source", "os_openmap_local")])
+        ],
+    )
+    client = _StubNgdClient(buildings=[_matched_ngd_building_feature()], roads=[])
+
+    md_path, _ = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "CLIPPED to the rectangle the NGD pull was made over" in text
+
+    # The excluded layer is named UNDER the excluded heading, not merely
+    # somewhere on the page: a report that clipped nothing would print
+    # the same layer name under the compared population instead, and an
+    # anywhere-in-the-text assertion could not tell the two apart.
+    excluded = text.split("Buildings, ours EXCLUDED as out of extent, by source:")[1]
+    excluded = excluded.split("\n\n")[0]
+    assert "- os_openmap_local: 1" in excluded
+    assert "- total: 1" in excluded
+
+    compared = text.split("Buildings, ours by source (in extent, the compared population):")[1]
+    compared = compared.split("\n\n")[0]
+    assert "os_openmap_local" not in compared
+    assert "- total: 2" in compared
+
+
+def test_a_package_wholly_inside_the_rectangle_excludes_nothing(tmp_path):
+    # The clip must be inert when there is nothing to clip: every fixture
+    # footprint sits inside the pulled rectangle, so the excluded table is
+    # empty and the report says so in words rather than printing a blank.
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    md_path, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert report["counts"]["buildings"]["ours_out_of_extent"] == {}
+    assert report["counts"]["buildings"]["ours"] == report["counts"]["buildings"]["ours_all"]
+    assert "every footprint of ours falls inside the pulled rectangle" in md_path.read_text(
+        encoding="utf-8"
+    )
+
+
+# --------------------------------------------------------------------------
+# FIX 2: the SUBDIVISION label is earned, not assumed. The containment
+# test compares no areas at all, so "OS split a building we hold whole"
+# and "our polygon is drawn oversized" are the same test result; one
+# aggregate integer separates them.
+# --------------------------------------------------------------------------
+
+
+def test_a_subdivision_whose_ngd_part_is_larger_than_our_footprint_is_counted(tmp_path):
+    # Our footprint here is a 10 m square, 100 m2 (building A). Two NGD
+    # parts stand inside it: a 3 m square, 9 m2 (smaller, the ordinary
+    # subdivision reading, and deliberately under the 0.1 IoU floor so it
+    # does not simply pair with A) and a 40 m square whose own interior
+    # point also falls inside A but which is sixteen times A's area. The
+    # second is the REVERSED reading: not OS splitting a building we hold
+    # whole, but our own polygon drawn small inside theirs, which the
+    # containment test cannot tell from the first because it compares no
+    # areas at all.
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    small_part = _square_feature("small-part-inside-A", 1.0, 1.0, 3.0, 3.0)
+    # Centred on A so its own representative point lands inside A.
+    large_part = _square_feature("large-part-over-A", -15.0, -15.0, 40.0, 40.0)
+    client = _StubNgdClient(buildings=[small_part, large_part], roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    containment = json.loads(json_path.read_text(encoding="utf-8"))["containment"]
+
+    assert containment["theirs_unmatched"]["subdivision"] == 2
+    assert containment["theirs_unmatched"]["absent"] == 0
+    # Exactly one of the two is the reversed reading.
+    assert containment["theirs_subdivision_larger_than_ours"] == 1
+
+
+def test_subdivisions_all_smaller_than_ours_count_zero_reversed(tmp_path):
+    # The ordinary case, and the one the label was written for: building A
+    # of ours (a 10 m square) cut into two 10 m by 5 m parts. One wins the
+    # pairing, the other is a subdivision, and neither is larger than A.
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    client = _StubNgdClient(
+        buildings=[
+            _square_feature("lower-half-of-A", 0.0, 0.0, 10.0, 5.0),
+            _square_feature("upper-half-of-A", 0.0, 5.0, 10.0, 5.0),
+        ],
+        roads=[],
+    )
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    containment = json.loads(json_path.read_text(encoding="utf-8"))["containment"]
+
+    assert containment["theirs_unmatched"]["subdivision"] == 1
+    assert containment["theirs_subdivision_larger_than_ours"] == 0
+
+
+def test_the_reversed_subdivision_count_is_printed_beside_the_subdivision_count(tmp_path):
+    package_dir = _build_package(tmp_path, with_os_roads=False)
+    client = _StubNgdClient(
+        buildings=[
+            _square_feature("small-part-inside-A", 1.0, 1.0, 3.0, 3.0),
+            _square_feature("large-part-over-A", -15.0, -15.0, 40.0, 40.0),
+        ],
+        roads=[],
+    )
+
+    md_path, _ = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "Subdivision (stands inside a footprint we hold): 2" in text
+    assert (
+        "of those, NGD part LARGER than the footprint of ours containing it: 1" in text
+    )
+
+
+# --------------------------------------------------------------------------
+# FIX 3: carriageways and paths are separate populations, and the epoch
+# verdict is read off the carriageway leg alone.
+#
+# NGD's roadlink collection holds carriageway centrelines only, so a
+# pavement has no counterpart in it: measured against the nearest
+# carriageway it contributes the width of the street, with a sign that
+# flips by which side of the street it runs down, and enough of those
+# cancel and drag the least-squares estimate toward zero.
+# --------------------------------------------------------------------------
+
+_PATH_HIGHWAY_FIXTURES = ("footway", "path", "bridleway", "steps", "cycleway", "track")
+_CARRIAGEWAY_HIGHWAY_FIXTURES = (
+    "motorway",
+    "trunk",
+    "primary_link",
+    "secondary",
+    "tertiary",
+    "unclassified",
+    "residential",
+    "service",
+    "living_street",
+)
+
+
+def test_osm_roads_split_into_carriageway_and_path_by_highway_value(tmp_path):
+    # One way per highway value, each a short line of its own well away
+    # from the others, so the split is decided by the tag alone.
+    extra_roads = [
+        ([(1_000.0 + 20.0 * i, 1_000.0), (1_000.0 + 20.0 * i + 10.0, 1_000.0)], [("highway", value)])
+        for i, value in enumerate(_PATH_HIGHWAY_FIXTURES)
+    ] + [
+        ([(2_000.0 + 20.0 * i, 2_000.0), (2_000.0 + 20.0 * i + 10.0, 2_000.0)], [("highway", value)])
+        for i, value in enumerate(_CARRIAGEWAY_HIGHWAY_FIXTURES)
+    ]
+    package_dir = _build_package(tmp_path, with_os_roads=False, extra_roads=extra_roads)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    counts = json.loads(json_path.read_text(encoding="utf-8"))["counts"]["roads"]
+
+    # The two fixture roads are highway=residential, so they join the
+    # carriageway leg alongside the nine added here.
+    assert counts["ours_osm_carriageway"] == len(_CARRIAGEWAY_HIGHWAY_FIXTURES) + 2
+    assert counts["ours_osm_path"] == len(_PATH_HIGHWAY_FIXTURES)
+    assert counts["ours_osm_other_values"] == {}
+
+
+def test_a_highway_value_in_neither_family_is_named_and_counted_never_folded_in(tmp_path):
+    extra_roads = [
+        ([(1_000.0, 1_000.0), (1_010.0, 1_000.0)], [("highway", "construction")]),
+        ([(1_000.0, 1_100.0), (1_010.0, 1_100.0)], [("highway", "pedestrian")]),
+        ([(1_000.0, 1_200.0), (1_010.0, 1_200.0)], [("highway", "construction")]),
+    ]
+    package_dir = _build_package(tmp_path, with_os_roads=False, extra_roads=extra_roads)
+    client = _StubNgdClient(buildings=[], roads=[])
+
+    md_path, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    counts = json.loads(json_path.read_text(encoding="utf-8"))["counts"]["roads"]
+
+    assert counts["ours_osm_carriageway"] == 2
+    assert counts["ours_osm_path"] == 0
+    assert counts["ours_osm_other_values"] == {"construction": 2, "pedestrian": 1}
+    assert "construction 2, pedestrian 1" in md_path.read_text(encoding="utf-8")
+
+
+def test_the_epoch_verdict_comes_from_the_carriageway_leg_alone(tmp_path):
+    # The construction that makes the defect visible. The two carriageways
+    # of the fixture are shifted (+0.9, +0.9) from their NGD counterparts,
+    # which is squarely inside the CONSISTENT band. Alongside them run
+    # four pavements, three down the south side of the horizontal
+    # carriageway and one down the north side: each finds that carriageway
+    # inside the 15 m search radius and contributes an offset of several
+    # metres pointing at it, positive from the south side and negative
+    # from the north, which is the sign flip that makes a mixed
+    # pavement population partly cancel. None of it is a survey
+    # disagreement; all of it is the width of the street. Folded into one
+    # population these drag the least-squares estimate right off the real
+    # shift; read separately, the carriageway verdict is untouched.
+    pavements = [
+        ([(0.0, offset_n), (100.0, offset_n)], [("highway", "footway")])
+        for offset_n in (-6.0, -8.0, -10.0, 6.0)
+    ]
+    package_dir = _build_package(tmp_path, with_os_roads=False, extra_roads=pavements)
+    client = _StubNgdClient(buildings=[], roads=_ngd_road_features())
+
+    _, json_path = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    report = json.loads(json_path.read_text(encoding="utf-8"))
+
+    carriageway = report["roads"]["osm_carriageway"]
+    path = report["roads"]["osm_path"]
+
+    assert report["counts"]["roads"]["ours_osm_carriageway"] == 2
+    assert report["counts"]["roads"]["ours_osm_path"] == 4
+
+    # The carriageway leg still recovers the true shift.
+    assert carriageway["lsq_de"] == pytest.approx(_SHIFT_E, abs=0.05)
+    assert carriageway["lsq_dn"] == pytest.approx(_SHIFT_N, abs=0.05)
+    assert report["epoch_basis"] == "osm_carriageway"
+    assert "CONSISTENT with the epoch-shift hypothesis" in report["epoch_verdict"]
+
+    # The path leg measured something else entirely: pavement-to-
+    # carriageway distance, metres of it, nothing like a sub-metre epoch
+    # shift.
+    assert path["count"] > 0
+    assert path["p50_abs"] > 4.0
+    assert path["mean_dn"] > 1.5
+
+    # And the same samples folded back into one population, the way this
+    # benchmark used to read them, do not produce that verdict at all:
+    # this is the continuity break, measured rather than asserted.
+    osm_root = benchmark_module._read_osm(package_dir / "Test-Site_2026-08-09.osm")
+    populations = benchmark_module._read_osm_roads(
+        osm_root, benchmark_module._osm_nodes(osm_root), _zero_shift_grid()
+    )
+    combined = benchmark_module.polyline_offsets(
+        populations.carriageway + populations.path,
+        benchmark_module._ngd_road_polylines(_ngd_road_features()),
+    )
+    assert combined.lsq_magnitude is not None
+    assert abs(combined.lsq_magnitude - carriageway["lsq_magnitude"]) > 1.0
+
+
+def test_the_report_says_the_split_breaks_continuity_and_labels_the_path_leg(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_roads=[([(0.0, 6.0), (100.0, 6.0)], [("highway", "footway")])],
+    )
+    client = _StubNgdClient(buildings=[], roads=_ngd_road_features())
+
+    md_path, _ = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "### OSM carriageway (the epoch measurement)" in text
+    assert (
+        "### OSM path (pavement-to-carriageway distance, NOT survey disagreement)" in text
+    )
+    assert "DELIBERATELY breaks continuity" in text
+    assert "Epoch verdict (carriageway leg alone):" in text
+
+
+# --------------------------------------------------------------------------
+# FIX 5: the closing framing. The subdivision half is not bookkeeping.
+# --------------------------------------------------------------------------
+
+
+def test_the_closing_section_calls_the_subdivisions_lines_an_architect_draws(tmp_path):
+    package_dir = _build_package(
+        tmp_path,
+        with_os_roads=False,
+        extra_buildings=[(_TINY_OURS_CORNERS, [("building", "shed")])],
+    )
+    client = _StubNgdClient(buildings=_containment_ngd_buildings(), roads=[])
+
+    md_path, _ = run_benchmark(
+        package_dir, _TEST_KEY, tmp_path / "benchmarks", client_factory=_stub_client_factory(client)
+    )
+    text = md_path.read_text(encoding="utf-8")
+
+    assert "## What this says" in text
+    assert "party walls, house-to-garage joins, terrace divisions" in text
+    assert "lines an" in text and "architect draws at 1:500" in text
+    assert "where one building stops and the next begins" in text
+    # The overclaim this section replaced, and the word it must not use
+    # for the subdivision half.
+    assert "not anything you would draw" not in text
+    assert "bookkeeping" not in text
 
 
 def test_missing_os_roads_file_is_an_empty_control_population_not_an_error(tmp_path):
