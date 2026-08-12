@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import pytest
 import requests
@@ -299,6 +299,207 @@ def test_sources_endpoint_names_the_config_field_for_a_source_that_needs_a_key(s
     assert status == 200
     elevation_entry = next(s for s in payload if s["id"] == "elevation")
     assert elevation_entry["api_key_config_field"] == "opentopography_api_key"
+
+
+# --------------------------------------------------------------------------
+# /api/coverage: what every registered source says about one drawn extent.
+#
+# The interface stopped asking the owner to tick layers and started
+# selecting every source that actually covers the rectangle they drew, so
+# it needs one cheap call it can make on every change to that rectangle.
+# Cheap is the whole design constraint: covers() and detail() are
+# documented in sources/base.py as disk-and-arithmetic only, never a live
+# lookup, which is what makes calling this per drag possible at all.
+# --------------------------------------------------------------------------
+
+# A real extent inside the ten covered quarter-tiles (BNG E 311300-311700,
+# N 177050-177450, the middle of the block), and a real one over Cowbridge,
+# which is where the owner actually drew when this endpoint's reason for
+# existing was discovered. Both hold whether or not this machine has an
+# OSTN15 grid cached: the covered block is 2 km across and this extent sits
+# in the middle of it, far further in than the grid shift could move it.
+_ST_FAGANS_BBOX = "-3.2774588,51.4847366,-3.2717995,51.4883950"
+_COWBRIDGE_BBOX = "-3.4530,51.4600,-3.4440,51.4670"
+# Creigiau, the village lidar_cardiff's own strings wrongly named as its
+# coverage until 2026-08-12. Asserted below to be exactly as uncovered as
+# Cowbridge is, because that is what made the wrong name expensive rather
+# than merely untidy.
+_CREIGIAU_BBOX = "-3.3200,51.5300,-3.3100,51.5360"
+
+
+class _RefusesToConnect:
+    """A session whose every method call fails the test outright.
+
+    The suite's established way to prove a code path opens no socket
+    without patching socket.socket itself, which is not an option here:
+    the server under test is a real HTTP server on a real loopback
+    socket, so a global socket ban would break the request long before it
+    reached the handler.
+    """
+
+    def __getattr__(self, name):
+        def _refuse(*args, **kwargs):
+            raise AssertionError(
+                f"/api/coverage must never touch the network (session.{name} called)"
+            )
+
+        return _refuse
+
+
+def _register_real_coverage_sources(tmp_path):
+    """A registry of exactly four sources in a known order, replacing the
+    real defaults `build_server` registers: StubSource plus the three the
+    coverage tests have something to prove about, each real one built so
+    that any network access at all fails loudly.
+
+    StubSource stays first, deliberately: it implements neither covers()
+    nor detail(), which is the "no coverage opinion" case this endpoint
+    has to answer for.
+    """
+    from mapgen.sources.lidar_cardiff import LidarCardiffSource
+    from mapgen.sources.os_uprn import OsUprnSource
+    from mapgen.sources.osm import OsmSource
+
+    clear_registry()
+    register(StubSource())
+    register(OsmSource(session=_RefusesToConnect()))
+    register(OsUprnSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path))
+    register(LidarCardiffSource(session=_RefusesToConnect(), ostn15_cache_dir=tmp_path))
+
+
+def _get_coverage(base, bbox, token=TOKEN):
+    """GET /api/coverage for one bbox.
+
+    Its own helper rather than `_get`, which appends "?token=" and would
+    turn a second "?" into part of the bbox value.
+    """
+    url = f"{base}/api/coverage?bbox={quote(bbox)}&token={token}"
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return response.status, json.loads(response.read().decode("utf-8"))
+
+
+def test_coverage_endpoint_requires_a_token(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(
+            f"{server}/api/coverage?bbox={_ST_FAGANS_BBOX}", timeout=10
+        )
+    assert excinfo.value.code == 403
+
+
+def test_coverage_endpoint_returns_one_entry_per_source_in_sources_order(
+    server, tmp_path
+):
+    # The browser zips this list against /api/sources positionally rather
+    # than matching on id, so the two orders agreeing is the contract,
+    # not a coincidence worth leaving untested.
+    _register_real_coverage_sources(tmp_path)
+    _, sources = _get(server, "/api/sources")
+    status, payload = _get_coverage(server, _ST_FAGANS_BBOX)
+
+    assert status == 200
+    assert [entry["id"] for entry in payload["sources"]] == [s["id"] for s in sources]
+    for entry in payload["sources"]:
+        assert set(entry) == {"id", "coverage", "heavy", "detail"}
+        assert entry["coverage"] in ("full", "partial", "none")
+
+
+def test_coverage_endpoint_reports_full_for_a_source_with_no_covers_method(server):
+    # StubSource implements neither covers() nor detail(). A source with
+    # no coverage opinion serves everywhere, so "full", and has nothing
+    # to say about resolution, so null. Real examples exist: osm,
+    # overture and elevation genuinely answer any extent on earth.
+    status, payload = _get_coverage(server, _COWBRIDGE_BBOX)
+    assert status == 200
+    stub = next(e for e in payload["sources"] if e["id"] == "stub")
+    assert stub["coverage"] == "full"
+    assert stub["detail"] is None
+    assert stub["heavy"] is False
+
+
+def test_coverage_endpoint_reports_lidar_cardiff_none_over_cowbridge(server, tmp_path):
+    # The owner's own extent, and the whole reason this endpoint exists:
+    # the interface can now see that this source has nothing here before
+    # a survey is ever started, instead of the survey discovering it.
+    _register_real_coverage_sources(tmp_path)
+    status, payload = _get_coverage(server, _COWBRIDGE_BBOX)
+
+    assert status == 200
+    entry = next(e for e in payload["sources"] if e["id"] == "lidar_cardiff")
+    assert entry["coverage"] == "none"
+    # detail() answers None for ground it does not cover, and null is
+    # what that has to reach the browser as.
+    assert entry["detail"] is None
+
+
+def test_coverage_endpoint_reports_lidar_cardiff_covering_st_fagans(server, tmp_path):
+    _register_real_coverage_sources(tmp_path)
+    status, payload = _get_coverage(server, _ST_FAGANS_BBOX)
+
+    assert status == 200
+    entry = next(e for e in payload["sources"] if e["id"] == "lidar_cardiff")
+    assert entry["coverage"] in ("full", "partial")
+    assert entry["detail"] == "25 cm at this extent, flown 2011"
+
+
+def test_coverage_endpoint_shows_creigiau_is_not_covered_at_all(server, tmp_path):
+    """The place lidar_cardiff's own copy named as its coverage until
+    2026-08-12 is as uncovered as Cowbridge is.
+
+    Pinned here rather than left as prose in a comment: an owner who read
+    the old display name and drew over Creigiau got exactly the outcome
+    that name promised them they would not.
+    """
+    _register_real_coverage_sources(tmp_path)
+    _, payload = _get_coverage(server, _CREIGIAU_BBOX)
+    entry = next(e for e in payload["sources"] if e["id"] == "lidar_cardiff")
+    assert entry["coverage"] == "none"
+
+
+def test_coverage_endpoint_flags_exactly_the_two_heavy_one_time_sources(
+    server, tmp_path
+):
+    # os_uprn's 619 MB national address file and lidar_cardiff's 84 MB of
+    # archive zips are the only two downloads that cost anything unusual
+    # the first time. Everything else is ordinary, and the getattr
+    # default is what says so.
+    _register_real_coverage_sources(tmp_path)
+    _, payload = _get_coverage(server, _ST_FAGANS_BBOX)
+    heavy = {entry["id"] for entry in payload["sources"] if entry["heavy"]}
+    assert heavy == {"os_uprn", "lidar_cardiff"}
+
+
+def test_coverage_endpoint_rejects_a_missing_bbox(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _get(server, "/api/coverage")
+    assert excinfo.value.code == 400
+    message = json.loads(excinfo.value.read().decode("utf-8"))["error"]
+    assert "bbox" in message
+    assert "http" not in message.lower()
+
+
+def test_coverage_endpoint_rejects_a_malformed_bbox(server):
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _get_coverage(server, "not,a,bbox")
+    assert excinfo.value.code == 400
+    message = json.loads(excinfo.value.read().decode("utf-8"))["error"]
+    assert message
+    # The same no-URL rule every other message in this project keeps.
+    assert "http" not in message.lower()
+
+
+def test_coverage_endpoint_touches_no_network(server, tmp_path):
+    """Every real source in this call is built with a session that fails
+    the test on any use at all, and the call still answers.
+
+    This is the property the endpoint's whole design rests on: covers()
+    and detail() are disk-and-arithmetic only, so the browser can call
+    this on every change to a drawn rectangle rather than once behind a
+    button.
+    """
+    _register_real_coverage_sources(tmp_path)
+    status, payload = _get_coverage(server, _ST_FAGANS_BBOX)
+    assert status == 200
+    assert len(payload["sources"]) == 4
 
 
 def test_categories_endpoint_requires_a_token(server):

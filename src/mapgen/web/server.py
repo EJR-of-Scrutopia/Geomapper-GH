@@ -335,6 +335,45 @@ def _survey_request(payload: dict) -> SurveyRequest:
     return request
 
 
+def _coverage_entry(source, bbox: BBox) -> dict[str, object]:
+    """One `/api/coverage` entry: what this source has to say about this
+    exact extent, with no network access whatsoever.
+
+    That last part is the whole reason this endpoint can exist. `covers()`
+    and `detail()` are documented in `sources/base.py` as disk-and-
+    arithmetic only, never a live lookup under any circumstance, which is
+    what makes it safe for the browser to call this on every change to a
+    drawn rectangle rather than once behind a button.
+
+    Every field is read the same defensive, optional-attribute way that
+    docstring prescribes, and each default says something true about a
+    source that omits it:
+
+      coverage  a source with no covers() at all serves everywhere, so
+                "full". osm, overture and elevation genuinely answer any
+                extent on earth and say so by not implementing it.
+      heavy     absent means the ordinary case, a source that costs no
+                more the first time than the tenth. Only os_uprn (619 MB
+                national address file) and lidar_cardiff (84 MB of
+                archive zips) set it.
+      detail    null when the source has no detail() or answers None for
+                this extent, which lidar_cardiff does for ground it does
+                not cover at all.
+
+    The order is `available_sources()`' own, the same order /api/sources
+    returns, so the browser can zip the two lists rather than matching on
+    id.
+    """
+    covers = getattr(source, "covers", None)
+    detail = getattr(source, "detail", None)
+    return {
+        "id": source.id,
+        "coverage": covers(bbox) if callable(covers) else "full",
+        "heavy": bool(getattr(source, "heavy_one_time", False)),
+        "detail": detail(bbox) if callable(detail) else None,
+    }
+
+
 def make_handler(
     manager: JobManager,
     token: str,
@@ -445,6 +484,20 @@ def make_handler(
                         }
                         for s in available_sources()
                     ],
+                )
+
+            if parsed.path == "/api/coverage":
+                raw_bbox = (query.get("bbox", [None])[0] or "").strip()
+                if not raw_bbox:
+                    return self._send_json(
+                        400, {"error": "bbox is required: west,south,east,north."}
+                    )
+                try:
+                    bbox = BBox.parse(raw_bbox)
+                except _REQUEST_VALUE_ERRORS as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                return self._send_json(
+                    200, {"sources": [_coverage_entry(s, bbox) for s in available_sources()]}
                 )
 
             if parsed.path == "/api/categories":

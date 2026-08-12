@@ -389,6 +389,17 @@ def _write_work_part(shard_dir: Path, extent: tuple[float, float, float, float],
 class OsUprnSource:
     id = "os_uprn"
     display_name = "Addresses (OS Open UPRN, GB)"
+    # The one-time cost this source's first ever use imposes: the 619 MB
+    # national address file (UPRN_BYTES_ONE_TIME), downloaded and sharded
+    # once and then answering for every later survey anywhere in GB. Read
+    # by the browser through /api/coverage the same defensive,
+    # optional-attribute way `sources/base.py` documents for every other
+    # source-specific extension (getattr(source, "heavy_one_time",
+    # False)), so the interface can auto-select every covering source
+    # while still flagging the two that are not free the first time. Only
+    # this source and lidar_cardiff.py set it; the getattr default
+    # answers for the rest.
+    heavy_one_time = True
     licence = "Open Government Licence v3.0"
     attribution = "Contains OS data © Crown copyright and database right [year]"
     requires_api_key = False
