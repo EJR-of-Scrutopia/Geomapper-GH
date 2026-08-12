@@ -262,6 +262,7 @@ from mapgen.fsutil import atomic_write_text, ensure_dir
 from mapgen.geo import BBox, Tile
 from mapgen.geotiff_write import write_bng_geotiff
 from mapgen.jobs import CancelToken
+from mapgen.os_shards import _MAX_EASTING, _MAX_NORTHING
 from mapgen.sources.base import (
     FAILURE_UNKNOWN,
     FAILURE_UNREACHABLE,
@@ -309,12 +310,6 @@ COVERAGE_TILES: tuple[tuple[float, float, float, float], ...] = (
     (312000.0, 177000.0, 312500.0, 177500.0),  # ST1277SW
 )
 
-# Fast membership test for covers()'s own lattice comparison. A plain set
-# rather than anything geometric: every element is already a 500 m
-# lattice cell in the exact same (e_min, n_min, e_max, n_max) shape
-# _touched_lattice_cells produces, so membership is the whole test.
-_COVERAGE_SET = frozenset(COVERAGE_TILES)
-
 # The bounding rectangle of the union of COVERAGE_TILES: 2000 x 1500 m,
 # (310500, 176500) to (312500, 178000). NOT the coverage footprint itself
 # (see the module docstring: the footprint has two missing corners inside
@@ -334,6 +329,21 @@ _ENVELOPE = (
 # the raster's own pixel size, and they happen to both come from the same
 # survey convention.
 _LATTICE_CELL_METRES = 500.0
+
+# The same ten tiles, as integer (column, row) lattice indices rather
+# than float bounds: `tile_e_min // 500 == column`, `tile_n_min // 500 ==
+# row`, exact because every COVERAGE_TILES edge already sits on the 500 m
+# lattice (this module's own "500 m lattice" section). covers() below
+# tests each of these ten fixed index pairs against the padded extent's
+# own touched-index RANGE directly, ten overlap comparisons, rather than
+# building _touched_lattice_cells' own list and intersecting it: see
+# covers()'s own docstring, "Fixed 2026-08-12", for why that list is the
+# one thing this module can never afford to build for an extent it does
+# not already trust.
+_COVERAGE_INDEX_SET = frozenset(
+    (int(e_min // _LATTICE_CELL_METRES), int(n_min // _LATTICE_CELL_METRES))
+    for e_min, n_min, _e_max, _n_max in COVERAGE_TILES
+)
 
 # The two zips, verbatim (probe-report.md, live 2026-08-08 against
 # lle.blob.core.windows.net). Sizes are exact Content-Length answers on
@@ -514,12 +524,24 @@ def _cache_is_warm(directory: Path) -> bool:
     )
 
 
-def _touched_lattice_cells(
+def _lattice_index_bounds(
     e_min: float, n_min: float, e_max: float, n_max: float
-) -> list[tuple[float, float, float, float]]:
-    """Every 500 m lattice cell the half-open rectangle
-    `[e_min, e_max) x [n_min, n_max)` touches, as
-    `(cell_e_min, cell_n_min, cell_e_max, cell_n_max)`.
+) -> tuple[int, int, int, int]:
+    """`(i_min, i_max, j_min, j_max)`: the inclusive column/row index
+    range of every 500 m lattice cell the half-open rectangle
+    `[e_min, e_max) x [n_min, n_max)` touches, column index `i` meaning
+    the cell spanning `[i * 500, (i + 1) * 500)`, row index `j` meaning
+    `[j * 500, (j + 1) * 500)` in northing.
+
+    The one copy of this arithmetic: `_touched_lattice_cells` below turns
+    it into the explicit list of cells for the handful of small, trusted
+    extents this module's own tests build; `covers()` uses the same four
+    numbers directly, as a COUNT (`i_max - i_min + 1` times `j_max -
+    j_min + 1`), for an extent it does not get to assume is small (see
+    `covers()`'s own docstring, "Fixed 2026-08-12"). Two independent
+    copies of `math.ceil(...) - 1` on the far edge would be exactly the
+    kind of second, driftable spelling this module's own docstring
+    otherwise refuses to carry.
 
     The lattice is aligned to plain multiples of 500 from grid zero, the
     same alignment every `COVERAGE_TILES` envelope already sits on (see
@@ -535,9 +557,31 @@ def _touched_lattice_cells(
     i_max = math.ceil(e_max / _LATTICE_CELL_METRES) - 1
     j_min = math.floor(n_min / _LATTICE_CELL_METRES)
     j_max = math.ceil(n_max / _LATTICE_CELL_METRES) - 1
+    return int(i_min), int(i_max), int(j_min), int(j_max)
+
+
+def _touched_lattice_cells(
+    e_min: float, n_min: float, e_max: float, n_max: float
+) -> list[tuple[float, float, float, float]]:
+    """Every 500 m lattice cell the half-open rectangle
+    `[e_min, e_max) x [n_min, n_max)` touches, as
+    `(cell_e_min, cell_n_min, cell_e_max, cell_n_max)`.
+
+    A testing and reference utility only, since the 2026-08-12 fix below:
+    `covers()` no longer calls this. Building the explicit list is exact
+    but its own size grows with the extent, unbounded, which is exactly
+    what made the padded extent from a pathological bbox (antimeridian-
+    normalised, reversed corners, or simply enormous) run this into
+    billions of entries and a `MemoryError` on a live survey machine (see
+    `covers()`'s own docstring for the fix). Safe to call directly with a
+    small, trusted extent, which is all this module's own tests ever
+    hand it; never call this with an extent taken from a request this
+    module does not already trust to be reasonably sized.
+    """
+    i_min, i_max, j_min, j_max = _lattice_index_bounds(e_min, n_min, e_max, n_max)
     cells: list[tuple[float, float, float, float]] = []
-    for i in range(int(i_min), int(i_max) + 1):
-        for j in range(int(j_min), int(j_max) + 1):
+    for i in range(i_min, i_max + 1):
+        for j in range(j_min, j_max + 1):
             cells.append(
                 (
                     i * _LATTICE_CELL_METRES,
@@ -547,6 +591,49 @@ def _touched_lattice_cells(
                 )
             )
     return cells
+
+
+def _clamp_to_grid_envelope(
+    e_min: float, n_min: float, e_max: float, n_max: float
+) -> tuple[float, float, float, float]:
+    """`(e_min, n_min, e_max, n_max)` clamped to the British National
+    Grid's own usable envelope, `0 <= easting < _MAX_EASTING` and
+    `0 <= northing < _MAX_NORTHING` (imported from `mapgen.os_shards`
+    rather than retyped: the identical bound that module's own
+    `_clamped_index_range` already clamps a 100 km or 10 km grid walk to,
+    for the identical reason given there, "no second, independently
+    typed spelling of the same fact" (see also `heights._percentile`,
+    imported the same way into `benchstats.py` and `canopy.py`).
+
+    Reached only from `covers()` below, and only to size the TOTAL
+    touched-cell count, never to decide whether any one of the ten
+    `COVERAGE_TILES` is touched: that test is ten fixed, tiny rectangles
+    compared against the extent directly, already O(1) at any extent
+    size, so it needs no clamp to stay cheap (see `covers()`'s own
+    docstring). The total count is the one number that would otherwise
+    grow with the extent itself; clamping it to Great Britain's own grid
+    keeps it a number that could ever mean something (at most a few
+    million cells, the whole country's own lattice) instead of an
+    arithmetically correct but meaningless count of ground this archive,
+    and this coordinate system, has no opinion about at all.
+
+    Every real survey extent already sits inside this envelope (the
+    National Grid covers the whole of Great Britain many times over
+    compared to any extent an owner draws), so this clamp is a genuine
+    no-op for every extent this module's own tests build and every
+    extent a real survey has ever drawn: it only ever changes anything
+    for the pathological shapes covers()'s own docstring names.
+
+    May return an EMPTY rectangle (`e_max <= e_min` or `n_max <= n_min`)
+    for an extent that misses the envelope entirely; the caller decides
+    what that means; see `covers()`'s own guard.
+    """
+    return (
+        max(e_min, 0.0),
+        max(n_min, 0.0),
+        min(e_max, float(_MAX_EASTING)),
+        min(n_max, float(_MAX_NORTHING)),
+    )
 
 
 def _window_pixels(bbox: BBox, ostn15_cache_dir: Path | None) -> int:
@@ -817,6 +904,50 @@ class LidarCardiffSource:
         enough for `lidar_wales.py`'s own `covers()` (that source's own
         coverage really is a solid rectangle; this one is not).
 
+        Fixed 2026-08-12: this used to build `_touched_lattice_cells`'
+        own list and filter it against the ten tiles, exact but
+        UNBOUNDED, and a pathological padded extent (an antimeridian-
+        normalised bbox; reversed corners fed straight to a `BBox` that
+        skips `.parse()`'s own sort; simply an enormous one) touches
+        billions of 500 m cells. A live verifier hit exactly that: 634
+        seconds and a `MemoryError` building the list, and `detail()`
+        (below), which calls this first, took the same process to 11.8 GB
+        before it was killed. `GET /api/coverage` calls `covers()` and
+        `detail()` on every registered source for every extent the
+        browser draws, so one bad rectangle hung the whole endpoint.
+
+        The fix answers the identical two questions without ever
+        building the list. "Does the extent touch tile N" is a single
+        rectangle overlap against tile N's own fixed, tiny bounds,
+        independent of how large the extent itself is; asking that ten
+        times, once per `COVERAGE_TILES` entry (`_COVERAGE_INDEX_SET`),
+        is the whole "covered" half, exact at the same lattice grain the
+        list-and-filter version was, because every entry already sits
+        one cell to a tile (see the module docstring's "500 m lattice"
+        section). "How many cells does the extent touch in total" is
+        `_lattice_index_bounds`' own four numbers multiplied together,
+        the identical index arithmetic `_touched_lattice_cells` turns
+        into an explicit list, read here as a COUNT instead: a
+        `covered == total` count comparison is exactly the `len(covered)
+        == len(touched)` comparison the old version made, just without
+        ever materialising either list. Both halves are O(1) in the size
+        of the extent: ten fixed comparisons, and four `floor`/`ceil`
+        calls on whatever `e_min`/`n_min`/`e_max`/`n_max` `best_effort_
+        padded_bng_extent` hands back, however far from Great Britain
+        they are.
+
+        `_clamp_to_grid_envelope` bounds the TOTAL count to Great
+        Britain's own National Grid before it is computed, a genuine
+        no-op for every real survey extent (see that function's own
+        docstring) and never applied to the ten-tile overlap test, which
+        needs no clamp to already be cheap. It does not change which of
+        "full"/"partial"/"none" this returns for any extent that reaches
+        it, including the pathological ones (an extent nonsensical
+        enough to need clamping is already so much larger than the ten-
+        tile block that `covered` can never equal a clamped `total`
+        either): it exists so the number this arithmetic works with stays
+        one that could mean something, not to change the answer.
+
         Never touches the network, matching every other `covers()` in
         this project: `best_effort_padded_bng_extent` reads a cached
         OSTN15 grid when one is already on disk and falls back to a
@@ -827,11 +958,35 @@ class LidarCardiffSource:
         e_min, n_min, e_max, n_max = best_effort_padded_bng_extent(
             bbox, PAD_METRES, cache_dir=self._ostn15_cache_dir
         )
-        touched = _touched_lattice_cells(e_min, n_min, e_max, n_max)
-        covered = [cell for cell in touched if cell in _COVERAGE_SET]
-        if not covered:
+        covered = sum(
+            1
+            for tile_i, tile_j in _COVERAGE_INDEX_SET
+            if tile_i * _LATTICE_CELL_METRES < e_max
+            and (tile_i + 1) * _LATTICE_CELL_METRES > e_min
+            and tile_j * _LATTICE_CELL_METRES < n_max
+            and (tile_j + 1) * _LATTICE_CELL_METRES > n_min
+        )
+        if covered == 0:
             return "none"
-        if len(covered) == len(touched):
+        grid_e_min, grid_n_min, grid_e_max, grid_n_max = _clamp_to_grid_envelope(
+            e_min, n_min, e_max, n_max
+        )
+        if grid_e_max <= grid_e_min or grid_n_max <= grid_n_min:
+            # Unreachable in practice: `covered > 0` already proves the
+            # extent overlaps ground well inside the grid envelope (every
+            # `COVERAGE_TILES` cell sits inside it), so the clamp can
+            # never empty out here. A guard rather than a trusted
+            # invariant regardless, the same instinct `merge()`'s own
+            # zero-width check on `_snapped_merge_window` follows for the
+            # identical reason: if two facts that should always agree
+            # ever stop agreeing, this returns an honest "partial" rather
+            # than dividing by, or ranging over, nothing.
+            return "partial"
+        i_min, i_max, j_min, j_max = _lattice_index_bounds(
+            grid_e_min, grid_n_min, grid_e_max, grid_n_max
+        )
+        total = (i_max - i_min + 1) * (j_max - j_min + 1)
+        if covered == total:
             return "full"
         return "partial"
 

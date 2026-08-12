@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import json
 import socket
+import time
+import tracemalloc
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -224,6 +226,114 @@ def test_covers_is_none_in_barry():
     source = LidarCardiffSource()
     barry_bbox = BBox.parse("-3.272,51.393,-3.268,51.397")
     assert source.covers(barry_bbox) == "none"
+
+
+# --------------------------------------------------------------------------
+# covers()/detail() on a pathological extent: bounded by time and by
+# memory, never by materialising the lattice.
+#
+# Fixed 2026-08-12. The old covers() built _touched_lattice_cells' own
+# list and filtered it; a live verifier fed it an antimeridian-normalised
+# extent and measured 634 seconds and a MemoryError, and detail() (which
+# calls covers() first) took the same process to 11.8 GB before it was
+# killed. A test that waited for the old failure would itself take 634
+# seconds to fail, so these assert boundedness directly instead: a wall-
+# clock budget, and tracemalloc's own peak, the same tool
+# test_os_downloads.py already uses to pin an unbounded-vs-bounded
+# allocation claim for a comparable fix.
+# --------------------------------------------------------------------------
+
+# A generous multiple of the sub-millisecond time every pathological case
+# below actually takes on this machine (measured directly, well under
+# 1 ms each), far short of the 634 seconds the bug this guards against
+# ran for. Generous rather than tight, so a slower CI machine never turns
+# this flaky: the point is proving "does not scale with the extent",
+# not pinning a speed.
+_PATHOLOGICAL_TIME_BUDGET_S = 2.0
+
+# A generous bound on tracemalloc's own peak: thousands of times the
+# roughly two kilobytes any of these three calls actually allocates
+# (measured directly), and many orders of magnitude under the gigabytes
+# the old, list-building covers() grew to for the identical extents.
+# Proves "never materialised the lattice" directly, rather than inferring
+# it from how fast the call returned.
+_PATHOLOGICAL_PEAK_BYTES_BUDGET = 5 * 1024 * 1024
+
+
+def _call_bounded(callable_, *args):
+    """Calls `callable_(*args)`, asserting it returns within
+    `_PATHOLOGICAL_TIME_BUDGET_S` and without `tracemalloc` ever
+    reporting a peak over `_PATHOLOGICAL_PEAK_BYTES_BUDGET`, and returns
+    the call's own result so a caller can still assert on the answer.
+    """
+    tracemalloc.start()
+    try:
+        start = time.perf_counter()
+        result = callable_(*args)
+        elapsed = time.perf_counter() - start
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert elapsed < _PATHOLOGICAL_TIME_BUDGET_S, (
+        f"took {elapsed:.3f}s; a bounded implementation must not scale "
+        f"with the extent at all"
+    )
+    assert peak < _PATHOLOGICAL_PEAK_BYTES_BUDGET, (
+        f"peaked at {peak} bytes; a bounded implementation must never "
+        f"materialise the lattice"
+    )
+    return result
+
+
+def test_covers_and_detail_on_antimeridian_normalised_extent_are_bounded(tmp_path):
+    # The verifier's own case: a bbox whose raw west/east straddle the
+    # antimeridian (179 to -179), which BBox.parse's plain sorted() reads
+    # as -179 to 179, a 358 degree span rather than the 2 degree sliver
+    # either raw value was probably meant to describe (this project's
+    # projection is not antimeridian-aware at all: see geo.py's own
+    # module docstring). Projected, the padded extent touches all ten
+    # covered tiles and billions of others: "partial" is the honest
+    # answer, not "full" or "none", and reaching it must never build the
+    # billions-strong list the old covers() did.
+    bbox = BBox.parse("179,-1,-179,1")
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    assert _call_bounded(source.covers, bbox) == "partial"
+    assert _call_bounded(source.detail, bbox) == (
+        "25 cm over part of this extent, flown 2011; "
+        "25 cm needs an extent under about 600 x 600 m here"
+    )
+
+
+def test_covers_and_detail_on_reversed_corners_extent_are_bounded(tmp_path):
+    # A BBox built with west/east the wrong way round, bypassing
+    # BBox.parse's own sort entirely: the same bare construction
+    # `_bbox_for_padded_bng_rect` above already uses to reach this module
+    # directly, so this is a real, reachable shape, not a contrived one.
+    # `best_effort_padded_bng_extent` takes min/max of the two PROJECTED
+    # corners regardless of which field held which raw value, so this is
+    # not a different code path from the sorted case, only a different
+    # way of arriving at one: still nowhere near the coverage block once
+    # projected, hence "none".
+    bbox = BBox(west=179.9, south=51.0, east=-179.9, north=52.0)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    assert _call_bounded(source.covers, bbox) == "none"
+    assert _call_bounded(source.detail, bbox) is None
+
+
+def test_covers_and_detail_on_globe_spanning_extent_are_bounded(tmp_path):
+    # The whole of longitude, a thin band of latitude either side of the
+    # equator (never the poles themselves: this projection's own
+    # cos(latitude) term collapses every longitude to nearly the same
+    # point AT a pole, which would hide rather than exercise the bug).
+    # Touches all ten covered tiles and, again, billions of cells that
+    # are not.
+    bbox = BBox(west=-180.0, south=-1.0, east=180.0, north=1.0)
+    source = LidarCardiffSource(ostn15_cache_dir=tmp_path)
+    assert _call_bounded(source.covers, bbox) == "partial"
+    assert _call_bounded(source.detail, bbox) == (
+        "25 cm over part of this extent, flown 2011; "
+        "25 cm needs an extent under about 600 x 600 m here"
+    )
 
 
 # --------------------------------------------------------------------------
