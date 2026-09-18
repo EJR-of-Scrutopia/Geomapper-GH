@@ -9610,6 +9610,11 @@ function ok(condition, message) {
     ok(html.includes("1 tile (1 x 1)"), `expected "1 tile (1 x 1)": ${html}`);
   });
 
+  await test("the tier list names the constraints category in words", async () => {
+    const { sandbox } = await bootedSandbox();
+    ok(sandbox.tierCategoryLabel("constraints") === "planning constraints", sandbox.tierCategoryLabel("constraints"));
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );

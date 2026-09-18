@@ -155,6 +155,7 @@ CATEGORIES = (
     "land_use",
     "water",
     "places",
+    "constraints",
 )
 
 # (category, source_id) -> role, for the entries whose role is a fact

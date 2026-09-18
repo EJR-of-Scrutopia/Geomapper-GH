@@ -278,6 +278,16 @@ fixed sentence `derived from map overlay, indicative`, is what
 the category is mapgen's own sampled guess at what sits inside HM Land
 Registry's geometry, not a second fact HM Land Registry itself supplied.
 
+## The planning constraints files: filtering by where and designation
+
+`<stem>_constraints_*.geojson` import through Import Geojson File like
+the other GeoJSON layers. Filter on key `where`, value `site` for what
+the drawn site itself touches, or `margin` for the 250 m around it; or
+on key `designation` (for example `Conservation area`, `Flood zone,
+rivers`, `Scheduled monument`). Listed buildings are points in their own
+file. Geometry is clipped to the site plus its margin, so a designation
+that runs far beyond the site stops at the margin's edge.
+
 ## Roof massing in Grasshopper
 
 `<stem>_roof_massing.geojson` (phase 2b item B, `src/mapgen/roofs.py`) is

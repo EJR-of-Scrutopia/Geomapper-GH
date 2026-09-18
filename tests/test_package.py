@@ -1758,8 +1758,8 @@ def test_register_default_sources_registers_the_five_default_sources():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_cardiff", "lidar_wales", "os_open", "os_uprn",
-        "osm", "overture",
+        "constraints_wales", "elevation", "inspire", "lidar_cardiff", "lidar_wales",
+        "os_open", "os_uprn", "osm", "overture",
     ]
 
 
@@ -1771,8 +1771,8 @@ def test_register_default_sources_called_twice_is_a_no_op():
     from mapgen.sources.base import available_sources
 
     assert sorted(s.id for s in available_sources()) == [
-        "elevation", "inspire", "lidar_cardiff", "lidar_wales", "os_open", "os_uprn",
-        "osm", "overture",
+        "constraints_wales", "elevation", "inspire", "lidar_cardiff", "lidar_wales",
+        "os_open", "os_uprn", "osm", "overture",
     ]
 
 
@@ -8653,3 +8653,46 @@ def test_lidar_cardiff_merges_through_the_real_run_survey_pipeline(tmp_path, mon
     dtm_window = read_full_window(CogReader.open(FileByteSource(dtm_output)))
     assert dsm_window.sample_bng(311151.0, 177151.0) == pytest.approx(123.456)
     assert dtm_window.sample_bng(311151.0, 177151.0) == pytest.approx(100.0)
+
+
+from mapgen.package import register_default_sources  # noqa: E402
+from mapgen.sources.base import available_sources  # noqa: E402
+from mapgen.sources.constraints_wales import ConstraintsWalesSource  # noqa: E402
+
+
+class _EmptyWfsSession:
+    """Every DataMapWales layer answers an empty FeatureCollection."""
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        class _Response:
+            status_code = 200
+
+            def json(self):
+                return {"type": "FeatureCollection", "features": [], "numberMatched": 0}
+
+        return _Response()
+
+
+def test_constraints_wales_is_a_default_source():
+    register_default_sources()
+    assert "constraints_wales" in {source.id for source in available_sources()}
+
+
+def test_a_survey_with_constraints_carries_the_record_and_the_summary(tmp_path):
+    register(ConstraintsWalesSource(session=_EmptyWfsSession()))
+    result = run_survey(_request(tmp_path, source_ids=("constraints_wales",)))
+    survey = json.loads((result.paths.root / "survey.json").read_text(encoding="utf-8"))
+    record = survey["constraints"]
+    assert record["checked"] is True
+    assert len(record["none_found"]) == 20
+    assert (result.paths.root / record["summary_file"]).is_file()
+    provenance = next(entry for entry in survey["sources"] if entry["id"] == "constraints_wales")
+    assert "Natural Resources Wales" in provenance["attribution"]
+
+
+def test_a_survey_without_constraints_says_not_checked(tmp_path):
+    register(StubSource())
+    result = run_survey(_request(tmp_path))
+    survey = json.loads((result.paths.root / "survey.json").read_text(encoding="utf-8"))
+    assert survey["constraints"]["checked"] is False
+    assert survey["constraints"]["summary_file"] is None

@@ -2851,6 +2851,7 @@ const TIER_CATEGORY_LABELS = {
   land: "woodland and water",
   sites: "functional sites",
   places: "place names",
+  constraints: "planning constraints",
 };
 
 function tierCategoryLabel(category) {

@@ -704,6 +704,28 @@ Each file:
   own, so raw tiles fetched under an old selection are never mistaken for
   the new one's.
 
+### Planning constraints (Wales)
+
+A survey whose extent is in Wales also checks twenty Welsh planning
+designation layers from DataMapWales over the site and a 250 m margin
+around it, and writes:
+
+- `<stem>_constraints_flood.geojson`, `_nature`, `_landscape`,
+  `_heritage` (areas and scheduled monuments) and `_listed_buildings`
+  (points), each only when it has something in it. Every feature carries
+  `designation`, `name`, `grade_or_zone`, `reference`, `where` (`site` or
+  `margin`) and `source`.
+- `<stem>_constraints.txt`, a short summary under four headings: On the
+  site, Within 250 m, Checked and none found, Not checked. Areas are
+  given as a share of the site, listed buildings are counted by grade,
+  and every source's attribution statement follows word for word.
+
+It is indicative, from open data, and says so: confirm with the council.
+Coal mining risk and Tree Preservation Orders are not in any open Welsh
+service and are listed as not checked. A layer that did not answer is
+listed as not checked, never as none found. The same facts are in
+survey.json under `constraints`.
+
 ### survey.json
 
 The audit trail. If this data ends up informing real project work, being able
@@ -854,6 +876,13 @@ extract to stay under an ODbL-compatible licence. See
 [Overture Maps licensing page](https://overturemaps.org/documentation/attribution/)
 for the current, authoritative text; the table above is a working summary,
 not a substitute for reading either.
+
+The planning constraints layers are DataMapWales services from Natural
+Resources Wales, Cadw and the Welsh Government, all under the Open
+Government Licence v3.0. Their attribution statements differ by
+publisher; the package's `<stem>_constraints.txt` reproduces each one
+that applies, word for word, with Cadw's date filled in as the date the
+data was fetched.
 
 ## Limits worth knowing about
 

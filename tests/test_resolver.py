@@ -240,6 +240,7 @@ def test_categories_is_the_fourteen_in_spec_order():
         "land_use",
         "water",
         "places",
+        "constraints",
     )
 
 

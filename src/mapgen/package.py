@@ -98,6 +98,7 @@ from mapgen.sources.inspire import BOUNDARY_INDICATIVE_NOTE, InspireSource
 from mapgen.sources.lidar_cardiff import LidarCardiffSource
 from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.os_open import OsOpenSource
+from mapgen.sources.constraints_wales import ConstraintsWalesSource
 from mapgen.sources.os_uprn import OsUprnSource
 from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
@@ -397,7 +398,7 @@ def register_default_sources() -> None:
     by_id = {source.id: source for source in available_sources()}
     for source in (
         OsmSource(), OvertureSource(), ElevationSource(), LidarWalesSource(), InspireSource(),
-        OsOpenSource(), OsUprnSource(), LidarCardiffSource(),
+        OsOpenSource(), OsUprnSource(), LidarCardiffSource(), ConstraintsWalesSource(),
     ):
         existing = by_id.get(source.id)
         if existing is not None and type(existing) is type(source):
@@ -2097,6 +2098,21 @@ def _canopy_record(**overrides) -> dict[str, object]:
     """
     record: dict[str, object] = {
         "points": None, "skipped_small": None, "resolution_m": None, "error": None,
+    }
+    record.update(overrides)
+    return record
+
+
+def _constraints_record(**overrides) -> dict[str, object]:
+    """survey.json's `constraints` block for a package whose constraints
+    source never merged: `checked` False, every list empty, everything
+    else None, so a reader can tell "not checked" from "checked, nothing
+    found" (which has `checked` True and a none_found list)."""
+    record: dict[str, object] = {
+        "checked": False, "fetched_on": None, "margin_m": None, "coverage": None,
+        "coverage_share": None, "councils": [], "authority": None, "on_site": [],
+        "margin": [], "none_found": [], "not_checked": [], "layers": {},
+        "skipped_geometry": None, "summary_file": None,
     }
     record.update(overrides)
     return record
@@ -4913,6 +4929,10 @@ def _build_survey_json(
     boundaries_categories = boundaries_categories or _categories_record()
     roof_forms = roof_forms or _roofs_record()
     canopy = canopy or _canopy_record()
+    constraints_source = next(
+        (source for source in sources if getattr(source, "id", None) == "constraints_wales"), None
+    )
+    constraints = getattr(constraints_source, "constraints_record", None) or _constraints_record()
     verified = verified or {
         "checked": 0, "ok": 0, "failed": 0, "pending": 0,
         "corrections": [], "failures": [],
@@ -5200,6 +5220,10 @@ def _build_survey_json(
         # above the 3 m floor, the identical zero-means-ran discipline
         # `build_canopy` itself already keeps.
         "canopy": canopy,
+        # Planning constraints (phase 2 item 4): the constraints source's
+        # own record when it merged, else `checked: False`; see
+        # `_constraints_record` and mapgen.constraints.to_record.
+        "constraints": constraints,
         # Task 5 of the INSPIRE curves plan. Same None-vs-0 discipline as
         # `lidar_heights` immediately above: `written` is None, not 0,
         # on a package this step never ran on at all (no `.osm`, or no
