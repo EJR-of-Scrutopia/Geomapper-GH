@@ -1,0 +1,247 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12245",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.46223308,
+      51.4561017
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13144,
+    "Name": "Church of St John the Baptist",
+    "Grade": "I"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12246",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.4613123,
+      51.45566357
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13145,
+    "Name": "Roadside Cross",
+    "Grade": "II"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12247",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.45639116,
+      51.45751427
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13146,
+    "Name": "St Quintin's Castle (Llanblethian Castle)",
+    "Grade": "II*"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12277",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.45136597,
+      51.46154214
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13181,
+    "Name": "Town Walls",
+    "Grade": "II*"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12278",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.44985411,
+      51.46171723
+     ],
+     [
+      -3.4498088,
+      51.46176472
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13182,
+    "Name": "6 & 7 Church Street",
+    "Grade": "II"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12279",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.45050445,
+      51.46115715
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13183,
+    "Name": "South Gate (Porth y Felin)",
+    "Grade": "II*"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12280",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.45038763,
+      51.46110465
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13184,
+    "Name": "The Boot House at Grammar School",
+    "Grade": "II"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12281",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.45018988,
+      51.46122399
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13185,
+    "Name": "Cowbridge Grammar School",
+    "Grade": "II*"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12282",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.44969908,
+      51.46163471
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13186,
+    "Name": "Gate Piers & End Piers, Walls, Railings & Gates at W Entrance to Churchyard",
+    "Grade": "II"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12283",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.44953168,
+      51.46134903
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13187,
+    "Name": "Church of the Holy Cross",
+    "Grade": "I"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12284",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.4491047,
+      51.46104858
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13188,
+    "Name": "S, SE & NW Churchyard Walls",
+    "Grade": "II"
+   }
+  },
+  {
+   "type": "Feature",
+   "id": "Cadw_ListedBuildings.12285",
+   "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+     [
+      -3.44444901,
+      51.46085426
+     ]
+    ]
+   },
+   "geometry_name": "geom",
+   "properties": {
+    "RecordNumber": 13190,
+    "Name": "71 & 73 Eastgate",
+    "Grade": "II"
+   }
+  }
+ ],
+ "totalFeatures": 91,
+ "numberMatched": 12,
+ "numberReturned": 12,
+ "timeStamp": "2026-09-18T22:49:25.556Z",
+ "crs": {
+  "type": "name",
+  "properties": {
+   "name": "urn:ogc:def:crs:EPSG::4326"
+  }
+ }
+}
