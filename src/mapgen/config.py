@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import warnings
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mapgen.elevation_models import DEFAULT_DEMTYPE
@@ -167,6 +168,22 @@ def load_config(path: Path | None = None) -> Config:
     return Config(**known)
 
 
+def _is_readable_config(target: Path) -> bool:
+    try:
+        return isinstance(json.loads(target.read_text(encoding="utf-8")), dict)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
 def save_config(config: Config, path: Path | None = None) -> None:
+    """Writes `config` to `path`, first moving aside an existing file that
+    load_config could not read. PUT /api/config loads (every default, for
+    such a file) and then saves, so without this one settings change in
+    the picker would silently destroy a hand-edited file and whatever it
+    held. The copy sits beside it as config.json.unreadable-<UTC time>.
+    """
     target = path or CONFIG_PATH
+    if target.exists() and not _is_readable_config(target):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target.replace(target.with_name(f"{target.name}.unreadable-{stamp}"))
     atomic_write_text(target, json.dumps(asdict(config), indent=2))

@@ -36,6 +36,28 @@ def test_a_config_that_is_not_json_says_so_rather_than_resetting_silently(tmp_pa
     assert loaded.output_root == Config().output_root
 
 
+def test_saving_over_an_unreadable_config_keeps_a_copy_of_it(tmp_path):
+    # PUT /api/config loads (defaults, since the file will not parse) and
+    # then saves, so without a copy one settings change in the picker
+    # would destroy a hand-edited file, API key and all.
+    target = tmp_path / "config.json"
+    original = r'{"output_root": "C:\Surveys", "opentopography_api_key": "abc123"}'
+    target.write_text(original, encoding="utf-8")
+    save_config(Config(theme="dark"), target)
+    copies = list(tmp_path.glob("config.json.unreadable-*"))
+    assert len(copies) == 1, copies
+    assert copies[0].read_text(encoding="utf-8") == original
+    assert load_config(target).theme == "dark"
+
+
+def test_saving_over_a_readable_config_keeps_no_copy(tmp_path):
+    target = tmp_path / "config.json"
+    save_config(Config(theme="dark"), target)
+    save_config(Config(theme="light"), target)
+    assert list(tmp_path.glob("config.json.unreadable-*")) == []
+    assert load_config(target).theme == "light"
+
+
 def test_a_config_that_is_json_but_not_an_object_says_so(tmp_path):
     target = tmp_path / "config.json"
     target.write_text("[1, 2, 3]", encoding="utf-8")
