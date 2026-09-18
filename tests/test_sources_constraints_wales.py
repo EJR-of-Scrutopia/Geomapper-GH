@@ -87,7 +87,8 @@ def test_one_request_per_layer_in_table_order_with_the_verified_shape(tmp_path):
     assert call["params"]["outputFormat"] == "application/json"
     # lon,lat order: the verified trap is that lat,lon silently returns nothing.
     assert call["params"]["bbox"] == f"{west},{south},{east},{north},EPSG:4326"
-    assert call["params"]["startIndex"] == "0"
+    # A keyless DataMapWales table answers 400 to any startIndex.
+    assert "startIndex" not in call["params"]
     assert call["headers"]["User-Agent"] == USER_AGENT
     assert call["timeout"] == REQUEST_TIMEOUT_SECONDS
 
@@ -98,7 +99,7 @@ def test_a_full_page_asks_for_the_next(tmp_path, monkeypatch):
     session = _RoutedSession({"inspire-wg:Cadw_ListedBuildings": [_collection([point, point], matched=3), _collection([point], matched=3)]})
     ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
     listed = [c for c in session.calls if c["params"]["typeNames"] == "inspire-wg:Cadw_ListedBuildings"]
-    assert [c["params"]["startIndex"] for c in listed] == ["0", "2"]
+    assert [c["params"].get("startIndex") for c in listed] == [None, "2"]
     rows = [json.loads(line) for line in (tmp_path / WORK_FEATURES).read_text(encoding="utf-8").splitlines()]
     assert len(next(r for r in rows if r["type_name"] == "inspire-wg:Cadw_ListedBuildings")["features"]) == 3
 
@@ -268,6 +269,29 @@ def test_merge_with_no_work_files_clears_earlier_records(tmp_path):
     source.merge([], out, "Again_2026-09-18")
     assert source.constraints_record is None
     assert source.attribution == ConstraintsWalesSource.attribution
+
+
+def test_a_table_with_no_primary_key_is_never_sent_a_start_index(tmp_path):
+    """GeoServer answers HTTP 400 'Cannot do natural order without a primary
+    key' whenever a request carries startIndex to a table with no primary key.
+    This test ensures we never send startIndex on the first page."""
+    class _NoStartIndexOnFirstPage(_RoutedSession):
+        def get(self, url, params=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "params": dict(params or {}), "headers": dict(headers or {}), "timeout": timeout})
+            if "startIndex" in params:
+                return _Response(status_code=400, text="")
+            answer = self.answers.get(params["typeNames"], _collection())
+            if isinstance(answer, list):
+                answer = answer.pop(0) if len(answer) > 1 else answer[0]
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+    session = _NoStartIndexOnFirstPage()
+    source = ConstraintsWalesSource(session=session)
+    source.fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    rows = {r["type_name"]: r for r in (json.loads(l) for l in (tmp_path / WORK_FEATURES).read_text(encoding="utf-8").splitlines())}
+    assert all(row["ok"] for row in rows.values())
 
 
 @pytest.mark.live

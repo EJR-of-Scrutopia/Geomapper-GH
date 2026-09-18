@@ -5,9 +5,11 @@ The spec is docs/superpowers/specs/2026-09-18-mapgen-planning-
 constraints-wales-design.md. This module fetches and writes; every
 decision about a feature is mapgen.constraints'.
 
-One WFS 2.0 GetFeature per layer, one at a time, in table order. Two
+One WFS 2.0 GetFeature per layer, one at a time, in table order. Three
 traps verified live: without srsName GeoServer answers in EPSG:27700,
-and the bbox must be lon,lat order (lat,lon returns nothing, silently).
+the bbox must be lon,lat order (lat,lon returns nothing, silently), and
+startIndex on a table with no primary key answers HTTP 400; therefore we
+omit it on the first page and send it only from the second page on.
 A layer that fails is tried once more after the others; if it fails
 again it is reported as not checked, never as none found, and the run
 carries on. Only when every layer fails does this source record
@@ -125,8 +127,10 @@ class ConstraintsWalesSource:
             "srsName": "EPSG:4326",
             "bbox": f"{padded[0]},{padded[1]},{padded[2]},{padded[3]},EPSG:4326",
             "count": str(PAGE_SIZE),
-            "startIndex": str(start),
         }
+        # GeoServer answers HTTP 400 to startIndex on a table with no primary key.
+        if start:
+            params["startIndex"] = str(start)
         try:
             response = self.session.get(
                 WFS_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT_SECONDS
