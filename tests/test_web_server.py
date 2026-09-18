@@ -888,6 +888,19 @@ def test_index_is_served_without_a_token(server):
         assert b"<html" in response.read().lower()
 
 
+def test_the_page_names_a_tab_icon_the_server_actually_serves(server):
+    # Every browser asks for an icon, and with none named it asked for
+    # /favicon.ico and got a 404 on every load.
+    with urllib.request.urlopen(f"{server}/", timeout=10) as response:
+        page = response.read().decode("utf-8")
+    match = re.search(r'<link rel="icon" href="([^"]+)"', page)
+    assert match, "expected the page to name its own icon"
+    with urllib.request.urlopen(f"{server}/{match.group(1)}", timeout=10) as response:
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "image/svg+xml"
+        assert b"<svg" in response.read()
+
+
 def test_static_path_traversal_is_rejected(server):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         urllib.request.urlopen(f"{server}/../pyproject.toml", timeout=10)
@@ -2132,7 +2145,9 @@ def test_build_server_wires_a_real_nominatim_client_by_default():
 # www.openstreetmap.org is a link the viewer may follow, never something
 # the page fetches: the basemap attribution must link "OpenStreetMap" to
 # its copyright page under both the tile policy and the ODbL.
-_ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org", "www.openstreetmap.org"}
+# www.w3.org is the SVG namespace name favicon.svg must declare, an
+# identifier no browser ever requests.
+_ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org", "www.openstreetmap.org", "www.w3.org"}
 # Matches a URL host after "http(s)://" anywhere in the text (deliberately
 # unanchored: this is what already catches a form action, a CSS url(...),
 # or an ES import, none of which need their own special case, simply
