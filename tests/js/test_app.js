@@ -9346,6 +9346,47 @@ function ok(condition, message) {
     ok(/background:\s*var\(--paper\)/.test(rule), `expected the panel's own background: ${rule}`);
   });
 
+  // =======================================================================
+  // Categories fold away under a one-line count, like the layers do
+  // =======================================================================
+  //
+  // Fifteen always-ticked checkboxes were most of the panel's height. The
+  // owner's rule for the layers applies here too: say that everything is
+  // captured, and keep the override one click away. The count is what
+  // stops a folded list hiding an unticked box.
+
+  await test("the category checkboxes sit inside a collapsed section under their legend", () => {
+    const legend = INDEX_HTML_MARKUP.indexOf("<legend>Categories</legend>");
+    const boxes = INDEX_HTML_MARKUP.indexOf('id="categories"');
+    const opens = INDEX_HTML_MARKUP.lastIndexOf("<details", boxes);
+    ok(legend !== -1 && boxes !== -1, "expected the Categories legend and #categories");
+    ok(legend < opens && opens < boxes, "expected a <details> opened between the legend and #categories");
+    ok(!INDEX_HTML_MARKUP.slice(opens, boxes).includes("</details>"), "expected #categories inside that <details>");
+    ok(!/<details[^>]*\bopen\b/.test(INDEX_HTML_MARKUP.slice(opens, boxes)), "expected it collapsed by default");
+  });
+
+  await test("the count says everything is captured when every category is ticked", async () => {
+    const { sandbox } = await bootedSandbox();
+    const text = sandbox.document.getElementById("categories-summary").textContent;
+    ok(text === "All 3 captured", `got ${JSON.stringify(text)}`);
+  });
+
+  await test("unticking a category changes the count, so a folded list hides nothing", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.document.querySelectorAll("#categories input")[0].checked = false;
+    sandbox.document.getElementById("categories").fire("change");
+    const text = sandbox.document.getElementById("categories-summary").textContent;
+    ok(text === "2 of 3 captured", `got ${JSON.stringify(text)}`);
+  });
+
+  await test("Keep intermediate tiles moved into the layers' Advanced section", () => {
+    const advanced = INDEX_HTML_MARKUP.indexOf('<details class="advanced">');
+    const end = INDEX_HTML_MARKUP.indexOf("</details>", advanced);
+    const keep = INDEX_HTML_MARKUP.indexOf('id="keep-work"');
+    ok(keep !== -1, "expected the checkbox kept, not removed");
+    ok(advanced < keep && keep < end, "expected it inside the first Advanced section");
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );

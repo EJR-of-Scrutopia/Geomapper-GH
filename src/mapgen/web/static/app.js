@@ -4093,6 +4093,16 @@ function renderCategories(groups) {
       return `<div class="category-group-label">${escapeHtml(group.label)}</div>${children}`;
     })
     .join("");
+  renderCategorySummary();
+}
+
+// The one line shown while the checkboxes are folded away. It names the
+// count whenever anything is unticked, so the fold never hides a choice.
+function renderCategorySummary() {
+  const boxes = [...document.querySelectorAll("#categories input")];
+  const ticked = boxes.filter((box) => box.checked).length;
+  $("categories-summary").textContent =
+    ticked === boxes.length ? `All ${boxes.length} captured` : `${ticked} of ${boxes.length} captured`;
 }
 
 // Task 21, defect 2: a saved key and an unsaved one both render as the
@@ -4196,6 +4206,7 @@ function renderApiKeys(sources, config) {
 
     const categories = await api("/api/categories");
     renderCategories(categories);
+    $("categories").addEventListener("change", renderCategorySummary);
     $("categories").addEventListener("change", refreshEstimate);
   } catch (error) {
     // Without this, a wrong or stale token throws on the very first await

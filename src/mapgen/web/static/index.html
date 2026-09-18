@@ -198,18 +198,28 @@
               the move.
             -->
             <div id="tier-list" class="tier-list" hidden></div>
+            <label class="checkbox">
+              <input id="keep-work" type="checkbox" />
+              Keep intermediate tiles
+            </label>
           </details>
         </fieldset>
 
+        <!--
+          The layers' own rule, applied to categories: one line saying
+          everything is captured, the checkboxes one click away. Fifteen
+          always-ticked boxes were most of the panel's height. The count
+          reads "12 of 15" the moment anything is unticked, so a folded
+          list never hides a choice.
+        -->
         <fieldset>
           <legend>Categories</legend>
-          <div id="categories"></div>
+          <div id="categories-summary" class="coverage-all"></div>
+          <details class="advanced">
+            <summary>Choose</summary>
+            <div id="categories"></div>
+          </details>
         </fieldset>
-
-        <label class="checkbox">
-          <input id="keep-work" type="checkbox" />
-          Keep intermediate tiles
-        </label>
 
         <div id="estimate" class="estimate">Draw or paste an extent to see an estimate.</div>
 
