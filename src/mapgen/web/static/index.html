@@ -244,8 +244,16 @@
         </label>
         <button id="output-root-browse" type="button">Browse for a folder</button>
 
-        <button id="download" type="button" class="primary" disabled>Download package</button>
-        <button id="cancel" type="button" class="danger" hidden>Stop</button>
+        <!--
+          Sticky at the foot of the panel, so Download never needs a
+          scroll to find however long the panel above it grows. Only the
+          button row: a sticky estimate and destination would cover half
+          the panel on a laptop screen.
+        -->
+        <div class="panel-actions">
+          <button id="download" type="button" class="primary" disabled>Download package</button>
+          <button id="cancel" type="button" class="danger" hidden>Stop</button>
+        </div>
 
         <!--
           Task 27's note about a run that is longer than its estimate,

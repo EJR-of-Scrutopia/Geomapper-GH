@@ -9319,6 +9319,33 @@ function ok(condition, message) {
     );
   });
 
+  // =======================================================================
+  // Download stays in view however long the panel grows
+  // =======================================================================
+  //
+  // A 1300 px window put Download below fifteen category checkboxes, so
+  // the one action this page exists for needed a scroll to find. Only the
+  // button row sticks: the estimate and the destination above it stay in
+  // the flow, since a sticky block that tall would cover half the panel
+  // on a laptop screen.
+
+  await test("Download and Stop sit in the panel's sticky footer", () => {
+    const footer = INDEX_HTML_MARKUP.indexOf('class="panel-actions"');
+    const end = INDEX_HTML_MARKUP.indexOf("</div>", footer);
+    const download = INDEX_HTML_MARKUP.indexOf('id="download"');
+    const cancel = INDEX_HTML_MARKUP.indexOf('id="cancel"');
+    ok(footer !== -1, "expected a .panel-actions element in the markup");
+    ok(footer < download && download < end, "expected Download inside the footer");
+    ok(footer < cancel && cancel < end, "expected Stop inside the footer");
+  });
+
+  await test("the footer sticks to the panel's bottom and covers what scrolls under it", () => {
+    const rule = cssRule(".panel-actions");
+    ok(/position:\s*sticky/.test(rule), `expected position: sticky: ${rule}`);
+    ok(/bottom:\s*0/.test(rule), `expected bottom: 0: ${rule}`);
+    ok(/background:\s*var\(--paper\)/.test(rule), `expected the panel's own background: ${rule}`);
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );

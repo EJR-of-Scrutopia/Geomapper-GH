@@ -223,6 +223,22 @@ main {
   gap: 12px;
 }
 
+/* Download and Stop stay in view at the foot of the panel however long
+   what is above them grows. The negative side margins and matching
+   padding take the band's background to the pane's own edges, so nothing
+   scrolling under it shows at the sides. */
+.panel-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 -16px;
+  padding: 12px 16px;
+  background: var(--paper);
+  border-top: 1px solid var(--line);
+}
+
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
 
