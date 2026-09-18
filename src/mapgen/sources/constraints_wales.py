@@ -31,14 +31,19 @@ import requests
 
 from mapgen.cog import USER_AGENT
 from mapgen.constraints import (
+    LAYER_BY_TYPE,
     LAYERS,
     MARGIN_METRES,
+    OUTPUT_GROUPS,
     Layer,
     LayerResult,
     assess,
     attribution_statements,
+    group_collections,
     padded_rect,
+    render_text,
     summarise,
+    to_record,
 )
 from mapgen.fsutil import atomic_write_text
 from mapgen.geo import BBox, Tile
@@ -238,3 +243,55 @@ class ConstraintsWalesSource:
             progress.emit("constraint_on_site", line=entry["line"])
         progress.emit("tile_done", source=self.id, tile_id=WHOLE_AREA)
         return [features_path, meta_path]
+
+    def merge(self, parts: Sequence[Path], out_dir: Path, stem: str) -> list[Path]:
+        """Every package output, from the two work files: one GeoJSON per
+        group that has features, and the summary text, always. Sets
+        constraints_record (read by package.py into survey.json) and
+        attribution (only the groups whose layers answered, Cadw's date
+        substituted)."""
+        features_path = next((Path(p) for p in parts if Path(p).name == WORK_FEATURES), None)
+        meta_path = next((Path(p) for p in parts if Path(p).name == WORK_META), None)
+        if features_path is None or meta_path is None:
+            return []
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        results = []
+        for line in features_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            layer = LAYER_BY_TYPE.get(row["type_name"])
+            if layer is None:
+                continue
+            results.append(
+                LayerResult(layer=layer, ok=row["ok"], features=tuple(row["features"]), kind=row["kind"], reason=row["reason"])
+            )
+        site = tuple(meta["site"])
+        assessment = assess(site, results, meta["margin_m"])
+        summary = summarise(assessment, meta["councils"], meta["coverage"])
+        out_dir = Path(out_dir)
+        written: list[Path] = []
+        for group, collection in group_collections(assessment).items():
+            path = out_dir / f"{stem}_constraints_{group}.geojson"
+            atomic_write_text(path, json.dumps(collection, separators=(",", ":")))
+            written.append(path)
+        summary_path = out_dir / f"{stem}_constraints.txt"
+        atomic_write_text(summary_path, render_text(summary, stem, meta["fetched_on"], meta["margin_m"]))
+        written.append(summary_path)
+        self.constraints_record = to_record(
+            summary,
+            assessment,
+            councils=meta["councils"],
+            coverage=meta["coverage"],
+            coverage_share=meta["coverage_share"],
+            margin_m=meta["margin_m"],
+            summary_file=summary_path.name,
+            fetched_on=meta["fetched_on"],
+        )
+        self.attribution = "\n".join(attribution_statements(summary.attribution_groups, meta["fetched_on"]))
+        return written
+
+    def possible_outputs(self, stem: str) -> list[str]:
+        """Every root file merge() could ever write for this stem. Read by
+        package.py's stale-output sweep; see sources/base.py."""
+        return [f"{stem}_constraints_{group}.geojson" for group in OUTPUT_GROUPS] + [f"{stem}_constraints.txt"]

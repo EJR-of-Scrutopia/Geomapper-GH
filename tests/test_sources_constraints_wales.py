@@ -186,3 +186,71 @@ def test_covers_tier_detail_estimate_never_touch_the_network():
     assert source.detail(COWBRIDGE) == "Welsh designations as published, indicative"
     estimate = source.estimate(COWBRIDGE, _tiles())
     assert estimate.bytes_estimate == len(LAYERS) * constraints_wales.BYTES_PER_LAYER_ESTIMATE
+
+
+def _fetched(tmp_path, answers):
+    work = tmp_path / "work"
+    work.mkdir()
+    source = ConstraintsWalesSource(session=_RoutedSession(answers))
+    parts = source.fetch(COWBRIDGE, _tiles(), work, _Recorder())
+    out = tmp_path / "package"
+    out.mkdir()
+    return source, parts, out
+
+
+def test_merge_writes_only_groups_with_features_and_always_the_summary(tmp_path):
+    source, parts, out = _fetched(tmp_path, {
+        "geonode:conservation_areas_wales": _fixture("cowbridge_conservation_areas.json"),
+        "inspire-wg:Cadw_ListedBuildings": _fixture("cowbridge_listed_buildings.json"),
+    })
+    written = source.merge(parts, out, "Cowbridge_2026-09-18")
+    names = sorted(p.name for p in written)
+    assert names == [
+        "Cowbridge_2026-09-18_constraints.txt",
+        "Cowbridge_2026-09-18_constraints_heritage.geojson",
+        "Cowbridge_2026-09-18_constraints_listed_buildings.geojson",
+    ]
+    heritage = json.loads((out / "Cowbridge_2026-09-18_constraints_heritage.geojson").read_text(encoding="utf-8"))
+    assert {f["properties"]["name"] for f in heritage["features"]} >= {"Cowbridge"}
+    assert {f["properties"]["where"] for f in heritage["features"]} <= {"site", "margin"}
+
+
+def test_merge_summary_and_record(tmp_path):
+    source, parts, out = _fetched(tmp_path, {
+        "geonode:conservation_areas_wales": _fixture("cowbridge_conservation_areas.json"),
+        "inspire-nrw:NRW_SAC": requests.ConnectionError("down"),
+    })
+    source.merge(parts, out, "Cowbridge_2026-09-18")
+    text = (out / "Cowbridge_2026-09-18_constraints.txt").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    today = json.loads(parts[1].read_text(encoding="utf-8"))["fetched_on"]
+    assert "Confirm with the council (Vale of Glamorgan)." in text
+    assert "- Special Area of Conservation: DataMapWales could not be reached" in lines
+    # Never under "Checked, none found": the line after that heading.
+    assert "Special Area of Conservation" not in lines[lines.index("Checked, none found") + 1]
+    # Cadw's layers answered (found or not), so Cadw's statement is in
+    # Sources, carrying the fetch date.
+    assert f"The Welsh Historic Environment Service (Cadw), {today}," in text
+    record = source.constraints_record
+    assert record["checked"] is True
+    assert record["summary_file"] == "Cowbridge_2026-09-18_constraints.txt"
+    assert record["layers"]["inspire-nrw:NRW_SAC"]["status"] == "failed"
+    assert "Natural Resources Wales" in source.attribution
+    assert f"(Cadw), {today}," in source.attribution
+
+
+def test_merge_with_no_work_files_writes_nothing(tmp_path):
+    source = ConstraintsWalesSource(session=_RoutedSession())
+    assert source.merge([], tmp_path, "X_2026-09-18") == []
+    assert source.constraints_record is None
+
+
+def test_possible_outputs_is_the_closed_list():
+    assert ConstraintsWalesSource(session=_RoutedSession()).possible_outputs("S") == [
+        "S_constraints_flood.geojson",
+        "S_constraints_nature.geojson",
+        "S_constraints_landscape.geojson",
+        "S_constraints_heritage.geojson",
+        "S_constraints_listed_buildings.geojson",
+        "S_constraints.txt",
+    ]
