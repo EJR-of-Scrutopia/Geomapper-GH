@@ -147,7 +147,11 @@ over the extent padded by 250 m. Two verified traps: without
 `srsName`, GeoServer answers in EPSG:27700; and the bbox must be in
 lon,lat order (lat,lon returns nothing, silently). Paged with `count`
 and `startIndex` so a dense layer (485 surface-water polygons over
-Cowbridge alone) is never truncated; a layer whose total would pass a
+Cowbridge alone) is never truncated, with `startIndex` sent only from
+the second page on: a third trap, found by the live test on 2026-09-19,
+is that a table with no primary key (the Heritage Coast and World
+Heritage Site layers) answers HTTP 400 "Cannot do natural order without
+a primary key" to any request carrying `startIndex`, even zero; a layer whose total would pass a
 fixed ceiling of 20,000 features is recorded as failed rather than cut
 short. The shared descriptive User-Agent; the request timeout used by
 the other WFS callers. `cancel` is checked between layers.
