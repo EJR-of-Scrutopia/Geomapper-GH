@@ -265,6 +265,28 @@ def _sweep_stale_months(cache_dir: Path, name: str, keep: Path) -> None:
             candidate.unlink(missing_ok=True)
 
 
+_MONTH_STAMP_SHAPE = re.compile(r"\d{4}-\d{2}")
+
+
+def _sweep_older_months(cache_dir: Path, month: str) -> None:
+    """Deletes every authority's zip stamped with a month before `month`.
+
+    Owner ruling, 2026-09-18: "just clear the old ones out". Nothing ever
+    reads a month before the current one (a cache miss downloads this
+    month's copy, and a failed download raises rather than falling
+    back), so another authority's older zip is dead weight once the
+    month turns, whether or not that authority is surveyed again. Called
+    only once this month's copy is safely on disk, the same condition
+    `_sweep_stale_months` keeps. A file whose name does not end in a
+    month stamp is not one of this module's and is left alone, as is
+    every file of `month` itself or later.
+    """
+    for candidate in cache_dir.glob("*_*.zip"):
+        stamp = candidate.stem.rsplit("_", 1)[1]
+        if _MONTH_STAMP_SHAPE.fullmatch(stamp) and stamp < month:
+            candidate.unlink(missing_ok=True)
+
+
 def _resolve_inspire_cache_dir(cache_dir: Path | None) -> Path:
     """`cache_dir` if given, otherwise `_default_inspire_cache_dir()`: the
     one-line ternary `fetch_authority_zip` itself resolves, factored out so
@@ -359,7 +381,11 @@ def fetch_authority_zip(
 
     resolved_cache_dir = _resolve_inspire_cache_dir(cache_dir)
     cache_path = _authority_cache_path(name, resolved_cache_dir)
+    # Read off the path rather than the clock again, so a call that
+    # straddles midnight at a month's end cannot disagree with itself.
+    month = cache_path.stem.rsplit("_", 1)[1]
     if cache_path.exists():
+        _sweep_older_months(resolved_cache_dir, month)
         return cache_path
 
     ensure_dir(resolved_cache_dir)
@@ -403,6 +429,7 @@ def fetch_authority_zip(
         raise
 
     _sweep_stale_months(resolved_cache_dir, name, keep=cache_path)
+    _sweep_older_months(resolved_cache_dir, month)
     return cache_path
 
 

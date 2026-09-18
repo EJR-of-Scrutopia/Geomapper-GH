@@ -674,14 +674,46 @@ def test_fetch_authority_zip_never_sweeps_on_a_failed_download(tmp_path):
     assert stale.read_bytes() == b"old"
 
 
-def test_fetch_authority_zip_only_sweeps_the_same_authoritys_own_files(tmp_path):
-    other_authority = tmp_path / "Cardiff_Council_2020-01.zip"
-    other_authority.write_bytes(b"unrelated")
+def test_fetch_authority_zip_clears_other_authorities_older_months_but_never_their_current_one(tmp_path):
+    # Owner ruling, 2026-09-18: "just clear the old ones out". No code
+    # path ever reads a month before the current one, so another
+    # authority's older zip is dead weight the moment the month turns;
+    # its current-month zip is live and must survive.
+    stamp = datetime.datetime.now().strftime("%Y-%m")
+    older = tmp_path / "Cardiff_Council_2020-01.zip"
+    older.write_bytes(b"old cardiff")
+    current = tmp_path / f"Cardiff_Council_{stamp}.zip"
+    current.write_bytes(b"current cardiff")
+    unrelated = tmp_path / "notes.zip"
+    unrelated.write_bytes(b"not a month-stamped authority zip")
     session = _CookieCarryingSession(zip_bytes=b"vale bytes")
 
     fetch_authority_zip("Vale_of_Glamorgan_Council", session, cache_dir=tmp_path)
 
-    assert other_authority.exists()
+    assert not older.exists()
+    assert current.read_bytes() == b"current cardiff"
+    assert unrelated.exists()
+
+
+def test_fetch_authority_zip_cache_hit_also_clears_older_months(tmp_path):
+    stamp = datetime.datetime.now().strftime("%Y-%m")
+    (tmp_path / f"Vale_of_Glamorgan_Council_{stamp}.zip").write_bytes(b"already cached")
+    older = tmp_path / "Swansea_Council_2020-01.zip"
+    older.write_bytes(b"old swansea")
+
+    fetch_authority_zip("Vale_of_Glamorgan_Council", _RaisesOnAnyCall(), cache_dir=tmp_path)
+
+    assert not older.exists()
+
+
+def test_fetch_authority_zip_failed_download_clears_nothing_of_any_authority(tmp_path):
+    older = tmp_path / "Cardiff_Council_2020-01.zip"
+    older.write_bytes(b"old cardiff")
+
+    with pytest.raises(InspireError):
+        fetch_authority_zip("Vale_of_Glamorgan_Council", _CookielessSession(), cache_dir=tmp_path)
+
+    assert older.exists()
 
 
 def test_fetch_authority_zip_non_200_sets_status_code_structurally(tmp_path):
