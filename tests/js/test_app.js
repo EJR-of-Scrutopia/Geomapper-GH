@@ -4024,6 +4024,97 @@ function ok(condition, message) {
   });
 
   // =======================================================================
+  // Region and site follow the extent unless the person typed them
+  // =======================================================================
+  //
+  // A Cowbridge extent was about to be filed under
+  // Surveys\Llantwit-major\..., last session's region: a region restored
+  // on boot counted as typed, and no suggestion ever replaced an earlier
+  // one. A suggestion may replace a suggestion; nothing replaces what the
+  // person typed this session.
+
+  const COWBRIDGE_BBOX = "-3.46,51.455,-3.438,51.468";
+  const BARRY_BBOX = "-3.29,51.37,-3.25,51.41";
+  const reverseByPlace = (url) => {
+    if (url.pathname !== "/api/reverse") return null;
+    return Number(url.searchParams.get("lon")) < -3.35
+      ? jsonResponse(200, { region: "Vale of Glamorgan", site: "Cowbridge" })
+      : jsonResponse(200, { region: "Vale of Glamorgan (Barry)", site: "Barry" });
+  };
+  const fieldValue = (sandbox, id) => sandbox.document.getElementById(id).value;
+
+  await test("a region remembered from last session gives way to the new extent's own", async () => {
+    const { sandbox } = await bootedSandbox((url, options) => {
+      if (url.pathname === "/api/config" && (!options.method || options.method === "GET")) {
+        return jsonResponse(200, { ...DEFAULT_CONFIG, last_region: "Llantwit major" });
+      }
+      return reverseByPlace(url);
+    });
+    ok(fieldValue(sandbox, "region") === "Llantwit major", "expected last session's region restored on boot");
+    setField(sandbox, "bbox", COWBRIDGE_BBOX);
+    await flush(600);
+    ok(fieldValue(sandbox, "region") === "Vale of Glamorgan", `got region ${fieldValue(sandbox, "region")}`);
+    ok(fieldValue(sandbox, "site") === "Cowbridge", `got site ${fieldValue(sandbox, "site")}`);
+  });
+
+  await test("moving the extent replaces the names suggested for the old one", async () => {
+    const { sandbox } = await bootedSandbox(reverseByPlace);
+    setField(sandbox, "bbox", COWBRIDGE_BBOX);
+    await flush(600);
+    ok(fieldValue(sandbox, "site") === "Cowbridge", `got site ${fieldValue(sandbox, "site")}`);
+    setField(sandbox, "bbox", BARRY_BBOX);
+    await flush(600);
+    ok(fieldValue(sandbox, "site") === "Barry", `got site ${fieldValue(sandbox, "site")}`);
+    ok(fieldValue(sandbox, "region") === "Vale of Glamorgan (Barry)", `got region ${fieldValue(sandbox, "region")}`);
+  });
+
+  await test("a typed region and site survive a new extent", async () => {
+    const { sandbox } = await bootedSandbox(reverseByPlace);
+    setField(sandbox, "region", "My Region");
+    setField(sandbox, "site", "My Site");
+    setField(sandbox, "bbox", BARRY_BBOX);
+    await flush(600);
+    ok(fieldValue(sandbox, "region") === "My Region", `got region ${fieldValue(sandbox, "region")}`);
+    ok(fieldValue(sandbox, "site") === "My Site", `got site ${fieldValue(sandbox, "site")}`);
+  });
+
+  await test("a typed field emptied again goes back to following the extent", async () => {
+    const { sandbox } = await bootedSandbox(reverseByPlace);
+    setField(sandbox, "region", "Mine");
+    setField(sandbox, "region", "");
+    setField(sandbox, "bbox", BARRY_BBOX);
+    await flush(600);
+    ok(fieldValue(sandbox, "region") === "Vale of Glamorgan (Barry)", `got region ${fieldValue(sandbox, "region")}`);
+  });
+
+  await test("a place chosen by name keeps its names for its own extent, and only that one", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/geocode") {
+        return jsonResponse(200, [
+          {
+            display_name: "Barry Island, Barry, Vale of Glamorgan, Wales, United Kingdom",
+            west: -3.29,
+            south: 51.37,
+            east: -3.25,
+            north: 51.41,
+            region: "Vale of Glamorgan",
+            site: "Barry Island",
+          },
+        ]);
+      }
+      return reverseByPlace(url);
+    });
+    typeIntoPlace(sandbox, "Barry Island");
+    await flush(500);
+    sandbox.document.getElementById("place").fire("keydown", { key: "Enter" });
+    await flush(600); // past the suggest debounce: the centroid lookup says "Barry"
+    ok(fieldValue(sandbox, "site") === "Barry Island", `got site ${fieldValue(sandbox, "site")}`);
+    setField(sandbox, "bbox", COWBRIDGE_BBOX);
+    await flush(600);
+    ok(fieldValue(sandbox, "site") === "Cowbridge", `got site ${fieldValue(sandbox, "site")}`);
+  });
+
+  // =======================================================================
   // Task 19, item 1: choosing a typeahead result fills region/site from
   // that result's own address, without waiting on a second reverse lookup
   // at the bbox centroid.

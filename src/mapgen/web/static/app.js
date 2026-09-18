@@ -1989,9 +1989,13 @@ function choosePlaceMatch(match) {
   // and fills whichever of the two, if either, this result's address did
   // not have: not a redundant lookup, since it only acts on a field this
   // block left blank.
-  if (!$("site").value) $("site").value = match.site || "";
-  if (!$("region").value) $("region").value = match.region || "";
+  for (const id of ["site", "region"]) {
+    if (nameOrigin[id] === "typed") continue;
+    $(id).value = match[id] || "";
+    nameOrigin[id] = match[id] ? "place" : "suggested";
+  }
   setBBox({ west: match.west, south: match.south, east: match.east, north: match.north });
+  placeBBox = bbox;
 }
 
 $("place").addEventListener("input", () => {
@@ -2092,9 +2096,38 @@ async function runPlaceSearch(query) {
 // already-filled suggestion.
 let suggestController = null;
 
+// Where region and site each got their current value. "typed": the
+// person entered it this session, and nothing replaces it. "place": a
+// place chosen by name supplied it, and the centroid lookup for the
+// extent that choice produced (placeBBox) must not replace that better
+// evidence, though a later extent may. "suggested": a lookup filled it,
+// or it is last session's region restored on boot, and the next extent's
+// own lookup replaces it. Without the distinction a remembered region
+// counted as typed, and a Cowbridge survey was filed under Llantwit
+// Major.
+const nameOrigin = { region: "suggested", site: "suggested" };
+let placeBBox = null;
+
+function mayReplaceName(id, forBBox) {
+  if (nameOrigin[id] === "typed") return false;
+  return !(nameOrigin[id] === "place" && forBBox === placeBBox);
+}
+
+// "change" as well as "input": a browser fires change when a field the
+// person edited loses focus, and nothing in this file assigns either
+// field and then dispatches an event, so an event here is always the
+// person. Emptying a field hands it back to the suggestions.
+for (const id of ["region", "site"]) {
+  for (const type of ["input", "change"]) {
+    $(id).addEventListener(type, () => {
+      nameOrigin[id] = $(id).value.trim() ? "typed" : "suggested";
+    });
+  }
+}
+
 async function suggestNames() {
   if (!bbox) return;
-  if ($("region").value && $("site").value) return;
+  if (!mayReplaceName("region", bbox) && !mayReplaceName("site", bbox)) return;
   const requestedBBox = bbox;
   const lat = (requestedBBox.south + requestedBBox.north) / 2;
   const lon = (requestedBBox.west + requestedBBox.east) / 2;
@@ -2105,12 +2138,10 @@ async function suggestNames() {
     const result = await api(`/api/reverse?lat=${lat}&lon=${lon}`, { signal: controller.signal });
     if (bbox !== requestedBBox) return;
     let filled = false;
-    if (!$("site").value && result.site) {
-      $("site").value = result.site;
-      filled = true;
-    }
-    if (!$("region").value && result.region) {
-      $("region").value = result.region;
+    for (const id of ["site", "region"]) {
+      if (!mayReplaceName(id, requestedBBox) || !result[id] || $(id).value === result[id]) continue;
+      $(id).value = result[id];
+      nameOrigin[id] = "suggested";
       filled = true;
     }
     // Task 36, item 1. The owner reported Download sitting dead at the
