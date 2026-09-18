@@ -300,6 +300,34 @@ def test_merge_with_no_work_files_clears_earlier_records(tmp_path):
     assert source.attribution == ConstraintsWalesSource.attribution
 
 
+def test_fetch_resets_what_an_earlier_survey_left_on_the_shared_instance(tmp_path):
+    """The registered source is one instance shared by every survey
+    (package.py's registration docstring). Survey A fetches and merges,
+    narrowing source.attribution to A's Cadw date; survey B then fetches
+    over a fresh work_dir with every layer failing. Without a reset at
+    the top of fetch(), B's raise would leave A's attribution and
+    constraints_record behind for B's own survey.json to pick up."""
+    first_work = tmp_path / "first_work"
+    first_work.mkdir()
+    first_out = tmp_path / "first_out"
+    first_out.mkdir()
+    source = ConstraintsWalesSource(session=_RoutedSession({
+        "geonode:conservation_areas_wales": _fixture("cowbridge_conservation_areas.json"),
+    }))
+    parts = source.fetch(COWBRIDGE, _tiles(), first_work, _Recorder())
+    source.merge(parts, first_out, "Cowbridge_2026-09-18")
+    assert source.constraints_record is not None
+    assert source.attribution != ConstraintsWalesSource.attribution
+
+    second_work = tmp_path / "second_work"
+    second_work.mkdir()
+    source.session = _RoutedSession({layer.type_name: _Response(status_code=503, text="") for layer in LAYERS})
+    with pytest.raises(ConstraintsWalesError):
+        source.fetch(COWBRIDGE, _tiles(), second_work, _Recorder())
+    assert source.attribution == ConstraintsWalesSource.attribution
+    assert source.constraints_record is None
+
+
 def test_a_table_with_no_primary_key_is_never_sent_a_start_index(tmp_path):
     """GeoServer answers HTTP 400 'Cannot do natural order without a primary
     key' to any request that carries startIndex to a table with no primary

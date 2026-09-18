@@ -106,6 +106,7 @@ class ConstraintsWalesSource:
         self.tile_failures: list[TileFailure] = []
         self.endpoints_used: list[str] = []
         self.constraints_record: dict | None = None
+        self.skipped_reason: str | None = None
 
     def covers(self, bbox: BBox) -> str:
         return verdict(coverage_share(padded_rect(_site_rect(bbox)), self._coverage_path))
@@ -213,6 +214,9 @@ class ConstraintsWalesSource:
     ) -> list[Path]:
         self.tile_failures = []
         self.constraints_record = None
+        self.attribution = type(self).attribution
+        self.endpoints_used = []
+        self.skipped_reason = None
         site = _site_rect(bbox)
         padded = padded_rect(site)
         features_path = Path(work_dir) / WORK_FEATURES
