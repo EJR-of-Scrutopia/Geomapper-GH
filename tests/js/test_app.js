@@ -9432,6 +9432,38 @@ function ok(condition, message) {
     ok(sandbox.document.getElementById("log").hidden === false, "expected the log still shown");
   });
 
+  // =======================================================================
+  // Settings says true things, briefly
+  // =======================================================================
+  //
+  // The elevation hint still said Welsh 1 m LiDAR was something "this tool
+  // cannot fetch yet", false since lidar_wales shipped: package.py samples
+  // the LiDAR DTM first and the 30 m model only where LiDAR has no data.
+  // The owner's rule for the side panel, short lines and not long text,
+  // holds here too.
+
+  const settingsMarkup = () =>
+    INDEX_HTML_MARKUP.slice(INDEX_HTML_MARKUP.indexOf('id="settings-panel"'));
+
+  await test("Settings no longer claims Welsh LiDAR cannot be fetched", () => {
+    ok(!/cannot fetch yet/.test(settingsMarkup()), "expected the out-of-date claim gone");
+  });
+
+  await test("the elevation hint says LiDAR comes first where it exists", () => {
+    const field = settingsMarkup().slice(settingsMarkup().indexOf('id="demtype-field"'));
+    const hints = field.slice(0, field.indexOf("</label>"));
+    ok(/(Wales|Welsh)[^.]*LiDAR[^.]*\bfirst\b/.test(hints), `expected Welsh LiDAR said to come first: ${hints}`);
+  });
+
+  await test("every static hint in Settings is one short line", () => {
+    const hints = Array.from(settingsMarkup().matchAll(/<span class="hint">([\s\S]*?)<\/span>/g), (m) =>
+      m[1].replace(/\s+/g, " ").trim()
+    );
+    ok(hints.length > 0, "expected some hints to check");
+    const long = hints.filter((text) => text.length > 120);
+    ok(long.length === 0, `hints over 120 characters: ${JSON.stringify(long)}`);
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );

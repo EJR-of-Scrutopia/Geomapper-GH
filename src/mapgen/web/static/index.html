@@ -305,7 +305,7 @@
           <h2>Settings</h2>
           <button id="settings-close" type="button">Close</button>
         </div>
-        <p class="settings-panel-intro">Defaults the owner sets once, not per-survey choices. These apply to the next estimate or download, and are remembered from here on.</p>
+        <p class="settings-panel-intro">Set once, remembered for every survey.</p>
 
         <label>Appearance
           <select id="theme">
@@ -313,7 +313,7 @@
             <option value="light">Light</option>
             <option value="dark">Dark</option>
           </select>
-          <span class="hint">Applies to the whole page, including the tile grid drawn on the map while a download runs.</span>
+          <span class="hint">The whole page, map grid included.</span>
         </label>
 
         <!--
@@ -332,12 +332,12 @@
           </span>
           <span id="tile-size-cost" class="hint"></span>
           <span id="tile-size-trade" class="hint"></span>
-          <span class="hint">There is no failure risk shown here on purpose. It would depend on how dense the OpenStreetMap data is on this particular ground, which nothing can know before downloading it. A tile that turns out to be over the map API's 50000 node limit is split into four and fetched in pieces, twice over if it needs it, rather than failing: the rest of the run is unaffected, nothing already downloaded is fetched again, and the download just takes a little longer. Only ground still over the limit at a sixteenth of a tile fails, and the log says which piece and how large it was.</span>
+          <span class="hint">Busy ground splits itself into smaller pieces; the log names any piece that still fails.</span>
         </label>
 
         <label>Overlap (m)
           <input id="overlap" type="number" min="0" step="10" value="100" />
-          <span class="hint">Neighbouring tiles overlap by this much so a feature crossing a seam is captured whole in both, with duplicates removed when the tiles are merged. 100 m is usually enough.</span>
+          <span class="hint">Catches features crossing a tile seam whole. 100 m is usually enough.</span>
         </label>
 
         <!--
@@ -354,7 +354,8 @@
         -->
         <label id="demtype-field">Elevation model
           <select id="demtype"></select>
-          <span class="hint">Nothing in this list is higher resolution than the COP30 default. OpenTopography's global service serves 30 m at best, anywhere, and a paid OpenTopography plan buys high resolution LiDAR for North America rather than sharper data over Wales. What changes is the kind of model. COP30, COP90, SRTMGL1, SRTMGL3, NASADEM and AW3D30 measure the surface, so roofs and tree canopy are in the heights. EU_DTM is bare earth terrain at the same 30 m, which is usually what a site section or a ground plane wants. Genuine 1 m ground for a Welsh site is NRW LiDAR through DataMapWales, which this tool cannot fetch yet.</span>
+          <span class="hint">Welsh sites use 1 m LiDAR first; this model fills any gaps and covers England.</span>
+          <span class="hint">None is finer than 30 m. EU_DTM is bare ground; the rest include roofs and trees.</span>
         </label>
 
         <fieldset>
