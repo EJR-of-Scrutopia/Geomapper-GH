@@ -42,6 +42,7 @@ from mapgen.geo import BBox, Tile
 from mapgen.jobs import CancelToken, Cancelled
 from mapgen.os_downloads import OsOpenError
 from mapgen.os_shards import shards_complete, write_uprn_shards
+from mapgen.sources import os_uprn as os_uprn_module
 from mapgen.sources.base import NullProgress
 from mapgen.sources.os_uprn import (
     BYTES_PER_SECOND_ESTIMATE,
@@ -239,11 +240,76 @@ def test_routing_note_warns_when_no_complete_cache_exists(tmp_path):
     )
 
 
-def test_routing_note_is_none_once_a_complete_cache_exists(tmp_path):
-    _seed_complete_uprn_cache()
+def test_routing_note_is_none_once_a_complete_cache_was_checked_this_month(tmp_path, monkeypatch):
+    monkeypatch.setattr(os_uprn_module, "_current_month", lambda: "2026-09")
+    shard_dir = _seed_complete_uprn_cache(version="2026-09")
+    (shard_dir.parent / "checked.txt").write_text("2026-09", encoding="utf-8")
     source = OsUprnSource(session=_PoisonedSession(), ostn15_cache_dir=tmp_path)
 
     assert source.routing_note() is None
+
+
+# A complete cache is not the end of it: OS publishes new editions, and the
+# first fetch after one downloads the whole national file again (seen
+# 2026-09-18: August replaced by September, five minutes, no warning). The
+# estimate cannot touch the network, so it warns until a fetch has checked
+# the live listing this month, and says nothing once one has.
+
+
+def test_routing_note_warns_of_a_possible_new_edition_when_never_checked(tmp_path, monkeypatch):
+    monkeypatch.setattr(os_uprn_module, "_current_month", lambda: "2026-09")
+    _seed_complete_uprn_cache(version="2026-08")
+    source = OsUprnSource(session=_PoisonedSession(), ostn15_cache_dir=tmp_path)
+
+    note = source.routing_note()
+
+    assert note is not None and "2026-08" in note and "619 MB" in note, note
+
+
+def test_routing_note_warns_when_last_checked_in_an_earlier_month(tmp_path, monkeypatch):
+    monkeypatch.setattr(os_uprn_module, "_current_month", lambda: "2026-10")
+    shard_dir = _seed_complete_uprn_cache(version="2026-09")
+    (shard_dir.parent / "checked.txt").write_text("2026-09", encoding="utf-8")
+    source = OsUprnSource(session=_PoisonedSession(), ostn15_cache_dir=tmp_path)
+
+    assert source.routing_note() is not None
+
+
+def test_a_fetch_that_checked_the_live_listing_silences_the_note_for_the_month(
+    tmp_path, ostn15_fixture_grid, monkeypatch
+):
+    monkeypatch.setattr(os_uprn_module, "_current_month", lambda: "2026-09")
+    _seed_ostn15_cache(tmp_path, ostn15_fixture_grid)
+    _seed_complete_uprn_cache(version="2026-08")
+    opener = _RoutedOpener({_UPRN_VERSION_URL: _version_response("2026-08")})
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: opener)
+    source = OsUprnSource(session=_PoisonedSession(), ostn15_cache_dir=tmp_path)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    assert source.routing_note() is not None
+
+    source.fetch(NEAR_TP06_BBOX, _tiles("r00_c00"), work_dir, NullProgress())
+
+    assert source.routing_note() is None
+
+
+def test_a_fetch_that_fell_back_to_the_cache_does_not_count_as_a_check(
+    tmp_path, ostn15_fixture_grid, monkeypatch
+):
+    import urllib.error
+
+    monkeypatch.setattr(os_uprn_module, "_current_month", lambda: "2026-09")
+    _seed_ostn15_cache(tmp_path, ostn15_fixture_grid)
+    _seed_complete_uprn_cache(version="2026-08")
+    opener = _RoutedOpener({_UPRN_VERSION_URL: urllib.error.URLError("the fake link is down")})
+    monkeypatch.setattr(os_downloads, "_build_opener", lambda: opener)
+    source = OsUprnSource(session=_PoisonedSession(), ostn15_cache_dir=tmp_path)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    source.fetch(NEAR_TP06_BBOX, _tiles("r00_c00"), work_dir, NullProgress())
+
+    assert source.routing_note() is not None
 
 
 # --------------------------------------------------------------------------
@@ -564,9 +630,12 @@ def test_live_fetch_over_cowbridge_yields_over_1000_uprn_rows(tmp_path):
     """`routing_note()` is the same public signal package.py's own
     estimate warnings already read (see estimate_survey), so this test
     reuses it, rather than reaching into the cache layout by hand, to
-    decide whether a complete national cache exists. A non-None note
-    means the 619 MB download has never completed on this machine, and
-    this test must not be what triggers it.
+    decide whether the next fetch could download the national file. A
+    non-None note means either the 619 MB download has never completed
+    on this machine, or no fetch has checked this month's live listing,
+    so a new OS edition could trigger it again (this test did exactly
+    that on 2026-09-18, before the note covered new editions). This test
+    must not be what triggers it.
 
     With a complete cache present, fetch() over a real Cowbridge extent
     makes only the small `product_version` listing call (already proven
@@ -578,8 +647,9 @@ def test_live_fetch_over_cowbridge_yields_over_1000_uprn_rows(tmp_path):
     source = OsUprnSource(session=requests.Session())
     if source.routing_note() is not None:
         pytest.skip(
-            "national UPRN cache not present; run a real survey with "
-            "os_uprn selected to build it"
+            "the next fetch could download the national UPRN file (no "
+            "complete cache, or this month's listing not yet checked); run "
+            "a real survey first"
         )
 
     bbox = BBox.parse(_COWBRIDGE_BBOX)

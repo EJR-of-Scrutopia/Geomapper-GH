@@ -80,6 +80,7 @@ once, correctly, and published the result in the same row.
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
 import zipfile
@@ -171,6 +172,34 @@ _ROUTING_NOTE = (
 )
 
 _WORK_PART_NAME = "os_uprn.csv"
+
+
+_EDITION_NOTE = (
+    "Addresses: OS may have a newer edition than {edition}; if so this "
+    "survey downloads it once (619 MB)."
+)
+
+# Inside a version's own cache directory: the month fetch() last read the
+# live listing. OS publishes new editions, and the first fetch after one
+# downloads the whole national file again (seen 2026-09-18: August
+# replaced by September, five minutes, no warning). estimate() and
+# routing_note() may not touch the network, so this is how they know
+# whether this month has been checked yet.
+_CHECKED_MARKER = "checked.txt"
+
+
+def _current_month() -> str:
+    """This month as "YYYY-MM", the shape OS Open's own versions take.
+    A seam of its own so a test can fix the month."""
+    return datetime.date.today().strftime("%Y-%m")
+
+
+def _checked_month(version: str) -> str | None:
+    marker = product_cache_dir(PRODUCT, version) / _CHECKED_MARKER
+    try:
+        return marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
 
 
 class OsUprnSourceError(RuntimeError):
@@ -455,9 +484,15 @@ class OsUprnSource:
         below: a settings panel can call `/api/estimate` before a single
         survey has ever run.
         """
-        if _any_complete_uprn_cache():
+        latest = _latest_complete_uprn_version()
+        if latest is None:
+            return _ROUTING_NOTE
+        # A complete cache answers only until OS publishes again. Quiet
+        # once a fetch has read the live listing this month; until then,
+        # say that a new edition would cost the download once more.
+        if _checked_month(latest) == _current_month():
             return None
-        return _ROUTING_NOTE
+        return _EDITION_NOTE.format(edition=latest)
 
     def covers(self, bbox: BBox) -> str:
         """"full" when every 100 km square the padded extent touches is
@@ -544,8 +579,11 @@ class OsUprnSource:
         unchanged); raises the original `OsOpenError` unchanged when no
         cached version is complete either.
         """
+        # Whether the live listing actually answered: only then has this
+        # month been checked for a new edition (see _CHECKED_MARKER).
+        self._listing_checked = False
         try:
-            return product_version(PRODUCT)
+            version = product_version(PRODUCT)
         except OsOpenError as exc:
             if exc.kind != "listing":
                 raise
@@ -554,6 +592,8 @@ class OsUprnSource:
                 raise
             progress.emit("os_uprn_cache_fallback", source=self.id, version=fallback)
             return fallback
+        self._listing_checked = True
+        return version
 
     def fetch(
         self,
@@ -645,6 +685,8 @@ class OsUprnSource:
 
         self.versions_used[PRODUCT] = version
         sweep_old_versions(PRODUCT, version)
+        if self._listing_checked:
+            atomic_write_text(product_dir / _CHECKED_MARKER, _current_month())
 
         if cancel is not None:
             cancel.raise_if_cancelled()
