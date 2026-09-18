@@ -188,9 +188,15 @@ National Marine Plan's "Inshore Region" (DataMapWales
 `geonode:wnmp_areas`, OGL v3, out to the 12 nautical mile limit),
 simplified the same way (planning note, 2026-09-18). Coverage is the
 share of the padded extent covered by councils plus inshore waters:
-"full" at 99.5% and above (simplification leaves slivers along the
-coast), "partial" above zero, "none" at zero. "Outside Wales" in the
-summary therefore means England, or open sea beyond 12 nautical miles. The same file names the
+"full" at 98% and above, "partial" above zero, "none" at zero. The 98%
+is measured, not guessed (planning spike, 2026-09-18): the councils'
+high-water line and the marine plan's landward edge are separate lines,
+so coastal extents sum to between 99.0% (Aberystwyth) and 100.2%
+(Penarth, where they overlap) whatever the simplification tolerance (20 m
+and 5 m gave the same spread), while an extent across the English
+border at Chepstow sums to 50%. The measured share is recorded in
+survey.json beside the verdict. "Outside Wales" in the summary
+therefore means England, or open sea beyond 12 nautical miles. The same file names the
 council or councils the site touches, for the summary's "confirm with"
 line. The LiDAR mosaic's bounding rectangle is not used: it includes
 parts of England, where every Welsh layer would return nothing and a
