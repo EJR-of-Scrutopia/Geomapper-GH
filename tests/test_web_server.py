@@ -2147,7 +2147,17 @@ def test_build_server_wires_a_real_nominatim_client_by_default():
 # its copyright page under both the tile policy and the ODbL.
 # www.w3.org is the SVG namespace name favicon.svg must declare, an
 # identifier no browser ever requests.
-_ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org", "www.openstreetmap.org", "www.w3.org"}
+# tiles.openfreemap.org serves the Bright vector basemap (style, tiles,
+# fonts); openfreemap.org and www.openmaptiles.org are attribution links
+# its terms require, never fetched.
+_ALLOWED_STATIC_HOSTS = {
+    "tile.openstreetmap.org",
+    "www.openstreetmap.org",
+    "www.w3.org",
+    "tiles.openfreemap.org",
+    "openfreemap.org",
+    "www.openmaptiles.org",
+}
 # Matches a URL host after "http(s)://" anywhere in the text (deliberately
 # unanchored: this is what already catches a form action, a CSS url(...),
 # or an ES import, none of which need their own special case, simply

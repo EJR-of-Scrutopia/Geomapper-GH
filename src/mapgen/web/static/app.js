@@ -18,18 +18,69 @@ let jobId = null;
 let poller = null;
 
 const map = L.map("map").setView([51.48, -3.18], 11);
+
+// --- basemap -------------------------------------------------------------
+//
+// OpenFreeMap's "Bright" vector map, the owner's choice from a side-by-side
+// of its four styles (2026-09-18): the richness of the OSM map without
+// OSM's volunteer tile servers, free with no key and no usage limit.
+// MapLibre draws it inside an ordinary Leaflet layer (vendor/README.md),
+// so every shape this page draws stays Leaflet code.
+//
+// The OSM raster map is the fallback, for a machine MapLibre cannot run
+// on (no WebGL, which throws on adding the layer) and for a style that
+// does not arrive: an error before it has loaded, or no load within
+// VECTOR_LOAD_TIMEOUT_MS. After it has loaded an error is one tile or
+// one glyph, and the map it would throw away is otherwise fine.
+const VECTOR_STYLE_URL = "https://tiles.openfreemap.org/styles/bright";
+const VECTOR_LOAD_TIMEOUT_MS = 10000;
+const VECTOR_ATTRIBUTION =
+  '<a href="https://openfreemap.org">OpenFreeMap</a> ' +
+  '<a href="https://www.openmaptiles.org/">&copy; OpenMapTiles</a> ' +
+  'Data from <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
+
 // OSM's tile usage policy refuses requests that carry no Referer, and
 // index.html sets no-referrer page-wide to keep the launch token in this
 // page's URL on this machine. The layer's own referrerPolicy overrides
 // the page's for its tile images alone, and strict-origin sends only the
 // bare origin (scheme, loopback host, port), never the path or the
 // ?token= query.
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
-  referrerPolicy: "strict-origin",
-  attribution:
-    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-}).addTo(map);
+function addRasterBasemap() {
+  return L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    referrerPolicy: "strict-origin",
+    attribution:
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }).addTo(map);
+}
+
+function addBasemap() {
+  if (typeof L.maplibreGL !== "function") return addRasterBasemap();
+  const vector = L.maplibreGL({ style: VECTOR_STYLE_URL, attribution: VECTOR_ATTRIBUTION });
+  try {
+    vector.addTo(map);
+  } catch (error) {
+    map.removeLayer(vector);
+    return addRasterBasemap();
+  }
+  let settled = false;
+  const fallBack = () => {
+    if (settled) return;
+    settled = true;
+    map.removeLayer(vector);
+    addRasterBasemap();
+  };
+  const limit = setTimeout(fallBack, VECTOR_LOAD_TIMEOUT_MS);
+  const gl = vector.getMaplibreMap();
+  gl.on("load", () => {
+    settled = true;
+    clearTimeout(limit);
+  });
+  gl.on("error", fallBack);
+  return vector;
+}
+
+addBasemap();
 
 // --- theme -------------------------------------------------------------
 //

@@ -9464,6 +9464,120 @@ function ok(condition, message) {
     ok(long.length === 0, `hints over 120 characters: ${JSON.stringify(long)}`);
   });
 
+  // =======================================================================
+  // The basemap is OpenFreeMap's Bright vector map, with the OSM raster
+  // map as its fallback
+  // =======================================================================
+  //
+  // The owner's choice, 2026-09-18, from a side-by-side of the four
+  // OpenFreeMap styles: Bright, in both themes. The raster fallback covers
+  // a machine MapLibre cannot run on (no WebGL) and a style that does not
+  // arrive (an error before it loads, or nothing within ten seconds). An
+  // error after it has loaded, one tile say, must not throw the map away.
+
+  // A stand-in for @maplibre/maplibre-gl-leaflet's L.maplibreGL: records
+  // the options it was built with and whether it was added or removed, and
+  // hands back a MapLibre map whose load and error events a test fires.
+  function installVectorStub(sandbox, { throwOnAdd = false } = {}) {
+    const made = [];
+    sandbox.L.maplibreGL = (options) => {
+      const listeners = {};
+      const gl = {
+        on(type, fn) {
+          (listeners[type] = listeners[type] || []).push(fn);
+          return gl;
+        },
+        fire(type, event = {}) {
+          for (const fn of listeners[type] || []) fn(event);
+        },
+      };
+      const layer = {
+        options,
+        added: false,
+        removed: false,
+        gl,
+        addTo() {
+          if (throwOnAdd) throw new Error("Failed to initialize WebGL");
+          layer.added = true;
+          return layer;
+        },
+        getMaplibreMap() {
+          return gl;
+        },
+      };
+      made.push(layer);
+      return layer;
+    };
+    return made;
+  }
+
+  async function vectorSandbox(stubOptions) {
+    let made = null;
+    const timers = [];
+    const { sandbox } = await bootedSandbox(undefined, undefined, (sb) => {
+      made = installVectorStub(sb, stubOptions);
+      const realSetTimeout = sb.setTimeout;
+      sb.setTimeout = (fn, ms, ...rest) => {
+        timers.push({ fn, ms });
+        return realSetTimeout(fn, ms, ...rest);
+      };
+    });
+    return { sandbox, made, timers };
+  }
+
+  await test("the basemap is OpenFreeMap's Bright vector map when MapLibre is here", async () => {
+    const { sandbox, made } = await vectorSandbox();
+    ok(made.length === 1, `expected one vector layer, got ${made.length}`);
+    ok(made[0].added, "expected it added to the map");
+    ok(
+      made[0].options.style === "https://tiles.openfreemap.org/styles/bright",
+      `expected the Bright style, got ${made[0].options.style}`
+    );
+    ok(sandbox.L._tileLayers.length === 0, "expected no raster layer alongside it");
+    const attribution = made[0].options.attribution || "";
+    for (const needed of ["OpenFreeMap", "OpenMapTiles", 'href="https://www.openstreetmap.org/copyright"']) {
+      ok(attribution.includes(needed), `expected ${needed} in the attribution: ${attribution}`);
+    }
+  });
+
+  await test("an error before the vector map loads falls back to the OSM raster map", async () => {
+    const { sandbox, made } = await vectorSandbox();
+    made[0].gl.fire("error", { error: new Error("style failed") });
+    ok(made[0].removed, "expected the vector layer removed");
+    ok(sandbox.L._tileLayers.length === 1, "expected the raster layer added");
+    ok(sandbox.L._tileLayers[0].options.referrerPolicy === "strict-origin", "expected the raster fallback to keep its Referer fix");
+  });
+
+  await test("an error after the vector map has loaded keeps it", async () => {
+    const { sandbox, made } = await vectorSandbox();
+    made[0].gl.fire("load");
+    made[0].gl.fire("error", { error: new Error("one tile failed") });
+    ok(!made[0].removed, "expected the vector layer kept");
+    ok(sandbox.L._tileLayers.length === 0, "expected no raster layer");
+  });
+
+  await test("a vector layer that cannot be added, with no WebGL, falls back to raster", async () => {
+    const { sandbox } = await vectorSandbox({ throwOnAdd: true });
+    ok(sandbox.L._tileLayers.length === 1, "expected the raster layer added");
+  });
+
+  await test("a vector map that never loads falls back after ten seconds", async () => {
+    const { sandbox, made, timers } = await vectorSandbox();
+    const limit = timers.find((t) => t.ms === 10000);
+    ok(limit, `expected a ten second limit set, got delays ${timers.map((t) => t.ms)}`);
+    limit.fn();
+    ok(made[0].removed, "expected the vector layer removed");
+    ok(sandbox.L._tileLayers.length === 1, "expected the raster layer added");
+  });
+
+  await test("a vector map that loads in time is not replaced when the limit passes", async () => {
+    const { sandbox, made, timers } = await vectorSandbox();
+    made[0].gl.fire("load");
+    timers.find((t) => t.ms === 10000).fn();
+    ok(!made[0].removed, "expected the vector layer kept");
+    ok(sandbox.L._tileLayers.length === 0, "expected no raster layer");
+  });
+
   await test("the slider's sentence is one short line at every position", async () => {
     const { sandbox } = await bootedSandbox();
     for (const metres of [500, 2000, 6000]) {

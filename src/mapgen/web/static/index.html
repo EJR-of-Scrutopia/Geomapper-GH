@@ -21,6 +21,7 @@
     <title>mapgen</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="vendor/leaflet.css" />
+    <link rel="stylesheet" href="vendor/maplibre-gl.css" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -367,6 +368,9 @@
     </div>
 
     <script src="vendor/leaflet.js"></script>
+    <!-- MapLibre before the bridge: the bridge reads the maplibregl global as it loads. -->
+    <script src="vendor/maplibre-gl.js"></script>
+    <script src="vendor/leaflet-maplibre-gl.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
