@@ -2985,7 +2985,7 @@ async function refreshEstimate() {
     $("estimate").className = "estimate";
     let html =
       `<strong>${data.extent_km.width.toFixed(2)} x ${data.extent_km.height.toFixed(2)} km</strong><br />` +
-      `${data.tiles} tiles (${data.rows} x ${data.cols})<br />` +
+      `${data.tiles} ${data.tiles === 1 ? "tile" : "tiles"} (${data.rows} x ${data.cols})<br />` +
       `around ${Math.round(data.bytes_estimate / 1e6)} MB, about ${minutes} min`;
     if (data.warnings && data.warnings.length) {
       html += `<span class="estimate-warning">${data.warnings.map(escapeHtml).join("<br />")}</span>`;

@@ -9464,6 +9464,30 @@ function ok(condition, message) {
     ok(long.length === 0, `hints over 120 characters: ${JSON.stringify(long)}`);
   });
 
+  await test("a one-tile estimate says 1 tile, not 1 tiles", async () => {
+    const { sandbox } = await bootedSandbox((url) => {
+      if (url.pathname === "/api/estimate") {
+        return jsonResponse(200, {
+          tiles: 1,
+          rows: 1,
+          cols: 1,
+          extent_km: { width: 1.53, height: 1.45 },
+          bytes_estimate: 79e6,
+          seconds_estimate: 60,
+          warnings: [],
+          folder: "C:\\Users\\Param\\Surveys\\Vale-of-Glamorgan\\2026-09-18_Cowbridge",
+        });
+      }
+      return null;
+    });
+    setField(sandbox, "region", "Vale of Glamorgan");
+    setField(sandbox, "site", "Cowbridge");
+    setField(sandbox, "bbox", "-3.46,51.455,-3.438,51.468");
+    await flush(600);
+    const html = sandbox.document.getElementById("estimate").innerHTML;
+    ok(html.includes("1 tile (1 x 1)"), `expected "1 tile (1 x 1)": ${html}`);
+  });
+
   console.log(
     `\n${failures === 0 ? `ALL ${passed} CHECKS PASSED` : failures + " CHECK(S) FAILED: " + failedNames.join(", ")}`
   );
