@@ -54,3 +54,10 @@ benchmarks/
 # total; provenance and licence are in tests/data/README.md.
 !tests/data/
 !tests/data/*
+
+# Committed package data (task 2 of the Wales planning constraints work):
+# src/mapgen/data/ holds wales_coverage.geojson, shipped via pyproject.toml's
+# package-data, not downloaded survey output. Keep it visible despite the
+# survey-data rule above.
+!src/mapgen/data/
+!src/mapgen/data/*
