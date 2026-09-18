@@ -129,12 +129,16 @@ reads GeoJSON; the `.osm` fusion adds nothing for this data).
 polygons to a rectangle, area share of the site in British National
 Grid metres, point counting by grade, and composing the summary text
 and the survey.json record from fetched features. Everything testable
-without a server. "British National Grid metres" throughout means
-`bng.tm_forward`, the National Grid projection without the OSTN15
-datum shift (planning note, 2026-09-18): the site and every feature
-come from the same lon/lat, so intersections and area shares depend
-only on relative geometry, and the metre-level shift OSTN15 adds would
-change neither while pulling a downloaded grid into pure code.
+without a server. All of it works in the site's own lon/lat frame
+(planning note, 2026-09-18): the drawn site is a lon/lat rectangle, so
+clipping and intersection against it are exact there with no
+projection at all, and an area share is measured by a scanline grid of
+cells laid over the site (400 along its longer side, the other side in
+proportion to its true width), counting a cell when its centre falls
+inside any polygon of the designation. That counts overlapping polygons
+of one designation once, where summing clipped polygon areas would
+count them twice (adjacent flood-model reaches overlap), and it is
+exact to one cell, about 4 m on a 1.5 km site.
 
 **Fetch.** One WFS 2.0 GetFeature per layer, one at a time:
 `typeNames=<typeName>`, `outputFormat=application/json`,
@@ -154,7 +158,7 @@ feature's envelope rather than its shape: the research query over a
 1.5 km Cowbridge box returned a Heritage Coast feature although the
 Glamorgan Heritage Coast lies about 7 km south. Every returned feature
 is therefore re-tested locally for true intersection with the site and
-with the margin, in British National Grid metres, and one that touches
+with the margin, in the site's lon/lat frame, and one that touches
 neither is dropped before it reaches any file, count or summary line.
 
 **Failures are never absences.** A layer that fails (transport, status,
@@ -170,14 +174,23 @@ twenty failing would have painted the whole extent red and marked the
 package incomplete, when nineteen layers of real answers had arrived).
 
 **Coverage.** `covers(bbox)` answers from a committed file, never the
-network: `src/mapgen/data/wales_local_authorities.geojson`, the 22
+network: `src/mapgen/data/wales_coverage.geojson`, the 22
 Welsh unitary authorities to the high-water mark from DataMapWales
 `inspire-wg:localauthorities` (OGL v3, 2026-09-18), simplified to about
 20 m for size (the full layer is 7.2 MB and 270,107 vertices), with the
 script that produced it committed beside the source as
-`tools/build_wales_authorities.py`. "full" when the padded extent lies
-wholly within the union, "partial" when it crosses the edge (the coast
-or the English border), "none" otherwise. The same file names the
+`tools/build_wales_coverage.py`. The councils stop at the
+high-water mark, so on its own the file would call every coastal site
+"partly outside Wales" and the summary would claim the sea side went
+unchecked, which is false: the Welsh layers include marine designations
+and sea flood zones. The same file therefore also holds the Welsh
+National Marine Plan's "Inshore Region" (DataMapWales
+`geonode:wnmp_areas`, OGL v3, out to the 12 nautical mile limit),
+simplified the same way (planning note, 2026-09-18). Coverage is the
+share of the padded extent covered by councils plus inshore waters:
+"full" at 99.5% and above (simplification leaves slivers along the
+coast), "partial" above zero, "none" at zero. "Outside Wales" in the
+summary therefore means England, or open sea beyond 12 nautical miles. The same file names the
 council or councils the site touches, for the summary's "confirm with"
 line. The LiDAR mosaic's bounding rectangle is not used: it includes
 parts of England, where every Welsh layer would return nothing and a
@@ -242,9 +255,10 @@ Sources
 - <each attribution group used, verbatim>
 ```
 
-Rules the tests pin: an area's share is its clipped area over the
-drawn site's area, both in British National Grid metres, rounded to a
-whole percent, written "under 1%" below 0.5%, and "the whole site" at
+Rules the tests pin: an area's share is the fraction of the site's
+scanline grid cells it covers (see "Architecture"), rounded to a whole
+percent, written "under 1%" below 0.5% (including a feature that
+touches the site but covers no cell centre), and "the whole site" at
 99.5% and above; "Within 250 m" lists only features that touch the
 margin and not the site; a designation checked and absent everywhere
 goes under "Checked, none found" by its table label; any layer that
