@@ -254,3 +254,17 @@ def test_possible_outputs_is_the_closed_list():
         "S_constraints_listed_buildings.geojson",
         "S_constraints.txt",
     ]
+
+
+def test_merge_with_no_work_files_clears_earlier_records(tmp_path):
+    source, parts, out = _fetched(tmp_path, {
+        "geonode:conservation_areas_wales": _fixture("cowbridge_conservation_areas.json"),
+    })
+    source.merge(parts, out, "First_2026-09-18")
+    assert source.constraints_record is not None
+    earlier_attribution = source.attribution
+    assert "Natural Resources Wales" in earlier_attribution
+    assert earlier_attribution != ConstraintsWalesSource.attribution
+    source.merge([], out, "Again_2026-09-18")
+    assert source.constraints_record is None
+    assert source.attribution == ConstraintsWalesSource.attribution

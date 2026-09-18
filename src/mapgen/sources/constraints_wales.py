@@ -250,6 +250,8 @@ class ConstraintsWalesSource:
         constraints_record (read by package.py into survey.json) and
         attribution (only the groups whose layers answered, Cadw's date
         substituted)."""
+        self.constraints_record = None
+        self.attribution = type(self).attribution
         features_path = next((Path(p) for p in parts if Path(p).name == WORK_FEATURES), None)
         meta_path = next((Path(p) for p in parts if Path(p).name == WORK_META), None)
         if features_path is None or meta_path is None:
