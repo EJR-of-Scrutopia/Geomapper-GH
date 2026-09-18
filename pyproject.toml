@@ -39,7 +39,7 @@ mapgen = "mapgen.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-mapgen = ["web/static/*", "web/static/**/*"]
+mapgen = ["web/static/*", "web/static/**/*", "data/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
