@@ -128,3 +128,154 @@ def test_group_collections_carry_the_filterable_properties():
         "source": "geonode:conservation_areas_wales",
     }
     assert collections["listed_buildings"]["features"][0]["properties"]["grade_or_zone"] == "II*"
+
+
+from mapgen.constraints import (
+    ATTRIBUTIONS,
+    COAL_LINE,
+    CONSERVATION_CAVEAT,
+    PARTIAL_LINE,
+    TPO_LINE,
+    attribution_statements,
+    render_text,
+    share_text,
+    summarise,
+    to_record,
+)
+
+NATIONAL_PARK = LAYER_BY_TYPE["inspire-nrw:NRW_NATIONAL_PARK"]
+
+
+def _site_left_half():
+    """A polygon covering the west half of SITE exactly."""
+    middle = (SITE[0] + SITE[2]) / 2
+    return _polygon(SITE[0] - 0.01, SITE[1] - 0.01, middle, SITE[3] + 0.01)
+
+
+def _all_checked_but(*results):
+    """Every layer checked and empty, except the given results."""
+    given = {result.layer for result in results}
+    return list(results) + [LayerResult(layer, ok=True) for layer in LAYERS if layer not in given]
+
+
+@pytest.mark.parametrize(
+    "share,text",
+    [
+        (0.0, "under 1% of the site"),
+        (0.0049, "under 1% of the site"),
+        (0.005, "1% of the site"),
+        (0.5, "50% of the site"),
+        (0.125, "13% of the site"),
+        (0.994, "99% of the site"),
+        (0.995, "the whole site"),
+        (1.0, "the whole site"),
+    ],
+)
+def test_share_text_rules(share, text):
+    assert share_text(share) == text
+
+
+def test_an_area_on_the_site_gets_its_share():
+    results = _all_checked_but(LayerResult(CONSERVATION, ok=True, features=(_feature(_site_left_half(), sitename="Cowbridge"),)))
+    summary = summarise(assess(SITE, results), ["Vale of Glamorgan"], "full")
+    assert [entry["line"] for entry in summary.on_site] == ["Conservation area: Cowbridge (50% of the site)"]
+    assert summary.on_site[0]["share"] == pytest.approx(0.5, abs=0.01)
+
+
+def test_a_nameless_flood_zone_is_labelled_by_its_zone():
+    results = _all_checked_but(LayerResult(FLOOD_RIVERS, ok=True, features=(_feature(_site_left_half(), risk="Flood Zone 3"),)))
+    summary = summarise(assess(SITE, results), [], "full")
+    assert summary.on_site[0]["line"] == "Flood zone, rivers: Flood Zone 3 (50% of the site)"
+
+
+def test_listed_buildings_are_counted_by_grade_in_order():
+    points = [
+        _feature({"type": "Point", "coordinates": [-3.45, 51.46]}, Name="A", Grade="II"),
+        _feature({"type": "Point", "coordinates": [-3.449, 51.46]}, Name="B", Grade="II*"),
+        _feature({"type": "Point", "coordinates": [-3.448, 51.46]}, Name="C", Grade="II"),
+        _feature({"type": "Point", "coordinates": [-3.447, 51.46]}, Name="D", Grade="I"),
+    ]
+    summary = summarise(assess(SITE, _all_checked_but(LayerResult(LISTED, ok=True, features=tuple(points)))), [], "full")
+    assert summary.on_site[0]["line"] == "Listed buildings: 4 (Grade I 1, Grade II* 1, Grade II 2)"
+    assert summary.on_site[0]["grades"] == {"II": 2, "II*": 1, "I": 1}
+
+
+def test_the_margin_lists_only_what_is_not_on_the_site():
+    on_site = _feature(_polygon(-3.455, 51.458, -3.445, 51.465), sitename="Cowbridge")
+    margin_same = _feature(_polygon(-3.455, 51.4535, -3.445, 51.4545), sitename="Cowbridge")
+    margin_other = _feature(_polygon(-3.455, 51.4535, -3.445, 51.4545), sitename="Llanblethian")
+    results = _all_checked_but(LayerResult(CONSERVATION, ok=True, features=(on_site, margin_same, margin_other)))
+    summary = summarise(assess(SITE, results), [], "full")
+    assert [entry["line"] for entry in summary.margin] == ["Conservation area: Llanblethian"]
+
+
+def test_a_failed_layer_is_not_checked_and_never_none_found():
+    results = _all_checked_but(LayerResult(SAC, ok=False, kind="timeout", reason="DataMapWales did not answer in time"))
+    summary = summarise(assess(SITE, results), [], "full")
+    assert "Special Area of Conservation" not in summary.none_found
+    lines = [entry["line"] for entry in summary.not_checked]
+    assert lines[0] == "Special Area of Conservation: DataMapWales did not answer in time"
+    assert COAL_LINE in lines and TPO_LINE in lines
+
+
+def test_everything_checked_and_absent_is_none_found_in_table_order():
+    summary = summarise(assess(SITE, _all_checked_but()), [], "full")
+    assert summary.none_found == [layer.designation for layer in LAYERS]
+    assert [entry["line"] for entry in summary.not_checked] == [COAL_LINE, TPO_LINE]
+
+
+def test_partial_coverage_adds_the_outside_wales_line():
+    summary = summarise(assess(SITE, _all_checked_but()), [], "partial")
+    assert summary.not_checked[-1]["line"] == PARTIAL_LINE
+
+
+def test_the_authority_is_the_park_when_a_national_park_covers_the_site():
+    park = LayerResult(NATIONAL_PARK, ok=True, features=(_feature(_site_left_half(), np_name="Bannau Brycheiniog"),))
+    assert summarise(assess(SITE, _all_checked_but(park)), ["Powys"], "full").authority == (
+        "the National Park authority (Bannau Brycheiniog)"
+    )
+    assert summarise(assess(SITE, _all_checked_but()), ["Vale of Glamorgan"], "full").authority == (
+        "the council (Vale of Glamorgan)"
+    )
+    assert summarise(assess(SITE, _all_checked_but()), [], "full").authority == "the local planning authority"
+
+
+def test_cadw_attribution_carries_the_fetch_date():
+    statements = attribution_statements(["C"], "2026-09-18")
+    assert statements == [ATTRIBUTIONS["C"].format(date="2026-09-18")]
+    assert "2026-09-18" in statements[0]
+
+
+def test_render_text_layout():
+    results = _all_checked_but(LayerResult(CONSERVATION, ok=True, features=(_feature(_site_left_half(), sitename="Cowbridge"),)))
+    summary = summarise(assess(SITE, results), ["Vale of Glamorgan"], "full")
+    text = render_text(summary, "Cowbridge_2026-09-18", "2026-09-18")
+    lines = text.splitlines()
+    assert lines[0] == "Planning constraints: Cowbridge_2026-09-18"
+    assert lines[1] == "Indicative, from open data checked 2026-09-18. Confirm with the council (Vale of Glamorgan)."
+    assert "On the site" in lines and "Within 250 m" in lines
+    assert "Checked, none found" in lines and "Not checked" in lines and "Sources" in lines
+    assert "- Conservation area: Cowbridge (50% of the site)" in lines
+    assert lines[lines.index("Within 250 m") + 1] == "- nothing found"
+    assert CONSERVATION_CAVEAT in lines
+    assert text.endswith("\n")
+    assert "—" not in text
+
+
+def test_to_record_shape():
+    results = _all_checked_but(LayerResult(SAC, ok=False, kind="timeout", reason="DataMapWales did not answer in time"))
+    assessment = assess(SITE, results)
+    summary = summarise(assessment, ["Vale of Glamorgan"], "full")
+    record = to_record(
+        summary, assessment, councils=["Vale of Glamorgan"], coverage="full", coverage_share=0.9991,
+        margin_m=250.0, summary_file="x_constraints.txt", fetched_on="2026-09-18",
+    )
+    assert record["checked"] is True
+    assert record["coverage"] == "full" and record["coverage_share"] == 0.9991
+    assert record["layers"]["inspire-nrw:NRW_SAC"] == {
+        "designation": "Special Area of Conservation", "status": "failed", "features": None,
+        "reason": "DataMapWales did not answer in time",
+    }
+    assert record["layers"]["inspire-nrw:NRW_SSSI"]["status"] == "ok"
+    assert record["layers"]["inspire-nrw:NRW_SSSI"]["features"] == 0
+    assert record["summary_file"] == "x_constraints.txt"

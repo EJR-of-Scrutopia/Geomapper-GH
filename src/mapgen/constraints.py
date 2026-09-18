@@ -17,7 +17,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from mapgen.planar import Rect, clip_polygon, point_in_rect, polygon_area_in_rect
+from mapgen.planar import Rect, clip_polygon, point_in_rect, polygon_area_in_rect, share_of_rect
 
 METRES_PER_DEGREE_LAT = 111_320.0
 MARGIN_METRES = 250.0
@@ -236,4 +236,246 @@ def group_collections(assessment: Assessment) -> dict[str, dict]:
         group: {"type": "FeatureCollection", "features": by_group[group]}
         for group in OUTPUT_GROUPS
         if group in by_group
+    }
+
+
+# The four attribution groups, verbatim from each layer's DataMapWales
+# page (the spec's "Attribution groups"). C's {date} is the date the
+# data was received from Cadw, as Cadw's own wording instructs; D is
+# OGL v3's own default statement, for layers that publish none.
+ATTRIBUTIONS: dict[str, str] = {
+    "A": (
+        "Contains Natural Resources Wales information © Natural Resources Wales and database right. "
+        "All rights reserved. Some features of this information are based on digital spatial data licensed "
+        "from the UK Centre for Ecology & Hydrology © UKCEH. Defra, Met Office and DARD Rivers Agency "
+        "© Crown copyright. © Cranfield University. © James Hutton Institute. Contains OS data "
+        "© Crown copyright and database right."
+    ),
+    "B": (
+        "Contains Natural Resources Wales information © Natural Resources Wales and Database Right. "
+        "All rights Reserved. Contains Ordnance Survey Data. Ordnance Survey Licence number AC0000849444. "
+        "Crown Copyright and Database Right."
+    ),
+    "C": (
+        "Designated Historic Asset GIS Data, The Welsh Historic Environment Service (Cadw), {date}, "
+        "licensed under the Open Government Licence"
+    ),
+    "D": "Contains public sector information licensed under the Open Government Licence v3.0.",
+}
+
+COAL_LINE = "Coal mining risk: no open data service. See the Mining Remediation Authority's interactive map."
+TPO_LINE = "Tree Preservation Orders: no national dataset for Wales. Ask the council."
+PARTIAL_LINE = "Part of the extent is outside Wales and was not checked."
+CONSERVATION_CAVEAT = "Conservation areas are boundaries only; contact the council for full details."
+GRADE_ORDER = ("I", "II*", "II")
+LISTED_GROUP = "listed_buildings"
+NATIONAL_PARK_TYPE = "inspire-nrw:NRW_NATIONAL_PARK"
+CONSERVATION_TYPE = "geonode:conservation_areas_wales"
+
+
+def attribution_statements(groups, fetched_on: str) -> list[str]:
+    wanted = set(groups)
+    return [
+        ATTRIBUTIONS[group].format(date=fetched_on) if group == "C" else ATTRIBUTIONS[group]
+        for group in ("A", "B", "C", "D")
+        if group in wanted
+    ]
+
+
+def share_text(share: float) -> str:
+    if share >= 0.995:
+        return "the whole site"
+    if share < 0.005:
+        return "under 1% of the site"
+    # Half up, not Python's round-half-to-even, so 0.5% reads 1%.
+    return f"{int(share * 100 + 0.5)}% of the site"
+
+
+@dataclass
+class Summary:
+    on_site: list
+    margin: list
+    none_found: list
+    not_checked: list
+    authority: str
+    conservation_found: bool
+    attribution_groups: list
+
+
+def _label(item: Found) -> str | None:
+    return item.name if item.layer.name_field else item.grade_or_zone
+
+
+def _grade_counts(items: Sequence[Found]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        grade = item.grade_or_zone or "ungraded"
+        counts[grade] = counts.get(grade, 0) + 1
+    return counts
+
+
+def _grades_text(counts: dict[str, int]) -> str:
+    known = [grade for grade in GRADE_ORDER if grade in counts]
+    others = sorted(grade for grade in counts if grade not in GRADE_ORDER)
+    parts = [f"Grade {grade} {counts[grade]}" for grade in known]
+    parts += [f"{grade} {counts[grade]}" for grade in others]
+    return ", ".join(parts)
+
+
+def _area_groups(items: Sequence[Found]) -> dict[tuple[str, str | None], list]:
+    groups: dict[tuple[str, str | None], list] = {}
+    for item in items:
+        if item.layer.group == LISTED_GROUP:
+            continue
+        groups.setdefault((item.layer.type_name, _label(item)), []).append(item)
+    return groups
+
+
+def summarise(assessment: Assessment, councils: Sequence[str], coverage: str) -> Summary:
+    order = {layer.type_name: index for index, layer in enumerate(LAYERS)}
+    site_items = [item for item in assessment.found if item.where == "site"]
+    margin_items = [item for item in assessment.found if item.where == "margin"]
+    x_scale = math.cos(math.radians((assessment.site[1] + assessment.site[3]) / 2))
+
+    ranked: list[tuple[int, str, dict]] = []
+    site_groups = _area_groups(site_items)
+    for (type_name, label), items in site_groups.items():
+        layer = LAYER_BY_TYPE[type_name]
+        polygons = [rings for item in items for rings in item.site_polygons]
+        share = share_of_rect(polygons, assessment.site, SHARE_GRID_CELLS, x_scale)
+        subject = f"{layer.designation}: {label}" if label else layer.designation
+        ranked.append(
+            (order[type_name], label or "", {
+                "designation": layer.designation, "label": label, "share": round(share, 4),
+                "count": len(items), "grades": None, "line": f"{subject} ({share_text(share)})",
+            })
+        )
+    listed_site = [item for item in site_items if item.layer.group == LISTED_GROUP]
+    if listed_site:
+        counts = _grade_counts(listed_site)
+        ranked.append(
+            (order["inspire-wg:Cadw_ListedBuildings"], "", {
+                "designation": "Listed building", "label": None, "share": None, "count": len(listed_site),
+                "grades": counts, "line": f"Listed buildings: {len(listed_site)} ({_grades_text(counts)})",
+            })
+        )
+    on_site = [entry for _, _, entry in sorted(ranked, key=lambda r: (r[0], r[1]))]
+
+    ranked = []
+    for (type_name, label), items in _area_groups(margin_items).items():
+        if (type_name, label) in site_groups:
+            continue
+        layer = LAYER_BY_TYPE[type_name]
+        ranked.append(
+            (order[type_name], label or "", {
+                "designation": layer.designation, "label": label, "share": None, "count": len(items),
+                "grades": None, "line": f"{layer.designation}: {label}" if label else layer.designation,
+            })
+        )
+    listed_margin = [item for item in margin_items if item.layer.group == LISTED_GROUP]
+    if listed_margin:
+        counts = _grade_counts(listed_margin)
+        ranked.append(
+            (order["inspire-wg:Cadw_ListedBuildings"], "", {
+                "designation": "Listed building", "label": None, "share": None, "count": len(listed_margin),
+                "grades": counts, "line": f"Listed buildings: {len(listed_margin)} ({_grades_text(counts)})",
+            })
+        )
+    margin = [entry for _, _, entry in sorted(ranked, key=lambda r: (r[0], r[1]))]
+
+    found_types = {item.layer.type_name for item in assessment.found}
+    none_found = [layer.designation for layer in assessment.checked if layer.type_name not in found_types]
+    none_found.sort(key=lambda designation: next(i for i, l in enumerate(LAYERS) if l.designation == designation))
+
+    not_checked = [
+        {"designation": layer.designation, "reason": reason, "line": f"{layer.designation}: {reason}"}
+        for layer, reason in assessment.failed
+    ]
+    not_checked.append({"designation": "Coal mining risk", "reason": "no open data service", "line": COAL_LINE})
+    not_checked.append({"designation": "Tree Preservation Orders", "reason": "no national dataset for Wales", "line": TPO_LINE})
+    if coverage == "partial":
+        not_checked.append({"designation": "Outside Wales", "reason": "outside the Welsh layers", "line": PARTIAL_LINE})
+
+    parks = sorted({item.name for item in site_items if item.layer.type_name == NATIONAL_PARK_TYPE and item.name})
+    if parks:
+        authority = f"the National Park authority ({' and '.join(parks)})"
+    elif councils:
+        authority = f"the council ({' and '.join(councils)})"
+    else:
+        authority = "the local planning authority"
+
+    return Summary(
+        on_site=on_site,
+        margin=margin,
+        none_found=none_found,
+        not_checked=not_checked,
+        authority=authority,
+        conservation_found=any(item.layer.type_name == CONSERVATION_TYPE for item in assessment.found),
+        attribution_groups=sorted({layer.attribution for layer in assessment.checked}),
+    )
+
+
+def render_text(summary: Summary, title: str, fetched_on: str, margin_m: float = MARGIN_METRES) -> str:
+    lines = [
+        f"Planning constraints: {title}",
+        f"Indicative, from open data checked {fetched_on}. Confirm with {summary.authority}.",
+        "",
+        "On the site",
+    ]
+    lines += [f"- {entry['line']}" for entry in summary.on_site] or ["- nothing found"]
+    lines += ["", f"Within {int(margin_m)} m"]
+    lines += [f"- {entry['line']}" for entry in summary.margin] or ["- nothing found"]
+    lines += ["", "Checked, none found"]
+    lines.append(f"- {'; '.join(summary.none_found)}" if summary.none_found else "- none")
+    lines += ["", "Not checked"]
+    lines += [f"- {entry['line']}" for entry in summary.not_checked]
+    if summary.conservation_found:
+        lines += ["", CONSERVATION_CAVEAT]
+    lines += ["", "Sources"]
+    lines += [f"- {statement}" for statement in attribution_statements(summary.attribution_groups, fetched_on)]
+    return "\n".join(lines) + "\n"
+
+
+def to_record(
+    summary: Summary,
+    assessment: Assessment,
+    *,
+    councils: Sequence[str],
+    coverage: str,
+    coverage_share: float,
+    margin_m: float,
+    summary_file: str,
+    fetched_on: str,
+) -> dict:
+    found_counts: dict[str, int] = {}
+    for item in assessment.found:
+        found_counts[item.layer.type_name] = found_counts.get(item.layer.type_name, 0) + 1
+    failed = {layer.type_name: reason for layer, reason in assessment.failed}
+    layers: dict[str, dict] = {}
+    for layer in LAYERS:
+        if layer.type_name in failed:
+            layers[layer.type_name] = {
+                "designation": layer.designation, "status": "failed", "features": None,
+                "reason": failed[layer.type_name],
+            }
+        elif layer in assessment.checked:
+            layers[layer.type_name] = {
+                "designation": layer.designation, "status": "ok",
+                "features": found_counts.get(layer.type_name, 0), "reason": None,
+            }
+    return {
+        "checked": True,
+        "fetched_on": fetched_on,
+        "margin_m": margin_m,
+        "coverage": coverage,
+        "coverage_share": round(coverage_share, 4),
+        "councils": list(councils),
+        "authority": summary.authority,
+        "on_site": summary.on_site,
+        "margin": summary.margin,
+        "none_found": summary.none_found,
+        "not_checked": summary.not_checked,
+        "layers": layers,
+        "skipped_geometry": assessment.skipped_geometry,
+        "summary_file": summary_file,
     }
