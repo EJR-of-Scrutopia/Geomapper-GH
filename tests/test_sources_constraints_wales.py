@@ -93,15 +93,44 @@ def test_one_request_per_layer_in_table_order_with_the_verified_shape(tmp_path):
     assert call["timeout"] == REQUEST_TIMEOUT_SECONDS
 
 
-def test_a_full_page_asks_for_the_next(tmp_path, monkeypatch):
+def test_an_incomplete_first_page_is_discarded_and_restarted_with_start_index_on_every_page(tmp_path, monkeypatch):
+    # A bare first page that is not complete (a full page, and numberMatched
+    # says there is more) cannot be trusted: GeoServer only sorts a table by
+    # its primary key once startIndex is on the request, so a keyless page
+    # one and a keyed page two need not agree. Discard it and restart from
+    # zero, sending startIndex on every page this time, so the whole layer
+    # was served in one sort order.
     monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
     point = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-3.45, 51.46]}, "properties": {"Name": "A", "Grade": "II"}}
-    session = _RoutedSession({"inspire-wg:Cadw_ListedBuildings": [_collection([point, point], matched=3), _collection([point], matched=3)]})
+    other = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-3.44, 51.46]}, "properties": {"Name": "B", "Grade": "II"}}
+    third = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-3.43, 51.46]}, "properties": {"Name": "C", "Grade": "II"}}
+    session = _RoutedSession({
+        "inspire-wg:Cadw_ListedBuildings": [
+            _collection([point, other], matched=3),  # bare first page: full, and more to come, so discarded
+            _collection([point, other], matched=3),  # restart, startIndex=0, same sort order this time
+            _collection([third], matched=3),  # restart, startIndex=2
+        ]
+    })
     ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
     listed = [c for c in session.calls if c["params"]["typeNames"] == "inspire-wg:Cadw_ListedBuildings"]
-    assert [c["params"].get("startIndex") for c in listed] == [None, "2"]
+    assert [c["params"].get("startIndex") for c in listed] == [None, "0", "2"]
     rows = [json.loads(line) for line in (tmp_path / WORK_FEATURES).read_text(encoding="utf-8").splitlines()]
-    assert len(next(r for r in rows if r["type_name"] == "inspire-wg:Cadw_ListedBuildings")["features"]) == 3
+    features = next(r for r in rows if r["type_name"] == "inspire-wg:Cadw_ListedBuildings")["features"]
+    assert len(features) == 3
+    assert [f["properties"]["Name"] for f in features] == ["A", "B", "C"]
+
+
+def test_a_short_first_page_is_used_as_is(tmp_path, monkeypatch):
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    point = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-3.45, 51.46]}, "properties": {"Name": "A", "Grade": "II"}}
+    session = _RoutedSession({"inspire-wg:Cadw_ListedBuildings": _collection([point], matched=1)})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    listed = [c for c in session.calls if c["params"]["typeNames"] == "inspire-wg:Cadw_ListedBuildings"]
+    assert len(listed) == 1
+    assert "startIndex" not in listed[0]["params"]
+    rows = [json.loads(line) for line in (tmp_path / WORK_FEATURES).read_text(encoding="utf-8").splitlines()]
+    features = next(r for r in rows if r["type_name"] == "inspire-wg:Cadw_ListedBuildings")["features"]
+    assert len(features) == 1
 
 
 def test_a_layer_over_the_ceiling_is_not_checked(tmp_path):
@@ -273,9 +302,10 @@ def test_merge_with_no_work_files_clears_earlier_records(tmp_path):
 
 def test_a_table_with_no_primary_key_is_never_sent_a_start_index(tmp_path):
     """GeoServer answers HTTP 400 'Cannot do natural order without a primary
-    key' whenever a request carries startIndex to a table with no primary key.
-    This test ensures we never send startIndex on the first page."""
-    class _NoStartIndexOnFirstPage(_RoutedSession):
+    key' to any request that carries startIndex to a table with no primary
+    key. A short first page (the whole fixture, here) is used as is and
+    never triggers the restart that would send one."""
+    class _RefusesAnyStartIndex(_RoutedSession):
         def get(self, url, params=None, headers=None, timeout=None):
             self.calls.append({"url": url, "params": dict(params or {}), "headers": dict(headers or {}), "timeout": timeout})
             if "startIndex" in params:
@@ -287,7 +317,7 @@ def test_a_table_with_no_primary_key_is_never_sent_a_start_index(tmp_path):
                 raise answer
             return answer
 
-    session = _NoStartIndexOnFirstPage()
+    session = _RefusesAnyStartIndex()
     source = ConstraintsWalesSource(session=session)
     source.fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
     rows = {r["type_name"]: r for r in (json.loads(l) for l in (tmp_path / WORK_FEATURES).read_text(encoding="utf-8").splitlines())}

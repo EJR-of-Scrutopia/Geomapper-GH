@@ -8,9 +8,14 @@ decision about a feature is mapgen.constraints'.
 One WFS 2.0 GetFeature per layer, one at a time, in table order. Three
 traps verified live: without srsName GeoServer answers in EPSG:27700,
 the bbox must be lon,lat order (lat,lon returns nothing, silently), and
-startIndex on a table with no primary key answers HTTP 400; therefore we
-omit it on the first page and send it only from the second page on.
-A layer that fails is tried once more after the others; if it fails
+startIndex on a table with no primary key answers HTTP 400, and only a
+request carrying startIndex is sorted at all (GeoServer's own natural
+order, by primary key), so a bare page one and a startIndex page two
+need not agree. Every layer's first request is bare; if that page is
+already complete (short, or numberMatched says there is no more) it
+stands, otherwise it is discarded and the whole layer is re-fetched from
+zero with startIndex on every page, so every page it keeps was served in
+the same sorted order (see _fetch_layer's own docstring). A layer that fails
 again it is reported as not checked, never as none found, and the run
 carries on. Only when every layer fails does this source record
 tile_failures and raise, so the package is marked incomplete and the
@@ -117,7 +122,7 @@ class ConstraintsWalesSource:
             seconds_estimate=len(LAYERS) * SECONDS_PER_LAYER_ESTIMATE,
         )
 
-    def _get_page(self, layer: Layer, padded, start: int) -> dict:
+    def _get_page(self, layer: Layer, padded, start: int, send_start_index: bool) -> dict:
         params = {
             "service": "WFS",
             "version": "2.0.0",
@@ -128,8 +133,9 @@ class ConstraintsWalesSource:
             "bbox": f"{padded[0]},{padded[1]},{padded[2]},{padded[3]},EPSG:4326",
             "count": str(PAGE_SIZE),
         }
-        # GeoServer answers HTTP 400 to startIndex on a table with no primary key.
-        if start:
+        # GeoServer answers HTTP 400 to startIndex on a table with no primary key,
+        # so the bare first request never sends one.
+        if send_start_index:
             params["startIndex"] = str(start)
         try:
             response = self.session.get(
@@ -150,19 +156,44 @@ class ConstraintsWalesSource:
         return body
 
     def _fetch_layer(self, layer: Layer, padded) -> list:
+        """One page, bare, first: GeoServer only sorts a keyless table once
+        startIndex is on the request, so a bare page one and a startIndex
+        page two need not agree, and the union would carry duplicates and
+        omissions with no error. If that first page is already complete
+        (short, or numberMatched says there is no more) it stands; a
+        complete page from one bare request was, trivially, served in one
+        order. Otherwise it is discarded and every page, starting again
+        from zero, carries startIndex, so the whole layer was served in
+        the same sorted order throughout. A keyless table that needs a
+        second page then answers 400 on that restart, same as any other
+        service failure."""
         too_many = f"holds more than {FEATURE_CEILING:,} features here, too many to check"
+
+        def _checked(features: list, matched: object) -> list:
+            if isinstance(matched, int) and matched > FEATURE_CEILING:
+                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
+            if len(features) > FEATURE_CEILING:
+                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
+            return features
+
+        def _complete(page: list, matched: object) -> bool:
+            return len(page) < PAGE_SIZE or (isinstance(matched, int) and matched <= len(page))
+
+        first_body = self._get_page(layer, padded, 0, send_start_index=False)
+        first_matched = first_body.get("numberMatched")
+        first_page = first_body["features"]
+        if _complete(first_page, first_matched):
+            return _checked(first_page, first_matched)
+
         features: list = []
         start = 0
         while True:
-            body = self._get_page(layer, padded, start)
+            body = self._get_page(layer, padded, start, send_start_index=True)
             matched = body.get("numberMatched")
-            if isinstance(matched, int) and matched > FEATURE_CEILING:
-                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
             page = body["features"]
             features.extend(page)
-            if len(features) > FEATURE_CEILING:
-                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
-            if len(page) < PAGE_SIZE:
+            _checked(features, matched)
+            if len(page) < PAGE_SIZE or (isinstance(matched, int) and len(features) >= matched):
                 return features
             start += PAGE_SIZE
 
