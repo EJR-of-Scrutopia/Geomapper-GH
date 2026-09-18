@@ -102,10 +102,12 @@ names the source of the flooding, which the merged layer loses.
 2. **robots.txt.** DataMapWales's robots.txt disallows `/geoserver/`
    for crawlers. mapgen is not a crawler: it sends one request per
    layer (about twenty) per survey the owner starts, over one small
-   area, identified by its User-Agent, and `lidar_wales` already queries
-   the same server. Owner action before any public release: a short
-   courtesy note to DataMapWales describing that pattern. Not a blocker
-   for this build.
+   area, identified by its User-Agent. This is the first mapgen source
+   to query `/geoserver/`: `lidar_wales` reads DataMapWales's LiDAR from
+   its Azure blob storage, a different host (corrected during planning,
+   2026-09-18; the approved design had said the two shared a server).
+   Owner action before any public release: a short courtesy note to
+   DataMapWales describing that pattern. Not a blocker for this build.
 3. **Conservation areas** are boundaries only. The dataset's own caveat
    is carried into the summary: "This dataset provides information on
    the map boundaries only. For the full information, including
@@ -127,7 +129,12 @@ reads GeoJSON; the `.osm` fusion adds nothing for this data).
 polygons to a rectangle, area share of the site in British National
 Grid metres, point counting by grade, and composing the summary text
 and the survey.json record from fetched features. Everything testable
-without a server.
+without a server. "British National Grid metres" throughout means
+`bng.tm_forward`, the National Grid projection without the OSTN15
+datum shift (planning note, 2026-09-18): the site and every feature
+come from the same lon/lat, so intersections and area shares depend
+only on relative geometry, and the metre-level shift OSTN15 adds would
+change neither while pulling a downloaded grid into pure code.
 
 **Fetch.** One WFS 2.0 GetFeature per layer, one at a time:
 `typeNames=<typeName>`, `outputFormat=application/json`,
@@ -151,9 +158,16 @@ with the margin, in British National Grid metres, and one that touches
 neither is dropped before it reaches any file, count or summary line.
 
 **Failures are never absences.** A layer that fails (transport, status,
-unparseable body, over the ceiling) goes into `tile_failures` with its
-reason and appears in the summary under "Not checked", never under
-"Checked, none found". The run carries on with the other layers.
+unparseable body, over the ceiling) is tried once more after the other
+layers, and if it fails again it appears in the summary and the
+survey.json record under "Not checked" with its reason, never under
+"Checked, none found", and the run carries on with the other layers.
+Only when every layer fails does the source record `tile_failures` and
+raise, so the package is marked incomplete and the retry pass gets its
+turn (planning note, 2026-09-18: the design first put each failed layer
+in `tile_failures`, but that list is per map tile, and one layer out of
+twenty failing would have painted the whole extent red and marked the
+package incomplete, when nineteen layers of real answers had arrived).
 
 **Coverage.** `covers(bbox)` answers from a committed file, never the
 network: `src/mapgen/data/wales_local_authorities.geojson`, the 22
@@ -258,8 +272,9 @@ finishes, so the headline is on screen without opening the folder.
   "Checked, none found" versus "Not checked", the partial-coverage line,
   the Cadw DATE substitution.
 - The source: request shape (srsName, lon,lat bbox order, paging), a
-  failed layer landing in `tile_failures` and never in none found, the
-  feature ceiling, `covers()` full, partial and none against the
+  failed layer retried once and then landing in "Not checked" and never
+  in none found, every layer failing reaching `tile_failures` and
+  raising, the feature ceiling, `covers()` full, partial and none against the
   committed councils file, cancel between layers.
 - The local intersection re-test: a feature whose envelope overlaps the
   padded extent but whose shape touches neither the site nor the margin
