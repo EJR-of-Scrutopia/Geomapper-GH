@@ -268,3 +268,28 @@ def test_merge_with_no_work_files_clears_earlier_records(tmp_path):
     source.merge([], out, "Again_2026-09-18")
     assert source.constraints_record is None
     assert source.attribution == ConstraintsWalesSource.attribution
+
+
+@pytest.mark.live
+def test_live_cowbridge(tmp_path):
+    """The real service over the real town: both conservation areas, at
+    least 30 listed buildings, and no Heritage Coast, which the loose
+    bbox returns and the local re-test must drop (the spec's "Testing")."""
+    work = tmp_path / "work"
+    work.mkdir()
+    out = tmp_path / "package"
+    out.mkdir()
+    source = ConstraintsWalesSource()
+    parts = source.fetch(COWBRIDGE, _tiles(), work, _Recorder())
+    source.merge(parts, out, "Cowbridge_live")
+    heritage = json.loads((out / "Cowbridge_live_constraints_heritage.geojson").read_text(encoding="utf-8"))
+    names = {f["properties"]["name"] for f in heritage["features"] if f["properties"]["designation"] == "Conservation area"}
+    assert {"Cowbridge", "Llanblethian"} <= names
+    listed = json.loads((out / "Cowbridge_live_constraints_listed_buildings.geojson").read_text(encoding="utf-8"))
+    assert len(listed["features"]) >= 30
+    landscape_path = out / "Cowbridge_live_constraints_landscape.geojson"
+    if landscape_path.exists():
+        landscape = json.loads(landscape_path.read_text(encoding="utf-8"))
+        assert all(f["properties"]["designation"] != "Heritage Coast" for f in landscape["features"])
+    assert source.constraints_record["coverage"] == "full"
+    assert all(entry["status"] == "ok" for entry in source.constraints_record["layers"].values())
