@@ -20,7 +20,28 @@ def test_save_then_load_round_trips(tmp_path):
 def test_a_corrupt_config_falls_back_to_defaults(tmp_path):
     target = tmp_path / "config.json"
     target.write_text("{not json", encoding="utf-8")
-    assert load_config(target).tile_size_m == 2000.0
+    with pytest.warns(UserWarning):
+        assert load_config(target).tile_size_m == 2000.0
+
+
+def test_a_config_that_is_not_json_says_so_rather_than_resetting_silently(tmp_path):
+    # A hand-edited Windows path with one backslash is the realistic way
+    # to get here: "C:\Surveys" is not valid JSON. Every field then falls
+    # back to its default, which is the same rule a single rejected field
+    # follows, so it gets the same visible warning a single field does.
+    target = tmp_path / "config.json"
+    target.write_text(r'{"output_root": "C:\Surveys"}', encoding="utf-8")
+    with pytest.warns(UserWarning, match=r"not valid JSON.*using the defaults"):
+        loaded = load_config(target)
+    assert loaded.output_root == Config().output_root
+
+
+def test_a_config_that_is_json_but_not_an_object_says_so(tmp_path):
+    target = tmp_path / "config.json"
+    target.write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.warns(UserWarning, match=r"not a JSON object.*using the defaults"):
+        loaded = load_config(target)
+    assert loaded.tile_size_m == Config().tile_size_m
 
 
 def test_unknown_keys_are_ignored(tmp_path):
@@ -238,11 +259,16 @@ def test_the_log_height_defaults_to_never_chosen():
 
 
 def test_a_config_written_before_the_log_height_existed_still_loads(tmp_path):
+    # The file must genuinely parse, and carry values that differ from the
+    # defaults, or this passes on the fallback alone: an earlier version
+    # wrote "C:\Surveys" with one backslash, which is not valid JSON, and
+    # asserted tile_size_m == 2000.0, which is the default.
     target = tmp_path / "config.json"
-    target.write_text('{"output_root": "C:\Surveys", "tile_size_m": 2000}', encoding="utf-8")
+    target.write_text(r'{"output_root": "C:\\Surveys", "tile_size_m": 1500}', encoding="utf-8")
     loaded = load_config(target)
+    assert loaded.output_root == "C:\\Surveys"
+    assert loaded.tile_size_m == 1500.0
     assert loaded.log_height_px == 0.0
-    assert loaded.tile_size_m == 2000.0
 
 
 def test_save_then_load_round_trips_the_log_height(tmp_path):

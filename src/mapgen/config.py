@@ -82,9 +82,20 @@ def load_config(path: Path | None = None) -> Config:
     target = path or CONFIG_PATH
     if not target.exists():
         return Config()
+    # A whole file that cannot be used falls back to every default, and
+    # says so, for the same reason a single rejected field below does: a
+    # silent reset is indistinguishable from the settings having never
+    # been made. The realistic cause is a hand-edited Windows path with
+    # one backslash ("C:\Surveys"), which is not valid JSON.
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError as exc:
+        warnings.warn(
+            f"{target}: not valid JSON ({exc}); using the defaults for every field.",
+            stacklevel=2,
+        )
+        return Config()
+    except OSError:
         return Config()
 
     # Valid JSON is not guaranteed to be an object: a bare number, string,
@@ -96,6 +107,10 @@ def load_config(path: Path | None = None) -> Config:
     # it) and raises TypeError for others (an int or None is not iterable
     # at all). Neither outcome is intended; both are closed off here.
     if not isinstance(payload, dict):
+        warnings.warn(
+            f"{target}: not a JSON object; using the defaults for every field.",
+            stacklevel=2,
+        )
         return Config()
 
     defaults = Config()
