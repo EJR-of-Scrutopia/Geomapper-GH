@@ -82,6 +82,18 @@ const INPUT_MARKUP = new Map(
   }).filter(([id]) => id !== undefined)
 );
 
+// Every id whose own tag in the committed markup carries the `hidden`
+// attribute, so an element starts hidden here exactly when it starts
+// hidden in a browser. Every element used to start visible whatever the
+// markup said, which made the harness more permissive than a browser for
+// anything the page relies on the markup, not a script, to hide.
+const HIDDEN_AT_LOAD = new Set(
+  Array.from(INDEX_HTML_MARKUP.matchAll(/<[a-zA-Z][^>]*>/g), (match) => match[0])
+    .filter((tag) => /\shidden(?=[\s>/=])/.test(tag))
+    .map((tag) => (tag.match(/\bid="([^"]+)"/) || [])[1])
+    .filter((id) => id !== undefined)
+);
+
 // --- minimal DOM -----------------------------------------------------
 
 // Parses <input .../> tags out of an HTML string into small, live
@@ -222,7 +234,7 @@ function makeElement(id) {
     },
     checked: false,
     disabled: false,
-    hidden: false,
+    hidden: HIDDEN_AT_LOAD.has(id),
     className: "",
     textContent: "",
     style: {},
@@ -9385,6 +9397,39 @@ function ok(condition, message) {
     const keep = INDEX_HTML_MARKUP.indexOf('id="keep-work"');
     ok(keep !== -1, "expected the checkbox kept, not removed");
     ok(advanced < keep && keep < end, "expected it inside the first Advanced section");
+  });
+
+  // =======================================================================
+  // The map has the whole column until the log has something to say
+  // =======================================================================
+  //
+  // An empty log held its full saved height under the map while an extent
+  // was being chosen, a quarter of the screen showing nothing. It stays
+  // hidden, divider and all, until its first line, then opens at the
+  // owner's saved height and is never hidden again, so a run's own
+  // clear-and-refill does not flicker the map.
+
+  await test("the log and its divider start hidden, so the map has the column", async () => {
+    const { sandbox } = await bootedSandbox();
+    ok(sandbox.document.getElementById("log").hidden === true, "expected the empty log hidden");
+    ok(sandbox.document.getElementById("log-resizer").hidden === true, "expected its divider hidden with it");
+  });
+
+  await test("the first line opens the log and tells the map its box changed", async () => {
+    const { sandbox } = await bootedSandbox();
+    const before = sandbox.L.map()._invalidateSizeCalls;
+    sandbox.log("Starting");
+    ok(sandbox.document.getElementById("log").hidden === false, "expected the log shown");
+    ok(sandbox.document.getElementById("log-resizer").hidden === false, "expected the divider shown");
+    ok(sandbox.L.map()._invalidateSizeCalls > before, "expected Leaflet told to re-measure");
+  });
+
+  await test("a cleared log stays open, so each run does not flicker the map", async () => {
+    const { sandbox } = await bootedSandbox();
+    sandbox.log("Starting");
+    sandbox.document.getElementById("log").innerHTML = "";
+    sandbox.log("Again");
+    ok(sandbox.document.getElementById("log").hidden === false, "expected the log still shown");
   });
 
   console.log(

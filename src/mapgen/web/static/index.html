@@ -108,7 +108,7 @@
         -->
         <div id="log-resizer" class="log-resizer" role="separator"
              aria-orientation="horizontal"
-             title="Drag up for more log, down for more map"></div>
+             title="Drag up for more log, down for more map" hidden></div>
 
         <!--
           Task 38, item 3. "can we put the scripting part only below the
@@ -125,8 +125,12 @@
           Moved, not copied. There is exactly one element with id="log" in
           this document, so log() still writes to the one place the owner
           reads, and nothing else in app.js knows or cares where it sits.
+
+          Hidden, with its divider, until its first line: an empty log
+          held a quarter of the screen under the map while an extent was
+          being chosen. log() reveals both, once.
         -->
-        <div id="log" class="log"></div>
+        <div id="log" class="log" hidden></div>
       </section>
 
       <section class="form-pane">

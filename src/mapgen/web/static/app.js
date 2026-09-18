@@ -3531,11 +3531,27 @@ function describeEventValue(value) {
 }
 
 function log(message, failed = false) {
+  revealLog();
   const line = document.createElement("div");
   if (failed) line.className = "fail";
   line.textContent = message;
   $("log").appendChild(line);
   $("log").scrollTop = $("log").scrollHeight;
+}
+
+// The log and its divider start hidden (see index.html), so the map has
+// the whole column while an extent is being chosen. The first line
+// opens both, once and for good: Download clears the log and refills it
+// at once, and hiding it again in between would flicker the map on
+// every run. A saved height is re-clamped against the column the two now
+// share; with none, the stylesheet's own height stands, as it always has
+// for a split never chosen. Either way Leaflet is told its box changed.
+function revealLog() {
+  if (!$("log").hidden) return;
+  $("log").hidden = false;
+  $("log-resizer").hidden = false;
+  if ($("log").style.height) setLogHeight(logHeight());
+  else map.invalidateSize();
 }
 
 // --- how much of the column the log gets ---------------------------------
