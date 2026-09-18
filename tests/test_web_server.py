@@ -2129,7 +2129,10 @@ def test_build_server_wires_a_real_nominatim_client_by_default():
 # script, not grepping it, which is a different and much larger tool than
 # a regression guard for an honest mistake warrants.
 
-_ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org"}
+# www.openstreetmap.org is a link the viewer may follow, never something
+# the page fetches: the basemap attribution must link "OpenStreetMap" to
+# its copyright page under both the tile policy and the ODbL.
+_ALLOWED_STATIC_HOSTS = {"tile.openstreetmap.org", "www.openstreetmap.org"}
 # Matches a URL host after "http(s)://" anywhere in the text (deliberately
 # unanchored: this is what already catches a form action, a CSS url(...),
 # or an ES import, none of which need their own special case, simply

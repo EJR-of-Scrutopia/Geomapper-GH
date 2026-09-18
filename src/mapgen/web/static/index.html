@@ -12,6 +12,10 @@
       is server-side (see mapgen.geocode), this tag is what is left doing
       that job, made explicit here rather than left to rely only on
       whatever a browser's own default referrer policy happens to be.
+      The one exception is the basemap's tile images: OSM's tile servers
+      refuse a request with no Referer, so app.js gives that layer its own
+      strict-origin policy, which sends the bare origin and never the
+      token-bearing query.
     -->
     <meta name="referrer" content="no-referrer" />
     <title>mapgen</title>

@@ -495,6 +495,7 @@ function makeLeaflet() {
   const mapListeners = {};
   const rectangles = [];
   const markers = [];
+  const tileLayers = [];
 
   // L.latLng accepts [lat, lng] and {lat, lng} interchangeably, and
   // app.js hands markers the array form while Leaflet hands its own drag
@@ -587,11 +588,19 @@ function makeLeaflet() {
 
   return {
     map: () => mapObject,
-    tileLayer: () => ({
-      addTo() {
-        return this;
-      },
-    }),
+    // Recorded, not merely accepted: the basemap's own options are what
+    // decide whether OSM's tile servers serve it or refuse it (see the
+    // referrer test), so a stub that swallowed them could not tell a
+    // compliant layer from a blocked one.
+    _tileLayers: tileLayers,
+    tileLayer: (url, options) => {
+      tileLayers.push({ url, options: options || {} });
+      return {
+        addTo() {
+          return this;
+        },
+      };
+    },
     rectangle: (bounds, options) => {
       const layerListeners = {};
       const handle = {
@@ -1020,6 +1029,54 @@ function ok(condition, message) {
 }
 
 (async () => {
+  // =======================================================================
+  // The basemap must not be refused by OSM's tile servers
+  // =======================================================================
+  //
+  // The OSMF tile usage policy: "Do not set a restrictive Referrer-Policy
+  // that prevents the Referer header being sent on requests to
+  // tile.openstreetmap.org." index.html sets no-referrer page-wide so the
+  // launch token in this page's URL never leaves the machine, and OSM
+  // began answering those referer-less tile requests with an "access
+  // blocked" image instead of the map. The layer's own referrerPolicy
+  // overrides the page's for its tile images only, and strict-origin
+  // sends http://127.0.0.1:<port>/ alone: no path, no query, no token.
+
+  await test("the basemap sends an origin-only Referer, so OSM serves the tiles", async () => {
+    const { sandbox } = await bootedSandbox();
+    const layers = sandbox.L._tileLayers;
+    ok(layers.length === 1, `expected exactly one tile layer, got ${layers.length}`);
+    ok(
+      new URL(layers[0].url.replace(/\{[a-z]\}/g, "0")).host === "tile.openstreetmap.org",
+      `expected the OSM tile host, got ${layers[0].url}`
+    );
+    ok(
+      layers[0].options.referrerPolicy === "strict-origin",
+      `expected referrerPolicy "strict-origin", got ${JSON.stringify(layers[0].options.referrerPolicy)}`
+    );
+  });
+
+  await test("the page itself still sends no Referer anywhere else", async () => {
+    // The per-layer policy is an exception to this rule, not a
+    // replacement for it: everything that is not a tile image keeps it.
+    ok(
+      /<meta name="referrer" content="no-referrer"\s*\/?>/.test(INDEX_HTML_MARKUP),
+      "expected index.html to keep its page-wide no-referrer meta tag"
+    );
+  });
+
+  await test("the basemap attribution links to the OSM copyright page", async () => {
+    // The tile policy and the ODbL both ask for "(c) OpenStreetMap
+    // contributors" with OpenStreetMap linking to the copyright page.
+    const { sandbox } = await bootedSandbox();
+    const attribution = sandbox.L._tileLayers[0].options.attribution || "";
+    ok(
+      attribution.includes('href="https://www.openstreetmap.org/copyright"'),
+      `expected a link to https://www.openstreetmap.org/copyright, got ${attribution}`
+    );
+    ok(/OpenStreetMap<\/a> contributors/.test(attribution), `unexpected wording: ${attribution}`);
+  });
+
   // =======================================================================
   // Finding 1: the token must survive alongside a route's own query string
   // =======================================================================

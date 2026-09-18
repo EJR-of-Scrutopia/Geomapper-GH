@@ -18,9 +18,17 @@ let jobId = null;
 let poller = null;
 
 const map = L.map("map").setView([51.48, -3.18], 11);
+// OSM's tile usage policy refuses requests that carry no Referer, and
+// index.html sets no-referrer page-wide to keep the launch token in this
+// page's URL on this machine. The layer's own referrerPolicy overrides
+// the page's for its tile images alone, and strict-origin sends only the
+// bare origin (scheme, loopback host, port), never the path or the
+// ?token= query.
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
-  attribution: "&copy; OpenStreetMap contributors",
+  referrerPolicy: "strict-origin",
+  attribution:
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
 }).addTo(map);
 
 // --- theme -------------------------------------------------------------
