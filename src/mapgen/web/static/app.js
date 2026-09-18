@@ -3128,20 +3128,10 @@ function applyTileSizeBounds(savedMetres) {
 // the README already recommend.
 function tileSizeTrade(metres) {
   if (!Number.isFinite(metres)) return "";
-  if (metres < 2000) {
-    return (
-      "Smaller than the 2000 m default: more requests up front, and less " +
-      "chance that any one tile is dense enough to need splitting."
-    );
-  }
-  if (metres > 2000) {
-    return (
-      "Larger than the 2000 m default: fewer requests, quicker on sparse " +
-      "ground. On dense ground more tiles need splitting, and each split " +
-      "costs the requests its pieces take."
-    );
-  }
-  return "The default. Fewest requests that rarely need splitting, on most ground.";
+  // One short line each, per the owner's rule for the panels.
+  if (metres < 2000) return "Smaller than the default: more requests, fewer splits.";
+  if (metres > 2000) return "Larger than the default: fewer requests, more splits on dense ground.";
+  return "The default: few requests, rarely split.";
 }
 
 // The time at THIS position, or an honest account of why there is not

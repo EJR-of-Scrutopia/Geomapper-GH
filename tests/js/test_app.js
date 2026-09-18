@@ -9464,6 +9464,14 @@ function ok(condition, message) {
     ok(long.length === 0, `hints over 120 characters: ${JSON.stringify(long)}`);
   });
 
+  await test("the slider's sentence is one short line at every position", async () => {
+    const { sandbox } = await bootedSandbox();
+    for (const metres of [500, 2000, 6000]) {
+      const sentence = sandbox.tileSizeTrade(metres);
+      ok(sentence.length <= 80, `over 80 characters at ${metres} m: ${sentence}`);
+    }
+  });
+
   await test("a one-tile estimate says 1 tile, not 1 tiles", async () => {
     const { sandbox } = await bootedSandbox((url) => {
       if (url.pathname === "/api/estimate") {
