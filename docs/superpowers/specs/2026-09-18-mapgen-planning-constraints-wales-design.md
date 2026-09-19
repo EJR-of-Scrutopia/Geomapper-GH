@@ -226,8 +226,9 @@ category, "planning constraints", with this source at tier 1 in Wales,
 so the Advanced tier list names it. The picker's layer panel needs no
 new line.
 
-**Estimate.** No network. A small fixed byte figure and about one
-second per layer.
+**Estimate.** No network. A small fixed byte figure and half a second
+per layer (the live Cowbridge run on 2026-09-19 took 3.05 s for all
+twenty, about 0.15 s each, rounded up).
 
 ## Outputs in the package
 
@@ -297,8 +298,14 @@ together in the "Confirm with" line.
 
 **survey.json** gains a `constraints` record carrying the same facts as
 the summary in structure (on_site, margin, none_found, not_checked, each
-a list of objects), the councils, the margin in metres, and the
-per-layer feature counts. Provenance records the layers used, the
+a list of objects), the councils, the margin in metres, and a `layers`
+map keyed by type name. Each entry has a status: "ok" (with its feature
+count), "failed" (with the reason), or "unreadable" (it answered only in
+geometry mapgen does not read, so the summary lists it under "Not
+checked"), plus the count of features skipped for their geometry (final
+re-review, 2026-09-19). When the source was not run, or was skipped
+outside Wales, the record says `checked: false`. Provenance records the
+layers used, the
 licence, and each attribution statement as used, with Cadw's DATE
 already substituted.
 
