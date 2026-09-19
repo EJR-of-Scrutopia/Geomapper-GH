@@ -203,6 +203,31 @@ def test_work_files_and_a_resume_that_touches_nothing(tmp_path):
     assert [p.name for p in again] == [WORK_FEATURES, WORK_META]
 
 
+def test_an_extent_outside_wales_is_skipped_never_none_found(tmp_path):
+    """A Bristol extent, selected explicitly (possible from the CLI's
+    --source), must never read as twenty designations checked and none
+    found: it was never checked at all. lidar_cardiff.py's own skipped_
+    reason convention (package.py around lines 794-845) means package.py
+    needs no change to honour this."""
+    class _Poisoned:
+        def get(self, *args, **kwargs):
+            raise AssertionError("an extent outside Wales must not be fetched")
+
+    source = ConstraintsWalesSource(session=_Poisoned())
+    recorder = _Recorder()
+    result = source.fetch(BRISTOL, _tiles(BRISTOL), tmp_path, recorder)
+    assert result == []
+    assert source.skipped_reason == (
+        "The extent is outside Wales, so the Welsh planning constraints layers were not checked."
+    )
+    assert not (tmp_path / WORK_FEATURES).exists()
+    assert not (tmp_path / WORK_META).exists()
+    assert (
+        "tile_skipped",
+        {"source": "constraints_wales", "tile_id": "whole-area", "reason": source.skipped_reason},
+    ) in recorder.events
+
+
 def test_covers_tier_detail_estimate_never_touch_the_network():
     class _Poisoned:
         def get(self, *args, **kwargs):

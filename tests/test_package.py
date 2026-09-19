@@ -8696,3 +8696,19 @@ def test_a_survey_without_constraints_says_not_checked(tmp_path):
     survey = json.loads((result.paths.root / "survey.json").read_text(encoding="utf-8"))
     assert survey["constraints"]["checked"] is False
     assert survey["constraints"]["summary_file"] is None
+
+
+def test_a_bristol_survey_skips_constraints_wales_never_none_found(tmp_path):
+    # Possible from the CLI's --source: the source is selected explicitly
+    # over an extent outside Wales. It must be skipped, not read as twenty
+    # designations checked and none found (the lidar_cardiff.py skipped_
+    # reason convention package.py already honours generically).
+    bristol = BBox.parse("-2.62,51.44,-2.56,51.47")
+    register(ConstraintsWalesSource(session=_EmptyWfsSession()))
+    result = run_survey(_request(tmp_path, bbox=bristol, source_ids=("constraints_wales",)))
+    survey = json.loads((result.paths.root / "survey.json").read_text(encoding="utf-8"))
+    assert survey["constraints"]["checked"] is False
+    provenance = next(entry for entry in survey["sources"] if entry["id"] == "constraints_wales")
+    assert provenance["skipped_reason"] == (
+        "The extent is outside Wales, so the Welsh planning constraints layers were not checked."
+    )

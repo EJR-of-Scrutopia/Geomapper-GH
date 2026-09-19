@@ -74,6 +74,7 @@ SECONDS_PER_LAYER_ESTIMATE = 1.0
 WORK_FEATURES = "constraints_layers.jsonl"
 WORK_META = "constraints_meta.json"
 WHOLE_AREA = "whole-area"
+OUTSIDE_WALES_REASON = "The extent is outside Wales, so the Welsh planning constraints layers were not checked."
 
 
 class ConstraintsWalesError(RuntimeError):
@@ -219,6 +220,11 @@ class ConstraintsWalesSource:
         self.skipped_reason = None
         site = _site_rect(bbox)
         padded = padded_rect(site)
+        share = coverage_share(padded, self._coverage_path)
+        if verdict(share) == "none":
+            self.skipped_reason = OUTSIDE_WALES_REASON
+            progress.emit("tile_skipped", source=self.id, tile_id=WHOLE_AREA, reason=self.skipped_reason)
+            return []
         features_path = Path(work_dir) / WORK_FEATURES
         meta_path = Path(work_dir) / WORK_META
         if features_path.exists() and meta_path.exists():
@@ -257,7 +263,6 @@ class ConstraintsWalesSource:
             if not result.ok:
                 progress.emit("constraint_layer_not_checked", layer=result.layer.designation, reason=result.reason)
 
-        share = coverage_share(padded, self._coverage_path)
         councils = councils_touching(site, self._coverage_path)
         meta = {
             "site": list(site),
