@@ -133,6 +133,151 @@ def test_a_short_first_page_is_used_as_is(tmp_path, monkeypatch):
     assert len(features) == 1
 
 
+def _point(name, lon=-3.45):
+    return {"type": "Feature", "geometry": {"type": "Point", "coordinates": [lon, 51.46]}, "properties": {"Name": name, "Grade": "II"}}
+
+
+class _Keyless(_RoutedSession):
+    """A table with no primary key: HTTP 400 to any startIndex, as
+    DataMapWales's Heritage Coast and World Heritage Site layers answer."""
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if "startIndex" in (params or {}):
+            self.calls.append({"url": url, "params": dict(params), "headers": dict(headers or {}), "timeout": timeout})
+            return _Response(status_code=400, text="")
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+
+LISTED = "inspire-wg:Cadw_ListedBuildings"
+
+
+def _listed_row(tmp_path):
+    rows = {r["type_name"]: r for r in (json.loads(l) for l in (tmp_path / WORK_FEATURES).read_text(encoding="utf-8").splitlines())}
+    return rows[LISTED]
+
+
+def _listed_start_indexes(session):
+    return [c["params"].get("startIndex") for c in session.calls if c["params"]["typeNames"] == LISTED]
+
+
+def test_a_keyless_layer_of_exactly_one_full_page_is_used_as_is(tmp_path, monkeypatch):
+    # numberMatched equal to a full page means there is no more: no
+    # restart, which a keyless table would answer with 400.
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    session = _Keyless({LISTED: _collection([_point("A"), _point("B", -3.44)], matched=2)})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    assert _listed_start_indexes(session) == [None]
+    assert _listed_row(tmp_path)["ok"] is True
+    assert len(_listed_row(tmp_path)["features"]) == 2
+
+
+def test_a_keyless_layer_that_needs_a_second_page_is_not_checked(tmp_path, monkeypatch):
+    # The ruling's accepted outcome: the restart carries startIndex, the
+    # keyless table refuses it, and the layer is not checked, never kept
+    # as the partial first page.
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    session = _Keyless({LISTED: _collection([_point("A"), _point("B", -3.44)], matched=3)})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    row = _listed_row(tmp_path)
+    assert row["ok"] is False
+    assert row["features"] == []
+
+
+def test_the_restart_stops_once_number_matched_is_reached(tmp_path, monkeypatch):
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    session = _RoutedSession({LISTED: [
+        _collection([_point("A"), _point("B", -3.44)], matched=4),
+        _collection([_point("A"), _point("B", -3.44)], matched=4),
+        _collection([_point("C", -3.43), _point("D", -3.42)], matched=4),
+        _collection([], matched=4),
+    ]})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    assert _listed_start_indexes(session) == [None, "0", "2"]
+    assert [f["properties"]["Name"] for f in _listed_row(tmp_path)["features"]] == ["A", "B", "C", "D"]
+
+
+def test_the_ceiling_is_checked_while_paging_when_number_matched_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    monkeypatch.setattr(constraints_wales, "FEATURE_CEILING", 3)
+    # Full pages throughout, so the retry after the other layers meets the
+    # same layer; the closing AssertionError stops a loop with no ceiling
+    # from running forever (six calls reach the ceiling twice).
+    full = _collection([_point("A"), _point("B", -3.44)], matched="unknown")
+    session = _RoutedSession({LISTED: [full] * 8 + [AssertionError("paged past the ceiling")]})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    row = _listed_row(tmp_path)
+    assert row["ok"] is False
+    assert "too many" in row["reason"]
+
+
+def test_a_full_first_page_over_the_ceiling_fails_without_a_restart(tmp_path, monkeypatch):
+    # Re-review N3: numberMatched already says too many, so the restart
+    # would only spend a request, and on a keyless table would turn the
+    # true reason into an HTTP 400.
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    session = _Keyless({LISTED: _collection([_point("A"), _point("B", -3.44)], matched=FEATURE_CEILING + 1)})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    assert all(index is None for index in _listed_start_indexes(session))
+    assert "too many" in _listed_row(tmp_path)["reason"]
+
+
+def test_a_short_page_short_of_number_matched_is_not_checked(tmp_path, monkeypatch):
+    # A service cap below PAGE_SIZE would end the layer early and silently:
+    # a short page is the end only when numberMatched does not say more.
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    session = _RoutedSession({LISTED: _collection([_point("A")], matched=5)})
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    row = _listed_row(tmp_path)
+    assert row["ok"] is False
+    assert row["reason"] == "DataMapWales sent fewer features than it said it holds"
+
+
+def test_a_number_matched_that_is_not_a_count_never_ends_the_layer(tmp_path, monkeypatch):
+    # -1 (and a JSON true, which Python counts as an int) is no count: a
+    # full first page carrying one must not read as complete.
+    monkeypatch.setattr(constraints_wales, "PAGE_SIZE", 2)
+    for matched in (-1, True):
+        work = tmp_path / str(matched)
+        work.mkdir()
+        session = _RoutedSession({LISTED: [
+            _collection([_point("A"), _point("B", -3.44)], matched=matched),
+            _collection([_point("A"), _point("B", -3.44)], matched=matched),
+            _collection([_point("C", -3.43)], matched=matched),
+        ]})
+        ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), work, _Recorder())
+        assert _listed_start_indexes(session) == [None, "0", "2"]
+        assert len(_listed_row(work)["features"]) == 3
+
+
+def test_a_wales_fetch_after_an_outside_wales_skip_is_not_skipped(tmp_path):
+    source = ConstraintsWalesSource(session=_RoutedSession())
+    source.fetch(BRISTOL, _tiles(BRISTOL), tmp_path / "bristol", _Recorder())
+    assert source.skipped_reason is not None
+    work = tmp_path / "cowbridge"
+    work.mkdir()
+    source.fetch(COWBRIDGE, _tiles(), work, _Recorder())
+    assert source.skipped_reason is None
+
+
+def test_not_checked_layers_reach_the_live_log_on_a_run_and_on_a_resume(tmp_path):
+    # Re-review N5: a failed layer and an unreadable-geometry layer both
+    # announce themselves, and a resume says the same as the run did.
+    line = {"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-3.45, 51.46], [-3.44, 51.46]]}, "properties": {}}
+    session = _RoutedSession({
+        "inspire-nrw:NRW_SAC": _Response(status_code=503, text=""),
+        "inspire-nrw:NRW_SSSI": _collection([line]),
+    })
+    recorder = _Recorder()
+    ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, recorder)
+    announced = {(f["layer"], f["reason"]) for e, f in recorder.events if e == "constraint_layer_not_checked"}
+    assert {designation for designation, _ in announced} == {"Special Area of Conservation", "SSSI"}
+    assert ("SSSI", "DataMapWales answered with geometry mapgen does not read") in announced
+
+    resumed = _Recorder()
+    ConstraintsWalesSource(session=_RoutedSession()).fetch(COWBRIDGE, _tiles(), tmp_path, resumed)
+    assert {(f["layer"], f["reason"]) for e, f in resumed.events if e == "constraint_layer_not_checked"} == announced
+
+
 def test_a_layer_over_the_ceiling_is_not_checked(tmp_path):
     session = _RoutedSession({"inspire-nrw:NRW_SSSI": _collection([], matched=FEATURE_CEILING + 1)})
     ConstraintsWalesSource(session=session).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())

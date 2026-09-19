@@ -491,10 +491,16 @@ def to_record(
                 "reason": failed[layer.type_name],
             }
         elif layer in assessment.checked:
+            features = found_counts.get(layer.type_name, 0)
+            skipped = assessment.skipped_geometry_by_layer.get(layer.type_name, 0)
+            # The same test summarise() uses to put a layer under Not checked,
+            # so the layers map never reads a layer as checked and empty
+            # when the summary says it was not checked.
+            unreadable = features == 0 and skipped > 0
             layers[layer.type_name] = {
-                "designation": layer.designation, "status": "ok",
-                "features": found_counts.get(layer.type_name, 0), "reason": None,
-                "skipped_geometry": assessment.skipped_geometry_by_layer.get(layer.type_name, 0),
+                "designation": layer.designation, "status": "unreadable" if unreadable else "ok",
+                "features": features, "reason": UNREADABLE_GEOMETRY_REASON if unreadable else None,
+                "skipped_geometry": skipped,
             }
     return {
         "checked": True,

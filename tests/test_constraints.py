@@ -234,8 +234,12 @@ def test_a_layer_answering_only_unreadable_geometry_is_not_checked():
         summary, assessment, councils=[], coverage="full", coverage_share=1.0,
         margin_m=250.0, summary_file="x_constraints.txt", fetched_on="2026-09-18",
     )
-    assert record["layers"]["inspire-nrw:NRW_SAC"]["status"] == "ok"
-    assert record["layers"]["inspire-nrw:NRW_SAC"]["skipped_geometry"] == 1
+    # The layers map must agree with not_checked: a reader of `layers`
+    # alone must not take this layer as checked and empty (re-review N6).
+    assert record["layers"]["inspire-nrw:NRW_SAC"] == {
+        "designation": "Special Area of Conservation", "status": "unreadable", "features": 0,
+        "reason": "DataMapWales answered with geometry mapgen does not read", "skipped_geometry": 1,
+    }
     assert record["layers"]["inspire-nrw:NRW_SSSI"]["skipped_geometry"] == 0
     assert record["skipped_geometry"] == 1
 

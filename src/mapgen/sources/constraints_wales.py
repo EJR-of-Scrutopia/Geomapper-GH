@@ -15,9 +15,9 @@ need not agree. Every layer's first request is bare; if that page is
 already complete (short, or numberMatched says there is no more) it
 stands, otherwise it is discarded and the whole layer is re-fetched from
 zero with startIndex on every page, so every page it keeps was served in
-the same sorted order (see _fetch_layer's own docstring). A layer that fails
-again it is reported as not checked, never as none found, and the run
-carries on. Only when every layer fails does this source record
+the same sorted order (see _fetch_layer's own docstring). A layer that
+fails is tried once more after the others; if it fails again it is
+reported as not checked, never as none found, and the run carries on. Only when every layer fails does this source record
 tile_failures and raise, so the package is marked incomplete and the
 retry pass gets its turn (the spec's "Failures are never absences").
 
@@ -93,6 +93,22 @@ class _LayerFetchError(Exception):
 
 def _site_rect(bbox: BBox) -> tuple[float, float, float, float]:
     return (bbox.west, bbox.south, bbox.east, bbox.north)
+
+
+_LAYER_DESIGNATIONS = frozenset(layer.designation for layer in LAYERS)
+
+
+def _announce(progress: ProgressSink, summary) -> None:
+    """The live log's view of a summary, the same on a run and a resume:
+    every table layer the summary puts under Not checked (failed, or
+    answered only in geometry mapgen does not read), then every line on
+    the site. The permanent exclusions and the partial-coverage line are
+    not layers and stay in the summary file."""
+    for entry in summary.not_checked:
+        if entry["designation"] in _LAYER_DESIGNATIONS:
+            progress.emit("constraint_layer_not_checked", layer=entry["designation"], reason=entry["reason"])
+    for entry in summary.on_site:
+        progress.emit("constraint_on_site", line=entry["line"])
 
 
 def _read_layer_results(features_path: Path) -> list[LayerResult]:
@@ -191,44 +207,56 @@ class ConstraintsWalesSource:
         return body
 
     def _fetch_layer(self, layer: Layer, padded) -> list:
-        """One page, bare, first: GeoServer only sorts a keyless table once
-        startIndex is on the request, so a bare page one and a startIndex
-        page two need not agree, and the union would carry duplicates and
-        omissions with no error. If that first page is already complete
-        (short, or numberMatched says there is no more) it stands; a
-        complete page from one bare request was, trivially, served in one
-        order. Otherwise it is discarded and every page, starting again
-        from zero, carries startIndex, so the whole layer was served in
-        the same sorted order throughout. A keyless table that needs a
-        second page then answers 400 on that restart, same as any other
-        service failure."""
+        """One page, bare, first. GeoServer sorts by primary key only when
+        startIndex is on the request (a table with no key answers 400 to
+        it), so a bare page one and a startIndex page two need not agree,
+        and their union would carry duplicates and omissions with no
+        error. If that first page is already complete (short, or
+        numberMatched says there is no more) it stands: one bare request
+        was, trivially, served in one order. Otherwise it is discarded and
+        every page, starting again from zero, carries startIndex, so the
+        whole layer was served in the same sorted order throughout. A
+        keyless table that needs a second page then answers 400 on that
+        restart, same as any other service failure.
+
+        numberMatched counts only as a non-negative int (a JSON true is an
+        int to Python, and -1 is no count). When it is one: over the
+        ceiling fails before any restart, and a short page that falls
+        short of it fails too, since a service cap below PAGE_SIZE would
+        otherwise end the layer early and silently."""
         too_many = f"holds more than {FEATURE_CEILING:,} features here, too many to check"
 
-        def _checked(features: list, matched: object) -> list:
-            if isinstance(matched, int) and matched > FEATURE_CEILING:
-                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
-            if len(features) > FEATURE_CEILING:
-                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
-            return features
+        def _count(body: dict) -> int | None:
+            matched = body.get("numberMatched")
+            return matched if type(matched) is int and matched >= 0 else None
 
-        def _complete(page: list, matched: object) -> bool:
-            return len(page) < PAGE_SIZE or (isinstance(matched, int) and matched <= len(page))
+        def _checked(features: list, count: int | None) -> None:
+            if (count is not None and count > FEATURE_CEILING) or len(features) > FEATURE_CEILING:
+                raise _LayerFetchError(FAILURE_SERVICE_ERROR, too_many)
+
+        def _ended(page: list, features: list, count: int | None) -> bool:
+            if len(page) < PAGE_SIZE:
+                if count is not None and count > len(features):
+                    raise _LayerFetchError(FAILURE_SERVICE_ERROR, "sent fewer features than it said it holds")
+                return True
+            return count is not None and len(features) >= count
 
         first_body = self._get_page(layer, padded, 0, send_start_index=False)
-        first_matched = first_body.get("numberMatched")
+        first_count = _count(first_body)
         first_page = first_body["features"]
-        if _complete(first_page, first_matched):
-            return _checked(first_page, first_matched)
+        _checked(first_page, first_count)
+        if _ended(first_page, first_page, first_count):
+            return first_page
 
         features: list = []
         start = 0
         while True:
             body = self._get_page(layer, padded, start, send_start_index=True)
-            matched = body.get("numberMatched")
+            count = _count(body)
             page = body["features"]
             features.extend(page)
-            _checked(features, matched)
-            if len(page) < PAGE_SIZE or (isinstance(matched, int) and len(features) >= matched):
+            _checked(features, count)
+            if _ended(page, features, count):
                 return features
             start += PAGE_SIZE
 
@@ -271,9 +299,7 @@ class ConstraintsWalesSource:
                 # constraint_on_site lines an unresumed fetch would have.
                 results = _read_layer_results(features_path)
                 assessment = assess(site, results, meta["margin_m"])
-                summary = summarise(assessment, meta["councils"], meta["coverage"])
-                for entry in summary.on_site:
-                    progress.emit("constraint_on_site", line=entry["line"])
+                _announce(progress, summarise(assessment, meta["councils"], meta["coverage"]))
                 progress.emit("tile_skipped", source=self.id, tile_id=WHOLE_AREA)
                 return [features_path, meta_path]
 
@@ -300,10 +326,6 @@ class ConstraintsWalesSource:
             ]
             raise ConstraintsWalesError("No planning constraint layer arrived from DataMapWales.")
 
-        for result in ordered:
-            if not result.ok:
-                progress.emit("constraint_layer_not_checked", layer=result.layer.designation, reason=result.reason)
-
         councils = councils_touching(site, self._coverage_path)
         meta = {
             "site": list(site),
@@ -323,9 +345,7 @@ class ConstraintsWalesSource:
         atomic_write_text(features_path, "\n".join(rows) + "\n")
         atomic_write_text(meta_path, json.dumps(meta, separators=(",", ":")))
 
-        summary = summarise(assess(site, ordered), councils, meta["coverage"])
-        for entry in summary.on_site:
-            progress.emit("constraint_on_site", line=entry["line"])
+        _announce(progress, summarise(assess(site, ordered), councils, meta["coverage"]))
         progress.emit("tile_done", source=self.id, tile_id=WHOLE_AREA)
         return [features_path, meta_path]
 
