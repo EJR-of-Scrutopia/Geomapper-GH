@@ -147,13 +147,21 @@ over the extent padded by 250 m. Two verified traps: without
 `srsName`, GeoServer answers in EPSG:27700; and the bbox must be in
 lon,lat order (lat,lon returns nothing, silently). Paged with `count`
 and `startIndex` so a dense layer (485 surface-water polygons over
-Cowbridge alone) is never truncated, with `startIndex` sent only from
-the second page on: a third trap, found by the live test on 2026-09-19,
-is that a table with no primary key (the Heritage Coast and World
-Heritage Site layers) answers HTTP 400 "Cannot do natural order without
-a primary key" to any request carrying `startIndex`, even zero; a layer whose total would pass a
-fixed ceiling of 20,000 features is recorded as failed rather than cut
-short. The shared descriptive User-Agent; the request timeout used by
+Cowbridge alone) is never truncated. A third trap, found by the live
+test on 2026-09-19: a table with no primary key (the Heritage Coast and
+World Heritage Site layers) answers HTTP 400 "Cannot do natural order
+without a primary key" to any request carrying `startIndex`, even zero,
+because `startIndex` is what makes GeoServer sort by key. So the first
+request for a layer carries no `startIndex`, and when that one page
+holds the whole answer it is used as it stands. When a second page is
+needed, the first is discarded and the layer is asked again from zero
+with `startIndex` on every page, so that every page combined was served
+in the same sorted order (final review, 2026-09-19: an unsorted first
+page joined to sorted later pages can repeat some features and silently
+drop others). A keyless layer that ever needs a second page is
+therefore recorded as not checked, never as a partial answer. A layer
+whose total would pass a fixed ceiling of 20,000 features is recorded
+as failed rather than cut short. The shared descriptive User-Agent; the request timeout used by
 the other WFS callers. `cancel` is checked between layers.
 
 **The server's bbox filter is a prefilter, never the answer.** A
@@ -204,7 +212,13 @@ therefore means England, or open sea beyond 12 nautical miles. The same file nam
 council or councils the site touches, for the summary's "confirm with"
 line. The LiDAR mosaic's bounding rectangle is not used: it includes
 parts of England, where every Welsh layer would return nothing and a
-"none found" would be false.
+"none found" would be false. For the same reason, when the source runs
+over an extent whose coverage is "none" (possible when it is chosen by
+name from the command line), it asks the service nothing and reports
+itself skipped with the reason "The extent is outside Wales, so the
+Welsh planning constraints layers were not checked.", the convention
+the Cardiff LiDAR source already uses; survey.json then records the
+constraints as not checked (final review, 2026-09-19).
 
 **Selection.** Auto-selected by the existing coverage mechanism
 wherever `covers()` answers "full" or "partial". A new resolver
@@ -272,7 +286,11 @@ touches the site but covers no cell centre), and "the whole site" at
 99.5% and above; "Within 250 m" lists only features that touch the
 margin and not the site; a designation checked and absent everywhere
 goes under "Checked, none found" by its table label; any layer that
-failed, and the two permanent exclusions, go under "Not checked"; when
+failed, and the two permanent exclusions, go under "Not checked", and
+so does a layer that found nothing mapgen could read but answered with
+geometry it does not read (lines, collections), with the reason
+"DataMapWales answered with geometry mapgen does not read" (final
+review, 2026-09-19); when
 `covers()` answered "partial", "Not checked" gains "Part of the extent
 is outside Wales and was not checked." Multiple councils are listed
 together in the "Confirm with" line.
