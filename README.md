@@ -716,7 +716,8 @@ around it, and writes:
   `designation`, `name`, `grade_or_zone`, `reference`, `where` (`site` or
   `margin`) and `source`.
 - `<stem>_constraints.txt`, a short summary under four headings: On the
-  site, Within 250 m, Checked and none found, Not checked. Areas are
+  site, Within 250 m, Checked, none found, Not checked, followed by the
+  sources (and the conservation caveat when one is found). Areas are
   given as a share of the site, listed buildings are counted by grade,
   and every source's attribution statement follows word for word.
 

@@ -70,7 +70,10 @@ PAGE_SIZE = 1000
 FEATURE_CEILING = 20_000
 REQUEST_TIMEOUT_SECONDS = 60.0
 BYTES_PER_LAYER_ESTIMATE = 50_000
-SECONDS_PER_LAYER_ESTIMATE = 1.0
+# Measured live over Cowbridge on 2026-09-19 (test_live_cowbridge, 20
+# layers, fetch and merge together): 3.05 s, about 0.15 s/layer, rounded
+# up to the next 0.5.
+SECONDS_PER_LAYER_ESTIMATE = 0.5
 WORK_FEATURES = "constraints_layers.jsonl"
 WORK_META = "constraints_meta.json"
 WHOLE_AREA = "whole-area"
@@ -90,6 +93,26 @@ class _LayerFetchError(Exception):
 
 def _site_rect(bbox: BBox) -> tuple[float, float, float, float]:
     return (bbox.west, bbox.south, bbox.east, bbox.north)
+
+
+def _read_layer_results(features_path: Path) -> list[LayerResult]:
+    """WORK_FEATURES, one JSON row per layer, back into LayerResult, in
+    whatever order the file holds them (already table order, since that
+    is the order fetch() wrote them in). Shared by merge() and fetch()'s
+    own resume branch, so a resume can summarise without a second copy
+    of this parsing."""
+    results = []
+    for line in features_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        layer = LAYER_BY_TYPE.get(row["type_name"])
+        if layer is None:
+            continue
+        results.append(
+            LayerResult(layer=layer, ok=row["ok"], features=tuple(row["features"]), kind=row["kind"], reason=row["reason"])
+        )
+    return results
 
 
 class ConstraintsWalesSource:
@@ -233,6 +256,14 @@ class ConstraintsWalesSource:
             except ValueError:
                 meta = {}
             if meta.get("site") == list(site) and meta.get("margin_m") == MARGIN_METRES:
+                # No network here, but the owner still needs to see what is
+                # on the site: re-read the two work files and emit the same
+                # constraint_on_site lines an unresumed fetch would have.
+                results = _read_layer_results(features_path)
+                assessment = assess(site, results, meta["margin_m"])
+                summary = summarise(assessment, meta["councils"], meta["coverage"])
+                for entry in summary.on_site:
+                    progress.emit("constraint_on_site", line=entry["line"])
                 progress.emit("tile_skipped", source=self.id, tile_id=WHOLE_AREA)
                 return [features_path, meta_path]
 
@@ -301,17 +332,7 @@ class ConstraintsWalesSource:
         if features_path is None or meta_path is None:
             return []
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        results = []
-        for line in features_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            layer = LAYER_BY_TYPE.get(row["type_name"])
-            if layer is None:
-                continue
-            results.append(
-                LayerResult(layer=layer, ok=row["ok"], features=tuple(row["features"]), kind=row["kind"], reason=row["reason"])
-            )
+        results = _read_layer_results(features_path)
         site = tuple(meta["site"])
         assessment = assess(site, results, meta["margin_m"])
         summary = summarise(assessment, meta["councils"], meta["coverage"])

@@ -199,8 +199,16 @@ def test_work_files_and_a_resume_that_touches_nothing(tmp_path):
         def get(self, *args, **kwargs):
             raise AssertionError("a resume over the same extent must not fetch")
 
-    again = ConstraintsWalesSource(session=_Poisoned()).fetch(COWBRIDGE, _tiles(), tmp_path, _Recorder())
+    resumed_recorder = _Recorder()
+    again = ConstraintsWalesSource(session=_Poisoned()).fetch(COWBRIDGE, _tiles(), tmp_path, resumed_recorder)
     assert [p.name for p in again] == [WORK_FEATURES, WORK_META]
+    # A resume touches no network, but must still tell the owner what is
+    # on the site: re-read the two work files and emit the same lines.
+    assert any(
+        event == "constraint_on_site" and fields["line"].startswith("Conservation area: Cowbridge")
+        for event, fields in resumed_recorder.events
+    )
+    assert ("tile_skipped", {"source": "constraints_wales", "tile_id": "whole-area"}) in resumed_recorder.events
 
 
 def test_an_extent_outside_wales_is_skipped_never_none_found(tmp_path):

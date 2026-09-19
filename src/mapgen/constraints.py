@@ -269,7 +269,11 @@ ATTRIBUTIONS: dict[str, str] = {
         "Designated Historic Asset GIS Data, The Welsh Historic Environment Service (Cadw), {date}, "
         "licensed under the Open Government Licence"
     ),
-    "D": "Contains public sector information licensed under the Open Government Licence v3.0.",
+    "D": (
+        "Contains public sector information licensed under the Open Government Licence v3.0. "
+        "Datasets: World Heritage Sites (Site Boundary) and Conservation Area Boundaries, "
+        "published on DataMapWales by the Welsh Government."
+    ),
 }
 
 COAL_LINE = "Coal mining risk: no open data service. See the Mining Remediation Authority's interactive map."

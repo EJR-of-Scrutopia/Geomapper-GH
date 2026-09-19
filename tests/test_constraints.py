@@ -268,6 +268,14 @@ def test_cadw_attribution_carries_the_fetch_date():
     assert "2026-09-18" in statements[0]
 
 
+def test_attribution_d_names_the_dataset_title_and_publisher():
+    assert ATTRIBUTIONS["D"] == (
+        "Contains public sector information licensed under the Open Government Licence v3.0. "
+        "Datasets: World Heritage Sites (Site Boundary) and Conservation Area Boundaries, "
+        "published on DataMapWales by the Welsh Government."
+    )
+
+
 def test_render_text_layout():
     results = _all_checked_but(LayerResult(CONSERVATION, ok=True, features=(_feature(_site_left_half(), sitename="Cowbridge"),)))
     summary = summarise(assess(SITE, results), ["Vale of Glamorgan"], "full")
@@ -281,7 +289,7 @@ def test_render_text_layout():
     assert lines[lines.index("Within 250 m") + 1] == "- nothing found"
     assert CONSERVATION_CAVEAT in lines
     assert text.endswith("\n")
-    assert "—" not in text
+    assert "\u2014" not in text
 
 
 def test_to_record_shape():

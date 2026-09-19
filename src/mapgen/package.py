@@ -93,12 +93,12 @@ from mapgen.sources.base import (
     get_source,
     register,
 )
+from mapgen.sources.constraints_wales import ConstraintsWalesSource
 from mapgen.sources.elevation import ElevationSource
 from mapgen.sources.inspire import BOUNDARY_INDICATIVE_NOTE, InspireSource
 from mapgen.sources.lidar_cardiff import LidarCardiffSource
 from mapgen.sources.lidar_wales import LidarWalesSource
 from mapgen.sources.os_open import OsOpenSource
-from mapgen.sources.constraints_wales import ConstraintsWalesSource
 from mapgen.sources.os_uprn import OsUprnSource
 from mapgen.sources.osm import OsmSource
 from mapgen.urbano import (
@@ -2105,9 +2105,10 @@ def _canopy_record(**overrides) -> dict[str, object]:
 
 def _constraints_record(**overrides) -> dict[str, object]:
     """survey.json's `constraints` block for a package whose constraints
-    source never merged: `checked` False, every list empty, everything
-    else None, so a reader can tell "not checked" from "checked, nothing
-    found" (which has `checked` True and a none_found list)."""
+    source never merged: `checked` False, every list empty, `layers` an
+    empty dict, everything else None, so a reader can tell "not checked"
+    from "checked, nothing found" (which has `checked` True and a
+    none_found list)."""
     record: dict[str, object] = {
         "checked": False, "fetched_on": None, "margin_m": None, "coverage": None,
         "coverage_share": None, "councils": [], "authority": None, "on_site": [],

@@ -224,7 +224,7 @@ def test_os_uprn_tier_table(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_categories_is_the_fourteen_in_spec_order():
+def test_categories_is_the_fifteen_in_spec_order():
     assert CATEGORIES == (
         "terrain",
         "contours",
