@@ -218,6 +218,28 @@ def test_a_failed_layer_is_not_checked_and_never_none_found():
     assert COAL_LINE in lines and TPO_LINE in lines
 
 
+def test_a_layer_answering_only_unreadable_geometry_is_not_checked():
+    # A layer whose every feature is a LineString or GeometryCollection is
+    # counted per assessment only were it not also counted per layer, and
+    # would read as "Checked, none found", indistinguishable from a layer
+    # that genuinely has nothing here.
+    line = _feature({"type": "LineString", "coordinates": [[-3.45, 51.46], [-3.44, 51.46]]})
+    results = _all_checked_but(LayerResult(SAC, ok=True, features=(line,)))
+    assessment = assess(SITE, results)
+    summary = summarise(assessment, [], "full")
+    assert "Special Area of Conservation" not in summary.none_found
+    lines = [entry["line"] for entry in summary.not_checked]
+    assert "Special Area of Conservation: DataMapWales answered with geometry mapgen does not read" in lines
+    record = to_record(
+        summary, assessment, councils=[], coverage="full", coverage_share=1.0,
+        margin_m=250.0, summary_file="x_constraints.txt", fetched_on="2026-09-18",
+    )
+    assert record["layers"]["inspire-nrw:NRW_SAC"]["status"] == "ok"
+    assert record["layers"]["inspire-nrw:NRW_SAC"]["skipped_geometry"] == 1
+    assert record["layers"]["inspire-nrw:NRW_SSSI"]["skipped_geometry"] == 0
+    assert record["skipped_geometry"] == 1
+
+
 def test_everything_checked_and_absent_is_none_found_in_table_order():
     summary = summarise(assess(SITE, _all_checked_but()), [], "full")
     assert summary.none_found == [layer.designation for layer in LAYERS]

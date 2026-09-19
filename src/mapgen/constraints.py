@@ -110,7 +110,15 @@ class Assessment:
     found: list = field(default_factory=list)
     checked: list = field(default_factory=list)
     failed: list = field(default_factory=list)
-    skipped_geometry: int = 0
+    # type_name -> count of features whose geometry classify_feature never
+    # reads (a line, a GeometryCollection): counted per layer as well as
+    # in total, so summarise() can tell a layer that is truly empty from
+    # one DataMapWales answered with nothing mapgen reads.
+    skipped_geometry_by_layer: dict = field(default_factory=dict)
+
+    @property
+    def skipped_geometry(self) -> int:
+        return sum(self.skipped_geometry_by_layer.values())
 
 
 def padded_rect(site: Rect, margin_m: float = MARGIN_METRES) -> Rect:
@@ -205,7 +213,8 @@ def assess(site: Rect, results: Sequence[LayerResult], margin_m: float = MARGIN_
         for feature in result.features:
             geometry = feature.get("geometry") or {}
             if not _polygons(geometry) and not _points(geometry):
-                assessment.skipped_geometry += 1
+                by_layer = assessment.skipped_geometry_by_layer
+                by_layer[result.layer.type_name] = by_layer.get(result.layer.type_name, 0) + 1
                 continue
             item = classify_feature(result.layer, feature, assessment.site, padded)
             if item is not None:
@@ -265,6 +274,7 @@ ATTRIBUTIONS: dict[str, str] = {
 
 COAL_LINE = "Coal mining risk: no open data service. See the Mining Remediation Authority's interactive map."
 TPO_LINE = "Tree Preservation Orders: no national dataset for Wales. Ask the council."
+UNREADABLE_GEOMETRY_REASON = "DataMapWales answered with geometry mapgen does not read"
 PARTIAL_LINE = "Part of the extent is outside Wales and was not checked."
 CONSERVATION_CAVEAT = "Conservation areas are boundaries only; contact the council for full details."
 GRADE_ORDER = ("I", "II*", "II")
@@ -384,12 +394,30 @@ def summarise(assessment: Assessment, councils: Sequence[str], coverage: str) ->
     margin = [entry for _, _, entry in sorted(ranked, key=lambda r: (r[0], r[1]))]
 
     found_types = {item.layer.type_name for item in assessment.found}
-    none_found = [layer.designation for layer in assessment.checked if layer.type_name not in found_types]
+    # A layer whose every feature is geometry classify_feature never reads
+    # (a line, a GeometryCollection) is not "none found": it was never
+    # truly checked, and reads as such below, not here.
+    unreadable_types = {
+        layer.type_name for layer in assessment.checked
+        if layer.type_name not in found_types and assessment.skipped_geometry_by_layer.get(layer.type_name, 0) > 0
+    }
+    none_found = [
+        layer.designation for layer in assessment.checked
+        if layer.type_name not in found_types and layer.type_name not in unreadable_types
+    ]
     none_found.sort(key=lambda designation: next(i for i, l in enumerate(LAYERS) if l.designation == designation))
 
     not_checked = [
         {"designation": layer.designation, "reason": reason, "line": f"{layer.designation}: {reason}"}
         for layer, reason in assessment.failed
+    ]
+    not_checked += [
+        {
+            "designation": layer.designation, "reason": UNREADABLE_GEOMETRY_REASON,
+            "line": f"{layer.designation}: {UNREADABLE_GEOMETRY_REASON}",
+        }
+        for layer in assessment.checked
+        if layer.type_name in unreadable_types
     ]
     not_checked.append({"designation": "Coal mining risk", "reason": "no open data service", "line": COAL_LINE})
     not_checked.append({"designation": "Tree Preservation Orders", "reason": "no national dataset for Wales", "line": TPO_LINE})
@@ -462,6 +490,7 @@ def to_record(
             layers[layer.type_name] = {
                 "designation": layer.designation, "status": "ok",
                 "features": found_counts.get(layer.type_name, 0), "reason": None,
+                "skipped_geometry": assessment.skipped_geometry_by_layer.get(layer.type_name, 0),
             }
     return {
         "checked": True,
