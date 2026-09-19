@@ -132,6 +132,16 @@ class ConstraintsWalesSource:
         self.constraints_record: dict | None = None
         self.skipped_reason: str | None = None
 
+    def configure(self) -> "ConstraintsWalesSource":
+        """A fresh copy for one survey, sharing this instance's session and
+        coverage file. fetch() resets its own state on entry, but a survey
+        stopped before this source's turn never enters fetch(), and
+        package.py still reads constraints_record, skipped_reason and
+        attribution off the source it was handed: from the one registered
+        instance, that would be the previous survey's record, reported as
+        checked (final re-review N1, 2026-09-19)."""
+        return type(self)(session=self.session, coverage_path=self._coverage_path)
+
     def covers(self, bbox: BBox) -> str:
         return verdict(coverage_share(padded_rect(_site_rect(bbox)), self._coverage_path))
 

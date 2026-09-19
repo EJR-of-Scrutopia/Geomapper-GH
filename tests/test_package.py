@@ -8712,3 +8712,30 @@ def test_a_bristol_survey_skips_constraints_wales_never_none_found(tmp_path):
     assert provenance["skipped_reason"] == (
         "The extent is outside Wales, so the Welsh planning constraints layers were not checked."
     )
+
+
+def test_a_survey_stopped_before_constraints_never_carries_the_last_surveys_record(tmp_path):
+    # One registered instance serves every survey in a process. A survey
+    # stopped before constraints_wales's turn never enters its fetch(),
+    # so fetch()'s own resets never run: without a fresh copy per survey,
+    # survey.json would carry the previous site's record as "checked"
+    # (final re-review N1, 2026-09-19).
+    register(ConstraintsWalesSource(session=_EmptyWfsSession()))
+    first = run_survey(_request(tmp_path, source_ids=("constraints_wales",)))
+    first_survey = json.loads((first.paths.root / "survey.json").read_text(encoding="utf-8"))
+    assert first_survey["constraints"]["checked"] is True
+
+    token = CancelToken()
+    token.cancel()
+    llandaff = BBox.parse("-3.232,51.492,-3.212,51.502")
+    second = run_survey(
+        _request(tmp_path, bbox=llandaff, site="Llandaff", source_ids=("constraints_wales",)),
+        cancel=token,
+    )
+    survey = json.loads((second.paths.root / "survey.json").read_text(encoding="utf-8"))
+    assert survey["stopped"] is True
+    assert survey["constraints"]["checked"] is False
+    assert survey["constraints"]["summary_file"] is None
+    for entry in survey["sources"]:
+        if entry["id"] == "constraints_wales":
+            assert entry["attribution"] == ConstraintsWalesSource.attribution

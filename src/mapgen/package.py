@@ -482,6 +482,11 @@ def _configured_sources(request: SurveyRequest) -> list:
     for the whole process. Calling `configure()` with no arguments at all
     is what a source needs when "give me a clean, request-scoped copy" is
     the whole ask.
+
+    constraints_wales joins that branch for a sharper reason: a survey
+    stopped before its turn never enters its fetch(), whose resets would
+    otherwise be the only thing between this survey's survey.json and the
+    previous survey's constraints record (final re-review N1, 2026-09-19).
     """
     configured = []
     for source_id in request.source_ids:
@@ -494,7 +499,7 @@ def _configured_sources(request: SurveyRequest) -> list:
                 source = configure(request.effective_categories)
             elif source_id == "elevation":
                 source = configure(request.elevation_demtype)
-            elif source_id in ("inspire", "os_open", "os_uprn"):
+            elif source_id in ("inspire", "os_open", "os_uprn", "constraints_wales"):
                 source = configure()
         configured.append(source)
     return configured
